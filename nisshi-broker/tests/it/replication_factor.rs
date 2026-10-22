@@ -170,7 +170,6 @@ mod turso {
     use crate::common::{self, StorageType};
     use url::Url;
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn stored_out_of_range() -> Result<()> {
         let _guard = init_tracing()?;

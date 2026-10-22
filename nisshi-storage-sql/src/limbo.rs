@@ -276,6 +276,69 @@ impl Engine {
         db.connect().map_err(Into::into)
     }
 
+    /// Splits `topic` into its base topic and key when the base topic is virtual
+    /// (`tansu.virtual` is true).
+    async fn topic_with_key<'a>(&self, topic: &'a str) -> Result<(&'a str, Option<&'a str>)> {
+        if let Some((base, key)) = topic.split_once('/')
+            && self
+                .describe_config(base, ConfigResource::Topic, None)
+                .await
+                .map(|configs| {
+                    configs
+                        .configs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .find_map(|config| {
+                            if config.name == "tansu.virtual" {
+                                config
+                                    .value
+                                    .as_deref()
+                                    .and_then(|config| bool::from_str(config).ok())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                })?
+        {
+            Ok((base, Some(key)))
+        } else {
+            Ok((topic, None))
+        }
+    }
+
+    async fn base_topic<'a>(&self, topic: &'a str) -> Result<&'a str> {
+        self.topic_with_key(topic).await.map(|(topic, _key)| topic)
+    }
+
+    async fn virtual_topic_id(&self, topic: &str, key: &str) -> Result<Uuid> {
+        let uuid = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("tag:nisshi.io,2026-04:virtual:{topic}:{key}",).as_bytes(),
+        );
+
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        let row = self
+            .prepare_query_one(
+                &c,
+                &sql_lookup("virtual_topic_upsert.sql")?,
+                (self.cluster.as_str(), topic, key, uuid.to_string()),
+            )
+            .await?;
+
+        row.get_value(0)
+            .map_err(Error::from)
+            .and_then(|value| {
+                value
+                    .as_text()
+                    .map(|text| Uuid::parse_str(text).map_err(Error::from))
+                    .unwrap_or_else(|| Err(Error::UnexpectedValue(value)))
+            })
+            .inspect(|vt| debug!(%vt))
+    }
+
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
         debug!(sql, ?error);
 
@@ -1191,6 +1254,10 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("ddl/030-topic-configuration.sql"),
         ),
         ("030-topition.sql", include_sql!("ddl/030-topition.sql")),
+        (
+            "030-virtual-topic.sql",
+            include_sql!("ddl/030-virtual-topic.sql"),
+        ),
         ("030-txn.sql", include_sql!("ddl/030-txn.sql")),
         (
             "040-consumer-offset.sql",
@@ -1760,6 +1827,9 @@ impl Storage for Engine {
         _max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>> {
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
+
+        let (base_topic, key_filter) = self.topic_with_key(topition.topic()).await?;
+
         let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
@@ -1780,8 +1850,23 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut records = c
-            .query(
+        let mut records = if let Some(key) = key_filter {
+            c.query(
+                &sql_lookup("record_fetch_keyed.sql")?,
+                (
+                    self.cluster.as_str(),
+                    base_topic,
+                    topition.partition(),
+                    offset,
+                    (max_bytes as i64),
+                    high_watermark,
+                    key.as_bytes().to_vec(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        } else {
+            c.query(
                 &sql_lookup("record_fetch.sql")?,
                 (
                     self.cluster.as_str(),
@@ -1793,7 +1878,8 @@ impl Storage for Engine {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| error!(?err))?
+        };
 
         let mut batches = vec![];
 
@@ -2077,7 +2163,7 @@ impl Storage for Engine {
                 &sql_lookup("watermark_select.sql")?,
                 (
                     self.cluster.as_str(),
-                    topition.topic(),
+                    self.base_topic(topition.topic()).await?,
                     topition.partition(),
                 ),
             )
@@ -2133,7 +2219,7 @@ impl Storage for Engine {
                     &sql_lookup("topition_select.sql")?,
                     (
                         self.cluster.as_str(),
-                        topition.topic(),
+                        self.base_topic(topition.topic()).await?,
                         topition.partition(),
                     ),
                 )
@@ -2160,7 +2246,7 @@ impl Storage for Engine {
                         &sql_lookup("consumer_offset_insert.sql")?,
                         (
                             self.cluster.as_str(),
-                            topition.topic(),
+                            self.base_topic(topition.topic()).await?,
                             topition.partition(),
                             group,
                             offset.offset,
@@ -2316,7 +2402,7 @@ impl Storage for Engine {
                     (
                         self.cluster.as_str(),
                         group_id,
-                        topic.topic(),
+                        self.base_topic(topic.topic()).await?,
                         topic.partition(),
                     ),
                 )
@@ -2518,10 +2604,24 @@ impl Storage for Engine {
                 for topic in topics {
                     responses.push(match topic {
                         TopicId::Name(name) => {
+                            let (base_topic, key) = self
+                                .topic_with_key(name.as_str())
+                                .await
+                                .inspect(|(base_topic, key)| debug!(base_topic, key))?;
+
+                            let vtid = if let Some(key) = key {
+                                self.virtual_topic_id(base_topic, key)
+                                    .await
+                                    .map(|uuid| uuid.into_bytes())
+                                    .map(Some)
+                            } else {
+                                Ok(None)
+                            }?;
+
                             let mut rows = c
                                 .query(
                                     &sql_lookup("topic_select_name.sql")?,
-                                    (self.cluster.as_str(), name.as_str()),
+                                    (self.cluster.as_str(), base_topic),
                                 )
                                 .await?;
 
@@ -2529,21 +2629,19 @@ impl Storage for Engine {
                                 Ok(Some(row)) => {
                                     let error_code = ErrorCode::None.into();
 
-                                    let topic_id = row.get_value(0).map_err(Error::from).and_then(
-                                        |value| {
-                                            value
-                                                .as_text()
-                                                .map(|value| {
-                                                    Uuid::parse_str(value)
-                                                        .map(|uuid| uuid.into_bytes())
-                                                        .map_err(Into::into)
-                                                })
-                                                .transpose()
-                                        },
-                                    )?;
-
-                                    let name =
-                                        row.get_value(1).map(|value| value.as_text().cloned())?;
+                                    let topic_id = vtid.or(row
+                                        .get_value(0)
+                                        .map_err(Error::from)
+                                        .and_then(|value| {
+                                        value
+                                            .as_text()
+                                            .map(|value| {
+                                                Uuid::parse_str(value)
+                                                    .map(|uuid| uuid.into_bytes())
+                                                    .map_err(Into::into)
+                                            })
+                                            .transpose()
+                                    })?);
 
                                     let is_internal =
                                         row.get_value(2).map_err(Into::into).and_then(|value| {
@@ -2597,7 +2695,7 @@ impl Storage for Engine {
 
                                     MetadataResponseTopic::default()
                                         .error_code(error_code)
-                                        .name(name)
+                                        .name(Some(name.to_owned()))
                                         .topic_id(topic_id)
                                         .is_internal(is_internal)
                                         .partitions(partitions)

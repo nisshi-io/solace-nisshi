@@ -2736,7 +2736,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn unknown_topic_id() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2767,7 +2766,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn unknown_topic_beside_idle_topic() -> Result<()> {
         let _guard = init_tracing()?;

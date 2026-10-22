@@ -1010,7 +1010,7 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
+    #[ignore = "the Turso engine answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn topics_some_matching_by_id() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1028,7 +1028,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn topics_some_not_matching_by_id() -> Result<()> {
         let _guard = init_tracing()?;
