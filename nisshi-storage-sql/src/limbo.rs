@@ -6407,4 +6407,78 @@ mod tests {
 
         Ok(())
     }
+
+    /// Returns the journal mode of the database at `path`.
+    async fn journal_mode(path: &std::path::Path) -> Result<String> {
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        let row = db
+            .connect()?
+            .query("pragma journal_mode", ())
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| Error::Message("no journal mode".into()))?;
+
+        let value = row.get_value(0)?;
+        value
+            .as_text()
+            .cloned()
+            .ok_or(Error::UnexpectedValue(value))
+    }
+
+    /// A `turso://` database that an earlier release created is in WAL mode. The engine must turn
+    /// MVCC on without losing what the database holds.
+    #[tokio::test]
+    async fn a_database_in_wal_mode_moves_to_mvcc_with_its_data() -> Result<()> {
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        {
+            let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+                .build()
+                .await?;
+            ensure_schema(&db, Duration::from_secs(5)).await?;
+
+            let c = db.connect()?;
+            _ = c
+                .execute("insert into cluster (name) values ('kept')", ())
+                .await?;
+        }
+
+        assert_eq!("wal", journal_mode(&path).await?);
+
+        let _storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        assert_eq!("mvcc", journal_mode(&path).await?);
+
+        // the row survived the change of mode, and so did the schema version
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        assert_eq!(
+            1,
+            integer(
+                &db.connect()?
+                    .query("select count(*) from cluster where name = 'kept'", ())
+                    .await?
+                    .next()
+                    .await?
+                    .ok_or_else(|| Error::Message("no count".into()))?,
+                0
+            )?
+        );
+
+        Ok(())
+    }
 }
