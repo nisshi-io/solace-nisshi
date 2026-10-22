@@ -44,10 +44,10 @@ impl StorageFactory for LimboFactory {
         Regex::new(r"turso").map_err(Into::into)
     }
 
-    /// No SCRAM credentials yet: the Turso engine refuses to store them, with
-    /// [`nisshi_storage::Error::UserCredentialsUnsupported`].
     fn capabilities(&self) -> StorageCapabilities {
-        StorageCapabilities::default()
+        StorageCapabilities {
+            user_credentials: true,
+        }
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {

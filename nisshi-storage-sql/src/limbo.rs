@@ -1240,6 +1240,10 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
             "020-producer.sql",
             include_sql!("limbo/ddl/020-producer.sql"),
         ),
+        (
+            "020-scram-credential.sql",
+            include_sql!("limbo/ddl/020-scram-credential.sql"),
+        ),
         ("020-topic.sql", include_sql!("limbo/ddl/020-topic.sql")),
         (
             "030-consumer-group-detail.sql",
@@ -4289,36 +4293,92 @@ impl Storage for Engine {
         Ok(self.advertised_listener.clone())
     }
 
-    /// Turso keeps no SCRAM credentials, so it refuses the change instead of panicking.
     async fn delete_user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
+        user: &str,
+        mechanism: ScramMechanism,
     ) -> Result<()> {
-        Err(Error::UserCredentialsUnsupported {
-            engine: factory::NAME.into(),
-        })
+        let c = self.connection().await?;
+
+        self.prepare_execute(
+            &c,
+            &sql_lookup("scram_credential_delete.sql")?,
+            (self.cluster.as_str(), user, i32::from(mechanism)),
+        )
+        .await
+        .inspect_err(|err| error!(?err))
+        .map_err(Into::into)
+        .and(Ok(()))
     }
 
-    /// See [`Self::delete_user_scram_credential`].
     async fn upsert_user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
-        _credential: ScramCredential,
+        user: &str,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
     ) -> Result<()> {
-        Err(Error::UserCredentialsUnsupported {
-            engine: factory::NAME.into(),
-        })
+        let c = self.connection().await?;
+
+        self.prepare_execute(
+            &c,
+            &sql_lookup("scram_credential_insert.sql")?,
+            (
+                self.cluster.as_str(),
+                user,
+                i32::from(mechanism),
+                credential.salt.to_vec(),
+                credential.iterations,
+                credential.stored_key.to_vec(),
+                credential.server_key.to_vec(),
+            ),
+        )
+        .await
+        .inspect_err(|err| error!(?err))
+        .map_err(Into::into)
+        .and(Ok(()))
     }
 
-    /// No user has a credential here: [`Self::upsert_user_scram_credential`] stores none.
     async fn user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
+        user: &str,
+        mechanism: ScramMechanism,
     ) -> Result<Option<ScramCredential>> {
-        Ok(None)
+        let c = self.connection().await?;
+
+        let Some(row) = self
+            .prepare_query_opt(
+                &c,
+                &sql_lookup("scram_credential_select.sql")?,
+                (self.cluster.as_str(), user, i32::from(mechanism)),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?
+        else {
+            return Ok(None);
+        };
+
+        let blob = |index| {
+            row.get_value(index).map_err(Error::from).and_then(|value| {
+                value
+                    .as_blob()
+                    .map(|blob| Bytes::copy_from_slice(blob))
+                    .ok_or(Error::UnexpectedValue(value))
+            })
+        };
+
+        let iterations = row.get_value(1).map_err(Error::from).and_then(|value| {
+            value
+                .as_integer()
+                .map(|i| *i as i32)
+                .ok_or(Error::UnexpectedValue(value))
+        })?;
+
+        Ok(Some(ScramCredential {
+            salt: blob(0)?,
+            iterations,
+            stored_key: blob(2)?,
+            server_key: blob(3)?,
+        }))
     }
 
     async fn ping(&self) -> Result<()> {

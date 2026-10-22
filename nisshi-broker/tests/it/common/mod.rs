@@ -271,6 +271,20 @@ pub(crate) async fn lite_storage(
     .await
 }
 
+pub(crate) async fn turso_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Turso,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
 pub(crate) async fn slate_storage(
     cluster: impl Into<String> + Clone,
     node: i32,
