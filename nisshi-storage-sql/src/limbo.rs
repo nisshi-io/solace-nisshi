@@ -26,6 +26,7 @@ use std::{
 
 use crate::{
     database_file,
+    schema::{RecordedSchema, should_create_schema},
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
@@ -68,9 +69,10 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
     GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    StartupFailure, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -78,7 +80,7 @@ use opentelemetry::{
 };
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use turso::{
     Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
     transaction::TransactionBehavior,
@@ -1229,6 +1231,22 @@ impl<C, N, L, D> Builder<C, N, L, D> {
     }
 }
 
+/// The version of the schema that [`DDL`] creates. A database records the version of its schema
+/// in its `nisshi_schema_version` table.
+const SCHEMA_VERSION: i32 = 1;
+
+// The build fails here when someone changes `SCHEMA_VERSION`. In a file with tables but no
+// recorded version, `ensure_schema` creates only the missing tables, and then records
+// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a file has the
+// tables of version 1.
+const _: () = assert!(SCHEMA_VERSION == 1);
+
+/// The oldest schema version whose broker can use the schema that [`DDL`] creates.
+const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
+/// How long a broker waits for another broker on the same file to finish creating the schema.
+const SCHEMA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 static DDL: LazyLock<Cache> = LazyLock::new(|| {
     let mapping = [
         ("010-cluster.sql", include_sql!("ddl/010-cluster.sql")),
@@ -1308,6 +1326,96 @@ fn sql_lookup(key: &str) -> Result<String> {
         .and_then(|sql| fix_parameters(sql).inspect(|sql| debug!(key, sql)))
 }
 
+/// Makes sure that the database has the broker's schema before the broker serves a request.
+///
+/// When the database records no schema version, this function creates the missing tables and
+/// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
+    let mut connection = db.connect()?;
+
+    // Another broker on the same file can hold the write lock while it creates the schema. The
+    // busy timeout makes this broker wait for that lock, instead of failing at once.
+    connection.busy_timeout(busy_timeout)?;
+
+    // An immediate transaction takes the write lock before it reads the version. Two brokers that
+    // start together then read the version one at a time, and only the first one applies the
+    // schema.
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+
+    _ = tx
+        .execute(&sql_lookup("nisshi_schema_version_create.sql")?, ())
+        .await?;
+
+    let recorded = match tx
+        .query(&sql_lookup("nisshi_schema_version_select.sql")?, ())
+        .await?
+        .next()
+        .await?
+    {
+        Some(row) => {
+            let integer = |index| {
+                row.get_value(index).map_err(Error::from).and_then(|value| {
+                    value
+                        .as_integer()
+                        .map(|i| *i as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })
+            };
+
+            Some(RecordedSchema {
+                version: integer(0)?,
+                oldest_compatible_version: integer(1)?,
+            })
+        }
+        None => None,
+    };
+    debug!(?recorded);
+
+    if !should_create_schema(recorded, SCHEMA_VERSION)? {
+        return tx.commit().await.map_err(Into::into);
+    }
+
+    let has_tables = tx
+        .query(
+            "select 1 from sqlite_schema where type = 'table' and name = 'cluster'",
+            (),
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+
+    for (name, ddl) in DDL.iter() {
+        _ = tx
+            .execute(ddl.as_str(), ())
+            .await
+            .inspect(|rows| debug!(name, rows))
+            .inspect_err(|err| error!(name, ?err))?;
+    }
+
+    _ = tx
+        .execute(
+            &sql_lookup("nisshi_schema_version_insert.sql")?,
+            [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
+        )
+        .await?;
+
+    tx.commit().await?;
+
+    if has_tables {
+        warn!(
+            schema_version = SCHEMA_VERSION,
+            "recorded the schema version in a file whose tables an earlier release created"
+        );
+    } else {
+        info!(schema_version = SCHEMA_VERSION, "created the schema");
+    }
+
+    Ok(())
+}
+
 impl Builder<String, i32, Url, Url> {
     pub(crate) async fn build(self) -> Result<Engine> {
         debug!(domain = self.storage.domain(), path = self.storage.path());
@@ -1318,23 +1426,23 @@ impl Builder<String, i32, Url, Url> {
 
         debug!(?path);
 
-        let db = turso::Builder::new_local(
-            path.to_str()
-                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
-        )
-        .build()
-        .await?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?;
 
-        let connection = db.connect()?;
-
-        for (name, ddl) in DDL.iter() {
-            _ = connection
-                .execute(ddl.as_str(), ())
-                .await
-                .inspect(|rows| debug!(name, rows))
-                .inspect_err(|err| error!(name, ?err))
-                .map_err(|err| Error::Message(format!("{name}: {err}")))?;
+        // Turso reads the file's header when it opens the file, so a file that is not a database
+        // fails here, and not in `ensure_schema`.
+        let db = async {
+            let db = turso::Builder::new_local(path).build().await?;
+            ensure_schema(&db, SCHEMA_BUSY_TIMEOUT).await?;
+            Ok::<_, Error>(db)
         }
+        .await
+        .map_err(|source| Error::StartupFailed {
+            storage: Arc::new(redact_url(&self.storage)),
+            failure: StartupFailure::SchemaSetup,
+            source: Arc::new(source),
+        })?;
 
         Ok(Engine {
             cluster: self.cluster,
@@ -5510,6 +5618,232 @@ mod tests {
             engine.init_producer(Some("txn"), 10_000, None, None).await,
             Err(Error::TryFromInt(_))
         ));
+
+        Ok(())
+    }
+
+    /// A change to the schema must come with a new [`SCHEMA_VERSION`], and with an upgrade step for
+    /// databases of the earlier version. A database that records a version keeps the tables that
+    /// it has, so a change without a new version reaches only new databases. Update the digest
+    /// here once both are in place.
+    #[test]
+    fn schema_matches_its_version() -> Result<()> {
+        let digest = crate::schema::schema_digest(
+            DDL.values()
+                .map(|statement| statement.as_str())
+                .chain([crate::sql::SQL.get("nisshi_schema_version_create.sql")?]),
+        );
+
+        assert_eq!(
+            (SCHEMA_VERSION, digest.as_str()),
+            (
+                1,
+                "e2e43f34f6c79eb83f58d1ba73470e671d53dfd433c8b10d082289c7e0de2fc8"
+            )
+        );
+        Ok(())
+    }
+
+    /// Returns the version that `db`'s `nisshi_schema_version` table records, or `None` when it
+    /// records none.
+    async fn recorded_version(db: &Database) -> Result<Option<i32>> {
+        db.connect()?
+            .query("select version from nisshi_schema_version", ())
+            .await?
+            .next()
+            .await?
+            .map(|row| {
+                row.get_value(0).map_err(Error::from).and_then(|value| {
+                    value
+                        .as_integer()
+                        .map(|i| *i as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })
+            })
+            .transpose()
+    }
+
+    /// In a new file, `ensure_schema` must create every table and record [`SCHEMA_VERSION`].
+    #[tokio::test]
+    async fn ensure_schema_creates_the_schema_in_a_new_file() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        for table in ["cluster", "topic", "record", "scram_credential"] {
+            _ = db
+                .connect()?
+                .query(&format!("select count(*) from {table}"), ())
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Brokers that start together on one new file must all start, and the file must record
+    /// [`SCHEMA_VERSION`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_schema_succeeds_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let path = path.to_str().expect("a UTF-8 path").to_owned();
+        let barrier = Arc::new(tokio::sync::Barrier::new(BROKERS));
+
+        let mut setups = Vec::with_capacity(BROKERS);
+        for _ in 0..BROKERS {
+            let db = turso::Builder::new_local(&path).build().await?;
+            let barrier = Arc::clone(&barrier);
+            setups.push(tokio::spawn(async move {
+                _ = barrier.wait().await;
+                ensure_schema(&db, Duration::from_secs(5)).await
+            }));
+        }
+        for setup in setups {
+            setup
+                .await
+                .map_err(|err| Error::Message(err.to_string()))??;
+        }
+
+        let db = turso::Builder::new_local(&path).build().await?;
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        Ok(())
+    }
+
+    /// A newer release set up this file with a schema that this release can use. `ensure_schema`
+    /// must leave the tables and the recorded version as they are.
+    #[tokio::test]
+    async fn ensure_schema_keeps_a_file_that_records_a_version() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a newer release set it up.
+        _ = db
+            .connect()?
+            .execute("update nisshi_schema_version set version = 2", ())
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(2));
+
+        Ok(())
+    }
+
+    /// A file whose tables an earlier release created records no version. `ensure_schema` must
+    /// record version 1 in it.
+    #[tokio::test]
+    async fn ensure_schema_records_the_version_of_a_file_created_without_one() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a release before 0.7.0 set it up.
+        _ = db
+            .connect()?
+            .execute("drop table nisshi_schema_version", ())
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        Ok(())
+    }
+
+    fn configuration(storage: Url) -> Result<nisshi_storage::StorageFactoryConfiguration> {
+        Ok(nisshi_storage::StorageFactoryConfiguration {
+            node_id: 111,
+            cluster: String::from("nisshi"),
+            advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+            storage,
+            schema_registry: None,
+            lake_house: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    /// The storage file isn't a database. The broker must stop at startup with a `SchemaSetup`
+    /// failure, instead of running without tables.
+    #[tokio::test]
+    async fn factory_fails_with_schema_setup_on_a_file_that_is_not_a_database() -> Result<()> {
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        std::fs::write(&path, [0x5a_u8; 8192])?;
+
+        let storage = Url::parse(&format!("turso:///{}", path.display()))?;
+
+        let built = factory::LimboFactory
+            .build(configuration(storage.clone())?)
+            .await;
+
+        match built {
+            Err(Error::StartupFailed {
+                storage: reported,
+                failure: StartupFailure::SchemaSetup,
+                ..
+            }) => assert_eq!(*reported, storage),
+            Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
+            Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
+        }
+
+        Ok(())
+    }
+
+    /// A newer release set up this file with a schema that this release can't use. The broker must
+    /// stop at startup with an `IncompatibleSchema` error.
+    #[tokio::test]
+    async fn factory_refuses_a_file_whose_schema_this_release_cannot_use() -> Result<()> {
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // This makes the file look as if a newer release set it up with a schema that this
+        // release can't use.
+        _ = db
+            .connect()?
+            .execute(
+                "update nisshi_schema_version set version = 2, oldest_compatible_version = 2",
+                (),
+            )
+            .await?;
+        drop(db);
+
+        let built = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await;
+
+        match built {
+            Err(Error::StartupFailed {
+                failure: StartupFailure::SchemaSetup,
+                source,
+                ..
+            }) => assert_matches!(*source, Error::IncompatibleSchema { .. }),
+            Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
+            Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
+        }
 
         Ok(())
     }

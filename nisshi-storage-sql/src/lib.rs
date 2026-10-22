@@ -23,7 +23,7 @@
     )
 )]
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[cfg(any(feature = "libsql", feature = "postgres", feature = "turso"))]
 mod schema;
 mod sql;
 
