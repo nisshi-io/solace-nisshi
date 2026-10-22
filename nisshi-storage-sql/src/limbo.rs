@@ -2159,9 +2159,27 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>> {
-        debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
+        let started_at = SystemTime::now();
+
+        // The answer stops growing once `max_wait` has elapsed, but always holds the first record.
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        debug!(
+            ?topition,
+            offset,
+            min_bytes,
+            max_bytes,
+            ?isolation_level,
+            ?max_wait
+        );
 
         let (base_topic, key_filter) = self.topic_with_key(topition.topic()).await?;
 
@@ -2323,7 +2341,9 @@ impl Storage for Engine {
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
-            while let Some(row) = records.next().await? {
+            while let Some(row) = records.next().await?
+                && !has_deadline_expired()
+            {
                 let attributes = row
                     .get_value(1)
                     .map(|value| {

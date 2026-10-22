@@ -100,6 +100,7 @@ pub mod storage_describe_acls;
 pub mod storage_describe_cluster;
 pub mod storage_describe_configs;
 pub mod storage_fetch;
+pub mod storage_fetch_max_wait;
 pub mod storage_group_version;
 pub mod storage_list_offsets;
 pub mod storage_metadata;
