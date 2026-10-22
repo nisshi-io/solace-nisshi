@@ -731,6 +731,13 @@ impl Engine {
         ]
     }
 
+    /// Runs a statement that changes rows, and returns how many rows it changed.
+    ///
+    /// The statement comes from the connection's statement cache. Preparing a statement, which is
+    /// parsing, translating and optimising its SQL, took half of the time that a produce spent in
+    /// the database, because `record_insert.sql` was prepared again for every record. The engine
+    /// keeps its connections between operations, so a statement is prepared once for the life of
+    /// its connection. A connection that meets a conflict is closed, and its statements with it.
     async fn prepare_execute<P>(
         &self,
         connection: &Connection,
@@ -743,7 +750,7 @@ impl Engine {
         // The params hold record data, so we log only the SQL.
         debug!(?connection, sql);
 
-        let mut statement = connection.prepare(sql).await?;
+        let mut statement = connection.prepare_cached(sql).await?;
 
         let execute_start = SystemTime::now();
 
@@ -6729,6 +6736,103 @@ mod tests {
             assert!(
                 FETCH_SQL.get(name)?.to_lowercase().contains("limit"),
                 "{name} has no limit"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The engine runs the same statement for every record, on a connection that it keeps. The
+    /// statement is prepared once, so each run must bind its own parameters: a record goes to the
+    /// partition and the offset that its call named, and not to those of an earlier call.
+    #[tokio::test]
+    async fn a_cached_statement_runs_with_the_parameters_of_each_call() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopic;
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: "nisshi".into(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(3)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // The calls alternate between the partitions, one after another, so that each runs on the
+        // connection that the one before it ran on.
+        for round in 0..3 {
+            for partition in 0..3 {
+                let batch = inflated::Batch::builder()
+                    .producer_id(-1)
+                    .producer_epoch(-1)
+                    .record(Record::builder().value(Some(Bytes::from(format!(
+                        "partition {partition} round {round}"
+                    )))))
+                    .build()
+                    .and_then(deflated::Batch::try_from)?;
+
+                _ = storage
+                    .produce(None, &Topition::new("t", partition), batch)
+                    .await?;
+            }
+        }
+
+        for partition in 0..3 {
+            let mut answered = vec![];
+
+            for batch in storage
+                .fetch(
+                    &Topition::new("t", partition),
+                    0,
+                    1,
+                    1024 * 1024,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(60),
+                )
+                .await?
+            {
+                let batch = inflated::Batch::try_from(batch)?;
+
+                for record in batch.records {
+                    answered.push((
+                        batch.base_offset + i64::from(record.offset_delta),
+                        record.value,
+                    ));
+                }
+            }
+
+            assert_eq!(
+                (0..3)
+                    .map(|round| (
+                        round,
+                        Some(Bytes::from(format!("partition {partition} round {round}")))
+                    ))
+                    .collect::<Vec<_>>(),
+                answered,
+                "partition {partition}"
             );
         }
 
