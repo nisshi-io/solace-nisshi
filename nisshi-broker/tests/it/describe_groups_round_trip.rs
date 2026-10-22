@@ -104,6 +104,32 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn round_trip() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::round_trip(storage).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

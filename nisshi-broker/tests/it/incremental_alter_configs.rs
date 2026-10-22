@@ -686,6 +686,30 @@ mod lite {
     );
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await
+    }
+
+    backend_tests!(
+        simple,
+        append_and_subtract,
+        append_to_non_list_is_atomic,
+        invalid_request,
+        unknown_topic,
+        validate_only,
+        multiple_changes,
+        storage_rolls_back_failed_resource,
+        concurrent_appends,
+    );
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

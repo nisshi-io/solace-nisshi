@@ -563,6 +563,58 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use nisshi_storage::ArcDynStorage;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn reject_empty_member_id_on_join() -> Result<()> {
+        let _guard = common::init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::reject_empty_member_id_on_join(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn lifecycle() -> Result<()> {
+        let _guard = common::init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::lifecycle(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use nisshi_storage::ArcDynStorage;

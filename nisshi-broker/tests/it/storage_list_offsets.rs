@@ -673,6 +673,80 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn invalid_timestamp_is_scoped_to_its_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_timestamp_is_scoped_to_its_partition(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_level() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let broker_id = rng().random_range(0..i32::MAX);
+        let storage = storage_container(Uuid::now_v7(), broker_id).await?;
+
+        super::invalid_isolation_level(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timestamp_no_match() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::timestamp_no_match(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_partitions_with_latency() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::many_partitions_with_latency(storage, broker_id).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

@@ -1421,6 +1421,121 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use crate::common::lite_storage;
+    use nisshi_storage::ArcDynStorage;
+    use rand::rng;
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        lite_storage(cluster, node).await.map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::one_consumer_session_delay_after_initial_join(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_consumer_next_action() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::one_consumer_next_action(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_consumer_next_action() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::two_consumer_next_action(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_08c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..8).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_16c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..16).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_24c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..24).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_next_action_32c() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        group_consumer_next_action(storage, 0..32).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use crate::common::slate_storage;

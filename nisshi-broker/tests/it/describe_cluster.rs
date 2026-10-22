@@ -195,6 +195,41 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use crate::common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
+    use rand::{prelude::*, rng};
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+        advertised_listener: Url,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(StorageType::Turso, cluster, node, advertised_listener, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn describe() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster = Uuid::now_v7();
+        let node = rng().random_range(0..i32::MAX);
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+
+        super::describe(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use crate::common::{StorageType, init_tracing};

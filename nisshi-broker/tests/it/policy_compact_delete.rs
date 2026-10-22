@@ -3097,3 +3097,94 @@ mod lite {
         super::compact_delete_002(sc).await
     }
 }
+
+#[cfg(feature = "turso")]
+mod turso {
+    use nisshi_storage::ArcDynStorage;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[ignore = "the Turso engine does not implement retention or compaction yet"]
+    #[tokio::test]
+    async fn compact_only() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::compact_only(sc).await
+    }
+
+    #[ignore = "the Turso engine does not implement retention or compaction yet"]
+    #[tokio::test]
+    async fn delete_only() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::delete_only(sc).await
+    }
+
+    #[ignore = "the Turso engine does not implement retention or compaction yet"]
+    #[tokio::test]
+    async fn delete_no_retention_ms_only() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::delete_no_retention_ms_only(sc).await
+    }
+
+    #[ignore = "the Turso engine does not implement retention or compaction yet"]
+    #[tokio::test]
+    async fn compact_delete_001() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::compact_delete_001(sc).await
+    }
+
+    #[ignore = "the Turso engine does not implement retention or compaction yet"]
+    #[tokio::test]
+    async fn compact_delete_002() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::compact_delete_002(sc).await
+    }
+}

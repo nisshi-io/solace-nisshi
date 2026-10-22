@@ -487,6 +487,17 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    #[tokio::test]
+    async fn secrets_stay_out_of_logs() -> Result<()> {
+        let storage = lite_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+        super::secrets_stay_out_of_logs(storage).await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;
