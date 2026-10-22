@@ -474,5 +474,6 @@ macro_rules! backend {
 
 backend!(in_memory, "dynostore", StorageType::InMemory);
 backend!(lite, "libsql", StorageType::Lite);
+backend!(turso, "turso", StorageType::Turso);
 backend!(pg, "postgres", StorageType::Postgres);
 backend!(slatedb, "slatedb", StorageType::SlateDb);

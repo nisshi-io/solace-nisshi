@@ -584,3 +584,4 @@ macro_rules! backend {
 
 backend!(pg, "postgres", StorageType::Postgres);
 backend!(lite, "libsql", StorageType::Lite);
+backend!(turso, "turso", StorageType::Turso);

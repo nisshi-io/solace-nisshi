@@ -18,6 +18,7 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     ops::Deref,
+    path::PathBuf,
     result,
     str::FromStr as _,
     sync::{Arc, LazyLock, Mutex},
@@ -80,6 +81,7 @@ use opentelemetry::{
 };
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
+use tokio::{fs::rename, sync::Semaphore};
 use tracing::{debug, error, info, warn};
 use turso::{
     Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
@@ -188,6 +190,8 @@ pub struct Engine {
     node: i32,
     advertised_listener: Url,
     db: Arc<Mutex<Database>>,
+    maintenance: Arc<Semaphore>,
+    vacuum_into: Option<PathBuf>,
 
     schemas: Option<Registry>,
     lake: Option<House>,
@@ -276,6 +280,205 @@ impl Engine {
     async fn connection(&self) -> Result<Connection> {
         let db = self.db.lock()?;
         db.connect().map_err(Into::into)
+    }
+
+    /// Writes a snapshot of the database to the `vacuum_into` path, when the storage URL names
+    /// one. The snapshot is complete when it appears at the path, because the engine writes it to a
+    /// temporary file first.
+    async fn vacuum_into(&self) -> Result<()> {
+        let Some(vacuum_into) = self.vacuum_into.as_deref() else {
+            return Ok(());
+        };
+
+        debug!(vacuum_into = vacuum_into.to_str());
+
+        let mut temporary = PathBuf::from(vacuum_into);
+        if !temporary.add_extension("temporary") {
+            return Ok(());
+        }
+
+        let Some(vacuum_temporary) = temporary.to_str() else {
+            return Ok(());
+        };
+
+        // Turso takes only a string literal after `vacuum into`, not a parameter, and it does not
+        // unescape a doubled quote inside the literal. So the literal uses the quote that the path
+        // lacks, and a path with both quotes is refused instead of risking a statement that means
+        // something else.
+        let sql = if !vacuum_temporary.contains('\'') {
+            format!("vacuum into '{vacuum_temporary}'")
+        } else if !vacuum_temporary.contains('"') {
+            format!("vacuum into \"{vacuum_temporary}\"")
+        } else {
+            return Err(Error::Message(format!(
+                "vacuum_into path has a single and a double quote: {vacuum_into:?}"
+            )));
+        };
+
+        let c = self.connection().await?;
+        let rows = c.execute(&sql, ()).await?;
+
+        rename(temporary, vacuum_into).await?;
+        debug!(vacuum_into = vacuum_into.to_str(), rows);
+
+        Ok(())
+    }
+
+    async fn policy_compact_delete(&self, topition: i64, offset_id: i64) -> Result<u64> {
+        let c = self.connection().await?;
+
+        self.prepare_execute(
+            &c,
+            &sql_lookup("lite/policy_compact_delete.sql")?,
+            (topition, offset_id),
+        )
+        .await
+        .inspect(|rows| debug!(rows))
+        .map_err(Into::into)
+    }
+
+    async fn policy_compact_compaction(
+        &self,
+        topition: i64,
+        key: &[u8],
+        max_offset_id: i64,
+    ) -> Result<Vec<i64>> {
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup("lite/policy_compact_compaction.sql")?,
+                (topition, key.to_vec(), max_offset_id),
+            )
+            .await?;
+
+        let mut offsets = Vec::new();
+
+        while let Some(row) = rows.next().await? {
+            offsets.push(integer(&row, 0)?);
+        }
+
+        Ok(offsets)
+    }
+
+    async fn policy_compact_max_offset_id(&self, topition: i64, key: &[u8]) -> Result<Option<i64>> {
+        let c = self.connection().await?;
+
+        let Some(row) = self
+            .prepare_query_opt(
+                &c,
+                &sql_lookup("lite/policy_compact_max_offset_id.sql")?,
+                (topition, key.to_vec()),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // max() is null when no record has the key
+        row.get_value(0)
+            .map_err(Error::from)
+            .map(|value| value.as_integer().copied())
+            .inspect(|max_offset| debug!(max_offset))
+    }
+
+    async fn policy_compact_distinct_k(&self, topition: i64) -> Result<BTreeSet<Vec<u8>>> {
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup("lite/policy_compact_distinct_k.sql")?,
+                [topition],
+            )
+            .await?;
+
+        let mut keys = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            if let Some(key) = row.get_value(0)?.as_blob() {
+                _ = keys.insert(key.clone());
+            }
+        }
+
+        debug!(keys = keys.len());
+
+        Ok(keys)
+    }
+
+    async fn policy_compact_topitions(&self) -> Result<BTreeSet<i64>> {
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup("lite/policy_compact_topitions.sql")?,
+                [self.cluster.as_str()],
+            )
+            .await?;
+
+        let mut topitions = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            _ = topitions.insert(integer(&row, 0)?);
+        }
+
+        Ok(topitions)
+    }
+
+    /// Removes every record of a topic whose `cleanup.policy` includes `compact` that a later
+    /// record with the same key replaces.
+    async fn policy_compact(&self) -> Result<u64> {
+        let mut compacted = 0;
+
+        for topition in self.policy_compact_topitions().await? {
+            debug!(topition);
+
+            for key in self.policy_compact_distinct_k(topition).await? {
+                debug!(key_len = key.len());
+
+                if let Some(max_offset_id) =
+                    self.policy_compact_max_offset_id(topition, &key).await?
+                {
+                    debug!(max_offset_id);
+
+                    for offset in self
+                        .policy_compact_compaction(topition, &key, max_offset_id)
+                        .await?
+                    {
+                        debug!(offset);
+
+                        compacted += self.policy_compact_delete(topition, offset).await?;
+                    }
+                }
+            }
+        }
+
+        Ok(compacted)
+    }
+
+    /// Removes the records of a topic whose `cleanup.policy` includes `delete` that are older
+    /// than its `retention.ms`, and then the oldest records that exceed its `retention.bytes`.
+    async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
+        let now = to_timestamp(&now)?;
+        let retention_ms = i64::try_from(Duration::from_hours(7 * 24).as_millis())?;
+
+        let c = self.connection().await?;
+
+        let by_age = self
+            .prepare_execute(
+                &c,
+                &sql_lookup("lite/policy_delete.sql")?,
+                (self.cluster.as_str(), now, retention_ms),
+            )
+            .await?;
+
+        self.prepare_execute(
+            &c,
+            &sql_lookup("lite/policy_delete_bytes.sql")?,
+            [self.cluster.as_str()],
+        )
+        .await
+        .map(|by_bytes| by_age + by_bytes)
+        .map_err(Into::into)
     }
 
     /// Splits `topic` into its base topic and key when the base topic is virtual
@@ -1320,6 +1523,16 @@ fn fix_parameters(sql: &str) -> Result<String> {
         .map_err(Into::into)
 }
 
+/// Reads column `index` of `row` as an integer.
+fn integer(row: &Row, index: usize) -> Result<i64> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        value
+            .as_integer()
+            .copied()
+            .ok_or(Error::UnexpectedValue(value))
+    })
+}
+
 fn sql_lookup(key: &str) -> Result<String> {
     crate::sql::SQL
         .get(key)
@@ -1426,6 +1639,14 @@ impl Builder<String, i32, Url, Url> {
 
         debug!(?path);
 
+        let vacuum_into = self.storage.query_pairs().find_map(|(k, v)| {
+            if k == "vacuum_into" {
+                Some(PathBuf::from(v.as_ref()))
+            } else {
+                None
+            }
+        });
+
         let path = path
             .to_str()
             .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?;
@@ -1449,6 +1670,8 @@ impl Builder<String, i32, Url, Url> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             db: Arc::new(Mutex::new(db)),
+            maintenance: Arc::new(Semaphore::new(1)),
+            vacuum_into,
             schemas: self.schemas,
             lake: self.lake,
         })
@@ -4372,7 +4595,20 @@ impl Storage for Engine {
         Ok(error_code)
     }
 
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        self.vacuum_into().await?;
+
+        // A maintenance that is still running makes the next one wait for the next interval.
+        let Ok(_permit) = self.maintenance.try_acquire() else {
+            return Ok(());
+        };
+
+        let deleted = self.policy_delete(now).await?;
+        debug!(deleted);
+
+        let compacted = self.policy_compact().await?;
+        debug!(compacted);
+
         Ok(())
     }
 
@@ -5844,6 +6080,86 @@ mod tests {
             Err(err) => panic!("expected the SchemaSetup failure, got {err:?}"),
             Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
         }
+
+        Ok(())
+    }
+
+    /// Builds a storage on `database` that writes its snapshot to `snapshot`.
+    async fn storage_with_snapshot(
+        database: &std::path::Path,
+        snapshot: &std::path::Path,
+    ) -> Result<nisshi_storage::ArcDynStorage> {
+        use nisshi_storage::StorageFactory as _;
+
+        let mut storage = Url::parse(&format!("turso:///{}", database.display()))?;
+        _ = storage
+            .query_pairs_mut()
+            .append_pair("vacuum_into", snapshot.to_str().expect("a UTF-8 path"));
+
+        factory::LimboFactory.build(configuration(storage)?).await
+    }
+
+    /// Returns the version that the database at `path` records.
+    async fn snapshot_version(path: &std::path::Path) -> Result<Option<i32>> {
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        recorded_version(&db).await
+    }
+
+    /// `maintain` must write a complete snapshot at the `vacuum_into` path, and leave no temporary
+    /// file beside it.
+    #[tokio::test]
+    async fn maintain_writes_the_snapshot() -> Result<()> {
+        let directory = tempdir()?;
+        let database = directory.path().join("nisshi.db");
+        let snapshot = directory.path().join("snapshot.db");
+
+        let storage = storage_with_snapshot(&database, &snapshot).await?;
+        assert!(!snapshot.exists());
+
+        storage.maintain(SystemTime::now()).await?;
+
+        assert_eq!(snapshot_version(&snapshot).await?, Some(SCHEMA_VERSION));
+        assert!(!snapshot.with_extension("db.temporary").exists());
+
+        Ok(())
+    }
+
+    /// The path goes into the statement as a string literal, so a single quote in it must not end
+    /// the literal early. Turso does not unescape a doubled quote, so the literal uses the other
+    /// quote.
+    #[tokio::test]
+    async fn maintain_writes_the_snapshot_to_a_path_with_a_single_quote() -> Result<()> {
+        let directory = tempdir()?;
+        let quoted = directory.path().join("it's a snapshot");
+        std::fs::create_dir(&quoted)?;
+        let database = directory.path().join("nisshi.db");
+        let snapshot = quoted.join("snapshot.db");
+
+        let storage = storage_with_snapshot(&database, &snapshot).await?;
+        storage.maintain(SystemTime::now()).await?;
+
+        assert_eq!(snapshot_version(&snapshot).await?, Some(SCHEMA_VERSION));
+
+        Ok(())
+    }
+
+    /// A path with both kinds of quote has no literal that Turso reads as that path, so `maintain`
+    /// must fail and write nothing.
+    #[tokio::test]
+    async fn maintain_refuses_a_snapshot_path_with_both_quotes() -> Result<()> {
+        let directory = tempdir()?;
+        let quoted = directory.path().join("it's \"quoted\"");
+        std::fs::create_dir(&quoted)?;
+        let database = directory.path().join("nisshi.db");
+        let snapshot = quoted.join("snapshot.db");
+
+        let storage = storage_with_snapshot(&database, &snapshot).await?;
+
+        assert!(storage.maintain(SystemTime::now()).await.is_err());
+        assert!(!snapshot.exists());
+        assert!(!snapshot.with_extension("db.temporary").exists());
 
         Ok(())
     }
