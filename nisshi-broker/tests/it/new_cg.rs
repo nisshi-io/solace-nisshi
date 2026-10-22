@@ -1423,7 +1423,7 @@ mod lite {
 
 #[cfg(feature = "turso")]
 mod turso {
-    use crate::common::lite_storage;
+    use crate::common::turso_storage;
     use nisshi_storage::ArcDynStorage;
     use rand::rng;
     use uuid::Uuid;
@@ -1434,7 +1434,7 @@ mod turso {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await.map_err(Into::into)
+        turso_storage(cluster, node).await.map_err(Into::into)
     }
 
     #[tokio::test]

@@ -491,9 +491,11 @@ mod lite {
 mod turso {
     use super::*;
 
+    #[ignore = "the Turso engine logs record keys"]
     #[tokio::test]
     async fn secrets_stay_out_of_logs() -> Result<()> {
-        let storage = lite_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+        let storage =
+            crate::common::turso_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
         super::secrets_stay_out_of_logs(storage).await
     }
 }

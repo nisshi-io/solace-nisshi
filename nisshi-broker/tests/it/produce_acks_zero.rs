@@ -734,7 +734,7 @@ mod turso {
 
     use super::*;
 
-    async fn sqlite_url(name: &str) -> Result<Url> {
+    async fn turso_url(name: &str) -> Result<Url> {
         let relative = format!("../logs/{}/{name}.db", env!("CARGO_PKG_NAME"));
         let mut path = env::current_dir()?;
         path.push(&relative);
@@ -745,7 +745,7 @@ mod turso {
             Err(error) => Err(error),
         }?;
 
-        Url::parse(&format!("sqlite://{relative}")).map_err(Into::into)
+        Url::parse(&format!("turso://{relative}")).map_err(Into::into)
     }
 
     #[tokio::test]
@@ -755,7 +755,7 @@ mod turso {
             .name()
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
-        acks_zero_success_is_not_written(sqlite_url(&name).await?).await
+        acks_zero_success_is_not_written(turso_url(&name).await?).await
     }
 
     #[tokio::test]
@@ -765,7 +765,7 @@ mod turso {
             .name()
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
-        acks_zero_then_acks_one_on_one_connection(sqlite_url(&name).await?).await
+        acks_zero_then_acks_one_on_one_connection(turso_url(&name).await?).await
     }
 
     #[tokio::test]
@@ -775,7 +775,7 @@ mod turso {
             .name()
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
-        acks_zero_failure_closes_connection(sqlite_url(&name).await?).await
+        acks_zero_failure_closes_connection(turso_url(&name).await?).await
     }
 
     #[tokio::test]
@@ -785,6 +785,6 @@ mod turso {
             .name()
             .ok_or_else(|| anyhow!("unnamed thread"))?
             .to_owned();
-        acks_zero_storage_failure_closes_connection(sqlite_url(&name).await?).await
+        acks_zero_storage_failure_closes_connection(turso_url(&name).await?).await
     }
 }

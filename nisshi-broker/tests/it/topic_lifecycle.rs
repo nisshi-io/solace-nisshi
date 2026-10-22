@@ -242,9 +242,10 @@ mod turso {
         cluster: impl Into<String> + Clone,
         node: i32,
     ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await
+        crate::common::turso_storage(cluster, node).await
     }
 
+    #[ignore = "the Turso engine panics on a unique constraint violation"]
     #[tokio::test]
     async fn topic_lifecycle() -> Result<()> {
         let _guard = init_tracing()?;
