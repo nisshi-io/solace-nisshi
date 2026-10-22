@@ -2,6 +2,7 @@
 **/*.rs.bk
 *.db
 *.db-journal
+*.db-log
 *.db-shm
 *.db-wal
 *.duckdb
