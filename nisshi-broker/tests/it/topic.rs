@@ -709,7 +709,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_id() -> Result<()> {
         let _guard = init_tracing()?;
@@ -725,7 +724,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_name() -> Result<()> {
         let _guard = init_tracing()?;

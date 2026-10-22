@@ -2690,7 +2690,7 @@ impl Storage for Engine {
                                         partitions,
                                         replication_factor,
                                         error_code,
-                                        -1,
+                                        0,
                                     )?);
 
                                     MetadataResponseTopic::default()
@@ -2797,7 +2797,7 @@ impl Storage for Engine {
                                         partitions,
                                         replication_factor,
                                         error_code,
-                                        -1,
+                                        0,
                                     )?);
 
                                     MetadataResponseTopic::default()
@@ -2903,7 +2903,7 @@ impl Storage for Engine {
                         partitions,
                         replication_factor,
                         error_code,
-                        -1,
+                        0,
                     )?);
 
                     responses.push(
@@ -3094,7 +3094,7 @@ impl Storage for Engine {
                                                 .error_code(ErrorCode::None.into())
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
-                                                .leader_epoch(-1)
+                                                .leader_epoch(0)
                                                 .replica_nodes(Some(
                                                     nisshi_storage::single_node_replicas(
                                                         self.node,
@@ -3221,7 +3221,7 @@ impl Storage for Engine {
                                                 .error_code(ErrorCode::None.into())
                                                 .partition_index(partition_index)
                                                 .leader_id(self.node)
-                                                .leader_epoch(-1)
+                                                .leader_epoch(0)
                                                 .replica_nodes(Some(
                                                     nisshi_storage::single_node_replicas(
                                                         self.node,
