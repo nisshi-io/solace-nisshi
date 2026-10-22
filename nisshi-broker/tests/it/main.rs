@@ -67,7 +67,6 @@ pub mod person;
 pub mod pg_init_producer;
 pub mod pg_txn;
 pub mod policy_compact_delete;
-#[cfg(feature = "libsql")]
 pub mod pre_authentication_frame_size;
 pub mod produce;
 pub mod produce_acks_zero;

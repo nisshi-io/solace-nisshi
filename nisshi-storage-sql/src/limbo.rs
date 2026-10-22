@@ -20,7 +20,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     result,
-    str::FromStr as _,
+    str::FromStr,
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
@@ -335,6 +335,8 @@ pub struct Engine {
     produce_locks: Arc<ProduceLocks>,
     maintenance: Arc<Semaphore>,
     vacuum_into: Option<PathBuf>,
+    busy_timeout: Duration,
+    compaction: CompactionMode,
 
     schemas: Option<Registry>,
     lake: Option<House>,
@@ -433,7 +435,7 @@ impl Engine {
                 };
 
                 _ = connection.execute("PRAGMA foreign_keys = ON", ()).await?;
-                connection.busy_timeout(SCHEMA_BUSY_TIMEOUT)?;
+                connection.busy_timeout(self.busy_timeout)?;
 
                 connection
             }
@@ -590,6 +592,17 @@ impl Engine {
     /// Removes every record of a topic whose `cleanup.policy` includes `compact` that a later
     /// record with the same key replaces.
     async fn policy_compact(&self) -> Result<u64> {
+        if self.compaction == CompactionMode::Single {
+            return write_transaction!(self, tx => {
+                self.prepare_execute(
+                    &tx,
+                    &sql_lookup("policy_compact.sql")?,
+                    [self.cluster.as_str()],
+                )
+                .await?
+            });
+        }
+
         let mut compacted = 0;
 
         for topition in self.policy_compact_topitions().await? {
@@ -1611,8 +1624,33 @@ const _: () = assert!(SCHEMA_VERSION == 1);
 /// The oldest schema version whose broker can use the schema that [`DDL`] creates.
 const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 
-/// How long a broker waits for another broker on the same file to finish creating the schema.
-const SCHEMA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection waits for a lock that another connection holds, when the storage URL does
+/// not set `busy_timeout`. Brokers on the same file wait this long for one another to create the
+/// schema.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How `maintain` compacts a topic whose `cleanup.policy` includes `compact`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CompactionMode {
+    /// One statement for every partition of the cluster.
+    Single,
+
+    /// A few statements for every key of every partition.
+    #[default]
+    Multi,
+}
+
+impl FromStr for CompactionMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s {
+            "single" => Ok(Self::Single),
+            "multi" => Ok(Self::Multi),
+            otherwise => Err(Error::Message(otherwise.to_owned())),
+        }
+    }
+}
 
 static DDL: LazyLock<Cache> = LazyLock::new(|| {
     let mapping = [
@@ -1837,6 +1875,39 @@ impl Builder<String, i32, Url, Url> {
             }
         });
 
+        let busy_timeout = self
+            .storage
+            .query_pairs()
+            .find_map(|(k, v)| {
+                if k == "busy_timeout" {
+                    human_units::Duration::from_str(v.as_ref())
+                        .map(|duration| duration.0)
+                        .inspect_err(
+                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
+                        )
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(DEFAULT_BUSY_TIMEOUT);
+
+        let compaction = self
+            .storage
+            .query_pairs()
+            .find_map(|(k, v)| {
+                if k == "compaction" {
+                    CompactionMode::from_str(v.as_ref())
+                        .inspect_err(
+                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
+                        )
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
         let path = path
             .to_str()
             .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?;
@@ -1852,7 +1923,7 @@ impl Builder<String, i32, Url, Url> {
                 .pragma_update("journal_mode", "'mvcc'")
                 .await?;
 
-            ensure_schema(&db, SCHEMA_BUSY_TIMEOUT).await?;
+            ensure_schema(&db, busy_timeout).await?;
             Ok::<_, Error>(db)
         }
         .await
@@ -1871,6 +1942,8 @@ impl Builder<String, i32, Url, Url> {
             produce_locks: Arc::default(),
             maintenance: Arc::new(Semaphore::new(1)),
             vacuum_into,
+            busy_timeout,
+            compaction,
             schemas: self.schemas,
             lake: self.lake,
         })
@@ -6478,6 +6551,157 @@ mod tests {
                 0
             )?
         );
+
+        Ok(())
+    }
+
+    /// A column that is not a time must make the conversion fail, not panic the request.
+    #[test]
+    fn a_value_that_is_not_a_time_is_an_error() {
+        for value in [Value::Null, Value::Real(1.5), Value::Blob(vec![1, 2, 3])] {
+            assert_matches!(
+                LiteTimestamp::try_from(value),
+                Err(Error::UnexpectedValue(_))
+            );
+        }
+    }
+
+    /// A statement that returns no row, here the insert of a topic into a cluster that no broker
+    /// has registered, must answer an error, not panic the request.
+    #[tokio::test]
+    async fn a_statement_without_a_row_is_an_error() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopic;
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        // no `register_broker`, so the cluster has no row
+        let created = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("events".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await;
+
+        assert!(created.is_err(), "{created:?}");
+
+        Ok(())
+    }
+
+    /// Produces two records with one key to a topic that compacts, runs `maintain`, and returns the
+    /// values that a fetch answers, for a storage built with `query` on its URL.
+    async fn compacted_values(query: &str) -> Result<Vec<Bytes>> {
+        use nisshi_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}?{query}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: "nisshi".into(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("compacted".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        [CreatableTopicConfig::default()
+                            .name("cleanup.policy".into())
+                            .value(Some("compact".into()))]
+                        .into(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("compacted", 0);
+
+        for value in ["older", "newer"] {
+            let batch = inflated::Batch::builder()
+                .record(
+                    Record::builder()
+                        .key(Some(Bytes::from_static(b"key")))
+                        .value(Some(Bytes::from(value))),
+                )
+                .producer_id(-1)
+                .producer_epoch(-1)
+                .build()
+                .and_then(deflated::Batch::try_from)?;
+
+            _ = storage.produce(None, &topition, batch).await?;
+        }
+
+        storage.maintain(SystemTime::now()).await?;
+
+        storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(60),
+            )
+            .await?
+            .into_iter()
+            .map(|batch| {
+                inflated::Batch::try_from(batch).map(|batch| {
+                    batch
+                        .records
+                        .into_iter()
+                        .filter_map(|record| record.value)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .try_fold(Vec::new(), |mut values, batch| {
+                values.extend(batch?);
+                Ok(values)
+            })
+    }
+
+    /// Both compaction modes leave only the latest record of a key.
+    #[tokio::test]
+    async fn compaction_modes_keep_the_latest_record_of_a_key() -> Result<()> {
+        for query in [
+            "compaction=multi",
+            "compaction=single",
+            "busy_timeout=250ms",
+        ] {
+            assert_eq!(
+                vec![Bytes::from_static(b"newer")],
+                compacted_values(query).await?,
+                "{query}"
+            );
+        }
 
         Ok(())
     }

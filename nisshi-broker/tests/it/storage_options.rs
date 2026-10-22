@@ -204,3 +204,50 @@ mod sqlite {
         Ok(())
     }
 }
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    fn url(query: &str) -> String {
+        format!(
+            "turso://../logs/{}/storage-options-{}.db?{query}",
+            env!("CARGO_PKG_NAME"),
+            Uuid::now_v7()
+        )
+    }
+
+    #[tokio::test]
+    async fn accepts_interval_and_engine_options() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        build(&url(concat!(
+            "maintenance_interval=1m&busy_timeout=5s&compaction=single",
+            "&vacuum_into=../logs/nisshi-broker/storage-options.turso.vacuum.db"
+        )))
+        .await
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_interval() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let error = build(&url("maintenance_interval=0s")).await.unwrap_err();
+        assert!(
+            is_invalid_interval(&error, "maintenance_interval", "0s"),
+            "{error:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_misspelt_option() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let error = build(&url("vacuum_onto=/tmp/x")).await.unwrap_err();
+        assert!(is_unrecognized(&error, "turso", "vacuum_onto"), "{error:?}");
+
+        Ok(())
+    }
+}
