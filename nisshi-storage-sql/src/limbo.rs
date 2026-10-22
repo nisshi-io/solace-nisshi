@@ -1719,11 +1719,29 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
     Cache::new(BTreeMap::from(mapping))
 });
 
+/// The regular expression that finds the `$n` parameters of the shared SQL. Compiling it costs far
+/// more than running it, so it is compiled once.
+static PARAMETER: LazyLock<result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\$(?<i>\d+)"));
+
 fn fix_parameters(sql: &str) -> Result<String> {
-    Regex::new(r"\$(?<i>\d+)")
+    PARAMETER
+        .as_ref()
         .map(|re| re.replace_all(sql, "?$i").into_owned())
-        .map_err(Into::into)
+        .map_err(|err| err.clone().into())
 }
+
+/// The shared SQL with its `$n` parameters as `?n`, which is how Turso numbers them. Every
+/// statement is converted once, and not each time that an operation runs it.
+static CONVERTED_SQL: LazyLock<Cache> = LazyLock::new(|| {
+    Cache::new(
+        crate::sql::SQL
+            .iter()
+            .map(|(name, sql)| fix_parameters(sql).map(|sql| (*name, sql)))
+            .collect::<Result<BTreeMap<_, _>>>()
+            .unwrap_or_default(),
+    )
+});
 
 /// How many times an operation runs again when it conflicts with another writer.
 const MAXIMUM_CONFLICT_ATTEMPTS: u32 = 100;
@@ -1762,9 +1780,10 @@ fn integer(row: &Row, index: usize) -> Result<i64> {
 }
 
 fn sql_lookup(key: &str) -> Result<String> {
-    crate::sql::SQL
+    CONVERTED_SQL
         .get(key)
-        .and_then(|sql| fix_parameters(sql).inspect(|sql| debug!(key, sql)))
+        .map(str::to_owned)
+        .inspect(|sql| debug!(key, sql))
 }
 
 /// Makes sure that the database has the broker's schema before the broker serves a request.
@@ -6702,6 +6721,37 @@ mod tests {
                 "{query}"
             );
         }
+
+        Ok(())
+    }
+
+    /// The statements are converted once, into one table. A statement that failed to convert would
+    /// leave the table empty, and every lookup after it would fail.
+    #[test]
+    fn every_shared_statement_is_converted() {
+        assert_eq!(crate::sql::SQL.len(), CONVERTED_SQL.len());
+
+        let placeholder = Regex::new(r"\$\d").expect("a valid regular expression");
+        for (name, sql) in CONVERTED_SQL.iter() {
+            assert!(
+                !placeholder.is_match(sql),
+                "{name} still has a $n parameter"
+            );
+        }
+    }
+
+    /// Turso numbers a parameter `?n`, where the shared SQL numbers it `$n`.
+    #[test]
+    fn a_statement_numbers_its_parameters_as_turso_does() -> Result<()> {
+        let sql = sql_lookup("topic_select_name.sql")?;
+
+        assert!(sql.contains("?1") && sql.contains("?2"), "{sql}");
+        assert!(!sql.contains("$1") && !sql.contains("$2"), "{sql}");
+
+        assert_matches!(
+            sql_lookup("no-such-statement.sql"),
+            Err(Error::UnknownCacheKey(_))
+        );
 
         Ok(())
     }
