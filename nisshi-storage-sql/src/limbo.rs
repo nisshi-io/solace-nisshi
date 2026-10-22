@@ -277,9 +277,20 @@ impl Engine {
         Builder::default()
     }
 
+    /// Opens a connection with foreign keys enforced.
+    ///
+    /// Turso, like SQLite, enforces foreign keys only on a connection that turns them on, and the
+    /// setting is not stored in the database. Without it, `on delete cascade` deletes nothing, and
+    /// a row can name a parent that does not exist.
     async fn connection(&self) -> Result<Connection> {
-        let db = self.db.lock()?;
-        db.connect().map_err(Into::into)
+        let connection = {
+            let db = self.db.lock()?;
+            db.connect()?
+        };
+
+        _ = connection.execute("PRAGMA foreign_keys = ON", ()).await?;
+
+        Ok(connection)
     }
 
     /// Writes a snapshot of the database to the `vacuum_into` path, when the storage URL names
@@ -6180,6 +6191,85 @@ mod tests {
         assert!(storage.maintain(SystemTime::now()).await.is_err());
         assert!(!snapshot.exists());
         assert!(!snapshot.with_extension("db.temporary").exists());
+
+        Ok(())
+    }
+
+    /// Counts the rows of `table` in the database at `path`.
+    async fn rows(path: &std::path::Path, table: &str) -> Result<i64> {
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        let row = db
+            .connect()?
+            .query(&format!("select count(*) from {table}"), ())
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| Error::Message(format!("no count for {table}")))?;
+
+        integer(&row, 0)
+    }
+
+    /// A virtual topic's row depends on its topic with `on delete cascade`, and
+    /// `delete_topic` does not delete it itself. SQLite enforces foreign keys only on a connection
+    /// that turns them on, so deleting the topic must leave no row behind.
+    #[tokio::test]
+    async fn delete_topic_cascades_to_its_virtual_topics() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: "nisshi".into(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("events".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        [CreatableTopicConfig::default()
+                            .name("tansu.virtual".into())
+                            .value(Some("true".into()))]
+                        .into(),
+                    )),
+                false,
+            )
+            .await?;
+
+        // a metadata request for a key of a virtual topic records the virtual topic
+        _ = storage
+            .metadata(Some(&[TopicId::Name("events/key".into())]))
+            .await?;
+        assert_eq!(1, rows(&path, "virtual_topic").await?);
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .delete_topic(&TopicId::Name("events".into()))
+                .await?
+        );
+
+        assert_eq!(0, rows(&path, "virtual_topic").await?);
 
         Ok(())
     }
