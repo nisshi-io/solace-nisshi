@@ -103,6 +103,7 @@ pub mod storage_fetch;
 pub mod storage_group_version;
 pub mod storage_list_offsets;
 pub mod storage_metadata;
+pub mod storage_offset_commit_timestamp;
 pub mod storage_options;
 pub mod tls;
 pub mod topic;
