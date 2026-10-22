@@ -1779,6 +1779,77 @@ fn integer(row: &Row, index: usize) -> Result<i64> {
     })
 }
 
+/// The most records that one fetch reads.
+const ROWS_PER_FETCH: i64 = 10_000;
+
+/// The fetch statements that only this engine has, in `limbo/sql/`, with their `$n` parameters as
+/// `?n`. They are converted once.
+static FETCH_SQL: LazyLock<Cache> = LazyLock::new(|| {
+    Cache::new(
+        [
+            (
+                "record_fetch.sql",
+                include_sql!("limbo/sql/record_fetch.sql"),
+            ),
+            (
+                "record_fetch_keyed.sql",
+                include_sql!("limbo/sql/record_fetch_keyed.sql"),
+            ),
+            (
+                "header_fetch_range.sql",
+                include_sql!("limbo/sql/header_fetch_range.sql"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, sql)| fix_parameters(&sql).map(|sql| (name, sql)))
+        .collect::<Result<BTreeMap<_, _>>>()
+        .unwrap_or_default(),
+    )
+});
+
+/// A record that a fetch read, with the columns that its answer uses.
+struct FetchedRecord {
+    offset: i64,
+    attributes: i16,
+    timestamp: i64,
+    key: Option<Bytes>,
+    value: Option<Bytes>,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl FetchedRecord {
+    /// Reads the columns of `limbo/sql/record_fetch.sql`.
+    fn try_from_row(row: &Row) -> Result<Self> {
+        let integer_or_null = |index| {
+            row.get_value(index)
+                .map_err(Error::from)
+                .map(|value| value.as_integer().copied())
+        };
+
+        Ok(Self {
+            offset: integer(row, 0)?,
+            attributes: integer_or_null(1)?.map_or(0, |attributes| attributes as i16),
+            timestamp: row
+                .get_value(2)
+                .map_err(Error::from)
+                .and_then(LiteTimestamp::try_from)
+                .and_then(|timestamp| to_timestamp(&timestamp.0).map_err(Into::into))?,
+            key: row.get_value(3)?.as_blob().cloned().map(Bytes::from),
+            value: row.get_value(4)?.as_blob().cloned().map(Bytes::from),
+            producer_id: integer_or_null(5)?.unwrap_or(-1),
+            producer_epoch: i16::try_from(integer_or_null(6)?.unwrap_or(-1))?,
+        })
+    }
+
+    /// What the record counts for against the byte limit of a fetch: the length of its key and of
+    /// its value.
+    fn size(&self) -> i64 {
+        self.key.as_ref().map_or(0, Bytes::len) as i64
+            + self.value.as_ref().map_or(0, Bytes::len) as i64
+    }
+}
+
 fn sql_lookup(key: &str) -> Result<String> {
     CONVERTED_SQL
         .get(key)
@@ -2485,16 +2556,16 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut records = if let Some(key) = key_filter {
+        let mut rows = if let Some(key) = key_filter {
             c.query(
-                &sql_lookup("record_fetch_keyed.sql")?,
+                FETCH_SQL.get("record_fetch_keyed.sql")?,
                 (
                     self.cluster.as_str(),
                     base_topic,
                     topition.partition(),
                     offset,
-                    (max_bytes as i64),
                     high_watermark,
+                    ROWS_PER_FETCH,
                     key.as_bytes().to_vec(),
                 ),
             )
@@ -2502,290 +2573,159 @@ impl Storage for Engine {
             .inspect_err(|err| error!(?err))?
         } else {
             c.query(
-                &sql_lookup("record_fetch.sql")?,
+                FETCH_SQL.get("record_fetch.sql")?,
                 (
                     self.cluster.as_str(),
-                    topition.topic(),
+                    base_topic,
                     topition.partition(),
                     offset,
-                    (max_bytes as i64),
                     high_watermark,
+                    ROWS_PER_FETCH,
                 ),
             )
             .await
             .inspect_err(|err| error!(?err))?
         };
 
-        let mut batches = vec![];
+        // The records are in offset order. A record is in the answer while the sizes of the records
+        // so far add up to less than `max_bytes`, and the answer stops growing once `max_wait` has
+        // elapsed, but always holds the first record.
+        let mut fetched = vec![];
+        let mut bytes = 0_i64;
 
-        if let Some(row) = records.next().await? {
-            let offset_delta = 0;
-            let timestamp_delta = 0;
+        while let Some(row) = rows.next().await? {
+            let record = FetchedRecord::try_from_row(&row)?;
 
-            let base_offset = row
-                .get_value(0)
-                .map_err(Into::into)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .ok_or(Error::UnexpectedValue(value))
-                })
-                .inspect(|base_offset| debug!(base_offset))
-                .inspect_err(|err| error!(?err))?;
-
-            let record_builder = {
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(
-                        row.get_value(3)
-                            .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    )
-                    .value(
-                        row.get_value(4)
-                            .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    );
-
-                let mut headers = c
-                    .query(
-                        &sql_lookup("header_fetch.sql")?,
-                        (
-                            self.cluster.as_str(),
-                            topition.topic(),
-                            topition.partition(),
-                            base_offset,
-                        ),
-                    )
-                    .await?;
-
-                while let Some(header) = headers.next().await? {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .get_value(0)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
-                    }
-
-                    if let Some(v) = header
-                        .get_value(1)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                record_builder
-            };
-
-            let mut batch_builder = inflated::Batch::builder()
-                .base_offset(base_offset)
-                .attributes(
-                    row.get_value(1)
-                        .map(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .map(|attributes| attributes as i32)
-                        })
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))? as i16,
-                )
-                .base_timestamp(
-                    row.get_value(2)
-                        .map_err(Error::from)
-                        .and_then(LiteTimestamp::try_from)
-                        .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    row.get_value(6)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(i16::try_from(
-                    row.get_value(7)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?)
-                .record(record_builder)
-                .last_offset_delta(offset_delta);
-
-            while let Some(row) = records.next().await?
-                && !has_deadline_expired()
-            {
-                let attributes = row
-                    .get_value(1)
-                    .map(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .map(|attributes| attributes as i16)
-                    })
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_id = row
-                    .get_value(6)
-                    .map(|value| value.as_integer().copied())
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_epoch = i16::try_from(
-                    row.get_value(7)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?;
-
-                let timestamp = row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::try_from)
-                    .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
-                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
-                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
-                // produce request, so one batch cannot hold two such times.
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
-                        && timestamp != batch_builder.base_timestamp)
-                {
-                    batches.push(
-                        batch_builder
-                            .max_timestamp_of_records()
-                            .build()
-                            .and_then(TryInto::try_into)?,
-                    );
-
-                    batch_builder = inflated::Batch::builder()
-                        .base_offset(
-                            row.get_value(0)
-                                .map_err(Into::into)
-                                .and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .copied()
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(timestamp)
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = timestamp - batch_builder.base_timestamp;
-
-                let record_builder = {
-                    let mut record_builder = Record::builder()
-                        .offset_delta(offset_delta)
-                        .timestamp_delta(timestamp_delta)
-                        .key(
-                            row.get_value(3)
-                                .map(|value| value.as_blob().cloned())
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .value(
-                            row.get_value(4)
-                                .map(|value| value.as_blob().cloned())
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        );
-
-                    let mut headers = c
-                        .query(
-                            &sql_lookup("header_fetch.sql")?,
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
-                        let mut header_builder = Header::builder();
-
-                        if let Some(k) = header
-                            .get_value(0)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(k);
-                        }
-
-                        if let Some(v) = header
-                            .get_value(1)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(v);
-                        }
-
-                        record_builder = record_builder.header(header_builder);
-                    }
-
-                    record_builder
-                };
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
+            // The first record is in the answer whatever its size, so that a consumer always gets
+            // past a record larger than its fetch limit.
+            bytes += record.size();
+            if !fetched.is_empty() && bytes >= i64::from(max_bytes) {
+                break;
             }
 
-            batches.push(
-                batch_builder
-                    .max_timestamp_of_records()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
-        } else {
-            batches.push(
+            fetched.push(record);
+
+            if has_deadline_expired() {
+                break;
+            }
+        }
+        drop(rows);
+
+        let (Some(first), Some(last)) = (fetched.first(), fetched.last()) else {
+            return Ok(vec![
                 inflated::Batch::builder()
                     .build()
                     .and_then(TryInto::try_into)?,
-            );
+            ]);
+        };
+
+        // One query reads the headers of every record in the answer.
+        let mut headers: BTreeMap<i64, Vec<(Option<Bytes>, Option<Bytes>)>> = BTreeMap::new();
+
+        let mut rows = c
+            .query(
+                FETCH_SQL.get("header_fetch_range.sql")?,
+                (
+                    self.cluster.as_str(),
+                    base_topic,
+                    topition.partition(),
+                    first.offset,
+                    last.offset,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        while let Some(row) = rows.next().await? {
+            headers.entry(integer(&row, 0)?).or_default().push((
+                row.get_value(1)?.as_blob().cloned().map(Bytes::from),
+                row.get_value(2)?.as_blob().cloned().map(Bytes::from),
+            ));
         }
+        drop(rows);
+
+        let batch_of = |record: &FetchedRecord| {
+            inflated::Batch::builder()
+                .base_offset(record.offset)
+                .base_timestamp(record.timestamp)
+                .attributes(record.attributes)
+                .producer_id(record.producer_id)
+                .producer_epoch(record.producer_epoch)
+        };
+
+        let mut record_of = |record: FetchedRecord, offset_delta: i32, timestamp_delta: i64| {
+            headers
+                .remove(&record.offset)
+                .unwrap_or_default()
+                .into_iter()
+                .fold(
+                    Record::builder()
+                        .offset_delta(offset_delta)
+                        .timestamp_delta(timestamp_delta)
+                        .key(record.key)
+                        .value(record.value),
+                    |record, (key, value)| {
+                        let mut header = Header::builder();
+
+                        if let Some(key) = key {
+                            header = header.key(key);
+                        }
+
+                        if let Some(value) = value {
+                            header = header.value(value);
+                        }
+
+                        record.header(header)
+                    },
+                )
+        };
+
+        let mut batches = vec![];
+
+        let mut fetched = fetched.into_iter();
+        let Some(first) = fetched.next() else {
+            return Ok(batches);
+        };
+
+        let mut batch_builder = batch_of(&first)
+            .record(record_of(first, 0, 0))
+            .last_offset_delta(0);
+
+        for record in fetched {
+            // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
+            // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
+            // `LogAppendTime` batch. Each stored record holds the broker's time of its own
+            // produce request, so one batch cannot hold two such times.
+            if batch_builder.attributes != record.attributes
+                || batch_builder.producer_id != record.producer_id
+                || batch_builder.producer_epoch != record.producer_epoch
+                || (TimestampType::from(record.attributes) == TimestampType::LogAppendTime
+                    && record.timestamp != batch_builder.base_timestamp)
+            {
+                batches.push(
+                    batch_builder
+                        .max_timestamp_of_records()
+                        .build()
+                        .and_then(TryInto::try_into)?,
+                );
+
+                batch_builder = batch_of(&record);
+            }
+
+            let offset_delta = i32::try_from(record.offset - batch_builder.base_offset)?;
+            let timestamp_delta = record.timestamp - batch_builder.base_timestamp;
+
+            batch_builder = batch_builder
+                .record(record_of(record, offset_delta, timestamp_delta))
+                .last_offset_delta(offset_delta);
+        }
+
+        batches.push(
+            batch_builder
+                .max_timestamp_of_records()
+                .build()
+                .and_then(TryInto::try_into)?,
+        );
 
         Ok(batches)
     }
@@ -6752,6 +6692,45 @@ mod tests {
             sql_lookup("no-such-statement.sql"),
             Err(Error::UnknownCacheKey(_))
         );
+
+        Ok(())
+    }
+
+    /// A fetch must cost in proportion to the records that it answers, and not to the backlog behind
+    /// them. Turso evaluates a window function, and a join that it sorts, before it returns a row,
+    /// so a fetch of the first records of a long backlog took longer than `max_wait` to answer
+    /// even one of them, and the answer was that one record. The statements must stream: a range
+    /// of one partition's primary key, in its order, with a limit.
+    #[test]
+    fn the_fetch_statements_stream_from_the_offset() -> Result<()> {
+        for name in [
+            "record_fetch.sql",
+            "record_fetch_keyed.sql",
+            "header_fetch_range.sql",
+        ] {
+            let sql = FETCH_SQL
+                .get(name)?
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("( ", "(");
+
+            assert!(!sql.contains(" over ("), "{name} has a window function");
+            assert!(
+                sql.contains("where r.topition = (select tp.id")
+                    || sql.contains("where h.topition = (select tp.id"),
+                "{name} must find the partition with a subquery, not a join: {sql}"
+            );
+            assert!(sql.contains("order by"), "{name} has no order");
+        }
+
+        for name in ["record_fetch.sql", "record_fetch_keyed.sql"] {
+            assert!(
+                FETCH_SQL.get(name)?.to_lowercase().contains("limit"),
+                "{name} has no limit"
+            );
+        }
 
         Ok(())
     }
