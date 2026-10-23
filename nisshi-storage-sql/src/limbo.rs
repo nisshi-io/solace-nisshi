@@ -1706,6 +1706,10 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
         ("040-txn-detail.sql", include_sql!("ddl/040-txn-detail.sql")),
         ("040-watermark.sql", include_sql!("ddl/040-watermark.sql")),
         (
+            "050-watermark-topition.sql",
+            include_sql!("limbo/ddl/050-watermark-topition.sql"),
+        ),
+        (
             "050-txn-offset-commit.sql",
             include_sql!("ddl/050-txn-offset-commit.sql"),
         ),
@@ -6078,7 +6082,7 @@ mod tests {
             (SCHEMA_VERSION, digest.as_str()),
             (
                 1,
-                "e2e43f34f6c79eb83f58d1ba73470e671d53dfd433c8b10d082289c7e0de2fc8"
+                "e939fdb1df0a7743180aba363de966e9982f6077d3a9b830415e82a9123ab19f"
             )
         );
         Ok(())
@@ -6121,6 +6125,33 @@ mod tests {
                 .query(&format!("select count(*) from {table}"), ())
                 .await?;
         }
+
+        Ok(())
+    }
+
+    /// Every produce looks up the watermark of its partition by `topition`. Turso runs only the
+    /// first statement of a string, so the index has a file of its own, and this test fails if
+    /// the index is not created.
+    #[tokio::test]
+    async fn ensure_schema_indexes_the_watermark_by_topition() -> Result<()> {
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        let row = db
+            .connect()?
+            .query(
+                "select name from sqlite_schema where type = 'index' and name = 'watermark_topition'",
+                (),
+            )
+            .await?
+            .next()
+            .await?;
+        assert_matches!(row, Some(_));
 
         Ok(())
     }
