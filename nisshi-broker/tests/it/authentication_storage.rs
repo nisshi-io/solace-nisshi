@@ -97,12 +97,20 @@ mod dynostore {
     }
 }
 
-/// Turso's SCRAM methods refuse the change, so it is refused at startup like the other engines
-/// that keep no credentials. The broker refuses before it opens the database.
+/// Turso stores SCRAM users, so a broker requiring authentication starts on it.
 #[cfg(feature = "turso")]
 #[tokio::test]
-async fn turso_is_refused() -> Result<()> {
-    assert_refused("turso://nisshi/", "Turso (turso://)").await
+async fn turso_starts() -> Result<()> {
+    let _guard = init_tracing()?;
+    let name = format!("authentication-storage-{}", Uuid::now_v7());
+    build(
+        Url::parse(&format!(
+            "turso://../logs/{}/{name}.db",
+            env!("CARGO_PKG_NAME")
+        ))?,
+        true,
+    )
+    .await
 }
 
 #[tokio::test]
