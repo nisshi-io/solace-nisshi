@@ -68,8 +68,9 @@ pub(super) struct OptiCon<D> {
     tags: TagSet,
     attributes: Attributes,
     data_version: Arc<Mutex<Option<DataVersion<D>>>>,
-    /// Counts the changes to `data_version`. A read of the object store that began before a
-    /// change must not install what it read, which may be older than what the change stored.
+    /// Counts the changes to `data_version`. A call to the object store that began before a
+    /// change must not install what it read or wrote, which may be older than what the change
+    /// stored.
     generation: Arc<AtomicU64>,
 }
 
@@ -280,6 +281,9 @@ where
         loop {
             REQUESTS.add(1, &[KeyValue::new("method", "with_mut_loop")]);
 
+            // Read before the data below, as in `with`.
+            let before = self.generation.load(Ordering::SeqCst);
+
             let (outcome, dv) = self.data_version.lock().map(|guard| {
                 let mut dv = guard.clone().unwrap_or_default();
                 let outcome = f(&mut dv.data);
@@ -305,22 +309,22 @@ where
                     on_error(error)
                 }) {
                 Ok(put_result) => {
-                    return self
-                        .data_version
-                        .lock()
-                        .map_err(Into::into)
-                        .map(|mut guard| {
-                            _ = self.generation.fetch_add(1, Ordering::SeqCst);
+                    let written = DataVersion {
+                        data: dv.data,
+                        version: Some(UpdateVersion {
+                            e_tag: put_result.e_tag,
+                            version: put_result.version,
+                        }),
+                    };
 
-                            guard.replace(DataVersion {
-                                data: dv.data,
-                                version: Some(UpdateVersion {
-                                    e_tag: put_result.e_tag,
-                                    version: put_result.version,
-                                }),
-                            })
-                        })
-                        .and(outcome);
+                    // A change while the put was in flight may have installed a later write
+                    // than this one, which this put's version must not replace. The cached
+                    // version is dropped instead, so the next read asks the store.
+                    if self.install(before, Some(written))?.is_some() {
+                        *self.data_version.lock()? = None;
+                    }
+
+                    return outcome;
                 }
 
                 Err(
@@ -694,6 +698,56 @@ mod tests {
 
         assert_eq!(2, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
         assert_eq!(Some(written), object_store.if_none_match().last().cloned());
+
+        Ok(())
+    }
+
+    /// A write whose response returns after a later write to the same document must not
+    /// install its version over the later write's: the next read does not present it.
+    #[tokio::test]
+    async fn with_mut_overlapping_a_write_does_not_install_the_older_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let object_store = Arc::new(Held::default());
+        let path = Path::from("/abc/test.json");
+        let opticon = OptiCon::<X>::path(path.clone());
+
+        // The first write is stored, and its response is held.
+        object_store.hold_next_put();
+        let first = tokio::spawn({
+            let opticon = opticon.clone();
+            let object_store = object_store.clone();
+            async move {
+                opticon
+                    .with_mut(object_store.as_ref(), |x| {
+                        x.0 = 1;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        object_store.reached().await;
+
+        let first_written = object_store.inner().head(&path).await?.e_tag;
+
+        // A second write finds the first in the store, and replaces it.
+        opticon
+            .with_mut(object_store.as_ref(), |x| {
+                x.0 = 2;
+                Ok(())
+            })
+            .await?;
+
+        object_store.release();
+        first.await.expect("first")?;
+
+        // The first write's version is not cached: the read asks the store without a version.
+        assert_eq!(2, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
+        assert_ne!(
+            first_written,
+            object_store.if_none_match().last().cloned().flatten()
+        );
+        assert_eq!(Some(&None), object_store.if_none_match().last());
 
         Ok(())
     }
