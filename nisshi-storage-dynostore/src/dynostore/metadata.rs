@@ -30,7 +30,7 @@ use futures::stream::{BoxStream, StreamExt};
 use nisshi_storage::Error;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tracing::{debug, instrument};
@@ -83,7 +83,13 @@ impl From<&GetResult> for CacheEntry {
 
 /// The number of counters that count the changes to the cache's entries, shared by the paths
 /// that hash to the same one.
-const GENERATIONS: usize = 64;
+///
+/// A path that shares a counter with another loses its entry when their writes overlap, and
+/// the next read of it asks the store. The table is sized so that the engine's replacing
+/// writes, a watermark and a `meta.json` write per produce across every partition and the
+/// offset commits, seldom share a counter within one store round trip. 4,096 counters take
+/// 32 KiB.
+const GENERATIONS: usize = 4_096;
 
 fn generation<'a>(generations: &'a [AtomicU64; GENERATIONS], location: &Path) -> &'a AtomicU64 {
     let mut hasher = DefaultHasher::new();
@@ -151,7 +157,9 @@ where
     /// A call that overlapped a change learned a version that may be older than the entry's,
     /// and storing it would let readers that present that version be answered NotModified
     /// without asking the store. Removing the entry instead is always safe: the next reader
-    /// asks the store. The caller holds the lock on `entries`, which orders this with every
+    /// asks the store. The removal does not count as a change, because it does not change the
+    /// object's version: a call that began after the change read a version at least as new,
+    /// and may store it. The caller holds the lock on `entries`, which orders this with every
     /// other change.
     fn record(
         &self,
@@ -176,7 +184,6 @@ where
             }
         } else {
             _ = guard.remove(location);
-            _ = generation.fetch_add(1, Ordering::SeqCst);
             "overlapped"
         }
     }
@@ -227,6 +234,7 @@ where
         REQUESTS.add(1, from_ref(&method));
 
         let before = self.generation(location).load(Ordering::SeqCst);
+        let replaces = !matches!(opts.mode, PutMode::Create);
 
         self.object_store
             .put_opts(location, payload, opts)
@@ -244,9 +252,16 @@ where
                     );
                     debug!(outcome);
 
+                    ENTRIES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+
                     // A reader that began before this write must not store the version it
-                    // read, which this write has replaced.
-                    _ = self.generation(location).fetch_add(1, Ordering::SeqCst);
+                    // read, which this write has replaced. A write that creates the object
+                    // replaces no version: a reader that began before it found nothing, or
+                    // read the created object. Each batch object is created, so this keeps
+                    // the batch writes out of the counters that the watermarks share.
+                    if replaces {
+                        _ = self.generation(location).fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             })
             .inspect_err(|error| {
@@ -493,6 +508,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use bytes::Bytes;
     use nisshi_storage::Result;
     use object_store::{ObjectStoreExt, PutMode, memory::InMemory};
@@ -967,6 +984,122 @@ mod tests {
             .await?;
 
         assert_eq!(second.e_tag, current.meta.e_tag);
+
+        Ok(())
+    }
+
+    /// A write that creates an object replaces no version, so it does not count as a change
+    /// for the readers in flight on the paths that share its counter. A write that replaces
+    /// a version does.
+    #[tokio::test]
+    async fn only_a_replacing_put_counts_as_a_change() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/test.json");
+        let cache = Cache::new(Counter::new(InMemory::new()), Duration::from_secs(60))?;
+        let payload = |value: i32| -> Result<PutPayload> {
+            serde_json::to_vec(&X(value))
+                .map(Bytes::from)
+                .map(PutPayload::from)
+                .map_err(Into::into)
+        };
+
+        let before_create = cache.generation(&path).load(Ordering::SeqCst);
+
+        let created = cache
+            .put_opts(
+                &path,
+                payload(1)?,
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            before_create,
+            cache.generation(&path).load(Ordering::SeqCst)
+        );
+
+        _ = cache
+            .put_opts(
+                &path,
+                payload(2)?,
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: created.e_tag,
+                        version: created.version,
+                    }),
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            before_create + 1,
+            cache.generation(&path).load(Ordering::SeqCst)
+        );
+
+        Ok(())
+    }
+
+    /// A write that creates an object on a path sharing a reader's counter does not cost the
+    /// reader its entry: the reader stores the version it read, and the next reader that
+    /// presents that version is answered without the store.
+    #[tokio::test]
+    async fn creating_put_on_a_sharing_path_keeps_an_overlapping_readers_entry() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/test.json");
+        let cache = Arc::new(Cache::new(Held::default(), Duration::from_secs(60))?);
+        let payload = |value: i32| -> Result<PutPayload> {
+            serde_json::to_vec(&X(value))
+                .map(Bytes::from)
+                .map(PutPayload::from)
+                .map_err(Into::into)
+        };
+        let create = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+
+        let created = cache.put_opts(&path, payload(1)?, create.clone()).await?;
+
+        let sharing = (0..)
+            .map(|n| Path::from(format!("/abc/sharing-{n}.json")))
+            .find(|candidate| std::ptr::eq(cache.generation(&path), cache.generation(candidate)))
+            .expect("a path that shares the counter");
+
+        // A reader that does not know the object's version reads it and is held.
+        cache.inner().hold_next_get();
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            let path = path.clone();
+            async move { cache.get_opts(&path, GetOptions::default()).await }
+        });
+        cache.inner().reached().await;
+
+        _ = cache.put_opts(&sharing, payload(2)?, create).await?;
+
+        cache.inner().release();
+        _ = reader.await.expect("reader")?;
+
+        let gets_before = cache.inner().if_none_match().len();
+
+        assert_matches!(
+            cache
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        if_none_match: created.e_tag.clone(),
+                        ..GetOptions::default()
+                    },
+                )
+                .await,
+            Err(object_store::Error::NotModified { .. })
+        );
+        assert_eq!(gets_before, cache.inner().if_none_match().len());
 
         Ok(())
     }
