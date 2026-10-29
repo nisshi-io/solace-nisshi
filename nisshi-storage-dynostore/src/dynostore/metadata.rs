@@ -14,9 +14,13 @@
 
 use std::{
     fmt::{Debug, Display},
+    hash::{DefaultHasher, Hash as _, Hasher as _},
     ops::DerefMut,
     slice::from_ref,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -77,9 +81,23 @@ impl From<&GetResult> for CacheEntry {
     }
 }
 
+/// The number of counters that count the changes to the cache's entries, shared by the paths
+/// that hash to the same one.
+const GENERATIONS: usize = 64;
+
+fn generation<'a>(generations: &'a [AtomicU64; GENERATIONS], location: &Path) -> &'a AtomicU64 {
+    let mut hasher = DefaultHasher::new();
+    location.hash(&mut hasher);
+    &generations[hasher.finish() as usize % GENERATIONS]
+}
+
 #[derive(Clone)]
 pub(super) struct Cache<O> {
     entries: Arc<Mutex<TtlSortedCache<Path, CacheEntry>>>,
+    /// Counts the entries' changes, to see whether a path's entry changed while a call to the
+    /// object store was in flight. A path that shares a counter with another only loses a
+    /// cache entry it could have kept, never keeps a stale one.
+    generations: Arc<[AtomicU64; GENERATIONS]>,
     object_store: O,
     retention: Duration,
 }
@@ -112,6 +130,7 @@ where
 
         Ok(Self {
             entries,
+            generations: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             object_store,
             retention,
         })
@@ -120,6 +139,46 @@ where
     #[cfg(test)]
     fn inner(&self) -> &O {
         &self.object_store
+    }
+
+    fn generation(&self, location: &Path) -> &AtomicU64 {
+        generation(&self.generations, location)
+    }
+
+    /// Records what an object store call learned about `location`'s current version, if no
+    /// other call changed the entry since `before`, the generation read before the call began.
+    ///
+    /// A call that overlapped a change learned a version that may be older than the entry's,
+    /// and storing it would let readers that present that version be answered NotModified
+    /// without asking the store. Removing the entry instead is always safe: the next reader
+    /// asks the store. The caller holds the lock on `entries`, which orders this with every
+    /// other change.
+    fn record(
+        &self,
+        guard: &mut TtlSortedCache<Path, CacheEntry>,
+        location: &Path,
+        before: u64,
+        replacement: CacheEntry,
+    ) -> &'static str {
+        let generation = self.generation(location);
+
+        if generation.load(Ordering::SeqCst) == before {
+            match guard
+                .set_with(location.to_owned(), replacement.clone())
+                .evict()
+                .set()
+            {
+                None => "add",
+
+                Some(existing) if existing == replacement => "existing",
+
+                Some(_) => "replace",
+            }
+        } else {
+            _ = guard.remove(location);
+            _ = generation.fetch_add(1, Ordering::SeqCst);
+            "overlapped"
+        }
     }
 }
 
@@ -167,6 +226,8 @@ where
 
         REQUESTS.add(1, from_ref(&method));
 
+        let before = self.generation(location).load(Ordering::SeqCst);
+
         self.object_store
             .put_opts(location, payload, opts)
             .await
@@ -175,10 +236,17 @@ where
                 if let Ok(mut guard) = self.entries.lock() {
                     debug!(cached = guard.len());
 
-                    _ = guard
-                        .set_with(location.to_owned(), CacheEntry::from(put_result))
-                        .evict()
-                        .set();
+                    let outcome = self.record(
+                        guard.deref_mut(),
+                        location,
+                        before,
+                        CacheEntry::from(put_result),
+                    );
+                    debug!(outcome);
+
+                    // A reader that began before this write must not store the version it
+                    // read, which this write has replaced.
+                    _ = self.generation(location).fetch_add(1, Ordering::SeqCst);
                 }
             })
             .inspect_err(|error| {
@@ -231,6 +299,8 @@ where
         let method = KeyValue::new("method", "get_opts");
 
         REQUESTS.add(1, from_ref(&method));
+
+        let before = self.generation(location).load(Ordering::SeqCst);
 
         if let Ok(mut guard) = self.entries.lock() {
             if let Some(entry) = guard.deref_mut().get(location) {
@@ -288,20 +358,12 @@ where
                 if let Ok(mut guard) = self.entries.lock() {
                     debug!(e_tag, version);
 
-                    let replacement = CacheEntry::from(get_result);
-
-                    let outcome = match guard
-                        .deref_mut()
-                        .set_with(location.to_owned(), replacement.clone())
-                        .evict()
-                        .set()
-                    {
-                        None => "add",
-
-                        Some(existing) if existing == replacement => "existing",
-
-                        Some(_) => "replace",
-                    };
+                    let outcome = self.record(
+                        guard.deref_mut(),
+                        location,
+                        before,
+                        CacheEntry::from(get_result),
+                    );
 
                     debug!(outcome);
 
@@ -313,20 +375,12 @@ where
 
                 if matches!(error, object_store::Error::NotModified { .. }) {
                     if let Ok(mut guard) = self.entries.lock() {
-                        let replacement = CacheEntry::from(options);
-
-                        let outcome = match guard
-                            .deref_mut()
-                            .set_with(location.to_owned(), replacement.clone())
-                            .evict()
-                            .set()
-                        {
-                            None => "add",
-
-                            Some(existing) if existing == replacement => "existing",
-
-                            Some(_) => "replace",
-                        };
+                        let outcome = self.record(
+                            guard.deref_mut(),
+                            location,
+                            before,
+                            CacheEntry::from(options),
+                        );
 
                         debug!(outcome);
 
@@ -351,14 +405,18 @@ where
         REQUESTS.add(1, &[KeyValue::new("method", "delete_stream")]);
 
         let entries = self.entries.clone();
+        let generations = self.generations.clone();
         let inner = self.object_store.delete_stream(locations);
 
         Box::pin(inner.inspect(move |result| {
             if let Ok(location) = result
                 && let Ok(mut guard) = entries.lock()
-                && guard.deref_mut().remove(location).is_some()
             {
-                ENTRIES.add(1, &[KeyValue::new("outcome", "delete")]);
+                _ = generation(&generations, location).fetch_add(1, Ordering::SeqCst);
+
+                if guard.deref_mut().remove(location).is_some() {
+                    ENTRIES.add(1, &[KeyValue::new("outcome", "delete")]);
+                }
             }
         }))
     }
@@ -437,13 +495,14 @@ where
 mod tests {
     use bytes::Bytes;
     use nisshi_storage::Result;
-    use object_store::{ObjectStoreExt, memory::InMemory};
+    use object_store::{ObjectStoreExt, PutMode, memory::InMemory};
     use serde::{Deserialize, Serialize};
     use tokio::time::sleep;
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+    use crate::dynostore::held::Held;
 
     #[derive(
         Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
@@ -774,6 +833,140 @@ mod tests {
             Err(object_store::Error::NotFound { .. })
         ));
         assert_eq!(1, cache.inner().get_opts()?);
+
+        Ok(())
+    }
+
+    /// A get that read an object before a put and returns after it must not make the cache
+    /// answer NotModified to a reader that presents the version the get read.
+    #[tokio::test]
+    async fn get_overlapping_a_put_does_not_cache_the_older_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/test.json");
+
+        let cache = Arc::new(Cache::new(Held::default(), Duration::from_secs(60))?);
+
+        let put = |value: i32, mode: PutMode| {
+            let cache = cache.clone();
+            let path = path.clone();
+
+            async move {
+                cache
+                    .put_opts(
+                        &path,
+                        serde_json::to_vec(&X(value))
+                            .map(Bytes::from)
+                            .map(PutPayload::from)?,
+                        PutOptions {
+                            mode,
+                            ..PutOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(Error::from)
+            }
+        };
+
+        let first = put(1, PutMode::Create).await?;
+
+        // A reader that does not know the object's version reads it and is held.
+        cache.inner().hold_next_get();
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            let path = path.clone();
+            async move { cache.get_opts(&path, GetOptions::default()).await }
+        });
+        cache.inner().reached().await;
+
+        // A write replaces the version that the reader read.
+        let second = put(
+            2,
+            PutMode::Update(UpdateVersion {
+                e_tag: first.e_tag.clone(),
+                version: first.version.clone(),
+            }),
+        )
+        .await?;
+
+        cache.inner().release();
+        _ = reader.await.expect("reader")?;
+
+        // A reader that holds the older version must get the newer one, not NotModified.
+        let current = cache
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_none_match: first.e_tag.clone(),
+                    ..GetOptions::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(second.e_tag, current.meta.e_tag);
+
+        Ok(())
+    }
+
+    /// Two writes finish in the store in one order and report to the cache in the other. The
+    /// cache must not keep the version of the write that finished first, which the second
+    /// replaced.
+    #[tokio::test]
+    async fn put_overlapping_a_put_does_not_cache_the_older_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/test.json");
+        let payload = |value: i32| -> Result<PutPayload> {
+            serde_json::to_vec(&X(value))
+                .map(Bytes::from)
+                .map(PutPayload::from)
+                .map_err(Into::into)
+        };
+
+        let cache = Arc::new(Cache::new(Held::default(), Duration::from_secs(60))?);
+
+        // The first write is stored, and its response is held.
+        cache.inner().hold_next_put();
+        let first = tokio::spawn({
+            let cache = cache.clone();
+            let path = path.clone();
+            let payload = payload(1)?;
+            async move { cache.put_opts(&path, payload, PutOptions::default()).await }
+        });
+        cache.inner().reached().await;
+
+        let first_e_tag = cache.inner().inner().head(&path).await?.e_tag;
+
+        // The second write replaces it, and finishes first.
+        let second = cache
+            .put_opts(
+                &path,
+                payload(2)?,
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: first_e_tag.clone(),
+                        version: None,
+                    }),
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+
+        cache.inner().release();
+        _ = first.await.expect("first")?;
+
+        // A reader that holds the first version must get the second, not NotModified.
+        let current = cache
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_none_match: first_e_tag,
+                    ..GetOptions::default()
+                },
+            )
+            .await?;
+
+        assert_eq!(second.e_tag, current.meta.e_tag);
 
         Ok(())
     }

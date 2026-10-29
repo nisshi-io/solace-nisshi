@@ -14,7 +14,10 @@
 
 use std::{
     fmt::Debug,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::dynostore::object_store_error_name;
@@ -65,6 +68,9 @@ pub(super) struct OptiCon<D> {
     tags: TagSet,
     attributes: Attributes,
     data_version: Arc<Mutex<Option<DataVersion<D>>>>,
+    /// Counts the changes to `data_version`. A read of the object store that began before a
+    /// change must not install what it read, which may be older than what the change stored.
+    generation: Arc<AtomicU64>,
 }
 
 impl<D> OptiCon<D> {
@@ -74,6 +80,7 @@ impl<D> OptiCon<D> {
             tags: Default::default(),
             attributes: Default::default(),
             data_version: Default::default(),
+            generation: Default::default(),
         }
     }
 
@@ -87,6 +94,25 @@ impl<D> OptiCon<D>
 where
     D: Clone + Debug + Default + DeserializeOwned + PartialEq + Serialize,
 {
+    /// Installs `replacement` as the cached version, unless it changed since `before`, the
+    /// generation read before the object store call that produced `replacement`. Returns
+    /// `replacement` when it did not install it.
+    fn install(
+        &self,
+        before: u64,
+        replacement: Option<DataVersion<D>>,
+    ) -> Result<Option<Option<DataVersion<D>>>> {
+        let mut guard = self.data_version.lock()?;
+
+        if self.generation.load(Ordering::SeqCst) == before {
+            *guard = replacement;
+            _ = self.generation.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        } else {
+            Ok(Some(replacement))
+        }
+    }
+
     #[instrument(skip_all, fields(path = %self.path))]
     async fn get(&self, object_store: &impl ObjectStore) -> Result<()> {
         const METHOD: &str = "get";
@@ -101,6 +127,8 @@ where
                 ],
             );
         };
+
+        let before = self.generation.load(Ordering::SeqCst);
 
         match object_store.get(&self.path).await.inspect_err(|error| {
             debug!(?error);
@@ -120,19 +148,13 @@ where
 
                 debug!(?version);
 
-                self.data_version
-                    .lock()
-                    .map_err(Into::into)
-                    .map(|mut lock| lock.replace(DataVersion { data, version }))
-                    .and(Ok(()))
+                self.install(before, Some(DataVersion { data, version }))
+                    .map(|_not_installed| ())
             }
 
-            Err(object_store::Error::NotFound { .. }) => self
-                .data_version
-                .lock()
-                .map_err(Into::into)
-                .map(|mut lock| lock.take())
-                .and(Ok(())),
+            Err(object_store::Error::NotFound { .. }) => {
+                self.install(before, None).map(|_not_installed| ())
+            }
 
             Err(otherwise) => Err(otherwise.into()),
         }
@@ -156,13 +178,20 @@ where
             );
         };
 
+        // Read before the version below: a change after this read, including one between the
+        // two reads, stops this call from installing what it fetches.
+        let before = self.generation.load(Ordering::SeqCst);
+
         let version = self
             .data_version
             .lock()
             .map(|guard| guard.as_ref().and_then(|dv| dv.version.clone()))?;
         debug!(?version);
 
-        match object_store
+        // What this call fetched, when it could not install it because the cached version
+        // changed meanwhile. The fetch began after this call did, so it is at least as new as
+        // anything written before this call.
+        let fetched = match object_store
             .get_opts(
                 &self.path,
                 GetOptions {
@@ -183,55 +212,50 @@ where
 
                 debug!(action = "out of date", ?version);
 
-                get_result
-                    .bytes()
-                    .await
-                    .inspect_err(|error| {
-                        debug!(?error);
-                        on_error(error)
-                    })
-                    .map_err(Into::into)
-                    .and_then(|encoded| serde_json::from_slice::<D>(&encoded).map_err(Into::into))
-                    .and_then(|data| {
-                        self.data_version
-                            .lock()
-                            .map_err(Into::into)
-                            .map(|mut guard| guard.replace(DataVersion { data, version }))
-                    })
-                    .and(Ok(()))
+                let encoded = get_result.bytes().await.inspect_err(|error| {
+                    debug!(?error);
+                    on_error(error)
+                })?;
+
+                let data = serde_json::from_slice::<D>(&encoded)?;
+
+                self.install(before, Some(DataVersion { data, version }))?
+                    .map(|not_installed| not_installed.map(|dv| dv.data).unwrap_or_default())
             }
 
             Err(object_store::Error::NotFound { .. }) => {
                 debug!(action = "not found");
-                self.data_version
-                    .lock()
-                    .map_err(Into::into)
-                    .map(|mut guard| guard.take())
-                    .and(Ok(()))
+
+                self.install(before, None)?
+                    .map(|_not_installed| D::default())
             }
 
             Err(object_store::Error::NotModified { .. }) => {
                 debug!(action = "not modified");
-                Ok(())
+                None
             }
 
-            Err(otherwise) => Err(otherwise.into()),
+            Err(otherwise) => return Err(otherwise.into()),
+        };
+
+        if let Some(data) = fetched {
+            debug!(action = "not installed", ?data);
+            return f(&data);
         }
-        .and(
-            self.data_version
-                .lock()
-                .map_err(Into::into)
-                .and_then(|lock| {
-                    if let Some(dv @ DataVersion { data, .. }) = lock.as_ref() {
-                        debug!(?dv);
-                        f(data)
-                    } else {
-                        let data = D::default();
-                        debug!(?data);
-                        f(&data)
-                    }
-                }),
-        )
+
+        self.data_version
+            .lock()
+            .map_err(Into::into)
+            .and_then(|lock| {
+                if let Some(dv @ DataVersion { data, .. }) = lock.as_ref() {
+                    debug!(?dv);
+                    f(data)
+                } else {
+                    let data = D::default();
+                    debug!(?data);
+                    f(&data)
+                }
+            })
     }
 
     #[instrument(skip_all, fields(path = %self.path))]
@@ -286,6 +310,8 @@ where
                         .lock()
                         .map_err(Into::into)
                         .map(|mut guard| {
+                            _ = self.generation.fetch_add(1, Ordering::SeqCst);
+
                             guard.replace(DataVersion {
                                 data: dv.data,
                                 version: Some(UpdateVersion {
@@ -320,6 +346,7 @@ mod tests {
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+    use crate::dynostore::held::Held;
 
     #[derive(
         Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
@@ -620,6 +647,53 @@ mod tests {
         let encoded = get_result.bytes().await?;
         let data = serde_json::from_slice::<X>(&encoded)?;
         assert_eq!(8, data.0);
+
+        Ok(())
+    }
+
+    /// A read that fetched a version before a write and returns after it must not install that
+    /// version over the write's: the next read presents the write's version.
+    #[tokio::test]
+    async fn with_overlapping_a_write_does_not_install_the_older_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let object_store = Arc::new(Held::default());
+        let path = Path::from("/abc/test.json");
+
+        // The object exists, at a version this OptiCon has not read.
+        OptiCon::<X>::path(path.clone())
+            .with_mut(object_store.as_ref(), |x| {
+                x.0 = 1;
+                Ok(())
+            })
+            .await?;
+
+        let opticon = OptiCon::<X>::path(path.clone());
+
+        object_store.hold_next_get();
+        let reader = tokio::spawn({
+            let opticon = opticon.clone();
+            let object_store = object_store.clone();
+            async move { opticon.with(object_store.as_ref(), |x| Ok(x.0)).await }
+        });
+        object_store.reached().await;
+
+        opticon
+            .with_mut(object_store.as_ref(), |x| {
+                x.0 = 2;
+                Ok(())
+            })
+            .await?;
+
+        let written = object_store.inner().head(&path).await?.e_tag;
+
+        object_store.release();
+
+        // The held read began before the write, so it may answer with the older value.
+        assert_eq!(1, reader.await.expect("reader")?);
+
+        assert_eq!(2, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
+        assert_eq!(Some(written), object_store.if_none_match().last().cloned());
 
         Ok(())
     }
