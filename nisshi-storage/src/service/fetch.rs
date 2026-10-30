@@ -285,6 +285,7 @@ where
         left: usize,
         min_bytes: u32,
         max_bytes: &mut u32,
+        is_first_non_empty: bool,
         isolation: IsolationLevel,
         topic: &str,
         fetch_partition: &FetchPartition,
@@ -424,7 +425,13 @@ where
         let mut offset = fetch_offset;
 
         loop {
-            if *max_bytes == 0 {
+            // With no bytes left, only the first non-empty partition reads,
+            // once: storage returns at least one batch, so the consumer
+            // makes progress whatever its limits. Kafka reads it with
+            // `minOneMessage` ([LogSegment.java#L439-L447]).
+            //
+            // [LogSegment.java#L439-L447]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L447
+            if *max_bytes == 0 && !(is_first_non_empty && batches.is_empty()) {
                 break;
             }
 
@@ -775,13 +782,13 @@ where
                     continue;
                 }
 
-                let partition_max_bytes = if *is_first_non_empty {
-                    *max_bytes
-                } else {
-                    min(fetch_partition.partition_max_bytes as u32, *max_bytes)
-                };
-
-                let mut partition_bytes = partition_max_bytes;
+                // Every partition reads within its own limit and what is left
+                // of `max_bytes`, the first one included
+                // ([ReplicaManager.scala#L1633]).
+                //
+                // [ReplicaManager.scala#L1633]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1633
+                let mut partition_bytes =
+                    min(fetch_partition.partition_max_bytes as u32, *max_bytes);
                 debug!(partition_bytes, is_first_non_empty);
 
                 let partition = self
@@ -790,6 +797,7 @@ where
                         *left,
                         min_bytes,
                         &mut partition_bytes,
+                        *is_first_non_empty,
                         isolation,
                         name,
                         fetch_partition,
@@ -799,11 +807,13 @@ where
 
                 *left = left.saturating_sub(1);
 
+                // A partition answered with no records, an empty or failed
+                // one, leaves the next partition first.
                 *is_first_non_empty = *is_first_non_empty
                     && partition
                         .records
                         .as_ref()
-                        .is_some_and(|records| records.batches.is_empty());
+                        .is_none_or(|records| records.batches.is_empty());
 
                 debug!(partition_bytes, is_first_non_empty);
 
@@ -814,11 +824,13 @@ where
                 // that batch as well, the response holds at most `max_bytes` and
                 // one batch, however many partitions the request lists. Kafka
                 // lets only the first non-empty partition exceed a limit
-                // ([ReplicaManager.scala#L1733-L1739]). Storage cannot tell the
+                // ([ReplicaManager.scala#L1731-L1740]). Storage cannot tell the
                 // first read of the first non-empty partition from any other
-                // read, so here every partition can.
+                // read, so here every partition with a limit above 0 can. A
+                // partition with no limit left reads only while it is the
+                // first non-empty one (see `fetch_partition`).
                 //
-                // [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
+                // [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
                 *max_bytes = max_bytes.saturating_sub(u32::try_from(partition.byte_size())?);
 
                 partitions.push(partition);
@@ -1391,6 +1403,7 @@ mod tests {
                 1,
                 1,
                 &mut remaining,
+                true,
                 isolation,
                 "abc",
                 &FetchPartition::default()
@@ -2753,8 +2766,8 @@ mod tests {
     }
 
     /// Every round of the long poll reads the partitions again as the first
-    /// round does: the first partition with the whole `max_bytes`, and the
-    /// others with their `partition_max_bytes`. Only the round's own bytes
+    /// round does, each with its `partition_max_bytes`, the first partition
+    /// included, as in Kafka. Only the round's own bytes
     /// count toward `min_bytes`. Each round reads the same records again, so
     /// `max_bytes` spent by the rounds before would leave the last round with
     /// nothing to return, and a sum over the rounds would meet `min_bytes`
@@ -2797,7 +2810,7 @@ mod tests {
         )
         .await?;
 
-        for (partition, round_max_bytes) in [(0, MAX_BYTES), (1, PARTITION_MAX_BYTES)] {
+        for partition in 0..2 {
             let calls = storage.calls(partition);
             assert!(
                 calls.len() > 4,
@@ -2807,8 +2820,8 @@ mod tests {
                 calls
                     .iter()
                     .step_by(2)
-                    .all(|call| i64::from(call.max_bytes) == i64::from(round_max_bytes)),
-                "a round read partition {partition} with other than {round_max_bytes} bytes: \
+                    .all(|call| i64::from(call.max_bytes) == i64::from(PARTITION_MAX_BYTES)),
+                "a round read partition {partition} with other than {PARTITION_MAX_BYTES} bytes: \
                  {calls:?}"
             );
         }
@@ -2820,6 +2833,67 @@ mod tests {
         assert_eq!(2, partitions.len());
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
+
+        Ok(())
+    }
+
+    /// The first partition that returns records reads even when its limit
+    /// is 0, because `max_bytes` or its `partition_max_bytes` is 0, so that
+    /// the consumer makes progress. Storage then returns one batch. A
+    /// partition before it that returns nothing does not count, and a
+    /// partition after it with no bytes left is not read. Kafka reads with
+    /// `minOneMessage` until a partition returns records
+    /// ([ReplicaManager.scala#L1731-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
+    #[tokio::test(start_paused = true)]
+    async fn the_first_non_empty_partition_reads_past_a_zero_limit() -> Result<()> {
+        for (max_bytes, partition_max_bytes) in [(0, MAX_BYTES), (u32::try_from(MAX_BYTES)?, 0)] {
+            let storage = Partitions::new([
+                (0, vec![]),
+                (1, vec![Read::Batch(batch(0, &[0])?)]),
+                (2, vec![Read::Batch(batch(0, &[0])?)]),
+            ]);
+
+            let responses = FetchService {
+                storage: storage.clone(),
+            }
+            .fetch(
+                MAX_WAIT,
+                1.min(max_bytes),
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                &[FetchTopic::default()
+                    .topic(Some(TOPIC.into()))
+                    .partitions(Some(
+                        (0..3)
+                            .map(|partition| {
+                                FetchPartition::default()
+                                    .partition(partition)
+                                    .fetch_offset(0)
+                                    .partition_max_bytes(partition_max_bytes)
+                            })
+                            .collect(),
+                    ))],
+            )
+            .await?;
+
+            let partitions = responses
+                .into_iter()
+                .flat_map(|topic| topic.partitions.unwrap_or_default())
+                .collect::<Vec<_>>();
+
+            let limits =
+                format!("max_bytes {max_bytes}, partition_max_bytes {partition_max_bytes}");
+            assert_eq!(
+                vec![0, 1, 0],
+                partitions.iter().map(batches).collect::<Vec<_>>(),
+                "{limits}"
+            );
+            assert_eq!(1, storage.calls(0).len(), "{limits}");
+            assert_eq!(1, storage.calls(1).len(), "{limits}");
+            assert_eq!(0, storage.calls(2).len(), "{limits}");
+        }
 
         Ok(())
     }

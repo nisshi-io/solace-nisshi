@@ -1774,6 +1774,120 @@ where
     Ok(())
 }
 
+/// The first partition of a request returns at most its
+/// `partition_max_bytes` and one batch, as every other partition does, and
+/// not the request's whole `max_bytes`.
+pub async fn first_partition_keeps_to_its_partition_max_bytes<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), 0), 3).await?;
+
+    // a limit smaller than one batch, which the first batch exceeds
+    let partitions = partition_data(
+        fetch_offsets_within(&sc, &topic_name, &[(0, 0)], 500, 1, 50 * 1024, 1).await?,
+    );
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+    assert_eq!(vec![0], record_offsets(&partitions[0])?);
+
+    Ok(())
+}
+
+/// The first partition that has records returns one batch when its limit is
+/// 0, because the request's `max_bytes` or the partition's
+/// `partition_max_bytes` is 0, so that the consumer makes progress. An empty
+/// partition before it does not count, and the partitions after it return
+/// nothing, as in Kafka.
+pub async fn first_non_empty_partition_returns_a_batch_past_a_zero_limit<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(3)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    for partition in 1..3 {
+        produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), partition), 2)
+            .await?;
+    }
+
+    for (max_bytes, partition_max_bytes) in [(0, 50 * 1024), (50 * 1024, 0)] {
+        let limits = format!("max_bytes {max_bytes}, partition_max_bytes {partition_max_bytes}");
+
+        let partitions = partition_data(
+            fetch_offsets_within(
+                &sc,
+                &topic_name,
+                &[(0, 0), (1, 0), (2, 0)],
+                500,
+                1,
+                max_bytes,
+                partition_max_bytes,
+            )
+            .await?,
+        );
+        assert_eq!(3, partitions.len(), "{limits}");
+
+        let mut offsets = vec![];
+        for partition in &partitions {
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(partition.error_code)?,
+                "partition {}, {limits}",
+                partition.partition_index
+            );
+            offsets.push(record_offsets(partition)?);
+        }
+        assert_eq!(vec![vec![], vec![0], vec![]], offsets, "{limits}");
+    }
+
+    Ok(())
+}
+
 /// A Fetch whose `min_bytes` is never met waits for its `max_wait`, and then
 /// returns the records that it read. Each wait round reads the partition again
 /// with the whole `max_bytes`, so the last round still returns records after
@@ -2084,6 +2198,36 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn first_partition_keeps_to_its_partition_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_partition_keeps_to_its_partition_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_partition_returns_a_batch_past_a_zero_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_non_empty_partition_returns_a_batch_past_a_zero_limit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn long_wait_for_min_bytes_spans_several_reads() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -2291,6 +2435,36 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::oversized_records_spend_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_partition_keeps_to_its_partition_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_partition_keeps_to_its_partition_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_partition_returns_a_batch_past_a_zero_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_non_empty_partition_returns_a_batch_past_a_zero_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2521,6 +2695,36 @@ mod lite {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::oversized_records_spend_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_partition_keeps_to_its_partition_max_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_partition_keeps_to_its_partition_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_non_empty_partition_returns_a_batch_past_a_zero_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::first_non_empty_partition_returns_a_batch_past_a_zero_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
