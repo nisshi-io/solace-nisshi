@@ -64,7 +64,10 @@ async fn commit_with_timestamp(storage: impl Storage) -> Result<()> {
     let offsets = storage
         .offset_fetch(Some(group_id), std::slice::from_ref(&topition), None)
         .await?;
-    assert_eq!(Some(&5), offsets.get(&topition));
+    assert_eq!(
+        Some(5),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     Ok(())
 }

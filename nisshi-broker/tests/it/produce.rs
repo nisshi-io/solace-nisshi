@@ -2289,7 +2289,8 @@ mod turso {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::non_txn_idempotent_duplicate_sequence(storage).await?;
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::DuplicateSequenceNumber)
+            .await?;
 
         Ok(())
     }
@@ -2376,7 +2377,7 @@ mod turso {
 
             let storage = storage_container(cluster_id, broker_id).await?;
 
-            super::produce_rewrites_header_max_timestamp(storage, false).await?;
+            super::produce_rewrites_header_max_timestamp(storage).await?;
 
             Ok(())
         }
@@ -2399,22 +2400,6 @@ mod turso {
     }
 
     #[tokio::test]
-    async fn produce_log_append_time_ignores_bounds_check() -> Result<()> {
-        {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            let storage = storage_container(cluster_id, broker_id).await?;
-
-            super::produce_log_append_time_ignores_bounds_check(storage, false).await?;
-
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
     async fn produce_rewrites_header_for_every_codec() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -2423,7 +2408,7 @@ mod turso {
 
         let storage = storage_container(cluster_id, broker_id).await?;
 
-        super::produce_rewrites_header_for_every_codec(storage, false).await
+        super::produce_rewrites_header_for_every_codec(storage).await
     }
 
     #[tokio::test]
