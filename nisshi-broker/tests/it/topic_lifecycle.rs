@@ -245,7 +245,6 @@ mod turso {
         crate::common::turso_storage(cluster, node).await
     }
 
-    #[ignore = "the Turso engine panics on a unique constraint violation"]
     #[tokio::test]
     async fn topic_lifecycle() -> Result<()> {
         let _guard = init_tracing()?;

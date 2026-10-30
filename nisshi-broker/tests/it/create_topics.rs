@@ -1564,7 +1564,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore = "the Turso engine panics on a unique constraint violation"]
     #[tokio::test]
     async fn duplicate() -> Result<()> {
         let _guard = init_tracing()?;
