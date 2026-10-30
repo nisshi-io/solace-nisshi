@@ -309,6 +309,8 @@ where
                     on_error(error)
                 }) {
                 Ok(put_result) => {
+                    let written_e_tag = put_result.e_tag.clone();
+
                     let written = DataVersion {
                         data: dv.data,
                         version: Some(UpdateVersion {
@@ -319,9 +321,20 @@ where
 
                     // A change while the put was in flight may have installed a later write
                     // than this one, which this put's version must not replace. The cached
-                    // version is dropped instead, so the next read asks the store.
+                    // version is dropped instead, so the next read asks the store. A reader
+                    // that read this put's own version installed it already, and it stays.
                     if self.install(before, Some(written))?.is_some() {
-                        *self.data_version.lock()? = None;
+                        let mut guard = self.data_version.lock()?;
+
+                        let holds_this_write = written_e_tag.is_some()
+                            && guard
+                                .as_ref()
+                                .and_then(|cached| cached.version.as_ref())
+                                .is_some_and(|version| version.e_tag == written_e_tag);
+
+                        if !holds_this_write {
+                            *guard = None;
+                        }
                     }
 
                     return outcome;
@@ -748,6 +761,46 @@ mod tests {
             object_store.if_none_match().last().cloned().flatten()
         );
         assert_eq!(Some(&None), object_store.if_none_match().last());
+
+        Ok(())
+    }
+
+    /// A reader that installs a write's own version while the write's response is held leaves
+    /// that version cached: the next read presents it, and the store answers not modified.
+    #[tokio::test]
+    async fn with_mut_keeps_the_version_that_a_reader_installed_for_the_same_write() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let object_store = Arc::new(Held::default());
+        let path = Path::from("/abc/test.json");
+        let opticon = OptiCon::<X>::path(path.clone());
+
+        object_store.hold_next_put();
+        let write = tokio::spawn({
+            let opticon = opticon.clone();
+            let object_store = object_store.clone();
+            async move {
+                opticon
+                    .with_mut(object_store.as_ref(), |x| {
+                        x.0 = 1;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        object_store.reached().await;
+
+        let written = object_store.inner().head(&path).await?.e_tag;
+        assert!(written.is_some());
+
+        // The cache is empty, so the reader fetches the write's version and installs it.
+        assert_eq!(1, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
+
+        object_store.release();
+        write.await.expect("write")?;
+
+        assert_eq!(1, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
+        assert_eq!(Some(written), object_store.if_none_match().last().cloned());
 
         Ok(())
     }
