@@ -428,9 +428,14 @@ where
             // With no bytes left, only the first non-empty partition reads,
             // once: storage returns at least one batch, so the consumer
             // makes progress whatever its limits. Kafka reads it with
-            // `minOneMessage` ([LogSegment.java#L439-L447]).
+            // `minOneMessage` ([LogSegment.java#L439-L447]). For Fetch v2 and
+            // older, Kafka sets `hardMaxBytesLimit` ([FetchParams.java#L72-L74]),
+            // reads without `minOneMessage` and returns nothing at a limit of
+            // 0. Nisshi returns one batch there too, because the service does
+            // not see the request version. That is looser, and harmless.
             //
             // [LogSegment.java#L439-L447]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L447
+            // [FetchParams.java#L72-L74]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/FetchParams.java#L72-L74
             if *max_bytes == 0 && !(is_first_non_empty && batches.is_empty()) {
                 break;
             }
