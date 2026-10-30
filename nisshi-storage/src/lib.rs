@@ -2164,6 +2164,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
     /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
+    /// `max_bytes` can be 0, and the read still returns that first batch. The fetch service
+    /// passes 0 for the first partition that has records when the request's limit is 0, as Kafka
+    /// does.
+    ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
     /// The caller drops the read at its deadline, and keeps what the read sent before it, so an
