@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{STOP_TIMEOUT, Shutdown};
@@ -32,8 +32,10 @@ use crate::{
 const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many times to ask `docker logs` for the log of a broker that exited without printing, and
-/// how long to wait between asks: 2 seconds in all, on a path that already fails a test.
+/// how long to wait between asks, and when to stop asking whatever the count: a hung `docker logs`
+/// takes up to a minute, and the test must reach its failure report before nextest kills it.
 const LOG_ATTEMPTS: u32 = 20;
+const LOG_WINDOW: Duration = Duration::from_secs(3);
 const LOG_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// What `docker cp` prints when the file to copy isn't in the container.
@@ -211,13 +213,15 @@ impl BrokerContainer {
         // that expects a refusal fails. A broker that exited has nothing more to print, so an
         // empty log is a lost one: ask again for a moment, in case `docker logs` failed
         // transiently. A broker that the harness killed may print nothing, so ask once.
-        let attempts = if code.is_some() { LOG_ATTEMPTS } else { 1 };
-
-        let log_problem = collect_log(attempts, LOG_RETRY_DELAY, || {
-            self.save_logs_expecting_output(log)
-        })
-        .err()
-        .map(|problem| format!("{problem}; {}", self.log_context()));
+        let log_problem = if code.is_some() {
+            collect_log(LOG_ATTEMPTS, LOG_RETRY_DELAY, LOG_WINDOW, || {
+                self.save_logs_expecting_output(log)
+            })
+            .err()
+            .map(|problem| format!("{problem}; {}", self.log_context()))
+        } else {
+            self.save_logs(log).err()
+        };
 
         remove_container(&self.name);
         (code, log_problem)
@@ -302,19 +306,27 @@ impl BrokerContainer {
     }
 }
 
-/// Calls `fetch` up to `attempts` times, `delay` apart, until it succeeds. Returns the last
-/// failure, with the number of attempts, if none does.
+/// Calls `fetch` up to `attempts` times, `delay` apart, until it succeeds, and stops asking once
+/// `window` has passed. Returns the last failure, with the number of attempts, if none succeeds.
 fn collect_log(
     attempts: u32,
     delay: Duration,
+    window: Duration,
     mut fetch: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
+    let started = Instant::now();
     let mut last = String::new();
+    let mut made = 0;
 
     for attempt in 1..=attempts {
+        made = attempt;
         match fetch() {
             Ok(()) => return Ok(()),
             Err(reason) => last = reason,
+        }
+
+        if started.elapsed() >= window {
+            break;
         }
 
         if attempt < attempts {
@@ -322,7 +334,7 @@ fn collect_log(
         }
     }
 
-    Err(format!("{last} after {attempts} attempt(s)"))
+    Err(format!("{last} after {made} attempt(s)"))
 }
 
 impl fmt::Display for BrokerContainer {
@@ -343,11 +355,13 @@ mod tests {
 
     use super::collect_log;
 
+    const WINDOW: Duration = Duration::from_secs(60);
+
     #[test]
     fn collect_log_asks_again_until_the_log_is_there() {
         let mut asked = 0;
 
-        let collected = collect_log(5, Duration::ZERO, || {
+        let collected = collect_log(5, Duration::ZERO, WINDOW, || {
             asked += 1;
             if asked < 3 {
                 Err("printed nothing".to_owned())
@@ -364,7 +378,7 @@ mod tests {
     fn collect_log_names_the_last_failure_and_the_attempts() {
         let mut asked = 0;
 
-        let collected = collect_log(3, Duration::ZERO, || {
+        let collected = collect_log(3, Duration::ZERO, WINDOW, || {
             asked += 1;
             Err(format!("failure {asked}"))
         });
@@ -373,10 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn collect_log_stops_asking_when_the_window_has_passed() {
+        let mut asked = 0;
+
+        let collected = collect_log(20, Duration::ZERO, Duration::ZERO, || {
+            asked += 1;
+            Err("timed out".to_owned())
+        });
+
+        assert_eq!(asked, 1);
+        assert_eq!(collected, Err("timed out after 1 attempt(s)".to_owned()));
+    }
+
+    #[test]
     fn collect_log_asks_once_when_given_one_attempt() {
         let mut asked = 0;
 
-        _ = collect_log(1, Duration::ZERO, || {
+        _ = collect_log(1, Duration::ZERO, WINDOW, || {
             asked += 1;
             Err("printed nothing".to_owned())
         });
