@@ -69,6 +69,7 @@ pub(crate) struct CountingStorage {
     listings: Arc<Mutex<usize>>,
     lookups: Arc<Mutex<usize>>,
     init_producer_error: Option<Error>,
+    create_topic_failure: Option<(String, Error)>,
 }
 
 impl CountingStorage {
@@ -87,6 +88,15 @@ impl CountingStorage {
     pub(crate) fn failing_init_producer(error: Error) -> Self {
         Self {
             init_producer_error: Some(error),
+            ..Self::default()
+        }
+    }
+
+    /// A storage whose `create_topic` of the topic `name` fails with `error`. A create of any
+    /// other topic succeeds.
+    pub(crate) fn failing_create_topic(name: &str, error: Error) -> Self {
+        Self {
+            create_topic_failure: Some((name.to_owned(), error)),
             ..Self::default()
         }
     }
@@ -198,6 +208,12 @@ impl Storage for CountingStorage {
     }
 
     async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+        if let Some((name, error)) = &self.create_topic_failure
+            && *name == topic.name
+        {
+            return Err(error.clone());
+        }
+
         _ = self.topics.lock()?.insert(topic.name.clone());
         self.created.lock()?.push(topic.name);
         Ok(Uuid::new_v4())

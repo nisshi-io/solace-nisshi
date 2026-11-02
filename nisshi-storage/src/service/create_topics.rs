@@ -20,7 +20,7 @@ use nisshi_sans_io::{
     topic::{has_collision_chars, unify_collision_chars},
 };
 use rama::Service;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 use validation::{ValidatedCreateTopicsRequest, ValidatedTopic, error_result};
@@ -171,6 +171,9 @@ impl TopicsWithCollisionChars {
 /// Kafka answers it for a topic that it created and has not yet propagated
 /// ([rdkafka_admin.c#L2047-L2056]). A permanent error answers `UNKNOWN_SERVER_ERROR`.
 ///
+/// `NOT_CONTROLLER` names a controller that this broker does not have, so the result also
+/// carries a message that says storage is the cause.
+///
 /// [rdkafka_admin.c#L2047-L2056]: https://github.com/confluentinc/librdkafka/blob/v2.3.0/src/rdkafka_admin.c#L2047-L2056
 fn storage_error(name: String, error: &Error) -> CreatableTopicResult {
     let error_code = error.error_code(ErrorCode::NotController);
@@ -179,11 +182,45 @@ fn storage_error(name: String, error: &Error) -> CreatableTopicResult {
         .name(name)
         .topic_id(Some(NULL_TOPIC_ID))
         .error_code(error_code.into())
-        .error_message(None)
+        .error_message(
+            (error_code == ErrorCode::NotController)
+                .then(|| "The storage is temporarily unavailable.".to_owned()),
+        )
         .topic_config_error_code(None)
         .num_partitions(None)
         .replication_factor(None)
         .configs(Some([].into()))
+}
+
+/// Changes each `NOT_CONTROLLER` result to `UNKNOWN_SERVER_ERROR` when another topic in
+/// `topics` succeeded.
+///
+/// The Java admin client throws when any topic in a response has `NOT_CONTROLLER`, and then
+/// sends the whole request again ([`handleNotControllerError`]). The retry answers
+/// `TOPIC_ALREADY_EXISTS` for each topic that this request created, and the caller gets a
+/// `TopicExistsException` for a topic that its own call created. Kafka's controller answers
+/// `NOT_CONTROLLER` for a whole request and never next to a success.
+///
+/// [`handleNotControllerError`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3958-L3968
+fn keep_not_controller_apart_from_success(topics: &mut [CreatableTopicResult]) {
+    if !topics
+        .iter()
+        .any(|topic| topic.error_code == i16::from(ErrorCode::None))
+    {
+        return;
+    }
+
+    for topic in topics
+        .iter_mut()
+        .filter(|topic| topic.error_code == i16::from(ErrorCode::NotController))
+    {
+        topic.error_code = ErrorCode::UnknownServerError.into();
+        topic.error_message = Some(
+            "The storage failed. The request is not retried because another topic in it \
+             succeeded."
+                .to_owned(),
+        );
+    }
 }
 
 impl<G> Service<ValidatedCreateTopicsRequest> for CreateTopicsService<G>
@@ -215,7 +252,12 @@ where
         {
             self.topics_with_collision_chars()
                 .await
-                .inspect_err(|error| debug!(?error))
+                .inspect_err(|error| {
+                    warn!(
+                        ?error,
+                        "listing the existing topics for a collision check failed"
+                    )
+                })
         } else {
             Ok(TopicsWithCollisionChars::default())
         };
@@ -310,12 +352,14 @@ where
                 )),
 
                 Err(error) => {
-                    debug!(?error);
+                    warn!(topic = name, ?error, "creating a topic failed in storage");
 
                     topics.push(storage_error(name, &error))
                 }
             }
         }
+
+        keep_not_controller_apart_from_success(&mut topics);
 
         Ok(CreateTopicsResponse::default()
             .topics(Some(topics))
@@ -368,7 +412,7 @@ mod tests {
 
     use super::CreateTopicsService;
     use crate::{
-        CreateTopicsValidationLayer, Result,
+        CreateTopicsValidationLayer, Error, Result,
         service::counting_storage::{CountingStorage, Listing},
     };
 
@@ -443,6 +487,88 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(vec![ErrorCode::NotController], error_codes);
+
+        Ok(())
+    }
+
+    /// The Java admin client retries a whole request when any topic in the response has
+    /// `NOT_CONTROLLER`, and the retry reports `TOPIC_ALREADY_EXISTS` for a topic that the
+    /// request created. A request that created a topic and failed another one in storage
+    /// answers `UNKNOWN_SERVER_ERROR` for the failed topic, whichever of the two comes first.
+    #[tokio::test]
+    async fn transient_failure_next_to_a_created_topic_is_not_not_controller() -> Result<()> {
+        for (topics, expected) in [
+            (
+                ["created", "failed"],
+                [ErrorCode::None, ErrorCode::UnknownServerError],
+            ),
+            (
+                ["failed", "created"],
+                [ErrorCode::UnknownServerError, ErrorCode::None],
+            ),
+        ] {
+            let storage = CountingStorage::failing_create_topic(
+                "failed",
+                Error::from(std::io::Error::other("connection reset")),
+            );
+            let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+                storage: storage.clone(),
+            });
+
+            let response = service
+                .serve(
+                    CreateTopicsRequest::default()
+                        .topics(Some(topics.map(|name| topic(name, 1)).into()))
+                        .validate_only(Some(false)),
+                )
+                .await?;
+
+            let error_codes = response
+                .topics
+                .unwrap_or_default()
+                .iter()
+                .map(|topic| ErrorCode::try_from(topic.error_code))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            assert_eq!(expected.to_vec(), error_codes, "{topics:?}");
+            assert_eq!(vec![String::from("created")], storage.created());
+        }
+
+        Ok(())
+    }
+
+    /// A request that created no topic answers `NOT_CONTROLLER` for a transient storage failure,
+    /// so that the Java admin client retries it, with a message that names storage as the cause.
+    #[tokio::test]
+    async fn transient_failure_with_no_created_topic_is_not_controller_with_a_message() -> Result<()>
+    {
+        let storage = CountingStorage::failing_create_topic(
+            "failed",
+            Error::from(std::io::Error::other("connection reset")),
+        );
+        let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+            storage: storage.clone(),
+        });
+
+        let response = service
+            .serve(
+                CreateTopicsRequest::default()
+                    .topics(Some(vec![topic("failed", 1)]))
+                    .validate_only(Some(false)),
+            )
+            .await?;
+
+        let topics = response.topics.unwrap_or_default();
+
+        assert_eq!(1, topics.len());
+        assert_eq!(
+            ErrorCode::NotController,
+            ErrorCode::try_from(topics[0].error_code)?
+        );
+        assert_eq!(
+            Some("The storage is temporarily unavailable."),
+            topics[0].error_message.as_deref()
+        );
 
         Ok(())
     }

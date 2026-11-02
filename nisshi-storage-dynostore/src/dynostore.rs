@@ -2497,6 +2497,7 @@ impl DynoStore {
                     base_sequence,
                 );
             })
+            .map_err(unretriable_after_write)
     }
 }
 
@@ -3293,7 +3294,18 @@ impl Storage for DynoStore {
                 )
                 .await
                 .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                .inspect_err(|error| error!(?error, transaction_id, ?topition))?;
+                .inspect_err(|error| error!(?error, transaction_id, ?topition))
+                .map_err(|error| {
+                    let error = Error::from(error);
+
+                    // An object store that times out can complete the write, so a retry of the
+                    // batch's sequence can store it twice.
+                    if idempotent.is_some() {
+                        unretriable_after_write(error)
+                    } else {
+                        error
+                    }
+                })?;
 
             if let Some(idempotent) = idempotent {
                 self.advance_idempotent_sequence(
@@ -5234,6 +5246,21 @@ fn post_write_failure_reason(error: &Error) -> Cow<'static, str> {
         Error::Api(code) => Cow::Owned(format!("{code:?}")),
         Error::ObjectStore(error) => Cow::Borrowed(object_store_error_name(error)),
         _ => Cow::Borrowed("other"),
+    }
+}
+
+/// Returns `UNKNOWN_SERVER_ERROR` for a transient `error` that an idempotent produce meets
+/// after its batch took an offset, and `error` for any other error.
+///
+/// The batch can be stored while the producer's sequence has not advanced. A transient error
+/// answers a retriable code, and the client's retry of the same sequence then stores the batch
+/// a second time at a new offset. `UNKNOWN_SERVER_ERROR` makes the client fail the batch
+/// instead.
+fn unretriable_after_write(error: Error) -> Error {
+    if error.is_transient() {
+        Error::Api(ErrorCode::UnknownServerError)
+    } else {
+        error
     }
 }
 

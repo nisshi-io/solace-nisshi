@@ -487,17 +487,30 @@ impl Error {
     ///
     /// Two backend errors are permanent because a retry can't fix them. An object store error
     /// that names a missing object, a rejected credential or an unsupported operation, and a
-    /// PostgreSQL error whose SQLSTATE is a data exception, an integrity violation or a syntax
-    /// or access rule violation (classes 22, 23 and 42).
+    /// PostgreSQL error whose SQLSTATE class names a request that the server never accepts: a
+    /// data exception, an integrity constraint violation, a syntax error or access rule
+    /// violation, or an internal error (classes 22, 23, 42 and XX). Every other SQLSTATE is
+    /// transient.
+    ///
+    /// [`Error::Acquire`], [`Error::UnableToSend`], [`Error::OneshotRecv`] and an
+    /// [`Error::Join`] of a cancelled task are transient. A semaphore, a channel to the storage
+    /// service or an offloaded task ends when the broker shuts down, and a retry reaches the
+    /// broker that replaces it. An [`Error::Join`] of a panicked task is permanent, because the
+    /// same input panics the task again.
     ///
     /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
     /// batch took its offset, so a retry can store the batch twice.
     ///
     /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
     /// [`Error::error_code`] keeps.
+    ///
+    /// The match lists every variant, so that a new variant does not compile until its author
+    /// decides whether a retry may succeed.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Io(_) => true,
+            Self::Acquire(_) | Self::Io(_) | Self::UnableToSend | Self::OneshotRecv => true,
+
+            Self::Join(error) => error.is_cancelled(),
 
             #[cfg(any(feature = "dynostore", feature = "slatedb"))]
             Self::ObjectStore(error) => !matches!(
@@ -522,17 +535,7 @@ impl Error {
 
             #[cfg(feature = "postgres")]
             Self::TokioPostgres(error) => match error.as_db_error() {
-                // The server answered with a SQLSTATE. Only the classes that the server uses
-                // for a state that clears are transient: connection exceptions (08),
-                // transaction rollback, which includes serialization failures and deadlocks
-                // (40), insufficient resources (53), operator intervention (57) and system
-                // errors (58).
-                Some(db_error) => {
-                    matches!(
-                        db_error.code().code().get(..2),
-                        Some("08" | "40" | "53" | "57" | "58")
-                    )
-                }
+                Some(db_error) => is_transient_sqlstate(db_error.code()),
 
                 // Without a SQLSTATE the error is the client's. A closed connection and an I/O
                 // error clear on a retry. A value that doesn't convert to its Rust type, a
@@ -553,7 +556,68 @@ impl Error {
             #[cfg(feature = "slatedb")]
             Self::Slate(_) => true,
 
-            _ => false,
+            Self::Api(_)
+            | Self::AuthenticationUnsupported { .. }
+            | Self::UserCredentialsUnsupported { .. }
+            | Self::AcksZeroProduceFailed { .. }
+            | Self::ChronoParse(_)
+            | Self::Decode(_)
+            | Self::Boxed(_)
+            | Self::FeatureNotEnabled { .. }
+            | Self::Glob(_)
+            | Self::NoEngineForScheme { .. }
+            | Self::IncompatibleSchema { .. }
+            | Self::OutdatedSchema { .. }
+            | Self::InsufficientCapacity(_)
+            | Self::LessThanBaseOffset { .. }
+            | Self::LessThanLastOffset { .. }
+            | Self::LessThanMaxTime { .. }
+            | Self::LessThanMinTime { .. }
+            | Self::MessageTooLarge { .. }
+            | Self::Message(_)
+            | Self::NoSuchEntry { .. }
+            | Self::NoSuchOffset(_)
+            | Self::OsString(_)
+            | Self::StartupFailed { .. }
+            | Self::ParseFilter(_)
+            | Self::Pattern(_)
+            | Self::ParseInt(_)
+            | Self::PhantomCached()
+            | Self::Poison
+            | Self::ProgressStyleTemplate(_)
+            | Self::Regex(_)
+            | Self::SansIo(_)
+            | Self::Schema(_)
+            | Self::Rustls(_)
+            | Self::SegmentEmpty(_)
+            | Self::SegmentMissing { .. }
+            | Self::SerdeJson(_)
+            | Self::SystemTime(_)
+            | Self::TryFromInt(_)
+            | Self::TryFromSlice(_)
+            | Self::TryGet(_)
+            | Self::UnexpectedBody(_)
+            | Self::UnexpectedServiceResponse(_)
+            | Self::UnknownCacheKey(_)
+            | Self::InvalidStorageOptionValue { .. }
+            | Self::UnrecognizedStorageOption { .. }
+            | Self::UnsupportedTxnAddPartitionsVersion
+            | Self::UnexpectedAddPartitionsToTxnRequest(_)
+            | Self::Url(_)
+            | Self::UnknownTxnState(_)
+            | Self::Uuid(_) => false,
+
+            #[cfg(any(feature = "postgres", feature = "libsql"))]
+            Self::DeadPoolBuild(_) => false,
+
+            #[cfg(feature = "slatedb")]
+            Self::Postcard(_) => false,
+
+            #[cfg(feature = "turso")]
+            Self::UnexpectedValue(_) => false,
+
+            #[cfg(feature = "libsql")]
+            Self::UnexpectedLibSqlValue(_) => false,
         }
     }
 
@@ -579,6 +643,19 @@ impl Error {
             _ => ErrorCode::UnknownServerError,
         }
     }
+}
+
+/// Returns whether a PostgreSQL error with `sqlstate` may clear on a retry.
+///
+/// The SQLSTATE classes for a data exception (22), an integrity constraint violation (23), a
+/// syntax error or access rule violation (42) and an internal error (XX) name a request that
+/// the server never accepts, so they are permanent. Every other class is transient. A state
+/// that nobody listed, such as `read_only_sql_transaction` (25006) on a pooled connection to a
+/// primary that a failover has demoted, or `lock_not_available` (55P03), then answers the
+/// retriable code and not a fatal one.
+#[cfg(feature = "postgres")]
+fn is_transient_sqlstate(sqlstate: &tokio_postgres::error::SqlState) -> bool {
+    !matches!(sqlstate.code().get(..2), Some("22" | "23" | "42" | "XX"))
 }
 
 impl Display for Error {
@@ -3449,6 +3526,61 @@ mod tests {
                 error.error_code(ErrorCode::CoordinatorNotAvailable),
                 "{error:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_closed_semaphore_or_channel_or_a_cancelled_task_is_transient() {
+        let semaphore = tokio::sync::Semaphore::new(0);
+        semaphore.close();
+        let acquire = semaphore.acquire().await.expect_err("closed semaphore");
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.expect_err("aborted task");
+
+        for error in [
+            Error::from(acquire),
+            Error::UnableToSend,
+            Error::OneshotRecv,
+            Error::Join(Arc::new(cancelled)),
+        ] {
+            assert!(error.is_transient(), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_panicked_task_is_permanent() {
+        let panicked = tokio::spawn(async { panic!("injected panic") })
+            .await
+            .expect_err("panicked task");
+
+        assert!(!Error::Join(Arc::new(panicked)).is_transient());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_sqlstate_is_transient_unless_its_class_names_a_request_the_server_never_accepts() {
+        use tokio_postgres::error::SqlState;
+
+        // A failover and a busy server produce these states, and they clear on their own.
+        for sqlstate in [
+            SqlState::CONNECTION_FAILURE,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::READ_ONLY_SQL_TRANSACTION,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::ADMIN_SHUTDOWN,
+        ] {
+            assert!(is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
+        }
+
+        for sqlstate in [
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::SYNTAX_ERROR,
+            SqlState::INTERNAL_ERROR,
+        ] {
+            assert!(!is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
         }
     }
 
