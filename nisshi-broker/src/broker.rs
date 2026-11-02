@@ -531,8 +531,8 @@ where
         let mut txn_sweep: Option<AbortHandle> = None;
 
         let engine = &self.storage_engine;
-        let maintenance_failures = Arc::new(SweepFailures::new("maintain", engine));
-        let txn_failures = Arc::new(SweepFailures::new("maintain_transactions", engine));
+        let maintenance_failures = Arc::new(SweepFailures::maintain(engine));
+        let txn_failures = Arc::new(SweepFailures::maintain_transactions(engine));
 
         let mut set = JoinSet::new();
 
@@ -1102,12 +1102,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             None
         };
 
-        // One engine, one label: `postgresql://` is `postgres://`.
-        let storage_engine = match self.storage.scheme() {
-            "postgresql" => "postgres",
-            scheme => scheme,
-        }
-        .to_owned();
+        let storage_engine = engine_label(self.storage.scheme()).to_owned();
 
         Ok(Broker {
             node_id: self.node_id,
@@ -1133,11 +1128,23 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
     }
 }
 
+/// Returns the engine label that the sweep log and metric carry for a storage URL scheme.
+///
+/// An alert matches this label, so one engine has one label: `postgresql://` is the same engine as
+/// `postgres://`. The storage factory owns the list of aliases, and this function copies the one
+/// alias that a factory accepts under two schemes.
+fn engine_label(scheme: &str) -> &str {
+    match scheme {
+        "postgresql" => "postgres",
+        scheme => scheme,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        address_family_unsupported_os_error, arm, bind, configure_listener, ipv4_fallback,
-        listener_addr, preferred_listener_addr,
+        address_family_unsupported_os_error, arm, bind, configure_listener, engine_label,
+        ipv4_fallback, listener_addr, preferred_listener_addr,
     };
     use crate::Error;
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1147,6 +1154,16 @@ mod tests {
     };
     use tokio::net::{TcpListener, TcpStream};
     use url::Url;
+
+    #[test]
+    fn engine_label_reports_one_label_per_engine() {
+        assert_eq!("postgres", engine_label("postgres"));
+        assert_eq!("postgres", engine_label("postgresql"));
+
+        for scheme in ["sqlite", "memory", "s3", "gs", "null", "slatedb"] {
+            assert_eq!(scheme, engine_label(scheme));
+        }
+    }
 
     async fn listener_addr_of(listener: &str) -> crate::Result<SocketAddr> {
         listener_addr(&Url::parse(listener).expect("listener URL")).await

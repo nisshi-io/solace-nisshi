@@ -14,10 +14,10 @@
 
 //! What the broker reports when a storage sweep fails.
 //!
-//! A sweep that fails stops retention, compaction, the lake sink or the transaction timeout from
-//! running, and the broker runs it again on its next tick, so a persistent fault fails every tick.
-//! The log carries the first failure and then one line per [`REPEAT_INTERVAL`], with the failures
-//! it left out, and the metric counts every one.
+//! A sweep that fails leaves its work undone until the broker runs it again on its next tick, so a
+//! persistent fault fails every tick. The log carries the first failure and then at most one line
+//! per [`REPEAT_INTERVAL`], for failures and recoveries together, and the metric counts every
+//! sweep.
 
 use std::{
     fmt::Display,
@@ -54,19 +54,51 @@ struct State {
     last_logged: Option<Instant>,
 }
 
+impl State {
+    fn log_is_due(&self, now: Instant) -> bool {
+        self.last_logged
+            .is_none_or(|logged| now.saturating_duration_since(logged) >= REPEAT_INTERVAL)
+    }
+}
+
 /// The failures of one kind of sweep (`maintain` or `maintain_transactions`) of one engine.
 #[derive(Debug)]
 pub(crate) struct SweepFailures {
     sweep: &'static str,
+
+    /// What an operator can expect to stop working while this sweep fails.
+    stopped: &'static str,
+
     engine: String,
+    counter: Counter<u64>,
     state: Mutex<State>,
 }
 
 impl SweepFailures {
-    pub(crate) fn new(sweep: &'static str, engine: impl Into<String>) -> Self {
+    /// The failures of `maintain`, which runs retention, compaction and the lake sink.
+    pub(crate) fn maintain(engine: impl Into<String>) -> Self {
+        Self::new(
+            "maintain",
+            "retention, compaction and the lake sink may have stopped",
+            engine,
+        )
+    }
+
+    /// The failures of `maintain_transactions`, which aborts the transactions that timed out.
+    pub(crate) fn maintain_transactions(engine: impl Into<String>) -> Self {
+        Self::new(
+            "maintain_transactions",
+            "timed-out transactions are not aborted, so read_committed consumers may stall",
+            engine,
+        )
+    }
+
+    fn new(sweep: &'static str, stopped: &'static str, engine: impl Into<String>) -> Self {
         Self {
             sweep,
+            stopped,
             engine: engine.into(),
+            counter: SWEEPS.clone(),
             state: Mutex::new(State::default()),
         }
     }
@@ -75,7 +107,7 @@ impl SweepFailures {
     pub(crate) fn record<E: Display>(&self, outcome: Result<(), E>, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 
-        SWEEPS.add(
+        self.counter.add(
             1,
             &[
                 KeyValue::new("sweep", self.sweep),
@@ -86,28 +118,30 @@ impl SweepFailures {
 
         match outcome {
             Ok(()) => {
-                if state.consecutive > 0 {
-                    // At warn, the level of the failure, so that an operator at the default level sees
-                    // it end. It fires once per run of failures.
+                let failed_sweeps = std::mem::take(&mut state.consecutive);
+                state.unlogged = 0;
+
+                // The recovery line counts against the same limit as the failure lines. A sweep that
+                // alternates between failing and succeeding would otherwise log two lines per cycle.
+                if failed_sweeps > 0 && state.log_is_due(now) {
+                    // At warn, the level of the failure, so that an operator at the default level
+                    // sees it end.
                     warn!(
                         sweep = self.sweep,
                         engine = %self.engine,
-                        failed_sweeps = state.consecutive,
+                        failed_sweeps,
                         "storage maintenance sweep succeeded again"
                     );
-                }
 
-                *state = State::default();
+                    state.last_logged = Some(now);
+                }
             }
 
             Err(error) => {
                 state.consecutive += 1;
                 state.unlogged += 1;
 
-                if state
-                    .last_logged
-                    .is_some_and(|logged| now.saturating_duration_since(logged) < REPEAT_INTERVAL)
-                {
+                if !state.log_is_due(now) {
                     return;
                 }
 
@@ -116,9 +150,9 @@ impl SweepFailures {
                     engine = %self.engine,
                     consecutive_failures = state.consecutive,
                     failures_since_last_log = state.unlogged,
+                    stopped = self.stopped,
                     %error,
-                    "storage maintenance sweep failed: retention, compaction, the lake sink or \
-                     the transaction timeout may have stopped"
+                    "storage maintenance sweep failed"
                 );
 
                 state.unlogged = 0;
@@ -135,6 +169,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint},
+    };
     use tracing::Level;
 
     use super::*;
@@ -186,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_failed_sweep_is_logged_at_warn_with_its_engine() {
-        let failures = SweepFailures::new("maintain", "postgres");
+        let failures = SweepFailures::maintain("postgres");
 
         let logs = captured(|| failures.record(Err("connection refused"), Instant::now()));
 
@@ -200,8 +239,26 @@ mod tests {
     }
 
     #[test]
+    fn each_sweep_names_the_work_that_its_failure_leaves_undone() {
+        let logs = captured(|| {
+            SweepFailures::maintain("memory").record(Err("boom"), Instant::now());
+            SweepFailures::maintain_transactions("postgres").record(Err("boom"), Instant::now());
+        });
+
+        let mut lines = logs.lines();
+
+        let maintain = lines.next().expect("a line for maintain");
+        assert!(maintain.contains("retention, compaction"), "{maintain}");
+        assert!(!maintain.contains("read_committed"), "{maintain}");
+
+        let transactions = lines.next().expect("a line for maintain_transactions");
+        assert!(transactions.contains("read_committed"), "{transactions}");
+        assert!(!transactions.contains("retention"), "{transactions}");
+    }
+
+    #[test]
     fn a_persistent_failure_is_logged_once_per_interval_with_the_count_it_left_out() {
-        let failures = SweepFailures::new("maintain_transactions", "sqlite");
+        let failures = SweepFailures::maintain_transactions("sqlite");
         let start = Instant::now();
 
         let logs = captured(|| {
@@ -221,23 +278,115 @@ mod tests {
     }
 
     #[test]
-    fn a_success_after_failures_is_logged_and_the_next_failure_logs_at_once() {
-        let failures = SweepFailures::new("maintain", "memory");
+    fn a_success_after_failures_is_logged_once_the_interval_has_passed() {
+        let failures = SweepFailures::maintain("memory");
         let start = Instant::now();
 
         _ = captured(|| failures.record(Err("boom"), start));
 
-        let logs = captured(|| failures.record(Ok::<(), &str>(()), start));
+        let logs = captured(|| failures.record(Ok::<(), &str>(()), start + REPEAT_INTERVAL));
         assert!(logs.contains("succeeded again"), "{logs}");
         assert!(logs.contains("failed_sweeps=1"), "{logs}");
 
-        let logs = captured(|| failures.record(Err("boom"), start));
-        assert_eq!(1, logs.matches("boom").count(), "{logs}");
-
-        let logs = captured(|| failures.record(Ok::<(), &str>(()), start));
-        assert!(logs.contains("succeeded again"), "{logs}");
-
-        let logs = captured(|| failures.record(Ok::<(), &str>(()), start));
+        // The run of failures is over, so a later success has nothing to report.
+        let logs = captured(|| {
+            failures.record(
+                Ok::<(), &str>(()),
+                start + REPEAT_INTERVAL + Duration::from_secs(10),
+            )
+        });
         assert!(logs.is_empty(), "{logs}");
+    }
+
+    #[test]
+    fn a_success_inside_the_interval_is_not_logged() {
+        let failures = SweepFailures::maintain("memory");
+        let start = Instant::now();
+
+        _ = captured(|| failures.record(Err("boom"), start));
+
+        let logs = captured(|| {
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(10));
+            failures.record(Err("boom"), start + Duration::from_secs(20));
+        });
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    #[test]
+    fn a_sweep_that_alternates_between_failing_and_succeeding_stays_within_the_interval() {
+        let failures = SweepFailures::maintain_transactions("postgres");
+        let start = Instant::now();
+
+        let logs = captured(|| {
+            // 61 ticks, 10 seconds apart, which is 10 minutes. The sweep fails on every even tick.
+            for tick in 0..=60 {
+                let now = start + Duration::from_secs(10 * tick);
+
+                if tick % 2 == 0 {
+                    failures.record(Err("pool timed out"), now);
+                } else {
+                    failures.record(Ok::<(), &str>(()), now);
+                }
+            }
+        });
+
+        // One line at 0, 5 and 10 minutes.
+        assert_eq!(3, logs.lines().count(), "{logs}");
+    }
+
+    /// Sums the `nisshi_storage_maintenance_sweeps` counter for `outcome`.
+    fn swept(exporter: &InMemoryMetricExporter, outcome: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("finished metrics")
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "nisshi_storage_maintenance_sweeps")
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
+                    sum.data_points()
+                        .filter(|point| {
+                            point.attributes().any(|attribute| {
+                                attribute.key.as_str() == "outcome"
+                                    && attribute.value.as_str() == outcome
+                            })
+                        })
+                        .map(SumDataPoint::value)
+                        .sum::<u64>(),
+                ),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn the_counter_counts_every_sweep_by_outcome_including_the_failures_that_are_not_logged() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+
+        let mut failures = SweepFailures::maintain("postgres");
+        failures.counter = provider
+            .meter("test")
+            .u64_counter("nisshi_storage_maintenance_sweeps")
+            .build();
+
+        let start = Instant::now();
+
+        _ = captured(|| {
+            // Only the first of these 30 failures is logged.
+            for tick in 0..30 {
+                failures.record(Err("disk full"), start + Duration::from_secs(10 * tick));
+            }
+
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(300));
+        });
+
+        provider.force_flush().expect("flush");
+
+        assert_eq!(30, swept(&exporter, "error"));
+        assert_eq!(1, swept(&exporter, "ok"));
     }
 }
