@@ -307,6 +307,8 @@ impl Consume {
             .max_wait_ms(self.configuration.max_wait_time_ms)
             .min_bytes(self.configuration.min_bytes)
             .max_bytes(self.configuration.max_bytes)
+            // `cat consume` asks for `read_committed` but does not use the response's
+            // `aborted_transactions`, so it still prints the records of an aborted transaction.
             .isolation_level(Some(1))
             .session_id(Some(-1))
             .session_epoch(Some(-1))
@@ -351,6 +353,9 @@ impl Consume {
 /// [`CompletedFetch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L232-L238
 fn readable(batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch> {
     if batch.is_control() {
+        // A fetch that returns only a marker prints nothing and exits 0, like a partition with
+        // nothing to read, so this line is the only trace of it.
+        debug!(base_offset = batch.base_offset, "skipped a control batch");
         None
     } else {
         from_offset(batch, fetch_offset)
