@@ -3913,6 +3913,31 @@ impl Storage for Engine {
             transaction_id, producer_id, producer_epoch, group_id
         );
 
+        // Kafka starts the transaction, and so its timeout, at AddOffsetsToTxn, as it does at
+        // AddPartitionsToTxn: the offsets partition of the group joins the transaction, which
+        // moves an empty or finished transaction to Ongoing and sets its start time. An
+        // ongoing one keeps the time it started.
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2728-L2733
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L328-L336
+        let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
+        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
+
+        _ = self
+            .prepare_execute(
+                &tx,
+                &sql_lookup("txn_detail_update_started_at.sql")?,
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        tx.commit().await?;
+
         Ok(ErrorCode::None)
     }
 
@@ -4079,6 +4104,7 @@ impl Storage for Engine {
             .inspect_err(|err| error!(?err))?;
 
         let mut topics = vec![];
+        let mut stored = false;
 
         for topic in offsets.topics {
             let mut partitions = vec![];
@@ -4108,6 +4134,8 @@ impl Storage for Engine {
                             .await
                             .inspect_err(|err| error!(?err))?;
 
+                        stored = true;
+
                         partitions.push(
                             TxnOffsetCommitResponsePartition::default()
                                 .partition_index(partition.partition_index)
@@ -4134,6 +4162,29 @@ impl Storage for Engine {
                     .name(topic.name)
                     .partitions(Some(partitions)),
             );
+        }
+
+        // The first stored offset starts the transaction when AddOffsetsToTxn did not: a
+        // pending offset holds the group's partition unstable until the transaction ends, so
+        // the transaction needs a start time for a timeout sweep to find it.
+        // Kafka instead refuses a TxnOffsetCommit whose offsets partition is not in the
+        // transaction when transaction.partition.verification.enable is on, its default
+        // (GroupCoordinator.scala#L935 at 3.9.1), so this is looser, by the ticket's choice: a client
+        // that skips AddOffsetsToTxn then still cannot pin a partition for good.
+        if stored {
+            _ = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("txn_detail_update_started_at.sql")?,
+                    (
+                        self.cluster.as_str(),
+                        offsets.transaction_id.as_str(),
+                        offsets.producer_id,
+                        offsets.producer_epoch,
+                    ),
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
         }
 
         tx.commit().await?;

@@ -361,6 +361,47 @@ impl Meta {
             .unwrap_or(BTreeMap::new())
     }
 
+    /// Fences the transaction's producer at `producer_epoch`, its current epoch, by starting the
+    /// next epoch, as Kafka does when it aborts a timed out transaction: a produce, or a request
+    /// of the transaction, with the older epoch is then answered `ProducerFenced`. A producer at
+    /// epoch `i16::MAX` has no next epoch, and is fenced already.
+    ///
+    /// <https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L713>
+    fn fence_producer(&mut self, transaction_id: &str, producer_epoch: ProducerEpoch) {
+        let Some(txn) = self.transactions.get_mut(transaction_id) else {
+            return;
+        };
+
+        if txn.epochs.last_key_value().map(|(epoch, _)| *epoch) != Some(producer_epoch) {
+            return;
+        }
+
+        let Some(next) = producer_epoch.checked_add(1) else {
+            return;
+        };
+
+        let transaction_timeout_ms = txn
+            .epochs
+            .get(&producer_epoch)
+            .map_or(0, |detail| detail.transaction_timeout_ms);
+
+        if let Some(producer) = self.producers.get_mut(&txn.producer) {
+            if producer.sequences.contains_key(&next) {
+                return;
+            }
+
+            _ = producer.sequences.insert(next, BTreeMap::new());
+        }
+
+        _ = txn.epochs.insert(
+            next,
+            TxnDetail {
+                transaction_timeout_ms,
+                ..Default::default()
+            },
+        );
+    }
+
     /// Whether a transactional ID owns the producer ID.
     fn transactional_id_owns(&self, producer_id: ProducerId) -> bool {
         self.transactions
@@ -773,6 +814,62 @@ struct TxnDetail {
     state: Option<TxnState>,
     produces: BTreeMap<Topic, BTreeMap<Partition, Option<TxnProduceOffset>>>,
     offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>>,
+}
+
+impl Txn {
+    /// Whether a request at `producer_epoch` is for this transaction's producer. Only its
+    /// newest epoch is, and a `fence` also accepts an older epoch that the broker fenced.
+    fn accepts_epoch(&self, producer_epoch: ProducerEpoch, fence: bool) -> bool {
+        self.epochs
+            .last_key_value()
+            .is_some_and(|(current, _)| *current == producer_epoch)
+            || fence && self.epochs.contains_key(&producer_epoch)
+    }
+}
+
+impl TxnDetail {
+    /// Starts the transaction, and its timeout, unless it has started. As in Kafka, only an
+    /// empty or finished transaction starts: one that is ongoing keeps the time it started, so
+    /// adding to it does not extend the timeout, and one that is preparing its end stays so.
+    ///
+    /// <https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L328-L336>
+    fn begin(&mut self, now: SystemTime) {
+        if matches!(
+            self.state,
+            None | Some(TxnState::Committed) | Some(TxnState::Aborted)
+        ) {
+            self.started_at = Some(now);
+            self.state = Some(TxnState::Begin);
+        }
+    }
+
+    /// Whether the transaction began, and its timeout has run out, at `now`. A transaction
+    /// with a timeout of 0 never times out.
+    ///
+    /// Kafka sweeps only an ongoing transaction. This also sweeps an abort that is prepared in
+    /// an epoch that is no longer the newest, which only a sweep leaves, because it fences the
+    /// producer: the abort stopped part way, and no client can retry it. A client's own abort
+    /// that waits behind an older transaction is in the newest epoch, and is left alone, or the
+    /// sweep would fence a producer that only waits.
+    ///
+    /// <https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala#L120-L139>
+    fn timed_out(&self, now: SystemTime, newest_epoch: bool) -> bool {
+        let (Some(started_at), Ok(timeout_ms)) =
+            (self.started_at, u64::try_from(self.transaction_timeout_ms))
+        else {
+            return false;
+        };
+
+        timeout_ms > 0
+            && match self.state {
+                Some(TxnState::Begin) => true,
+                Some(TxnState::PrepareAbort) => !newest_epoch,
+                _ => false,
+            }
+            && now
+                .duration_since(started_at)
+                .is_ok_and(|elapsed| elapsed.as_millis() > u128::from(timeout_ms))
+    }
 }
 
 impl From<&TxnDetail> for BTreeMap<Topition, Offset> {
@@ -2214,6 +2311,298 @@ impl DynoStore {
 
             Err(otherwise) => Err(otherwise.into()),
         }
+    }
+
+    /// Ends the transaction. A `fence` ends a timed out transaction on the broker's own account:
+    /// it also fences the producer, so that it cannot add to the transaction after it ended, and
+    /// can end the transaction of an epoch that it fenced on an earlier attempt.
+    async fn end_transaction(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+        fence: bool,
+    ) -> Result<ErrorCode> {
+        let produced = self
+            .meta
+            .with_mut(&self.object_store, |meta| {
+                debug!(transactions = ?meta.transactions);
+
+                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
+                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
+                };
+
+                if transaction.producer != producer_id {
+                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                }
+
+                if !transaction.accepts_epoch(producer_epoch, fence) {
+                    return Err(Error::Api(ErrorCode::ProducerFenced));
+                }
+
+                let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch) else {
+                    return Err(Error::Api(ErrorCode::ProducerFenced));
+                };
+
+                // A retry must repeat the decision that was prepared:
+                // markers of the opposite kind after the first would
+                // commit some partitions and abort others.
+                match (&txn_detail.state, committed) {
+                    (Some(TxnState::PrepareCommit), false)
+                    | (Some(TxnState::PrepareAbort), true) => {
+                        debug!(state = ?txn_detail.state, committed);
+                        return Err(Error::Api(ErrorCode::InvalidTxnState));
+                    }
+                    _ => {}
+                }
+
+                if txn_detail.state == Some(TxnState::Begin) {
+                    assert_eq!(
+                        Some(TxnState::Begin),
+                        txn_detail.state.replace(if committed {
+                            TxnState::PrepareCommit
+                        } else {
+                            TxnState::PrepareAbort
+                        })
+                    );
+                }
+
+                let mut produced = vec![];
+
+                // Recomputed from whatever is still in `produces` whenever
+                // we're in (freshly, or already) a `Prepare*` state, not
+                // only on a fresh transition out of `Begin`: `produces`
+                // isn't cleared until every marker below has been written
+                // and the transaction moves past `Prepare*` (further down
+                // in `txn_end`), so a retry after a partial failure here
+                // (some partitions' end-of-transaction marker written,
+                // others not) recomputes the same set and retries the
+                // missing ones, rather than computing an empty set and
+                // silently completing the transaction with some partitions
+                // never marked. Retrying a partition whose marker already
+                // landed just writes a second, harmless marker at a new
+                // offset - strictly better than one that's missing
+                // forever.
+                if matches!(
+                    txn_detail.state,
+                    Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
+                ) {
+                    for (topic, partitions) in &txn_detail.produces {
+                        for (partition, offset_range) in partitions {
+                            debug!(?topic, partition, ?offset_range);
+
+                            if offset_range.is_some() {
+                                produced.push(Topition::new(topic.to_owned(), *partition));
+                            }
+                        }
+                    }
+                }
+
+                // Fence the producer with the first call that ends the transaction, before the
+                // markers: a retry finds the epoch fenced already. Only an abort in progress
+                // is fenced: the transaction cannot end otherwise.
+                if fence && matches!(txn_detail.state, Some(TxnState::PrepareAbort)) {
+                    meta.fence_producer(transaction_id, producer_epoch);
+                }
+
+                Ok(produced)
+            })
+            .await
+            .inspect(|produced| debug!(?produced))
+            .inspect_err(|err| error!(?err))?;
+
+        for topition in produced {
+            debug!(?topition);
+
+            let control_batch: Bytes = if committed {
+                ControlBatch::default().commit().try_into()?
+            } else {
+                ControlBatch::default().abort().try_into()?
+            };
+
+            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
+
+            let batch = inflated::Batch::builder()
+                .record(
+                    Record::builder()
+                        .key(control_batch.into())
+                        .value(end_transaction_marker.into()),
+                )
+                .attributes(
+                    BatchAttribute::default()
+                        .control(true)
+                        .transaction(true)
+                        .into(),
+                )
+                .producer_id(producer_id)
+                .producer_epoch(producer_epoch)
+                .base_sequence(-1)
+                .build()
+                .and_then(TryInto::try_into)
+                .inspect(|deflated| debug!(?deflated))?;
+
+            match self.produce(Some(transaction_id), &topition, batch).await {
+                Ok(offset) => debug!(
+                    offset,
+                    ?topition,
+                    producer_id,
+                    producer_epoch,
+                    transaction_id,
+                    committed,
+                ),
+
+                // The topic was deleted while the transaction was open, so
+                // there is no log left to mark. Kafka's coordinator drops
+                // such a partition from the markers it writes; failing here
+                // instead would fail every retry of EndTxn and hold the
+                // last stable offset of the other partitions back for good.
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => warn!(
+                    ?topition,
+                    producer_id,
+                    producer_epoch,
+                    transaction_id,
+                    committed,
+                    "partition no longer exists, end transaction marker skipped"
+                ),
+
+                Err(err) => {
+                    error!(
+                        ?err,
+                        ?topition,
+                        producer_id,
+                        producer_epoch,
+                        transaction_id,
+                        committed,
+                    );
+
+                    return Err(err);
+                }
+            }
+        }
+
+        let offsets_to_commit = self
+            .meta
+            .with_mut(&self.object_store, |meta| {
+                debug!(transactions = ?meta.transactions);
+
+                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
+                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
+                };
+
+                if transaction.producer != producer_id {
+                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                }
+
+                if !transaction.accepts_epoch(producer_epoch, fence) {
+                    return Err(Error::Api(ErrorCode::ProducerFenced));
+                }
+
+                let mut overlaps =
+                    meta.overlapping_transactions(transaction_id, producer_id, producer_epoch)?;
+                debug!(?overlaps);
+
+                let mut offsets_to_commit: BTreeMap<
+                    Group,
+                    BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>,
+                > = BTreeMap::new();
+
+                if overlaps.iter().all(|txn_id| txn_id.state.is_prepared()) {
+                    let txn_ids = {
+                        overlaps.push(TxnId {
+                            transaction: transaction_id.into(),
+                            producer_id,
+                            producer_epoch,
+                            state: if committed {
+                                TxnState::PrepareCommit
+                            } else {
+                                TxnState::PrepareAbort
+                            },
+                        });
+
+                        overlaps
+                    };
+
+                    for txn_id in txn_ids {
+                        debug!(?txn_id);
+
+                        if let Some(txn) = meta.transactions.get_mut(txn_id.transaction.as_str())
+                            && let Some(txn_detail) = txn.epochs.get_mut(&txn_id.producer_epoch)
+                        {
+                            debug!(?txn_detail);
+
+                            match txn_detail.state {
+                                None | Some(TxnState::PrepareCommit) => {
+                                    _ = txn_detail.state.replace(TxnState::Committed);
+                                }
+
+                                Some(TxnState::PrepareAbort) => {
+                                    _ = txn_detail.state.replace(TxnState::Aborted);
+                                }
+
+                                otherwise => {
+                                    warn!(
+                                        transaction = txn_id.transaction,
+                                        producer = txn_id.producer_id,
+                                        epoch = txn_id.producer_epoch,
+                                        ?otherwise,
+                                    );
+
+                                    continue;
+                                }
+                            }
+
+                            if txn_id.state == TxnState::PrepareCommit {
+                                for (group, topics) in txn_detail.offsets.iter() {
+                                    for (topic, partitions) in topics.iter() {
+                                        for (partition, committed_offset) in partitions {
+                                            _ = offsets_to_commit
+                                                .entry(group.to_owned())
+                                                .or_default()
+                                                .entry(topic.to_owned())
+                                                .or_default()
+                                                .insert(*partition, committed_offset.to_owned());
+                                        }
+                                    }
+                                }
+                            }
+
+                            txn_detail.produces.clear();
+                            txn_detail.offsets.clear();
+                            _ = txn_detail.started_at.take();
+                        }
+                    }
+                }
+
+                Ok(offsets_to_commit)
+            })
+            .await
+            .inspect(|outcome| debug!(?outcome))
+            .inspect_err(|err| error!(?err))?;
+
+        debug!(?offsets_to_commit);
+
+        for (group, topics) in offsets_to_commit.iter() {
+            let mut offsets = vec![];
+
+            for (topic, partitions) in topics.iter() {
+                for (partition, txn_co) in partitions {
+                    let tp = Topition::new(topic.to_owned(), *partition);
+                    let ocr = OffsetCommitRequest {
+                        offset: txn_co.committed_offset,
+                        leader_epoch: txn_co.leader_epoch,
+                        timestamp: None,
+                        metadata: txn_co.metadata.clone(),
+                    };
+
+                    offsets.push((tp, ocr));
+                }
+            }
+
+            _ = self.offset_commit(group, None, &offsets[..]).await?;
+        }
+
+        Ok(ErrorCode::None)
     }
 
     fn txn_offset_commit_response_error(
@@ -4533,12 +4922,27 @@ impl Storage for DynoStore {
 
     async fn txn_add_offsets(
         &self,
-        _transaction_id: &str,
-        _producer_id: i64,
-        _producer_epoch: i16,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
         _group_id: &str,
     ) -> Result<ErrorCode> {
-        Ok(ErrorCode::None)
+        // Kafka starts the transaction, and so its timeout, at AddOffsetsToTxn, as it does at
+        // AddPartitionsToTxn: the offsets partition of the group joins the transaction.
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2728-L2733
+        self.meta
+            .with_mut(&self.object_store, |meta| {
+                if let Some(txn) = meta.transactions.get_mut(transaction_id)
+                    && txn.producer == producer_id
+                    && let Some(mut current) = txn.epochs.last_entry()
+                    && *current.key() == producer_epoch
+                {
+                    current.get_mut().begin(SystemTime::now());
+                }
+
+                Ok(ErrorCode::None)
+            })
+            .await
     }
 
     async fn txn_add_partitions(
@@ -4683,8 +5087,7 @@ impl Storage for DynoStore {
                             )
                         }
 
-                        txn_detail.started_at = Some(SystemTime::now());
-                        txn_detail.state = Some(TxnState::Begin);
+                        txn_detail.begin(SystemTime::now());
 
                         Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
                     })
@@ -4734,6 +5137,7 @@ impl Storage for DynoStore {
                 let txn_detail = current_epoch.get_mut();
 
                 let mut responses = vec![];
+                let mut stored = false;
 
                 for topic in &offsets.topics {
                     let mut partition_responses = vec![];
@@ -4755,6 +5159,8 @@ impl Storage for DynoStore {
                                     },
                                 );
 
+                            stored = true;
+
                             partition_responses.push(
                                 TxnOffsetCommitResponsePartition::default()
                                     .partition_index(partition.partition_index)
@@ -4770,6 +5176,17 @@ impl Storage for DynoStore {
                     );
                 }
 
+                // The first stored offset starts the transaction when AddOffsetsToTxn did not:
+                // a pending offset holds the group's partition unstable until the transaction
+                // ends, so the transaction needs a start time for the timeout sweep.
+                // Kafka instead refuses a TxnOffsetCommit whose offsets partition is not in the
+                // transaction when transaction.partition.verification.enable is on, its default
+                // (GroupCoordinator.scala#L935 at 3.9.1), so this is looser, by the ticket's choice: a client
+                // that skips AddOffsetsToTxn then still cannot pin a partition for good.
+                if stored {
+                    txn_detail.begin(SystemTime::now());
+                }
+
                 Ok(responses)
             })
             .await
@@ -4782,284 +5199,14 @@ impl Storage for DynoStore {
         producer_epoch: i16,
         committed: bool,
     ) -> Result<ErrorCode> {
-        let produced = self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                debug!(transactions = ?meta.transactions);
-
-                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
-                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
-                };
-
-                if transaction.producer != producer_id {
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                }
-
-                let Some(mut current_epoch) = transaction.epochs.last_entry() else {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                };
-
-                if &producer_epoch != current_epoch.key() {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                }
-
-                let txn_detail = current_epoch.get_mut();
-
-                // A retry must repeat the decision that was prepared:
-                // markers of the opposite kind after the first would
-                // commit some partitions and abort others.
-                match (&txn_detail.state, committed) {
-                    (Some(TxnState::PrepareCommit), false)
-                    | (Some(TxnState::PrepareAbort), true) => {
-                        debug!(state = ?txn_detail.state, committed);
-                        return Err(Error::Api(ErrorCode::InvalidTxnState));
-                    }
-                    _ => {}
-                }
-
-                if txn_detail.state == Some(TxnState::Begin) {
-                    assert_eq!(
-                        Some(TxnState::Begin),
-                        txn_detail.state.replace(if committed {
-                            TxnState::PrepareCommit
-                        } else {
-                            TxnState::PrepareAbort
-                        })
-                    );
-                }
-
-                let mut produced = vec![];
-
-                // Recomputed from whatever is still in `produces` whenever
-                // we're in (freshly, or already) a `Prepare*` state, not
-                // only on a fresh transition out of `Begin`: `produces`
-                // isn't cleared until every marker below has been written
-                // and the transaction moves past `Prepare*` (further down
-                // in `txn_end`), so a retry after a partial failure here
-                // (some partitions' end-of-transaction marker written,
-                // others not) recomputes the same set and retries the
-                // missing ones, rather than computing an empty set and
-                // silently completing the transaction with some partitions
-                // never marked. Retrying a partition whose marker already
-                // landed just writes a second, harmless marker at a new
-                // offset - strictly better than one that's missing
-                // forever.
-                if matches!(
-                    txn_detail.state,
-                    Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
-                ) {
-                    for (topic, partitions) in &txn_detail.produces {
-                        for (partition, offset_range) in partitions {
-                            debug!(?topic, partition, ?offset_range);
-
-                            if offset_range.is_some() {
-                                produced.push(Topition::new(topic.to_owned(), *partition));
-                            }
-                        }
-                    }
-                }
-
-                Ok(produced)
-            })
-            .await
-            .inspect(|produced| debug!(?produced))
-            .inspect_err(|err| error!(?err))?;
-
-        for topition in produced {
-            debug!(?topition);
-
-            let control_batch: Bytes = if committed {
-                ControlBatch::default().commit().try_into()?
-            } else {
-                ControlBatch::default().abort().try_into()?
-            };
-
-            let end_transaction_marker: Bytes = EndTransactionMarker::default().try_into()?;
-
-            let batch = inflated::Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(control_batch.into())
-                        .value(end_transaction_marker.into()),
-                )
-                .attributes(
-                    BatchAttribute::default()
-                        .control(true)
-                        .transaction(true)
-                        .into(),
-                )
-                .producer_id(producer_id)
-                .producer_epoch(producer_epoch)
-                .base_sequence(-1)
-                .build()
-                .and_then(TryInto::try_into)
-                .inspect(|deflated| debug!(?deflated))?;
-
-            match self.produce(Some(transaction_id), &topition, batch).await {
-                Ok(offset) => debug!(
-                    offset,
-                    ?topition,
-                    producer_id,
-                    producer_epoch,
-                    transaction_id,
-                    committed,
-                ),
-
-                // The topic was deleted while the transaction was open, so
-                // there is no log left to mark. Kafka's coordinator drops
-                // such a partition from the markers it writes; failing here
-                // instead would fail every retry of EndTxn and hold the
-                // last stable offset of the other partitions back for good.
-                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => warn!(
-                    ?topition,
-                    producer_id,
-                    producer_epoch,
-                    transaction_id,
-                    committed,
-                    "partition no longer exists, end transaction marker skipped"
-                ),
-
-                Err(err) => {
-                    error!(
-                        ?err,
-                        ?topition,
-                        producer_id,
-                        producer_epoch,
-                        transaction_id,
-                        committed,
-                    );
-
-                    return Err(err);
-                }
-            }
-        }
-
-        let offsets_to_commit = self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                debug!(transactions = ?meta.transactions);
-
-                let Some(transaction) = meta.transactions.get_mut(transaction_id) else {
-                    return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
-                };
-
-                if transaction.producer != producer_id {
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                }
-
-                let Some(current_epoch) = transaction.epochs.last_entry() else {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                };
-
-                if &producer_epoch != current_epoch.key() {
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                }
-
-                let mut overlaps =
-                    meta.overlapping_transactions(transaction_id, producer_id, producer_epoch)?;
-                debug!(?overlaps);
-
-                let mut offsets_to_commit: BTreeMap<
-                    Group,
-                    BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>,
-                > = BTreeMap::new();
-
-                if overlaps.iter().all(|txn_id| txn_id.state.is_prepared()) {
-                    let txn_ids = {
-                        overlaps.push(TxnId {
-                            transaction: transaction_id.into(),
-                            producer_id,
-                            producer_epoch,
-                            state: if committed {
-                                TxnState::PrepareCommit
-                            } else {
-                                TxnState::PrepareAbort
-                            },
-                        });
-
-                        overlaps
-                    };
-
-                    for txn_id in txn_ids {
-                        debug!(?txn_id);
-
-                        if let Some(txn) = meta.transactions.get_mut(txn_id.transaction.as_str())
-                            && let Some(txn_detail) = txn.epochs.get_mut(&txn_id.producer_epoch)
-                        {
-                            debug!(?txn_detail);
-
-                            match txn_detail.state {
-                                None | Some(TxnState::PrepareCommit) => {
-                                    _ = txn_detail.state.replace(TxnState::Committed);
-                                }
-
-                                Some(TxnState::PrepareAbort) => {
-                                    _ = txn_detail.state.replace(TxnState::Aborted);
-                                }
-
-                                otherwise => {
-                                    warn!(
-                                        transaction = txn_id.transaction,
-                                        producer = txn_id.producer_id,
-                                        epoch = txn_id.producer_epoch,
-                                        ?otherwise,
-                                    );
-
-                                    continue;
-                                }
-                            }
-
-                            if txn_id.state == TxnState::PrepareCommit {
-                                for (group, topics) in txn_detail.offsets.iter() {
-                                    for (topic, partitions) in topics.iter() {
-                                        for (partition, committed_offset) in partitions {
-                                            _ = offsets_to_commit
-                                                .entry(group.to_owned())
-                                                .or_default()
-                                                .entry(topic.to_owned())
-                                                .or_default()
-                                                .insert(*partition, committed_offset.to_owned());
-                                        }
-                                    }
-                                }
-                            }
-
-                            txn_detail.produces.clear();
-                            txn_detail.offsets.clear();
-                            _ = txn_detail.started_at.take();
-                        }
-                    }
-                }
-
-                Ok(offsets_to_commit)
-            })
-            .await
-            .inspect(|outcome| debug!(?outcome))
-            .inspect_err(|err| error!(?err))?;
-
-        debug!(?offsets_to_commit);
-
-        for (group, topics) in offsets_to_commit.iter() {
-            let mut offsets = vec![];
-
-            for (topic, partitions) in topics.iter() {
-                for (partition, txn_co) in partitions {
-                    let tp = Topition::new(topic.to_owned(), *partition);
-                    let ocr = OffsetCommitRequest {
-                        offset: txn_co.committed_offset,
-                        leader_epoch: txn_co.leader_epoch,
-                        timestamp: None,
-                        metadata: txn_co.metadata.clone(),
-                    };
-
-                    offsets.push((tp, ocr));
-                }
-            }
-
-            _ = self.offset_commit(group, None, &offsets[..]).await?;
-        }
-
-        Ok(ErrorCode::None)
+        self.end_transaction(
+            transaction_id,
+            producer_id,
+            producer_epoch,
+            committed,
+            false,
+        )
+        .await
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
@@ -5075,7 +5222,60 @@ impl Storage for DynoStore {
         Ok(())
     }
 
-    async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
+    /// Aborts the transactions that outlived their timeout, as Kafka's coordinator does, so that
+    /// a producer that died mid-transaction does not hold back the last stable offset of its
+    /// partitions, or the offsets that it committed, for good.
+    ///
+    /// <https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L693-L725>
+    async fn maintain_transactions(&self, now: SystemTime) -> Result<()> {
+        let timed_out = self
+            .meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .iter()
+                    .flat_map(|(transaction_id, txn)| {
+                        let newest = txn.epochs.last_key_value().map(|(epoch, _)| *epoch);
+
+                        txn.epochs
+                            .iter()
+                            .filter(move |(epoch, detail)| {
+                                detail.timed_out(now, Some(**epoch) == newest)
+                            })
+                            .map(|(epoch, _)| (transaction_id.clone(), txn.producer, *epoch))
+                    })
+                    .collect::<Vec<_>>())
+            })
+            .await?;
+
+        for (transaction_id, producer_id, producer_epoch) in timed_out {
+            match self
+                .end_transaction(&transaction_id, producer_id, producer_epoch, false, true)
+                .await
+            {
+                Ok(ErrorCode::None) => {
+                    debug!(
+                        transaction_id,
+                        producer_id, producer_epoch, "timed out transaction aborted"
+                    )
+                }
+
+                // The sweep lost a race against the client's own EndTxn.
+                Ok(error_code) | Err(Error::Api(error_code)) => debug!(
+                    ?error_code,
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    "timed out transaction not aborted"
+                ),
+
+                Err(ref err) => error!(
+                    ?err,
+                    transaction_id, producer_id, producer_epoch, "abort timed out transaction"
+                ),
+            }
+        }
+
         Ok(())
     }
 

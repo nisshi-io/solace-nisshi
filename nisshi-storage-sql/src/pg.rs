@@ -5189,6 +5189,28 @@ impl Storage for Postgres {
             transaction_id, producer_id, producer_epoch, group_id
         );
 
+        // Kafka starts the transaction, and so its timeout, at AddOffsetsToTxn, as it does at
+        // AddPartitionsToTxn: the offsets partition of the group joins the transaction, which
+        // moves an empty or finished transaction to Ongoing and sets its start time. An
+        // ongoing one keeps the time it started.
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2728-L2733
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L328-L336
+        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+
+        _ = self
+            .prepare_execute(
+                &c,
+                "txn_detail_update_started_at.sql",
+                &[
+                    &self.cluster,
+                    &transaction_id,
+                    &producer_id,
+                    &producer_epoch,
+                ],
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
         Ok(ErrorCode::None)
     }
 
@@ -5350,6 +5372,7 @@ impl Storage for Postgres {
             .inspect_err(|err| error!(?err))?;
 
         let mut topics = vec![];
+        let mut stored = false;
 
         for topic in offsets.topics {
             let mut partitions = vec![];
@@ -5379,6 +5402,8 @@ impl Storage for Postgres {
                             .await
                             .inspect_err(|err| error!(?err))?;
 
+                        stored = true;
+
                         partitions.push(
                             TxnOffsetCommitResponsePartition::default()
                                 .partition_index(partition.partition_index)
@@ -5405,6 +5430,29 @@ impl Storage for Postgres {
                     .name(topic.name)
                     .partitions(Some(partitions)),
             );
+        }
+
+        // The first stored offset starts the transaction when AddOffsetsToTxn did not: a
+        // pending offset holds the group's partition unstable until the transaction ends, so
+        // the transaction needs a start time for the timeout sweep to find it.
+        // Kafka instead refuses a TxnOffsetCommit whose offsets partition is not in the
+        // transaction when transaction.partition.verification.enable is on, its default
+        // (GroupCoordinator.scala#L935 at 3.9.1), so this is looser, by the ticket's choice: a client
+        // that skips AddOffsetsToTxn then still cannot pin a partition for good.
+        if stored {
+            _ = self
+                .tx_prepare_execute(
+                    &tx,
+                    "txn_detail_update_started_at.sql",
+                    &[
+                        &self.cluster,
+                        &offsets.transaction_id,
+                        &offsets.producer_id,
+                        &offsets.producer_epoch,
+                    ],
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
         }
 
         tx.commit().await?;
@@ -5661,7 +5709,10 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 mod tests {
     use super::*;
     use futures_util::future;
-    use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_sans_io::{
+        add_partitions_to_txn_request::AddPartitionsToTxnTopic,
+        txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
+    };
     use nisshi_storage::{
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
@@ -8117,6 +8168,128 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A transaction that only commits offsets starts at `AddOffsetsToTxn`, or at its first
+    /// `TxnOffsetCommit`, so the sweep aborts it after its timeout as Kafka does, and the
+    /// partitions its pending offsets held unstable are stable again. The producer is fenced.
+    async fn offsets_only_transaction_times_out(add_offsets: bool) -> Result<()> {
+        let test = if add_offsets {
+            "offsets_only_transaction_times_out_from_add_offsets"
+        } else {
+            "offsets_only_transaction_times_out_from_txn_offset_commit"
+        };
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(test, &CONNECTION, &cluster).await? else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let group_id = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let transaction_id = alphanumeric_string(10);
+        let producer = storage
+            .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
+            .await?;
+
+        if add_offsets {
+            assert_eq!(
+                ErrorCode::None,
+                storage
+                    .txn_add_offsets(&transaction_id, producer.id, producer.epoch, &group_id)
+                    .await?
+            );
+        }
+
+        let outcome = storage
+            .txn_offset_commit(TxnOffsetCommitRequest {
+                transaction_id: transaction_id.clone(),
+                group_id: group_id.clone(),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                generation_id: None,
+                member_id: None,
+                group_instance_id: None,
+                topics: vec![
+                    TxnOffsetCommitRequestTopic::default()
+                        .name(topic_name.clone())
+                        .partitions(Some(vec![
+                            TxnOffsetCommitRequestPartition::default()
+                                .partition_index(0)
+                                .committed_offset(7)
+                                .committed_leader_epoch(None)
+                                .committed_metadata(None),
+                        ])),
+                ],
+            })
+            .await?;
+        assert_eq!(
+            Some(i16::from(ErrorCode::None)),
+            outcome[0]
+                .partitions
+                .as_deref()
+                .and_then(|partitions| partitions.first())
+                .map(|partition| partition.error_code)
+        );
+
+        let pending = BTreeSet::from([Topition::new(topic_name.clone(), 0)]);
+        assert_eq!(pending, storage.pending_txn_offsets(&group_id).await?);
+
+        // before the timeout the sweep leaves the transaction alone
+        storage.maintain_transactions(SystemTime::now()).await?;
+        assert_eq!(pending, storage.pending_txn_offsets(&group_id).await?);
+
+        storage
+            .maintain_transactions(SystemTime::now() + Duration::from_secs(3600))
+            .await?;
+        assert_eq!(
+            BTreeSet::new(),
+            storage.pending_txn_offsets(&group_id).await?
+        );
+
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            storage
+                .txn_end(&transaction_id, producer.id, producer.epoch, true)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintain_transactions_aborts_offsets_only_transaction_from_add_offsets() -> Result<()>
+    {
+        offsets_only_transaction_times_out(true).await
+    }
+
+    #[tokio::test]
+    async fn maintain_transactions_aborts_offsets_only_transaction_from_txn_offset_commit()
+    -> Result<()> {
+        offsets_only_transaction_times_out(false).await
     }
 
     /// A transaction that hasn't reached its own `transaction_timeout_ms` yet must be left

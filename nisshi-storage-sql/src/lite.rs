@@ -5244,6 +5244,30 @@ impl Storage for Delegate {
             transaction_id, producer_id, producer_epoch, group_id
         );
 
+        // Kafka starts the transaction, and so its timeout, at AddOffsetsToTxn, as it does at
+        // AddPartitionsToTxn: the offsets partition of the group joins the transaction, which
+        // moves an empty or finished transaction to Ongoing and sets its start time. An
+        // ongoing one keeps the time it started.
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2728-L2733
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionMetadata.scala#L328-L336
+        let pc = self.connection().await?;
+        let tx = pc.transaction().await?;
+
+        _ = pc
+            .execute(
+                "txn_detail_update_started_at.sql",
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        pc.commit(tx).await?;
+
         Ok(ErrorCode::None).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
@@ -5414,6 +5438,7 @@ impl Storage for Delegate {
             .inspect_err(|err| error!(?err))?;
 
         let mut topics = vec![];
+        let mut stored = false;
 
         for topic in offsets.topics {
             let mut partitions = vec![];
@@ -5442,6 +5467,8 @@ impl Storage for Delegate {
                             .await
                             .inspect_err(|err| error!(?err))?;
 
+                        stored = true;
+
                         partitions.push(
                             TxnOffsetCommitResponsePartition::default()
                                 .partition_index(partition.partition_index)
@@ -5468,6 +5495,28 @@ impl Storage for Delegate {
                     .name(topic.name)
                     .partitions(Some(partitions)),
             );
+        }
+
+        // The first stored offset starts the transaction when AddOffsetsToTxn did not: a
+        // pending offset holds the group's partition unstable until the transaction ends, so
+        // the transaction needs a start time for a timeout sweep to find it.
+        // Kafka instead refuses a TxnOffsetCommit whose offsets partition is not in the
+        // transaction when transaction.partition.verification.enable is on, its default
+        // (GroupCoordinator.scala#L935 at 3.9.1), so this is looser, by the ticket's choice: a client
+        // that skips AddOffsetsToTxn then still cannot pin a partition for good.
+        if stored {
+            _ = pc
+                .execute(
+                    "txn_detail_update_started_at.sql",
+                    (
+                        self.cluster.as_str(),
+                        offsets.transaction_id.as_str(),
+                        offsets.producer_id,
+                        offsets.producer_epoch,
+                    ),
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
         }
 
         pc.commit(tx).await?;
@@ -7480,6 +7529,130 @@ mod tests {
                 transactional_batch(producer, 0)?,
             )
             .await?;
+
+        Ok(())
+    }
+
+    /// The status of the only `txn_detail` row, and whether it has a start time.
+    async fn txn_detail_status(db_file: &str) -> Result<(Option<String>, bool)> {
+        let connection = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?;
+
+        let row = connection
+            .query("select status, started_at is not null from txn_detail", ())
+            .await?
+            .next()
+            .await?
+            .expect("one txn_detail row");
+
+        Ok((row.get::<Option<String>>(0)?, row.get::<i64>(1)? == 1))
+    }
+
+    /// A transaction that only commits offsets is in BEGIN with a start time, from its
+    /// `AddOffsetsToTxn` or, without one, from its first stored `TxnOffsetCommit`, as in Kafka.
+    /// Without a start time nothing could time it out.
+    #[tokio::test]
+    async fn offsets_only_transaction_begins_at_add_offsets() -> Result<()> {
+        offsets_only_transaction_begins("offsets-only-begins-add-offsets-test.db", true).await
+    }
+
+    #[tokio::test]
+    async fn offsets_only_transaction_begins_at_txn_offset_commit() -> Result<()> {
+        offsets_only_transaction_begins("offsets-only-begins-txn-offset-commit-test.db", false)
+            .await
+    }
+
+    async fn offsets_only_transaction_begins(
+        db_file: &'static str,
+        add_offsets: bool,
+    ) -> Result<()> {
+        use nisshi_sans_io::txn_offset_commit_request::{
+            TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+        };
+
+        let _guard = init_tracing()?;
+
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let producer = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!((None, false), txn_detail_status(db_file).await?);
+
+        if add_offsets {
+            assert_eq!(
+                ErrorCode::None,
+                engine
+                    .txn_add_offsets("txn", producer.id, producer.epoch, "group")
+                    .await?
+            );
+
+            assert_eq!(
+                (Some(String::from("BEGIN")), true),
+                txn_detail_status(db_file).await?
+            );
+
+            // The transaction began: the state it is in is the one a retry finds.
+            execute_on(
+                db_file,
+                "update txn_detail set status = null, started_at = null",
+                (),
+            )
+            .await?;
+        }
+
+        let outcome = engine
+            .txn_offset_commit(TxnOffsetCommitRequest {
+                transaction_id: String::from("txn"),
+                group_id: String::from("group"),
+                producer_id: producer.id,
+                producer_epoch: producer.epoch,
+                generation_id: None,
+                member_id: None,
+                group_instance_id: None,
+                topics: vec![
+                    TxnOffsetCommitRequestTopic::default()
+                        .name(topition.topic().to_owned())
+                        .partitions(Some(vec![
+                            TxnOffsetCommitRequestPartition::default()
+                                .partition_index(0)
+                                .committed_offset(7)
+                                .committed_leader_epoch(None)
+                                .committed_metadata(None),
+                        ])),
+                ],
+            })
+            .await?;
+        assert_eq!(
+            Some(i16::from(ErrorCode::None)),
+            outcome[0]
+                .partitions
+                .as_deref()
+                .and_then(|partitions| partitions.first())
+                .map(|partition| partition.error_code)
+        );
+
+        assert_eq!(
+            (Some(String::from("BEGIN")), true),
+            txn_detail_status(db_file).await?
+        );
+
+        // A producer that restarts ends its open transaction, so its offsets stop being pending.
+        assert_eq!(
+            BTreeSet::from([topition.clone()]),
+            engine.pending_txn_offsets("group").await?
+        );
+        let restarted = engine
+            .init_producer(Some("txn"), 10_000, None, None)
+            .await?;
+        assert_eq!(
+            (ErrorCode::None, producer.epoch + 1),
+            (restarted.error, restarted.epoch)
+        );
+        assert_eq!(BTreeSet::new(), engine.pending_txn_offsets("group").await?);
 
         Ok(())
     }

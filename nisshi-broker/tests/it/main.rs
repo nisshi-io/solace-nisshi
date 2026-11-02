@@ -116,6 +116,7 @@ pub mod traceforge_produce_idempotent;
 pub mod traceforge_produce_object_store_fault;
 pub mod txn;
 pub mod txn_offset_commit_fence;
+pub mod txn_offsets_only_timeout;
 pub mod txn_produce_unadded_partition;
 #[cfg(feature = "libsql")]
 pub mod unauthenticated;
