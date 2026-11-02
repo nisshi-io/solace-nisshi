@@ -14,7 +14,9 @@
 
 pub mod group;
 mod maintenance;
+mod sweep_failures;
 
+use self::sweep_failures::SweepFailures;
 use crate::{
     CancelKind, Error, Result,
     coordinator::group::{
@@ -283,6 +285,9 @@ pub struct Broker<G, S> {
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
+    /// The scheme of the storage URL, which names the engine in a maintenance failure.
+    storage_engine: String,
+
     cancellation: CancellationToken,
 
     /// Present when OTLP metrics are enabled; flushed and shut down when
@@ -324,6 +329,7 @@ where
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
+            storage_engine: String::from("unknown"),
 
             cancellation: CancellationToken::new(),
 
@@ -523,6 +529,10 @@ where
         // previous sweep is still running.
         let mut maintenance_sweep: Option<AbortHandle> = None;
         let mut txn_sweep: Option<AbortHandle> = None;
+
+        let engine = &self.storage_engine;
+        let maintenance_failures = Arc::new(SweepFailures::new("maintain", engine));
+        let txn_failures = Arc::new(SweepFailures::new("maintain_transactions", engine));
 
         let mut set = JoinSet::new();
 
@@ -730,14 +740,16 @@ where
                         debug!("maintain still in flight; skipping tick");
                     } else {
                         let storage = self.storage.clone();
+                        let failures = maintenance_failures.clone();
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintenance");
 
                             async move {
-                                if let Err(err) = storage.maintain(SystemTime::now()).await {
-                                    debug!(?err);
-                                }
+                                failures.record(
+                                    storage.maintain(SystemTime::now()).await,
+                                    std::time::Instant::now(),
+                                );
                             }
                             .instrument(span)
                             .await
@@ -753,14 +765,16 @@ where
                         debug!("maintain_transactions still in flight; skipping tick");
                     } else {
                         let storage = self.storage.clone();
+                        let failures = txn_failures.clone();
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintain_transactions");
 
                             async move {
-                                if let Err(err) = storage.maintain_transactions(SystemTime::now()).await {
-                                    debug!(?err);
-                                }
+                                failures.record(
+                                    storage.maintain_transactions(SystemTime::now()).await,
+                                    std::time::Instant::now(),
+                                );
                             }
                             .instrument(span)
                             .await
@@ -1088,6 +1102,13 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             None
         };
 
+        // One engine, one label: `postgresql://` is `postgres://`.
+        let storage_engine = match self.storage.scheme() {
+            "postgresql" => "postgres",
+            scheme => scheme,
+        }
+        .to_owned();
+
         Ok(Broker {
             node_id: self.node_id,
             cluster_id: self.cluster_id.clone(),
@@ -1105,6 +1126,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             banner: self.banner,
             maintenance_interval: intervals.maintenance,
             transaction_maintenance_interval: intervals.transaction_maintenance,
+            storage_engine,
             cancellation: self.cancellation,
             meter_provider,
         })
