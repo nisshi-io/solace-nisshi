@@ -25,6 +25,9 @@ pub struct FailedStart {
     exit_code: Option<i32>,
     /// What the broker printed, stdout and stderr together.
     log: String,
+    /// Why the harness has no log, or an empty one, when it has none: the broker's error is then
+    /// lost, not absent.
+    log_problem: Option<String>,
     /// Why the harness counts the start as failed.
     reason: String,
 }
@@ -36,9 +39,17 @@ impl FailedStart {
         command: String,
         exit_code: Option<i32>,
         log: &Path,
+        log_problem: Option<String>,
         reason: String,
     ) -> Self {
-        let log = fs::read_to_string(log).unwrap_or_default();
+        let (log, read_problem) = match fs::read_to_string(log) {
+            Ok(log) => (log, None),
+            Err(err) => (
+                String::new(),
+                Some(format!("couldn't read {}: {err}", log.display())),
+            ),
+        };
+        let log_problem = log_problem.or(read_problem);
 
         Self {
             command,
@@ -47,6 +58,7 @@ impl FailedStart {
                 .lines()
                 .map(|line| stop_failure::without_colour(line) + "\n")
                 .collect(),
+            log_problem,
             reason,
         }
     }
@@ -90,9 +102,15 @@ impl fmt::Display for FailedStart {
 
         write!(
             formatter,
-            "`{}` didn't start: {}\nexit code: {exit_code}\nlog:\n{}",
-            self.command, self.reason, self.log
-        )
+            "`{}` didn't start: {}\nexit code: {exit_code}\n",
+            self.command, self.reason
+        )?;
+
+        if let Some(problem) = &self.log_problem {
+            writeln!(formatter, "the harness lost the log: {problem}")?;
+        }
+
+        write!(formatter, "log:\n{}", self.log)
     }
 }
 
@@ -105,6 +123,7 @@ mod tests {
             command: "nisshi broker".to_owned(),
             exit_code: Some(1),
             log: log.to_owned(),
+            log_problem: None,
             reason: "exited with 1".to_owned(),
         }
     }
@@ -142,6 +161,29 @@ mod tests {
         );
 
         failed_start.assert_error_names("maintenance_interval=0s");
+    }
+
+    #[test]
+    fn display_says_why_the_log_is_empty() {
+        let mut failed_start = failed_start_with_log("");
+        failed_start.log_problem =
+            Some("docker logs printed nothing after 20 attempt(s)".to_owned());
+
+        let shown = failed_start.to_string();
+
+        assert!(
+            shown.contains("the harness lost the log: docker logs printed nothing"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn display_leaves_out_the_log_problem_when_there_is_none() {
+        assert!(
+            !failed_start_with_log("error: x\n")
+                .to_string()
+                .contains("lost the log")
+        );
     }
 
     #[test]

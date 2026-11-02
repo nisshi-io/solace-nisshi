@@ -16,6 +16,7 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::Duration,
 };
 
@@ -29,6 +30,11 @@ use crate::{
 /// `run.sh` pulls the image before the tests run, so this covers only creating or starting the
 /// container, and stays well under the time nextest gives a test before it kills it.
 const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many times to ask `docker logs` for the log of a broker that exited without printing, and
+/// how long to wait between asks: 2 seconds in all, on a path that already fails a test.
+const LOG_ATTEMPTS: u32 = 20;
+const LOG_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// What `docker cp` prints when the file to copy isn't in the container.
 const DOCKER_CP_MISSING_FILE: &str = "Could not find the file";
@@ -186,8 +192,9 @@ impl BrokerContainer {
     }
 
     /// Kills a broker container that didn't start, if it is still running, saves what it printed
-    /// to `log`, and removes it. Returns its exit code, or `None` if the harness killed it.
-    pub(super) fn stop_after_failed_start(&self, log: &Path) -> Option<i32> {
+    /// to `log`, and removes it. Returns its exit code, or `None` if the harness killed it, and
+    /// why the log is missing or empty, if it is.
+    pub(super) fn stop_after_failed_start(&self, log: &Path) -> (Option<i32>, Option<String>) {
         let code = match self.check_running() {
             Ok(()) => {
                 _ = docker::execute(&["kill", &self.name]);
@@ -201,10 +208,29 @@ impl BrokerContainer {
 
         // Save the container's output before removing the container deletes it.
         // `FailedStart` reads the broker's error from this log, so without it a test
-        // that expects a refusal fails.
-        _ = self.save_logs(log);
+        // that expects a refusal fails. A broker that exited has nothing more to print, so an
+        // empty log is a lost one: ask again for a moment, in case `docker logs` failed
+        // transiently. A broker that the harness killed may print nothing, so ask once.
+        let attempts = if code.is_some() { LOG_ATTEMPTS } else { 1 };
+
+        let log_problem = collect_log(attempts, LOG_RETRY_DELAY, || self.save_logs(log))
+            .err()
+            .map(|problem| format!("{problem}; {}", self.log_context()));
+
         remove_container(&self.name);
-        code
+        (code, log_problem)
+    }
+
+    /// Describes how the container logs and how long it lived, to tell a log lost in a
+    /// short-lived container from one that `docker logs` couldn't read.
+    fn log_context(&self) -> String {
+        match docker::inspect(
+            &self.name,
+            "{{.HostConfig.LogConfig.Type}} started {{.State.StartedAt}} finished {{.State.FinishedAt}}",
+        ) {
+            Ok(context) => format!("log driver {context}"),
+            Err(reason) => reason,
+        }
     }
 
     #[track_caller]
@@ -242,7 +268,8 @@ impl BrokerContainer {
         metadata
     }
 
-    /// Writes what the container printed to `log`.
+    /// Writes what the container printed to `log`. Fails when `docker logs` fails, and when it
+    /// prints nothing, because a broker that started always prints something.
     fn save_logs(&self, log: &Path) -> Result<(), String> {
         let logs = docker::execute(&["logs", &self.name])?;
 
@@ -250,9 +277,40 @@ impl BrokerContainer {
             return Err(format!("docker logs {}: {}", self.name, logs.stderr.trim()));
         }
 
-        fs::write(log, logs.stdout + logs.stderr.as_str())
-            .map_err(|err| format!("couldn't write {}: {err}", log.display()))
+        let printed = logs.stdout + logs.stderr.as_str();
+
+        fs::write(log, &printed)
+            .map_err(|err| format!("couldn't write {}: {err}", log.display()))?;
+
+        if printed.is_empty() {
+            return Err(format!("docker logs {} printed nothing", self.name));
+        }
+
+        Ok(())
     }
+}
+
+/// Calls `fetch` up to `attempts` times, `delay` apart, until it succeeds. Returns the last
+/// failure, with the number of attempts, if none does.
+fn collect_log(
+    attempts: u32,
+    delay: Duration,
+    mut fetch: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut last = String::new();
+
+    for attempt in 1..=attempts {
+        match fetch() {
+            Ok(()) => return Ok(()),
+            Err(reason) => last = reason,
+        }
+
+        if attempt < attempts {
+            thread::sleep(delay);
+        }
+    }
+
+    Err(format!("{last} after {attempts} attempt(s)"))
 }
 
 impl fmt::Display for BrokerContainer {
@@ -265,4 +323,52 @@ impl fmt::Display for BrokerContainer {
 /// [`BrokerFiles`] removes.
 fn remove_container(name: &str) {
     _ = docker::execute(&["rm", "--force", "--volumes", name]);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::collect_log;
+
+    #[test]
+    fn collect_log_asks_again_until_the_log_is_there() {
+        let mut asked = 0;
+
+        let collected = collect_log(5, Duration::ZERO, || {
+            asked += 1;
+            if asked < 3 {
+                Err("printed nothing".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(collected, Ok(()));
+        assert_eq!(asked, 3);
+    }
+
+    #[test]
+    fn collect_log_names_the_last_failure_and_the_attempts() {
+        let mut asked = 0;
+
+        let collected = collect_log(3, Duration::ZERO, || {
+            asked += 1;
+            Err(format!("failure {asked}"))
+        });
+
+        assert_eq!(collected, Err("failure 3 after 3 attempt(s)".to_owned()));
+    }
+
+    #[test]
+    fn collect_log_asks_once_when_given_one_attempt() {
+        let mut asked = 0;
+
+        _ = collect_log(1, Duration::ZERO, || {
+            asked += 1;
+            Err("printed nothing".to_owned())
+        });
+
+        assert_eq!(asked, 1);
+    }
 }
