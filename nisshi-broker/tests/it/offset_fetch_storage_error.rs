@@ -59,12 +59,12 @@ const OFFSET: i64 = 42;
 
 const FAILING: &str = "failing";
 const CORRUPT: &str = "corrupt";
-const UNPARSEABLE: &str = "unparseable";
+const UNPARSABLE: &str = "unparsable";
 const HEALTHY: &str = "healthy";
 
 /// A storage that fails to read the committed offsets of each group in
 /// `failing` with an I/O error that a retry may clear, returns
-/// `UNKNOWN_SERVER_ERROR` for [`CORRUPT`], fails [`UNPARSEABLE`] with an error
+/// `UNKNOWN_SERVER_ERROR` for [`CORRUPT`], fails [`UNPARSABLE`] with an error
 /// that a retry can't clear, and returns
 /// [`OFFSET`] for every partition of any other group.
 #[derive(Clone, Debug, Default, Hash)]
@@ -88,7 +88,7 @@ impl FailingOffsets {
             Err(Error::from(std::io::Error::other(format!(
                 "offsets of {group_id} are unavailable"
             ))))
-        } else if group_id == UNPARSEABLE {
+        } else if group_id == UNPARSABLE {
             Err(Error::Message(format!(
                 "offsets of {group_id} do not parse"
             )))
@@ -247,7 +247,7 @@ async fn permanent_storage_error_is_unknown_server_error() -> Result<()> {
     let topics = request_topics();
 
     let response = controller
-        .offset_fetch(Some(UNPARSEABLE), Some(&topics), None, Some(false))
+        .offset_fetch(Some(UNPARSABLE), Some(&topics), None, Some(false))
         .await
         .and_then(|body| OffsetFetchResponse::try_from(body).map_err(Into::into))?;
 
@@ -256,7 +256,7 @@ async fn permanent_storage_error_is_unknown_server_error() -> Result<()> {
         response.error_code
     );
 
-    let groups = [request_group(UNPARSEABLE)];
+    let groups = [request_group(UNPARSABLE)];
 
     let response = controller
         .offset_fetch(None, None, Some(&groups), Some(false))
