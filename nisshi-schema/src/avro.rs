@@ -22,7 +22,7 @@ use apache_avro::{
     types::Value,
 };
 use bytes::Bytes;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 
 use nisshi_sans_io::{ErrorCode, record::inflated::Batch};
 use serde_json::{Map, Number, Value as JsonValue};
@@ -551,6 +551,19 @@ impl Generator for Schema {
     }
 }
 
+fn timestamp(value: &Value, date_time: Option<DateTime<Utc>>) -> Result<JsonValue> {
+    date_time
+        .map(|date_time| {
+            JsonValue::String(
+                date_time
+                    .naive_utc()
+                    .format("%Y-%m-%dT%H:%M:%S%.f")
+                    .to_string(),
+            )
+        })
+        .ok_or(Error::AvroToJson(SchemaKind::from(value)))
+}
+
 fn json_value(value: Value) -> Result<JsonValue> {
     match value {
         Value::Null => Ok(JsonValue::Null),
@@ -575,7 +588,9 @@ fn json_value(value: Value) -> Result<JsonValue> {
 
         Value::String(inner) | Value::Enum(_, inner) => Ok(JsonValue::String(inner)),
 
-        Value::Fixed(_, _) => todo!(),
+        Value::Fixed(_, inner) => Ok(JsonValue::String(
+            String::from_utf8_lossy(&inner[..]).into_owned(),
+        )),
 
         Value::Union(_, value) => json_value(*value),
 
@@ -599,23 +614,28 @@ fn json_value(value: Value) -> Result<JsonValue> {
             .map(Map::from_iter)
             .map(JsonValue::Object),
 
-        Value::Date(_) => todo!(),
+        // `cat produce` reads a timestamp as a string in this form, so `cat consume` writes one
+        // the same way and a record round-trips.
+        Value::TimestampMillis(inner) => timestamp(&value, DateTime::from_timestamp_millis(inner)),
+        Value::TimestampMicros(inner) => timestamp(&value, DateTime::from_timestamp_micros(inner)),
+        Value::TimestampNanos(inner) => {
+            timestamp(&value, Some(DateTime::from_timestamp_nanos(inner)))
+        }
 
-        Value::Decimal(_decimal) => todo!(),
-        Value::BigDecimal(_big_decimal) => todo!(),
+        // The other logical types are written as their underlying type, as the Avro
+        // specification's JSON encoding does.
+        Value::Date(inner) | Value::TimeMillis(inner) => Ok(JsonValue::Number(Number::from(inner))),
 
-        Value::TimeMillis(_) => todo!(),
-        Value::TimeMicros(_) => todo!(),
+        Value::TimeMicros(inner)
+        | Value::LocalTimestampMillis(inner)
+        | Value::LocalTimestampMicros(inner)
+        | Value::LocalTimestampNanos(inner) => Ok(JsonValue::Number(Number::from(inner))),
 
-        Value::TimestampMillis(_) => todo!(),
-        Value::TimestampMicros(_) => todo!(),
-        Value::TimestampNanos(_) => todo!(),
+        Value::BigDecimal(inner) => Ok(JsonValue::String(inner.to_string())),
 
-        Value::LocalTimestampMillis(_) => todo!(),
-        Value::LocalTimestampMicros(_) => todo!(),
-        Value::LocalTimestampNanos(_) => todo!(),
-
-        Value::Duration(_duration) => todo!(),
+        // A decimal's scale is in the schema, which isn't here, and a duration has no JSON
+        // encoding. Refuse the record rather than guess.
+        Value::Decimal(_) | Value::Duration(_) => Err(Error::AvroToJson(SchemaKind::from(&value))),
 
         Value::Uuid(uuid) => json_value(Value::String(uuid.to_string())),
     }
@@ -623,23 +643,24 @@ fn json_value(value: Value) -> Result<JsonValue> {
 
 impl AsJsonValue for Schema {
     fn as_json_value(&self, batch: &Batch) -> Result<JsonValue> {
-        Ok(JsonValue::Array(
-            batch
-                .records
-                .iter()
-                .map(|record| {
-                    JsonValue::Object(Map::from_iter(
-                        self.to_json_value(MessageKind::Key, self.key.as_ref(), record.key.clone())
-                            .into_iter()
-                            .chain(self.to_json_value(
-                                MessageKind::Value,
-                                self.value.as_ref(),
-                                record.value.clone(),
-                            )),
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        ))
+        batch
+            .records
+            .iter()
+            .map(|record| {
+                // A side that fails is an error, not a missing field: `Result` is an iterator
+                // of zero items for an `Err`, which would drop the field from the output.
+                let key =
+                    self.to_json_value(MessageKind::Key, self.key.as_ref(), record.key.clone())?;
+                let value = self.to_json_value(
+                    MessageKind::Value,
+                    self.value.as_ref(),
+                    record.value.clone(),
+                )?;
+
+                Ok(JsonValue::Object(Map::from_iter([key, value])))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(JsonValue::Array)
     }
 }
 
@@ -1459,6 +1480,112 @@ mod tests {
             )
             .await,
             Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        Ok(())
+    }
+
+    /// A topic whose schema has a key of `key` and a value of `value`, and a batch of one record.
+    async fn as_json_value_of(
+        key: (JsonValue, Value),
+        value: (JsonValue, Value),
+    ) -> Result<JsonValue> {
+        let topic = "abc";
+
+        let object_store = InMemory::new();
+        _ = object_store
+            .put(
+                &Path::from(format!("{topic}.avsc")),
+                serde_json::to_vec(&json!({
+                    "type": "record",
+                    "name": "Test",
+                    "fields": [
+                        {"name": "key", "type": key.0},
+                        {"name": "value", "type": value.0}
+                    ]
+                }))
+                .map(Bytes::from)
+                .map(PutPayload::from)?,
+            )
+            .await?;
+
+        let encode = |schema: &JsonValue, value: Value| {
+            let schema = AvroSchema::parse(schema)?;
+            let mut writer = apache_avro::Writer::new(&schema, vec![]);
+            _ = writer.append(value)?;
+            writer.into_inner().map(Bytes::from).map_err(Error::from)
+        };
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .key(encode(&json!(key.0), key.1)?.into())
+                    .value(encode(&json!(value.0), value.1)?.into()),
+            )
+            .build()?;
+
+        Registry::new(object_store)
+            .schema(topic)
+            .await?
+            .expect("a schema")
+            .as_json_value(&batch)
+    }
+
+    #[tokio::test]
+    async fn as_json_value_prints_key_and_value() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_eq!(
+            json!([{"key": 32123, "value": {"name": "alice"}}]),
+            as_json_value_of(
+                (json!("int"), Value::Int(32123)),
+                (
+                    json!({"type": "record", "name": "person", "fields": [{"name": "name", "type": "string"}]}),
+                    Value::Record(vec![("name".into(), Value::String("alice".into()))]),
+                ),
+            )
+            .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_json_value_prints_logical_types() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_eq!(
+            json!([{"key": "1970-01-02T00:00:00.123", "value": 19000}]),
+            as_json_value_of(
+                (
+                    json!({"type": "long", "logicalType": "timestamp-millis"}),
+                    Value::TimestampMillis(86_400_123),
+                ),
+                (
+                    json!({"type": "int", "logicalType": "date"}),
+                    Value::Date(19000),
+                ),
+            )
+            .await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_json_value_refuses_a_decimal() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        assert_matches!(
+            as_json_value_of(
+                (json!("int"), Value::Int(1)),
+                (
+                    json!({"type": "bytes", "logicalType": "decimal", "precision": 4, "scale": 2}),
+                    Value::Decimal(vec![1, 2].into()),
+                ),
+            )
+            .await,
+            Err(Error::AvroToJson(SchemaKind::Decimal))
         );
 
         Ok(())
