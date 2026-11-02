@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use std::{
+    assert_matches,
     fmt::{self, Display},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::SystemTime,
@@ -23,18 +24,23 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
+use futures::{
+    StreamExt as _, TryStreamExt as _,
+    stream::{self, BoxStream},
+};
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{Error, Storage as _, Topition};
+use nisshi_storage::{Error, Storage as _, TopicId, Topition};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
 };
+use tokio::sync::Notify;
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
@@ -90,18 +96,47 @@ async fn delete_records_partition(
     ))
 }
 
-/// An object store that counts the listings of batch objects, and can fail
-/// every delete.
+/// Returns the location of one partition's watermark document.
+fn watermark_location(topition: &Topition) -> Path {
+    Path::from(format!(
+        "clusters/nisshi/topics/{}/partitions/{:0>10}/watermark.json",
+        topition.topic(),
+        topition.partition()
+    ))
+}
+
+/// Holds a delete of the object store until the test lets it go: the delete
+/// tells `entered`, and then waits for `release`.
+#[derive(Clone, Debug, Default)]
+struct DeleteHold {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+/// An object store that counts the listings of batch objects, can fail
+/// every delete and every listing of batch objects, and can hold the next
+/// delete.
 #[derive(Clone, Debug, Default)]
 struct Counting {
     inner: Arc<InMemory>,
     batch_lists: Arc<AtomicUsize>,
     deletes_fail: Arc<AtomicBool>,
+    lists_fail: Arc<AtomicBool>,
+    held_delete: Arc<Mutex<Option<DeleteHold>>>,
 }
 
 impl Counting {
     fn batch_lists(&self) -> usize {
         self.batch_lists.load(Ordering::SeqCst)
+    }
+
+    /// Holds the next delete only: a later delete runs at once.
+    fn hold_next_delete(&self) -> Result<DeleteHold, Error> {
+        let hold = DeleteHold::default();
+
+        *self.held_delete.lock()? = Some(hold.clone());
+
+        Ok(hold)
     }
 }
 
@@ -142,6 +177,25 @@ impl ObjectStore for Counting {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
+        let hold = self
+            .held_delete
+            .lock()
+            .ok()
+            .and_then(|mut held| held.take());
+
+        if let Some(hold) = hold {
+            let inner = self.inner.clone();
+
+            return stream::once(async move {
+                hold.entered.notify_one();
+                hold.release.notified().await;
+
+                inner.delete_stream(locations)
+            })
+            .flatten()
+            .boxed();
+        }
+
         if self.deletes_fail.load(Ordering::SeqCst) {
             return locations
                 .map(|_| {
@@ -159,6 +213,16 @@ impl ObjectStore for Counting {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if prefix.is_some_and(|prefix| prefix.as_ref().ends_with("/records")) {
             _ = self.batch_lists.fetch_add(1, Ordering::SeqCst);
+
+            if self.lists_fail.load(Ordering::SeqCst) {
+                return stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "forced failure".into(),
+                    })
+                })
+                .boxed();
+            }
         }
 
         self.inner.list(prefix)
@@ -274,6 +338,179 @@ async fn maintain_retries_a_failed_reclaim() -> Result<(), Error> {
         vec![3],
         stored_base_offsets(&counting.inner, &topition).await?
     );
+
+    Ok(())
+}
+
+/// A listing of the batch objects that fails leaves the objects, and the
+/// next `maintain` lists again and removes them.
+#[tokio::test]
+async fn maintain_retries_a_failed_listing() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "relist";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    counting.lists_fail.store(true, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    // The failed listing must not record the cut as reclaimed.
+    counting.lists_fail.store(false, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A topic that is created again under the name of a deleted topic does not
+/// inherit the deleted topic's reclaim mark, so `maintain` removes the new
+/// topic's objects below a cut that lies under that mark.
+#[tokio::test]
+async fn recreated_topic_does_not_inherit_the_reclaim_mark() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let storage = DynoStore::new("nisshi", 1, bucket.clone())?;
+
+    let name = "again";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..10 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 8),
+        delete_records_partition(&storage, name, 8).await?
+    );
+    storage.maintain(SystemTime::now()).await?;
+
+    // Deleting the topic removes its watermark document. A reclaim that
+    // finishes after the delete can write one back, so the test puts the
+    // document back to be that leftover.
+    let location = watermark_location(&topition);
+    let leftover = bucket.get(&location).await?.bytes().await?;
+
+    _ = storage.delete_topic(&TopicId::Name(name.into())).await?;
+    _ = bucket.put(&location, leftover.into()).await?;
+
+    create_topic(&storage, name).await?;
+
+    for _ in 0..10 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    // The cut is under the leftover mark of 8.
+    assert_eq!(
+        (ErrorCode::None, 5),
+        delete_records_partition(&storage, name, 5).await?
+    );
+    storage.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        (5..10).collect::<Vec<_>>(),
+        stored_base_offsets(&bucket, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A topic that is deleted while `maintain` deletes its batch objects does
+/// not get a watermark document back from that reclaim.
+#[tokio::test]
+async fn maintain_does_not_recreate_the_watermark_of_a_deleted_topic() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "vanishing";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    let hold = counting.hold_next_delete()?;
+
+    let delete_the_topic = async {
+        hold.entered.notified().await;
+
+        let outcome = storage.delete_topic(&TopicId::Name(name.into())).await;
+
+        hold.release.notify_one();
+
+        outcome
+    };
+
+    let (maintained, deleted) = tokio::join!(storage.maintain(SystemTime::now()), delete_the_topic);
+
+    maintained?;
+    assert_eq!(ErrorCode::None, deleted?);
+
+    assert_matches!(
+        counting.inner.head(&watermark_location(&topition)).await,
+        Err(object_store::Error::NotFound { .. })
+    );
+
+    Ok(())
+}
+
+/// A broker that does not use a partition reads its watermark in `maintain`
+/// and does not keep the partition's watermark in its cache.
+#[tokio::test]
+async fn maintain_does_not_cache_the_watermark_of_a_partition_it_does_not_use() -> Result<(), Error>
+{
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let serving = DynoStore::new("nisshi", 1, bucket.clone())?;
+
+    let name = "elsewhere";
+    create_topic(&serving, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&serving, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&serving, name, 3).await?
+    );
+
+    let other = DynoStore::new("nisshi", 2, bucket.clone())?;
+    other.maintain(SystemTime::now()).await?;
+
+    assert_eq!(vec![3], stored_base_offsets(&bucket, &topition).await?);
+    assert!(other.watermarks.lock()?.is_empty());
 
     Ok(())
 }

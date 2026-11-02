@@ -168,6 +168,15 @@ const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
 /// any small bound gives most of the speed-up.
 const CONCURRENT_GROUP_STATE_READS: usize = 16;
 
+/// How many partitions one `maintain` pass reclaims at once (see [`DynoStore::reclaim_records`]).
+///
+/// A pass that visits the partitions one after another waits one round trip per partition. On a
+/// degraded store a round trip can wait for the retry timeout of the object store client, so a
+/// cluster with thousands of partitions then needs hours for one pass. A pass that visits them
+/// all at once opens a connection per partition. The limit is a small bound between the two. Its
+/// value is not measured: any small bound gives most of the speed-up.
+const CONCURRENT_RECLAIMS: usize = 16;
+
 /// How far below the fetch offset a Fetch starts its second listing, when
 /// its first listing, which starts at the fetch offset, finds no batch at or
 /// below the fetch offset.
@@ -200,6 +209,20 @@ static FETCH_FULL_LISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description(
             "Fetches that listed the whole partition, because the listing near the fetch \
              offset was out of key order or had a gap",
+        )
+        .build()
+});
+
+/// Counts the partitions that `maintain` tried to reclaim batch objects for, by `outcome`:
+/// `reclaimed`, `delete_failed` (at least one object was not deleted), or `listing_failed`.
+/// A partition that stays in `delete_failed` or `listing_failed` has objects that stay in the
+/// bucket after a `DeleteRecords` cut.
+static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_reclaimed_partitions")
+        .with_description(
+            "Partitions for which maintain tried to delete the batch objects below a \
+             DeleteRecords cut, by outcome",
         )
         .build()
 });
@@ -1242,8 +1265,10 @@ impl DynoStore {
     /// `maintain` calls this, so that the request does not list the partition
     /// (see [`Self::reclaim_records`]).
     ///
-    /// Each failure is logged and skipped, and the result is `false` if there
-    /// was one, so that the caller tries again on its next pass.
+    /// A failed delete does not stop the other deletes. This logs one error
+    /// for the partition, with the number of objects that failed and the first
+    /// error, and the result is `false`, so that the caller tries again on its
+    /// next pass.
     ///
     /// An object is named by the base offset of its batch, and the name does
     /// not hold the end offset. A batch ends before the base offset of the
@@ -1286,7 +1311,13 @@ impl DynoStore {
                 .collect::<Vec<_>>(),
 
             Err(error) => {
-                error!(?error, ?topition, cutoff);
+                error!(
+                    ?error,
+                    ?topition,
+                    cutoff,
+                    "listing the batch objects below the cut failed, maintain tries again on its next pass"
+                );
+                RECLAIMED_PARTITIONS.add(1, &[KeyValue::new("outcome", "listing_failed")]);
                 return false;
             }
         };
@@ -1313,11 +1344,13 @@ impl DynoStore {
             .object_store
             .delete_stream(stream::iter(expired).boxed());
 
-        let mut complete = true;
+        let mut deleted_objects = 0usize;
+        let mut failed_objects = 0usize;
+        let mut first_error = None;
 
         while let Some(outcome) = deleted.next().await {
             match outcome {
-                Ok(_) => {}
+                Ok(_) => deleted_objects += 1,
 
                 // Another broker's reclaim of the same partition got there first.
                 Err(object_store::Error::NotFound { .. }) => {
@@ -1325,13 +1358,32 @@ impl DynoStore {
                 }
 
                 Err(error) => {
-                    error!(?error, ?topition, cutoff);
-                    complete = false;
+                    failed_objects += 1;
+                    _ = first_error.get_or_insert(error);
                 }
             }
         }
 
-        complete
+        let Some(error) = first_error else {
+            debug!(
+                ?topition,
+                cutoff, deleted_objects, "reclaimed the batch objects below the cut"
+            );
+            RECLAIMED_PARTITIONS.add(1, &[KeyValue::new("outcome", "reclaimed")]);
+            return true;
+        };
+
+        error!(
+            ?error,
+            ?topition,
+            cutoff,
+            deleted_objects,
+            failed_objects,
+            "deleting the batch objects below the cut failed, maintain tries again on its next pass"
+        );
+        RECLAIMED_PARTITIONS.add(1, &[KeyValue::new("outcome", "delete_failed")]);
+
+        false
     }
 
     /// Reclaims, for each partition whose low watermark has moved past
@@ -1353,8 +1405,9 @@ impl DynoStore {
     /// A failure on one partition is logged and does not stop the others. A
     /// pass costs one read of each partition's watermark, as Kafka's
     /// retention check visits every log, and one listing for each partition
-    /// with something to reclaim. A slow listing delays the rest of the pass
-    /// and the lake's maintenance, and the broker skips the ticks meanwhile.
+    /// with something to reclaim. It reclaims up to [`CONCURRENT_RECLAIMS`]
+    /// partitions at once, and `maintain` runs the lake's maintenance beside
+    /// it, so that a slow store does not hold the lake back.
     ///
     /// The topic can be deleted and created again while a partition's objects
     /// go, and the cut then removes the new topic's objects below it. Kafka's
@@ -1378,19 +1431,26 @@ impl DynoStore {
             }
         };
 
-        for metadata in topics.values() {
-            for partition in 0..metadata.topic.num_partitions {
-                let topition = Topition::new(metadata.topic.name.as_str(), partition);
+        let partitions = topics.values().flat_map(|metadata| {
+            (0..metadata.topic.num_partitions).map(|partition| {
+                (
+                    Topition::new(metadata.topic.name.as_str(), partition),
+                    metadata.id,
+                )
+            })
+        });
 
-                if let Err(error) = self.reclaim_partition(&topition, &metadata.id).await {
+        stream::iter(partitions)
+            .for_each_concurrent(CONCURRENT_RECLAIMS, |(topition, topic_id)| async move {
+                if let Err(error) = self.reclaim_partition(&topition, &topic_id).await {
                     error!(?error, ?topition);
                 }
-            }
-        }
+            })
+            .await;
     }
 
     async fn reclaim_partition(&self, topition: &Topition, topic_id: &Uuid) -> Result<()> {
-        let watermark = self.watermark_for(topition)?;
+        let watermark = self.watermark_without_caching(topition)?;
 
         // The high watermark is read before the listing, as the cut check in
         // `delete_records_batches` requires. When a produce has moved it past
@@ -1433,6 +1493,26 @@ impl DynoStore {
                 Ok(())
             })
             .await
+    }
+
+    /// Returns the handle that this broker already caches for `topition`'s watermark document,
+    /// or, when it has none, a new handle that the broker does not keep.
+    ///
+    /// [`Self::reclaim_records`] reads every partition of the cluster. A cached handle would
+    /// stay in this broker for each partition that its clients never use, and for each topic
+    /// that another broker deletes, because `delete_topic` drops cached handles only on the
+    /// broker that runs it. A handle that is not cached reads the whole document on each call,
+    /// where a cached handle sends a conditional request.
+    fn watermark_without_caching(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
+        self.watermarks
+            .lock()
+            .map(|locked| {
+                locked
+                    .get(topition)
+                    .cloned()
+                    .unwrap_or_else(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+            })
+            .map_err(Into::into)
     }
 
     /// Returns [`Self::watermark_for`] `topition`, after it ensures, on the
@@ -5326,18 +5406,21 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
-        self.reclaim_records().await;
+        let lake = async {
+            let Some(ref lake) = self.lake else {
+                return Ok(());
+            };
 
-        if let Some(ref lake) = self.lake {
-            return lake
-                .maintain()
+            lake.maintain()
                 .await
                 .inspect(|maintain| debug!(?maintain))
                 .inspect_err(|err| debug!(?err))
-                .map_err(Into::into);
-        }
+                .map_err(Into::into)
+        };
 
-        Ok(())
+        let ((), lake) = tokio::join!(self.reclaim_records(), lake);
+
+        lake
     }
 
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
