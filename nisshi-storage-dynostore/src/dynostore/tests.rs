@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
+mod batched_produce;
 mod concurrent_retry;
 mod delete_records;
 mod describe_groups;
