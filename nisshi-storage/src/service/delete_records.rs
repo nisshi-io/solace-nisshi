@@ -26,7 +26,7 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, Topition,
     service::{
-        deadline::{DELETE_RECORDS_DEADLINE, Missed, within},
+        deadline::{DELETE_RECORDS_DEADLINE, started_before},
         storage_error_code,
     },
 };
@@ -58,10 +58,15 @@ where
     /// and a call with every partition would then fail partitions whose
     /// records were already deleted.
     ///
-    /// One deadline, [`DELETE_RECORDS_DEADLINE`], bounds all the calls. A
-    /// partition that is still unanswered at the deadline answers
+    /// One deadline, [`DELETE_RECORDS_DEADLINE`], bounds when the calls
+    /// start. A partition whose call has not started at the deadline answers
     /// `REQUEST_TIMED_OUT`, so a degraded engine does not hold the request
     /// past the client's own timeout, one engine timeout per partition.
+    ///
+    /// A call that has started runs to its end, so the request takes longer
+    /// than the deadline by at most one partition's call. The service does
+    /// not drop a started call, because a write that its caller drops can
+    /// leave its storage engine's connection busy for the next caller.
     ///
     /// [ReplicaManager.scala#L1122-L1146]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1122-L1146
     async fn delete_records(&self, topics: &[DeleteRecordsTopic]) -> Vec<DeleteRecordsTopicResult> {
@@ -70,7 +75,7 @@ where
 
         let mut responses = Vec::with_capacity(topics.len());
         let mut failed = Vec::new();
-        let mut timed_out = Vec::new();
+        let mut not_started = Vec::new();
         let mut first_error = None;
 
         for topic in topics {
@@ -81,7 +86,7 @@ where
                     .name(topic.name.clone())
                     .partitions(Some(vec![partition.clone()]));
 
-                let answer = within(
+                let answer = started_before(
                     "delete_records",
                     deadline,
                     self.storage.delete_records(slice::from_ref(&request)),
@@ -112,10 +117,10 @@ where
                         );
                     }
 
-                    Err(missed) => {
-                        timed_out.push((
-                            Topition::new(topic.name.as_str(), partition.partition_index),
-                            missed,
+                    Err(_not_started) => {
+                        not_started.push(Topition::new(
+                            topic.name.as_str(),
+                            partition.partition_index,
                         ));
 
                         partitions.push(
@@ -135,24 +140,13 @@ where
             );
         }
 
-        if !timed_out.is_empty() {
-            let count = |stage: Missed| {
-                timed_out
-                    .iter()
-                    .filter(|(_, missed)| *missed == stage)
-                    .count()
-            };
-
+        if !not_started.is_empty() {
             warn!(
                 deadline = ?DELETE_RECORDS_DEADLINE,
                 elapsed = ?started_at.elapsed(),
-                timed_out = timed_out.len(),
-                reading = count(Missed::Reading),
-                queued = count(Missed::Queued),
-                queued_for_connection_share = count(Missed::QueuedForConnectionShare),
-                not_started = count(Missed::NotStarted),
-                sample = ?&timed_out[..timed_out.len().min(PARTITION_SAMPLE)],
-                "delete records answered REQUEST_TIMED_OUT for partitions unanswered at the deadline"
+                not_started = not_started.len(),
+                sample = ?&not_started[..not_started.len().min(PARTITION_SAMPLE)],
+                "delete records answered REQUEST_TIMED_OUT for partitions not started at the deadline"
             );
         }
 
@@ -695,12 +689,12 @@ mod tests {
         Ok(())
     }
 
-    /// Each call takes 2s and the deadline is 5s, so two partitions answer
-    /// their cut. The third call is abandoned at the deadline and the
-    /// fourth is never made: both answer `REQUEST_TIMED_OUT`, and the
-    /// request ends at the deadline instead of after four calls.
+    /// Each call takes 2s and the deadline is 5s. The third call starts at
+    /// 4s, before the deadline, so it runs to its end at 6s and answers its
+    /// cut. The fourth call would start after the deadline, so it is never
+    /// made and answers `REQUEST_TIMED_OUT`.
     #[tokio::test(start_paused = true)]
-    async fn partitions_unanswered_at_the_deadline_time_out() -> Result<()> {
+    async fn partitions_not_started_at_the_deadline_time_out() -> Result<()> {
         let stub = Stub::new(&[
             ("a", 0, Answer::Cut(5)),
             ("a", 1, Answer::Cut(6)),
@@ -718,11 +712,7 @@ mod tests {
                     Some(vec![
                         (0, ErrorCode::None, 5),
                         (1, ErrorCode::None, 6),
-                        (
-                            2,
-                            ErrorCode::RequestTimedOut,
-                            DELETE_RECORDS_INVALID_LOW_WATERMARK
-                        ),
+                        (2, ErrorCode::None, 7),
                     ])
                 ),
                 (
@@ -741,7 +731,11 @@ mod tests {
             .await?
         );
 
-        assert_eq!(DELETE_RECORDS_DEADLINE, started_at.elapsed());
+        // the third call ran 1s past the deadline
+        assert_eq!(
+            DELETE_RECORDS_DEADLINE + Duration::from_secs(1),
+            started_at.elapsed()
+        );
 
         // the fourth partition was not started, because the deadline had passed
         assert_eq!(3, stub.calls().len());
