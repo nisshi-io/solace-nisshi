@@ -4514,6 +4514,90 @@ mod tests {
         Ok(())
     }
 
+    /// The fetch statements count a record's headers toward `max_bytes`: three records with a
+    /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
+    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine, because it rejects some SQL that
+    /// SQLite takes.
+    #[tokio::test]
+    async fn fetch_counts_header_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        for ddl in [
+            "010-cluster.sql",
+            "030-topition.sql",
+            "040-record.sql",
+            "040-header.sql",
+        ] {
+            _ = connection
+                .execute(&DDL.get(ddl)?, ())
+                .await
+                .inspect_err(|err| error!(ddl, ?err))?;
+        }
+
+        // The Turso engine does not take the DDL of the topic table (`default false not null`)
+        for sql in [
+            "create table topic (
+                id integer primary key autoincrement,
+                cluster int not null,
+                name text not null
+            )",
+            "insert into cluster (name) values ('c')",
+            "insert into topic (cluster, name) values (1, 't')",
+            "insert into topition (topic, partition) values (1, 0)",
+        ] {
+            _ = connection.execute(sql, ()).await?;
+        }
+
+        for offset in 0..3 {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+            _ = connection
+                .execute(
+                    "insert into header (topition, offset_id, ordinal, k, v)
+                        values (1, ?1, 0, x'68', zeroblob(99))",
+                    [offset],
+                )
+                .await?;
+        }
+
+        for (statement, extra) in [
+            ("record_fetch.sql", None),
+            ("record_fetch_keyed.sql", Some(Value::Blob(b"k".to_vec()))),
+        ] {
+            let sql = sql_lookup(statement)?;
+
+            for (max_bytes, expected) in [(250, vec![0, 1]), (50, vec![0]), (1_000, vec![0, 1, 2])]
+            {
+                let mut params = vec![
+                    Value::from("c"),
+                    Value::from("t"),
+                    Value::from(0),
+                    Value::from(0),
+                    Value::from(max_bytes),
+                    Value::from(3),
+                ];
+                params.extend(extra.clone());
+
+                let mut rows = connection.prepare(&sql).await?.query(params).await?;
+                let mut offsets = vec![];
+                while let Some(row) = rows.next().await? {
+                    offsets.push(row.get::<i64>(0)?);
+                }
+
+                assert_eq!(expected, offsets, "{statement} within {max_bytes}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
     /// first row. Returns whether it returned a row.
     async fn insert_returning(
