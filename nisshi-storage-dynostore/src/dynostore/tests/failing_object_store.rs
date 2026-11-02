@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An object store whose reads fail, to test how storage answers an object store error.
+//! An object store whose reads or chosen writes fail, to test how storage answers an object
+//! store error.
 
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -23,12 +27,18 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 
-/// Wraps an [`ObjectStore`] and makes each `get()` or each `list()` call fail.
+/// Selects a write by its path and payload.
+pub(crate) type PutSelector = fn(&Path, &PutPayload) -> bool;
+
+/// Wraps an [`ObjectStore`] and makes each `get()`, each `list()` or each `put()` call fail, or
+/// the next `put()` that a [`PutSelector`] picks.
 #[derive(Clone)]
 pub(crate) struct FailingObjectStore<O> {
     object_store: O,
     get_fails: bool,
     list_fails: bool,
+    put_fails: bool,
+    next_failing_put: Arc<Mutex<Option<PutSelector>>>,
 }
 
 impl<O> FailingObjectStore<O> {
@@ -37,6 +47,8 @@ impl<O> FailingObjectStore<O> {
             object_store,
             get_fails: true,
             list_fails: false,
+            put_fails: false,
+            next_failing_put: Arc::default(),
         }
     }
 
@@ -45,7 +57,49 @@ impl<O> FailingObjectStore<O> {
             object_store,
             get_fails: false,
             list_fails: true,
+            put_fails: false,
+            next_failing_put: Arc::default(),
         }
+    }
+
+    pub(crate) fn failing_put(object_store: O) -> Self {
+        Self {
+            object_store,
+            get_fails: false,
+            list_fails: false,
+            put_fails: true,
+            next_failing_put: Arc::default(),
+        }
+    }
+
+    /// Passes every call through until [`Self::fail_next_put`] picks a write to fail.
+    pub(crate) fn failing_put_on_demand(object_store: O) -> Self {
+        Self {
+            object_store,
+            get_fails: false,
+            list_fails: false,
+            put_fails: false,
+            next_failing_put: Arc::default(),
+        }
+    }
+
+    /// Makes the next `put()` that `selector` picks fail, and only that one. A clone of this
+    /// store shares the choice, so a test can keep a clone and arm it after setup.
+    pub(crate) fn fail_next_put(&self, selector: PutSelector) {
+        if let Ok(mut next_failing_put) = self.next_failing_put.lock() {
+            _ = next_failing_put.replace(selector);
+        }
+    }
+
+    fn selected_put_fails(&self, location: &Path, payload: &PutPayload) -> bool {
+        self.next_failing_put
+            .lock()
+            .ok()
+            .is_some_and(|mut next_failing_put| {
+                next_failing_put
+                    .take_if(|selector| selector(location, payload))
+                    .is_some()
+            })
     }
 }
 
@@ -79,6 +133,10 @@ where
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
+        if self.put_fails || self.selected_put_fails(location, &payload) {
+            return Err(forced_failure());
+        }
+
         self.object_store.put_opts(location, payload, opts).await
     }
 

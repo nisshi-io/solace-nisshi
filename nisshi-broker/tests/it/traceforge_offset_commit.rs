@@ -82,7 +82,7 @@ use nisshi_storage::{
     Version,
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -368,6 +368,10 @@ impl Storage for FaultInjectingStorage {
         group_id: &str,
     ) -> StorageResult<BTreeMap<Topition, CommittedOffset>> {
         self.inner.committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> StorageResult<BTreeSet<Topition>> {
+        self.inner.pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> StorageResult<MetadataResponse> {

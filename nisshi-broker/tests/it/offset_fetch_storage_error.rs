@@ -365,6 +365,14 @@ impl Storage for FailingOffsets {
     }
 
     #[instrument(skip_all)]
+    async fn pending_txn_offsets(
+        &self,
+        _group_id: &str,
+    ) -> nisshi_storage::Result<BTreeSet<Topition>> {
+        Ok(BTreeSet::new())
+    }
+
+    #[instrument(skip_all)]
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,

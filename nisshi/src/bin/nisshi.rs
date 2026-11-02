@@ -185,8 +185,9 @@ async fn main() -> ExitCode {
 /// no message in its output.
 ///
 /// The prefix is the one that `rustc` and `clap` print, so a reader or a script finds the failure
-/// line by it. The smoke tests' `error_lines` rule relies on it, because the broker's startup
-/// output also names the storage URL, so a test can't search the whole log for a bad value.
+/// line by it. The smoke tests' `error_lines` rule relies on it, because other lines of the
+/// broker's output can also name the storage URL, so a test can't search the whole log for a bad
+/// value.
 macro_rules! report_failure {
     ($($argument:tt)*) => {
         eprintln!("{}", failure_line(format_args!($($argument)*)))
@@ -279,7 +280,7 @@ fn report_error(err: &nisshi_cli::Error) {
                                 the broker must change the schema, and its role isn't allowed \
                                 to. Start one broker once with the credentials of the role that \
                                 owns Nisshi's tables, then start the others with this role. See \
-                                the PostgreSQL section of README.md."
+                                the PostgreSQL section of docs/storage.md."
                         )
                     }
                     _ => report_failure!("storage {storage} failed its schema setup: {source}"),

@@ -189,6 +189,9 @@ impl Command {
 /// Writes a line to `out` for each user that the broker failed to alter, with the broker's
 /// message, and returns the first failure's code, or [`ErrorCode::None`] when every user was
 /// altered.
+///
+/// Each line starts with `error: `, as the error line of every other failed command does, so a
+/// script finds both kinds of failure by the same prefix.
 fn report(response: &AlterUserScramCredentialsResponse, out: &mut impl Write) -> ErrorCode {
     let mut first = ErrorCode::None;
 
@@ -202,9 +205,19 @@ fn report(response: &AlterUserScramCredentialsResponse, out: &mut impl Write) ->
 
         match result.error_message.as_deref() {
             Some(message) if !message.is_empty() => {
-                _ = writeln!(out, "user {}: {message} ({error_code:?})", result.user);
+                _ = writeln!(
+                    out,
+                    "error: user {}: {message} ({error_code:?})",
+                    result.user
+                );
             }
-            _ => _ = writeln!(out, "user {}: {error_code} ({error_code:?})", result.user),
+            _ => {
+                _ = writeln!(
+                    out,
+                    "error: user {}: {error_code} ({error_code:?})",
+                    result.user
+                )
+            }
         }
 
         if first == ErrorCode::None {
@@ -259,8 +272,8 @@ mod tests {
         assert_eq!(ErrorCode::UnsupportedVersion, error_code);
         assert_eq!(
             format!(
-                "user bob: can't store SCRAM credentials (UnsupportedVersion)\n\
-                user carol: {} (UnsupportedSaslMechanism)\n",
+                "error: user bob: can't store SCRAM credentials (UnsupportedVersion)\n\
+                error: user carol: {} (UnsupportedSaslMechanism)\n",
                 ErrorCode::UnsupportedSaslMechanism
             ),
             out

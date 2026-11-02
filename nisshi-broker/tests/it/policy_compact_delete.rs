@@ -30,7 +30,7 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{Storage, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
@@ -69,6 +69,7 @@ where
         FrameRouteService::<Error>::builder(),
         storage,
         TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
     )
     .inspect(|builder| debug!(?builder))
     .and_then(|builder| builder.build().map_err(Into::into))

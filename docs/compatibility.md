@@ -12,7 +12,7 @@ The tables compare the PostgreSQL, SQLite, in-memory and S3 storage engines. The
 engines share one implementation, so their columns are the same. The tables do not cover Turso,
 which is experimental, or SlateDB, which is deprecated.
 
-The [storage engine table](../README.md#storage-options) in the README gives each engine's status, and
+The [storage engine table](storage.md) gives each engine's status, and
 [What CI tests on each storage engine](../CONTRIBUTING.md#what-ci-tests-on-each-storage-engine)
 gives the checks that CI runs on each engine.
 
@@ -94,9 +94,10 @@ advertises the other transaction APIs, but a client cannot start a transaction t
 
 An idempotent producer can bump its own epoch after an error and restart its sequence at 0
 (KIP-360), and the broker keeps the epoch for each partition, as Kafka does. A batch at an epoch
-older than its partition's gets INVALID_PRODUCER_EPOCH, as in Kafka. The broker refuses a bump to
-epoch 32766 or above with INVALID_PRODUCER_EPOCH, and Kafka accepts it. The Java producer then
-moves to a new producer ID and continues.
+older than its partition's gets INVALID_PRODUCER_EPOCH, as in Kafka. Every engine refuses such a
+batch also when the broker received it before the bump and the newer epoch's batch reached the
+partition first. The broker refuses a bump to epoch 32766 or above with INVALID_PRODUCER_EPOCH,
+and Kafka accepts it. The Java producer then moves to a new producer ID and continues.
 
 The in-memory and S3 engines answer a retry of one of an idempotent producer's last 5 batches to
 a partition as Kafka does: with no error and the offset of the stored batch. They answer any

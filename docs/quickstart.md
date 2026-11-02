@@ -48,6 +48,8 @@ ready in 12ms
 
 Your version number, list of storage engines, and startup time can differ.
 
+After `ready`, the broker logs only warnings and errors. To see each request, start the broker with `RUST_LOG=nisshi_service::frame=debug` before the command. That setting is verbose: it logs each request's API key as a number, and the whole request and response.
+
 By default, the broker keeps topics and messages in memory, and loses them when it stops. To keep them, you can start the broker with a SQLite file by running the following command:
 
 ```shell
@@ -85,6 +87,19 @@ The `nisshi cat` command sends and reads JSON messages from the terminal. The `c
 ```text
 [{"key":null,"value":"hello world"}]
 ```
+
+To list the broker's topics and their partition counts, run the following command:
+
+```shell
+./bin/nisshi topic list
+```
+
+```text
+TOPIC  PARTITIONS
+hello  3
+```
+
+To print the topic metadata as JSON for a script, add `--output json`.
 
 If a command prints nothing and does not return, check that the broker from Step 2 is running and that the command uses the same address.
 

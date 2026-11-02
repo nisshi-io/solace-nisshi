@@ -218,15 +218,17 @@ pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replic
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
+pub use producer::{
+    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
     DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
@@ -1500,6 +1502,26 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
 
+            // `DescribeGroups` v0 to v5 describes a group that does not exist with the error
+            // NONE and the state `Dead`. Kafka adds `GROUP_ID_NOT_FOUND` to `DescribeGroups` from
+            // v6 ([KIP-1043]), and Nisshi supports v5 at most. An admin client reads the group
+            // as missing from `Dead`, but fails on `GROUP_ID_NOT_FOUND` as an unexpected error
+            // ([`GroupCoordinator.handleDescribeGroup`]).
+            //
+            // [KIP-1043]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
+            // [`GroupCoordinator.handleDescribeGroup`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+            NamedGroupDetail {
+                name,
+                response: GroupDetailResponse::ErrorCode(ErrorCode::GroupIdNotFound),
+            } => Self::default()
+                .error_code(ErrorCode::None.into())
+                .group_id(name.clone())
+                .group_state(ConsumerGroupState::Dead.to_string())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some(vec![]))
+                .authorized_operations(Some(authorized_operations::OMITTED)),
+
             NamedGroupDetail {
                 name,
                 response: GroupDetailResponse::ErrorCode(error_code),
@@ -1915,6 +1937,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<(Topition, ErrorCode)>>;
 
     /// Fetch committed offsets for one or more topic partitions in a consumer group.
+    ///
+    /// The group coordinator answers `require_stable` with
+    /// [`Storage::pending_txn_offsets`], so an engine may ignore it here.
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
@@ -1927,6 +1952,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
         &self,
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>>;
+
+    /// Returns the partitions for which an open transaction has committed an offset of the
+    /// consumer group with `TxnOffsetCommit`, and has not yet ended.
+    ///
+    /// The current epoch of each transactional producer counts, and an earlier epoch only
+    /// while its end is prepared and waits behind an older open transaction: an
+    /// `InitProducerId` that moves the producer to a new epoch ends its earlier open
+    /// transaction in Kafka. An `OffsetFetch` with `require_stable` answers
+    /// `UNSTABLE_OFFSET_COMMIT` for each of these partitions.
+    ///
+    /// A transaction that only commits offsets, with no `AddPartitionsToTxn`, is not timed
+    /// out: its partitions stay unstable until its `EndTxn`, or until an `InitProducerId`
+    /// moves its producer to a new epoch.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -2187,6 +2226,10 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2464,6 +2507,10 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

@@ -1008,7 +1008,7 @@ async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
 
 mod unreadable_groups {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         time::{Duration, SystemTime},
     };
 
@@ -1143,6 +1143,10 @@ mod unreadable_groups {
             group_id: &str,
         ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             self.storage.committed_offset_topitions(group_id).await
+        }
+
+        async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+            self.storage.pending_txn_offsets(group_id).await
         }
 
         async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

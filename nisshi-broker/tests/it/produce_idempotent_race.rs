@@ -25,7 +25,7 @@
 
 use std::{assert_matches, collections::BTreeMap, time::Duration};
 
-use crate::common::{POSTGRES_URL, alphanumeric_string, postgres_storage};
+use crate::common::{alphanumeric_string, postgres_storage, postgres_url};
 use anyhow::Result;
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -252,7 +252,7 @@ impl Holder {
 }
 
 async fn connect() -> Result<Client> {
-    let (client, connection) = tokio_postgres::connect(POSTGRES_URL, NoTls).await?;
+    let (client, connection) = tokio_postgres::connect(&postgres_url(), NoTls).await?;
     _ = tokio::spawn(connection);
     Ok(client)
 }

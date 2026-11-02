@@ -505,6 +505,21 @@ mod tests {
         ))
     }
 
+    impl Iceberg {
+        /// Removes the lake's namespace and purges each of its tables, so that
+        /// a test leaves no namespace in the catalog.
+        async fn drop_namespace(&self) -> Result<()> {
+            let namespace = NamespaceIdent::new(self.namespace.clone());
+            for table in self.catalog.list_tables(&namespace).await? {
+                self.catalog.purge_table(&table).await?;
+            }
+            self.catalog
+                .drop_namespace(&namespace)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
     #[tokio::test]
     async fn create_namespace() -> Result<()> {
         _ = dotenv().ok();
@@ -529,6 +544,7 @@ mod tests {
         .await?;
 
         let ident = lake.create_namespace().await?;
+        lake.drop_namespace().await?;
         assert_eq!(namespace, ident.to_url_string());
 
         Ok(())
@@ -574,6 +590,7 @@ mod tests {
             .await?;
 
             let ident = lake.create_namespace().await?;
+            lake.drop_namespace().await?;
             assert_eq!(namespace, ident.to_url_string());
         }
 
@@ -617,6 +634,7 @@ mod tests {
         let table_name = alphanumeric_string(5);
 
         let table = lake_house.load_or_create_table(&table_name, schema).await?;
+        lake_house.drop_namespace().await?;
         assert_eq!(table_name, table.identifier().name());
         assert_eq!(namespace, table.identifier().namespace().to_url_string());
 
@@ -678,6 +696,7 @@ mod tests {
             .await?;
 
             let table = lake_house.load_or_create_table(&table_name, schema).await?;
+            lake_house.drop_namespace().await?;
             assert_eq!(table_name, table.identifier().name());
             assert_eq!(namespace, table.identifier().namespace().to_url_string());
         }

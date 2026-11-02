@@ -157,6 +157,7 @@ use crate::{
     primitive::varint::{LongVarInt, VarInt},
 };
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
+pub use codec::MAX_DECODED_BATCH_BYTES;
 use codec::{Octets, VarIntSequence};
 pub use header::Header;
 use serde::{
@@ -217,8 +218,7 @@ impl fmt::Debug for Record {
 
 impl ByteSize for Record {
     fn size_in_bytes(&self) -> Result<usize> {
-        let body = self.body_size_in_bytes()?;
-        Ok(VarInt::try_from(body)?.size_in_bytes()? + body)
+        self.size_in_bytes_with_deltas(self.timestamp_delta, self.offset_delta)
     }
 }
 
@@ -318,12 +318,33 @@ impl Record {
     /// (`Record { offset_delta, ..record }`) still encodes to a record that
     /// [`Decode`] accepts.
     fn body_size_in_bytes(&self) -> Result<usize> {
+        self.body_size_with_deltas(self.timestamp_delta, self.offset_delta)
+    }
+
+    /// [`Record::body_size_in_bytes`] for this record with `timestamp_delta` and `offset_delta` in
+    /// place of its own.
+    fn body_size_with_deltas(&self, timestamp_delta: i64, offset_delta: i32) -> Result<usize> {
         Ok(size_of::<u8>()
-            + LongVarInt::from(self.timestamp_delta).size_in_bytes()?
-            + VarInt::from(self.offset_delta).size_in_bytes()?
+            + LongVarInt::from(timestamp_delta).size_in_bytes()?
+            + VarInt::from(offset_delta).size_in_bytes()?
             + Octets(self.key.clone()).size_in_bytes()?
             + Octets(self.value.clone()).size_in_bytes()?
             + VarIntSequence(self.headers.clone()).size_in_bytes()?)
+    }
+
+    /// The encoded size of this record, length prefix included, with `timestamp_delta` and
+    /// `offset_delta` in place of its own: the size of the record once a merge rebases it.
+    fn size_in_bytes_with_deltas(&self, timestamp_delta: i64, offset_delta: i32) -> Result<usize> {
+        let body = self.body_size_with_deltas(timestamp_delta, offset_delta)?;
+        Ok(VarInt::try_from(body)?.size_in_bytes()? + body)
+    }
+
+    /// What decoding this record allocates beyond the record data it is decoded from: the
+    /// `Record` itself and its `Vec<Header>`. Keys and values are slices of the record data, so
+    /// the decoder charges the record data once instead: it charges the inflated bytes of a
+    /// compressed batch, and the frame size bounds an uncompressed one.
+    pub(crate) fn allocated_size(&self) -> usize {
+        size_of::<Record>() + self.headers.len() * size_of::<Header>()
     }
 
     pub fn key(&self) -> Option<Bytes> {

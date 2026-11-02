@@ -106,6 +106,18 @@ build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgre
 
 build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="nisshi": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
+# Fails if a single-engine build compiles another engine's database client.
+# ci.yml's build-storage job runs the same check; the client of each engine is
+# listed in .github/scripts/check-storage-deps.sh.
+check-storage-deps: (storage-deps "dynostore") (storage-deps "libsql") (storage-deps "postgres") (storage-deps "slatedb") (storage-deps "turso")
+
+[private]
+storage-deps feature:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo tree -p nisshi --no-default-features --features {{ feature }} -e normal,build --prefix none -f '{p}' \
+      | bash .github/scripts/check-storage-deps.sh {{ feature }}
+
 build-storage: clean-workspace (build "dev" "libsql") (build "dev" "dynostore") (build "dev" "postgres") (build "dev" "slatedb") (build "dev" "turso")
 
 build-examples: (cargo-build "--examples")
@@ -117,6 +129,11 @@ release-sqlite: (cargo-build "--release" "--bin" "nisshi" "--no-default-features
 test: test-workspace test-doc
 
 test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" "--exclude" "nisshi-smoke-test" args)
+
+# the tests that need no docker compose service (no Postgres, MinIO or Iceberg catalog);
+# NISSHI_WORKTREE_SERVICES=0 stops nextest's setup script starting this worktree's services
+test-fast *args:
+    NISSHI_WORKTREE_SERVICES=0 {{ just_executable() }} test-workspace --profile fast {{ args }}
 
 nextest *args:
     cargo nextest {{ args }}
@@ -355,11 +372,14 @@ lakehouse-catalog-up: (docker-compose-up "lakehouse-catalog")
 
 lakehouse-catalog-down: (docker-compose-down "lakehouse-catalog")
 
+# the lakehouse catalog's server, from ICEBERG_CATALOG, which .env names
+lakehouse_url := trim_end_match(env("ICEBERG_CATALOG", "http://localhost:8181/catalog"), "/catalog")
+
 lakehouse-accept-terms-of-use:
-    curl http://localhost:8181/management/v1/bootstrap -H "Content-Type: application/json" --data '{"accept-terms-of-use": true}'
+    curl {{ lakehouse_url }}/management/v1/bootstrap -H "Content-Type: application/json" --data '{"accept-terms-of-use": true}'
 
 lakehouse-create-warehouse:
-    curl http://localhost:8181/management/v1/warehouse -H "Content-Type: application/json" --data @etc/lakekeeper/create-default-warehouse.json
+    curl {{ lakehouse_url }}/management/v1/warehouse -H "Content-Type: application/json" --data @etc/lakekeeper/create-default-warehouse.json
 
 lakehouse-migrate:
     docker compose exec lakehouse-catalog /home/nonroot/iceberg-catalog migrate
@@ -368,6 +388,15 @@ docker-compose-up *args:
     docker compose --ansi never --progress plain up --no-color --quiet-pull --wait --detach {{ args }}
 
 docker-compose-down *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Before services-up has written COMPOSE_PROJECT_NAME to .env, a worktree's
+    # compose commands act on the default project, which the main checkout and
+    # other worktrees use, so this recipe refuses to remove it.
+    if [[ {{ worktree_services }} == true && "${COMPOSE_PROJECT_NAME:-}" != nisshi-wt-* ]]; then
+        echo "docker-compose-down: run 'just services-up' first, so that this removes this worktree's services and not the default project's" >&2
+        exit 1
+    fi
     docker compose down --remove-orphans --volumes {{ args }}
 
 ps:
@@ -398,16 +427,16 @@ docker-rm-f:
     docker rm --force nisshi
 
 list-topics:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command.properties --list
 
 list-topics-plain:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-plain.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-plain.properties --list
 
 list-topics-scram-256:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-scram-256.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-scram-256.properties --list
 
 list-topics-scram-512:
-    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config command-scram-512.properties --list
+    kafka-topics --bootstrap-server ${ADVERTISED_LISTENER} --command-config etc/kafka-client/command-scram-512.properties --list
 
 user-create user password profile mechanism="scram512":
     target/{{ replace(profile, "dev", "debug") }}/nisshi user create {{ user }} {{ password }} --mechanism {{ mechanism }}
@@ -474,10 +503,10 @@ generator topic *args:
     target/debug/nisshi generator {{ args }} {{ topic }} 2>&1 >generator.log
 
 duckdb-k-unnest-v-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
+    duckdb -init etc/duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
 
 duckdb-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT * FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
+    duckdb -init etc/duckdb-init.sql :memory: "SELECT * FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
 
 # create person topic with schema etc/schema/person.json
 person-topic-create: (topic-create "person")
@@ -601,8 +630,8 @@ flamegraph-nisshi-broker profile *args:
     export RUST_LOG=warn
     flamegraph --verbose -- ./target/{{ replace(profile, "dev", "debug") }}/nisshi broker {{ args }}
 
-# run a debug broker with configuration from .env
-broker *args: build docker-compose-down prometheus-up grafana-up db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up (nisshi-broker "debug" args)
+# tear down the default compose project and run a debug broker with configuration from .env
+broker-default-project *args: build docker-compose-down prometheus-up grafana-up db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up (nisshi-broker "debug" args)
 
 # run a release broker with configuration from .env
 broker-release *args: release docker-compose-down prometheus-up grafana-up db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up (nisshi-broker "release" args)
@@ -612,7 +641,7 @@ proxy *args:
     target/debug/nisshi proxy {{ args }} 2>&1 | tee proxy.log
 
 # teardown compose, rebuild: minio, db, nisshi and lake buckets
-server: (cargo-build "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
+server-default-project: (cargo-build "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
     target/debug/nisshi broker 2>&1  | tee broker.log
 
 gdb: (cargo-build "--profile" "debugging" "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket
@@ -621,7 +650,67 @@ gdb: (cargo-build "--profile" "debugging" "--bin" "nisshi") docker-compose-down 
 lldb: (cargo-build "--profile" "debugging" "--bin" "nisshi") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up
     rust-lldb target/debugging/nisshi broker
 
-ci: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up lakehouse-accept-terms-of-use lakehouse-create-warehouse
+ci-default-project: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket minio-lake-bucket lakehouse-catalog-up lakehouse-accept-terms-of-use lakehouse-create-warehouse
+
+# true in a linked worktree outside CI, where the services run in the
+# worktree's own compose project (etc/worktree-services.sh), so that `ci`,
+# `broker` and `server` never remove the services that other worktrees use
+worktree_services := if env("CI", "") != "" { "false" } else if env("NISSHI_WORKTREE_SERVICES", "") == "0" { "false" } else if `git rev-parse --path-format=absolute --git-dir` == `git rev-parse --path-format=absolute --git-common-dir` { "false" } else { "true" }
+
+# start this worktree's services and write their ports to .env (does nothing in the main checkout)
+services-up:
+    etc/worktree-services.sh up
+
+# remove this worktree's services and their volumes (does nothing in the main checkout)
+services-down:
+    etc/worktree-services.sh down
+
+# remove the services of each removed worktree
+services-prune:
+    etc/worktree-services.sh prune
+
+# (re)start the services that the tests need, with empty volumes: this worktree's own, or in the main checkout, the default project's
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{ worktree_services }} == false ]]; then
+        exec {{ quote(just_executable()) }} ci-default-project
+    fi
+    etc/worktree-services.sh down
+    etc/worktree-services.sh up
+
+# run a debug broker with configuration from .env
+broker *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{ worktree_services }} == false ]]; then
+        exec {{ quote(just_executable()) }} broker-default-project {{ args }}
+    fi
+    {{ quote(just_executable()) }} build
+    etc/worktree-services.sh up
+    # just read .env before the script wrote this worktree's ports to it.
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+    docker compose --ansi never up --wait --detach --quiet-pull prometheus grafana
+    target/debug/nisshi broker {{ args }} 2>&1 >broker.log
+
+# start this worktree's services (in the main checkout, rebuild the default project's) and run a debug broker
+server:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{ worktree_services }} == false ]]; then
+        exec {{ quote(just_executable()) }} server-default-project
+    fi
+    cargo build --bin nisshi
+    etc/worktree-services.sh up
+    # just read .env before the script wrote this worktree's ports to it.
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+    target/debug/nisshi broker 2>&1 | tee broker.log
 
 # bring up postgres and minio (with the nisshi bucket), without the lakehouse catalog
 compat-infra-up: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-nisshi-bucket
@@ -639,7 +728,7 @@ observation-topic-create: (topic-create "observation")
 observation-duckdb-parquet: (duckdb-k-unnest-v-parquet "observation")
 
 duckdb *sql:
-    duckdb -init duckdb-init.sql -markdown :memory: {{ sql }}
+    duckdb -init etc/duckdb-init.sql -markdown :memory: {{ sql }}
 
 # produce etc/data/trips.json with schema etc/schema/taxi.proto
 taxi-topic-populate: (cat-produce "taxi" "etc/data/trips.json")

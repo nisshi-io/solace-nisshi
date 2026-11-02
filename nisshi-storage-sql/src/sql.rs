@@ -21,6 +21,7 @@ pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;
 pub(crate) mod topic_select;
+pub(crate) mod txn_offset_commit_tp_select_pending;
 pub(crate) mod txn_produce_partition_select;
 pub(crate) mod watermark_select_for_write;
 
@@ -408,6 +409,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         (
             "txn_offset_commit_tp_insert.sql",
             include_sql!("sql/txn_offset_commit_tp_insert.sql"),
+        ),
+        (
+            "txn_offset_commit_tp_select_pending.sql",
+            include_sql!("sql/txn_offset_commit_tp_select_pending.sql"),
         ),
         (
             "txn_produce_offset_delete_by_topic.sql",

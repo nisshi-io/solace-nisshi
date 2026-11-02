@@ -27,6 +27,8 @@ mod create;
 mod delete;
 mod list;
 
+pub use list::Format;
+
 pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]

@@ -325,6 +325,8 @@ pub enum Error {
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
+    /// [`FrameRouteBuilder::wrap_route`] found no registered route of `api_key` to wrap.
+    NoRouteToWrap(i16),
     OneshotRecv(oneshot::error::RecvError),
     Poison,
     /// A connection that has not authenticated declared a frame larger than

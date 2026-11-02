@@ -65,7 +65,7 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
     Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
@@ -518,6 +518,14 @@ struct ProducerDetail {
     /// remembered batches.
     #[serde(default)]
     batches: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, ProducedBatches>>>,
+    /// The base offset of the first batch that the producer wrote to each partition at the
+    /// partition's epoch, for an epoch above 0.
+    ///
+    /// The advance after a record write uses it to tell whether a batch at the previous epoch
+    /// is in the log ahead of every batch at this epoch. The key is left out while the map is
+    /// empty, so a producer that never bumps its epoch adds nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    epoch_starts: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, i64>>>,
 }
 
 impl ProducerDetail {
@@ -567,6 +575,26 @@ impl ProducerDetail {
             .and_then(|partitions| partitions.get(&topition.partition))
     }
 
+    /// Whether a batch at `epoch`, stored at `offset`, is in the log ahead of every batch at a
+    /// newer epoch on the partition.
+    ///
+    /// It is when the partition's epoch is the one after `epoch`, and that epoch's first batch
+    /// on the partition is at a higher offset. When the partition's epoch is further ahead, the
+    /// partition no longer holds where the epochs in between started, so this answers false.
+    fn is_ahead_of_next_epoch(
+        &self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+        offset: i64,
+    ) -> bool {
+        epoch
+            .checked_add(1)
+            .and_then(|next| self.epoch_starts.get(&next))
+            .and_then(|topics| topics.get(&topition.topic))
+            .and_then(|partitions| partitions.get(&topition.partition))
+            .is_some_and(|&start| offset < start)
+    }
+
     /// Records a batch stored at `base_offset`: advances the partition's next sequence at
     /// `epoch` past the batch, and remembers the batch. `produce_epoch` says whether the batch
     /// starts `epoch` on the partition.
@@ -581,7 +609,7 @@ impl ProducerDetail {
     ) {
         let sequence = match produce_epoch {
             ProduceEpoch::Continue => self.sequence(epoch, topition),
-            ProduceEpoch::Start => self.start_epoch(epoch, topition),
+            ProduceEpoch::Start => self.start_epoch(epoch, topition, base_offset),
         };
 
         *sequence += last_offset_delta + 1;
@@ -597,16 +625,32 @@ impl ProducerDetail {
     }
 
     /// Returns the next sequence of `topition` at `epoch`, after the producer starts that
-    /// epoch on the partition.
+    /// epoch on the partition with a batch at `base_offset`.
     ///
-    /// Starting an epoch removes the partition's sequences and remembered batches at older
-    /// epochs, and each older epoch that then holds none. A produce never reads them again,
-    /// because the broker refuses a batch at an older epoch than its partition's. Keeping
-    /// them would grow meta.json, which every idempotent produce rewrites, by an entry for
-    /// each bump.
-    fn start_epoch(&mut self, epoch: ProducerEpoch, topition: &Topition) -> &mut Sequence {
+    /// Starting an epoch removes the partition's sequences, remembered batches and epoch
+    /// starts at older epochs, and each older epoch that then holds none. A produce never reads
+    /// them again, because the broker refuses a batch at an older epoch than its partition's.
+    /// Keeping them would grow meta.json, which every idempotent produce rewrites, by an entry
+    /// for each bump.
+    fn start_epoch(
+        &mut self,
+        epoch: ProducerEpoch,
+        topition: &Topition,
+        base_offset: i64,
+    ) -> &mut Sequence {
         forget_older_epochs(&mut self.sequences, epoch, topition);
         forget_older_epochs(&mut self.batches, epoch, topition);
+        forget_older_epochs(&mut self.epoch_starts, epoch, topition);
+
+        if epoch > 0 {
+            _ = self
+                .epoch_starts
+                .entry(epoch)
+                .or_default()
+                .entry(topition.topic.clone())
+                .or_default()
+                .insert(topition.partition, base_offset);
+        }
 
         self.sequence(epoch, topition)
     }
@@ -662,6 +706,7 @@ fn allocate_producer_id(
         ProducerDetail {
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
             batches: BTreeMap::new(),
+            epoch_starts: BTreeMap::new(),
         },
     );
 
@@ -774,6 +819,109 @@ struct Watermark {
     /// this type ignores it.
     #[serde(default)]
     time_index: TimeIndex,
+    /// The newest epoch above 0 of each idempotent producer that wrote to this partition.
+    ///
+    /// The produce path checks and records it in the compare-and-swap that gives a batch its
+    /// offset, so a batch at an older epoch is refused before it gets an offset. The sequence
+    /// check in `meta.json` runs in separate steps, before the offset and after the record
+    /// write, so it cannot refuse a batch that passed it before the producer's epoch moved.
+    ///
+    /// The key is left out while the map is empty, so a producer that never bumps its epoch
+    /// adds nothing. A document written before the key existed decodes to an empty map, and
+    /// a broker that does not know the key drops it when it writes the document.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    producer_epochs: BTreeMap<ProducerId, ProducerEpoch>,
+}
+
+impl Watermark {
+    /// The most producers whose epoch [`Watermark::producer_epochs`] holds for one partition.
+    ///
+    /// When a new producer goes over this limit, the partition forgets the producer with the
+    /// smallest ID. Producer IDs only go up, so that is the producer whose ID the broker
+    /// allocated first, which is not always the one that wrote last. A forgotten producer's
+    /// older-epoch batch is checked only against `meta.json` again, which refuses it after its
+    /// record write if it is behind the newer epoch's batches. Kafka 3.9.1
+    /// limits the producers it keeps by idle time (`producer.id.expiration.ms`) and not by
+    /// count ([`ProducerStateManager.removeExpiredProducers`]). We limit by count instead,
+    /// because every produce to the partition reads and writes this document, and a count
+    /// keeps it small without a clock.
+    ///
+    /// [`ProducerStateManager.removeExpiredProducers`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerStateManager.java#L359-L374
+    const MAX_FENCED_PRODUCERS: usize = 1024;
+
+    /// Refuses a batch whose epoch is older than the newest epoch this partition holds for its
+    /// producer, with [`OLDER_EPOCH_ERROR`], as the sequence check does.
+    fn fence_producer_epoch(
+        &self,
+        producer_id: ProducerId,
+        producer_epoch: ProducerEpoch,
+    ) -> Result<()> {
+        if self
+            .producer_epochs
+            .get(&producer_id)
+            .is_some_and(|&newest| newest > producer_epoch)
+        {
+            Err(Error::Api(OLDER_EPOCH_ERROR))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Records a batch's epoch as its producer's newest on this partition, when it is above 0
+    /// and above the epoch already recorded.
+    fn record_producer_epoch(&mut self, producer_id: ProducerId, producer_epoch: ProducerEpoch) {
+        if producer_epoch <= 0
+            || self
+                .producer_epochs
+                .get(&producer_id)
+                .is_some_and(|&newest| newest >= producer_epoch)
+        {
+            return;
+        }
+
+        _ = self.producer_epochs.insert(producer_id, producer_epoch);
+
+        if self.producer_epochs.len() > Self::MAX_FENCED_PRODUCERS {
+            _ = self.producer_epochs.pop_first();
+        }
+    }
+}
+
+/// Returns the last stable offset of a partition, from its high watermark,
+/// its log start and the first offset of its earliest open transaction.
+fn last_stable(
+    high_watermark: Offset,
+    log_start: Offset,
+    open_transaction_start: Option<Offset>,
+) -> Offset {
+    // A broker can pair a cached high watermark with open transactions that
+    // another broker recorded after it, so an open transaction can start
+    // past the high watermark read here. The last stable offset never passes
+    // the high watermark it is answered with.
+    //
+    // DeleteRecords can move the log start past the first offset of an open
+    // transaction. Kafka then raises the last stable offset to the log start
+    // ([UnifiedLog.scala#L964-L978]), so that it never names an offset below
+    // the log.
+    //
+    // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
+    open_transaction_start
+        .unwrap_or(high_watermark)
+        .min(high_watermark)
+        .max(log_start)
+}
+
+/// Returns the [`OffsetStage`] of a partition (see [`last_stable`]).
+fn offset_stage_of(
+    high_watermark: Offset,
+    log_start: Offset,
+    open_transaction_start: Option<Offset>,
+) -> OffsetStage {
+    OffsetStage {
+        last_stable: last_stable(high_watermark, log_start, open_transaction_start),
+        high_watermark,
+        log_start,
+    }
 }
 
 /// `clusters/{cluster}/topics/{topic}`, the prefix every key of a topic's
@@ -1139,40 +1287,103 @@ impl DynoStore {
         Ok(starts)
     }
 
-    /// Returns the [`OffsetStage`] of `topition`, with its last stable offset
-    /// taken from `open_transaction_starts`, which a caller that reads many
-    /// partitions reads once (see [`Self::open_transaction_starts`]).
-    async fn offset_stage_with(
-        &self,
-        topition: &Topition,
-        open_transaction_starts: &BTreeMap<Topition, Offset>,
-    ) -> Result<OffsetStage> {
+    /// Returns the high watermark and the log start of `topition`.
+    ///
+    /// A reader of the last stable offset calls this before it reads the open
+    /// transactions (see [`Self::open_transaction_starts`]). A transactional
+    /// produce records its partition's open transaction before it raises the
+    /// high watermark, so a reader that sees the raised high watermark then
+    /// sees the open transaction too. Reading them the other way round could
+    /// pair the open transactions from before the produce with the high
+    /// watermark from after it.
+    ///
+    /// This holds within one broker process. Across brokers, each caches
+    /// `watermark.json` and `meta.json` separately for up to 5s, so a reader
+    /// can still pair a fresh high watermark with an older `meta.json`.
+    async fn watermark_offsets(&self, topition: &Topition) -> Result<(Offset, Offset)> {
         self.checked_watermark_for(topition)
             .await?
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-
-                // DeleteRecords can move the log start past the first offset of
-                // an open transaction. Kafka then raises the last stable offset
-                // to the log start ([UnifiedLog.scala#L964-L978]), so that it
-                // never names an offset below the log.
-                //
-                // [UnifiedLog.scala#L964-L978]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
-                let last_stable = open_transaction_starts
-                    .get(topition)
-                    .copied()
-                    .unwrap_or(high_watermark)
-                    .max(log_start);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
+                Ok((watermark.high.unwrap_or(0), watermark.low.unwrap_or(0)))
             })
             .await
+    }
+
+    /// Records a lower bound of the first offset of `transaction_id` in
+    /// `topition`, when the transaction has no offset recorded there yet: the
+    /// partition's high watermark before this produce raises it.
+    ///
+    /// A produce calls this before it raises the high watermark, so that the
+    /// last stable offset never passes the records of an open transaction
+    /// whose offsets are allocated but not yet recorded. The partition is
+    /// then also recorded when the produce fails after it raised the high
+    /// watermark, so the end of the transaction writes its marker there.
+    ///
+    /// The bound can be below the transaction's real first offset, when
+    /// another batch takes offsets between the read and the raise. It holds
+    /// the last stable offset back until the transaction ends.
+    async fn record_transaction_start(
+        &self,
+        transaction_id: &str,
+        producer_epoch: ProducerEpoch,
+        topition: &Topition,
+    ) -> Result<()> {
+        let recorded = |meta: &Meta| {
+            meta.transactions
+                .get(transaction_id)
+                .and_then(|transaction| transaction.epochs.get(&producer_epoch))
+                .is_none_or(|txn_detail| {
+                    txn_detail
+                        .produces
+                        .get(&topition.topic)
+                        .and_then(|partitions| partitions.get(&topition.partition))
+                        .is_some_and(Option::is_some)
+                })
+        };
+
+        // A later batch of the transaction finds its partition recorded, and
+        // writes nothing here.
+        if self
+            .meta
+            .with(&self.object_store, |meta| Ok(recorded(meta)))
+            .await?
+        {
+            return Ok(());
+        }
+
+        // The high watermark only rises while the topic exists, so a cached
+        // high watermark is at most the offset that the produce allocates.
+        let (high_watermark, _) = self.watermark_offsets(topition).await?;
+
+        self.meta
+            .with_mut(&self.object_store, |meta| {
+                if let Some(txn_detail) = meta
+                    .transactions
+                    .get_mut(transaction_id)
+                    .and_then(|transaction| transaction.epochs.get_mut(&producer_epoch))
+                {
+                    // The partition is already in the transaction: the check before
+                    // this call refused a batch for any other partition.
+                    if let Some(range) = txn_detail
+                        .produces
+                        .get_mut(&topition.topic)
+                        .and_then(|partitions| partitions.get_mut(&topition.partition))
+                        .filter(|range| range.is_none())
+                    {
+                        debug!(transaction_id, ?topition, high_watermark);
+
+                        *range = Some(TxnProduceOffset {
+                            offset_start: high_watermark,
+                            offset_end: high_watermark,
+                        });
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+            .inspect_err(|err| error!(?err, transaction_id, ?topition))
     }
 
     async fn checked_watermark_for(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
@@ -2181,10 +2392,37 @@ impl DynoStore {
 
                 // with_mut stores each change that this closure makes, also when it
                 // then answers an error, so every check runs before any change.
-                let produce_epoch = stored
-                    .check_batch(producer_epoch, base_sequence)
-                    .inspect_err(|error| debug!(?error, ?stored, producer_epoch))
-                    .map_err(Error::Api)?;
+                let produce_epoch = match stored.check_batch(producer_epoch, base_sequence) {
+                    Ok(produce_epoch) => produce_epoch,
+
+                    // A batch that the producer's next epoch superseded after it got its
+                    // offset is in the log ahead of that epoch's batches, and Kafka
+                    // acknowledges such a batch too. Its sequence belongs to the older epoch,
+                    // so nothing advances. This compares offsets instead of relying on the
+                    // watermark fence, because the fence does not cover a producer that the
+                    // watermark has forgotten.
+                    Err(error)
+                        if stored.is_superseded(producer_epoch)
+                            && pd.is_ahead_of_next_epoch(producer_epoch, topition, offset) =>
+                    {
+                        info!(
+                            ?error,
+                            ?stored,
+                            producer_id,
+                            producer_epoch,
+                            offset,
+                            ?topition,
+                            "acknowledged a batch that a newer epoch superseded after it was \
+                             given its offset"
+                        );
+                        return Ok(());
+                    }
+
+                    Err(error) => {
+                        debug!(?error, ?stored, producer_epoch);
+                        return Err(Error::Api(error));
+                    }
+                };
 
                 let (sequence, remembered_batches) = match produce_epoch {
                     ProduceEpoch::Continue => (
@@ -2230,8 +2468,9 @@ impl DynoStore {
                 // write any failure here is not harmless: the client is told
                 // the batch failed while it is stored. That covers a rejected
                 // sequence, a fenced producer (the check before the write
-                // passed on stale metadata) and a transient object store
-                // error (the retry then stores the batch a second time).
+                // passed on stale metadata, and the watermark fence did not
+                // hold the producer) and a transient object store error
+                // (the retry then stores the batch a second time).
                 POST_WRITE_ADVANCE_FAILED.add(
                     1,
                     &[
@@ -2758,11 +2997,27 @@ impl Storage for DynoStore {
                 .with_mut(&self.object_store, |watermark| {
                     debug!(?watermark);
 
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
+
                     let offset = watermark.high.unwrap_or_default();
                     watermark.high = watermark.high.map_or_else(
                         || Some(deflated.last_offset_delta as i64 + 1i64),
                         |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
                     );
+
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
 
                     // Deliberately not touched: this branch (`nisshi.lake.sink`)
                     // never writes a `records/*.batch` object, so there is
@@ -2856,11 +3111,33 @@ impl Storage for DynoStore {
             self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
                 .await?;
 
+            if let Some(transaction_id) = transaction_id
+                && attributes.transaction
+            {
+                // This costs a `meta.json` write on the transaction's first batch to the
+                // partition, and a cached read on each later batch. Recording the bound in
+                // AddPartitionsToTxn instead would ride on that call's `meta.json` write, but
+                // the end of the transaction writes a marker to each partition with a recorded
+                // range, so an added partition that gets no batch would get a marker too.
+                self.record_transaction_start(transaction_id, deflated.producer_epoch, topition)
+                    .await?;
+            }
+
             let watermark = self.watermark_for(topition)?;
 
             let offset = watermark
                 .with_mut(&self.object_store, |watermark| {
                     debug!(?watermark);
+
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change. A refused batch
+                    // still costs one get and one put of an unchanged watermark.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
 
                     let offset = watermark.high.unwrap_or_default();
                     let is_new_partition = watermark.high.is_none();
@@ -2883,6 +3160,17 @@ impl Storage for DynoStore {
                         offset,
                         u64::try_from(deflated.batch_length).unwrap_or_default(),
                     );
+
+                    // The epoch is recorded before the record write. When that write fails,
+                    // the partition refuses the older epoch although it stores nothing at the
+                    // newer one. The client has already moved to the newer epoch, so it does
+                    // not send the older one again.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
 
                     debug!(?watermark);
 
@@ -2932,6 +3220,24 @@ impl Storage for DynoStore {
                                             offset_start: offset,
                                             offset_end,
                                         });
+
+                                        // The start only moves down (a defensive
+                                        // guard: the high watermark never falls, so
+                                        // the recorded bound is normally at or below
+                                        // every attempt's offset). It is not raised
+                                        // from the lower bound that
+                                        // `record_transaction_start` wrote: an attempt
+                                        // can hold a lower offset that it has not
+                                        // recorded yet. A concurrent retry of a batch
+                                        // can raise the high watermark after the first
+                                        // attempt did, and record its range first. The
+                                        // first attempt's records still go in the log
+                                        // (it then answers DUPLICATE_SEQUENCE_NUMBER),
+                                        // and raising the start to the retry's offset
+                                        // would let the last stable offset pass them.
+                                        if offset < range.offset_start {
+                                            range.offset_start = offset;
+                                        }
 
                                         if offset_end > range.offset_end {
                                             range.offset_end = offset_end;
@@ -3064,9 +3370,16 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        // The watermark first, then the open transactions (see
+        // `DynoStore::watermark_offsets`).
+        let (high_watermark, log_start) = self.watermark_offsets(topition).await?;
         let open_transaction_starts = self.open_transaction_starts().await?;
-        self.offset_stage_with(topition, &open_transaction_starts)
-            .await
+
+        Ok(offset_stage_of(
+            high_watermark,
+            log_start,
+            open_transaction_starts.get(topition).copied(),
+        ))
     }
 
     async fn list_offsets(
@@ -3074,6 +3387,48 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        // Every watermark of the request is read before the open transactions
+        // (see `DynoStore::watermark_offsets`). Each partition gets either its
+        // high watermark and log start, or the answer for a failed lookup.
+        let mut watermarks = Vec::with_capacity(offsets.len());
+
+        for (topition, _) in offsets {
+            // Kafka answers a partition that does not exist in the response,
+            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
+            // comes before every lookup, because each one caches the
+            // partition's watermark.
+            //
+            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
+            match self.ensure_partition_exists(topition).await {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    watermarks.push(Err(ListOffsetResponse {
+                        error_code: ErrorCode::UnknownTopicOrPartition,
+                        offset: None,
+                        timestamp: None,
+                    }));
+
+                    continue;
+                }
+                checked => _ = checked?,
+            }
+
+            // A store failure answers `KAFKA_STORAGE_ERROR` in its own
+            // partition, which a client retries, so the other partitions of
+            // the request still get their answers.
+            watermarks.push(self.watermark_offsets(topition).await.map_err(|error| {
+                error!(?error, ?topition, "list offsets");
+
+                ListOffsetResponse {
+                    error_code: match error {
+                        Error::Api(error_code) => error_code,
+                        _ => ErrorCode::KafkaStorageError,
+                    },
+                    offset: None,
+                    timestamp: None,
+                }
+            }));
+        }
+
         // Only READ_COMMITTED reads a last stable offset, so only it reads the
         // open transactions, once for the whole request.
         let open_transaction_starts = if isolation_level == IsolationLevel::ReadCommitted {
@@ -3084,53 +3439,16 @@ impl Storage for DynoStore {
 
         let mut responses = vec![];
 
-        for (topition, offset_request) in offsets {
-            // Kafka answers a partition that does not exist in the response,
-            // with no offset ([KafkaApis.scala#L1231-L1239]). The check
-            // comes before every lookup, because each one caches the
-            // partition's watermark.
-            //
-            // [KafkaApis.scala#L1231-L1239]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1231-L1239
-            match self.ensure_partition_exists(topition).await {
-                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
-                    responses.push((
-                        topition.to_owned(),
-                        ListOffsetResponse {
-                            error_code: ErrorCode::UnknownTopicOrPartition,
-                            offset: None,
-                            timestamp: None,
-                        },
-                    ));
+        for ((topition, offset_request), watermark) in offsets.iter().zip(watermarks) {
+            let stage = match watermark {
+                Ok((high_watermark, log_start)) => offset_stage_of(
+                    high_watermark,
+                    log_start,
+                    open_transaction_starts.get(topition).copied(),
+                ),
 
-                    continue;
-                }
-                checked => _ = checked?,
-            }
-
-            // A store failure answers `KAFKA_STORAGE_ERROR` in its own
-            // partition, which a client retries, so the other partitions of
-            // the request still get their answers.
-            let stage = match self
-                .offset_stage_with(topition, &open_transaction_starts)
-                .await
-            {
-                Ok(stage) => stage,
-
-                Err(error) => {
-                    error!(?error, ?topition, "list offsets");
-
-                    responses.push((
-                        topition.to_owned(),
-                        ListOffsetResponse {
-                            error_code: match error {
-                                Error::Api(error_code) => error_code,
-                                _ => ErrorCode::KafkaStorageError,
-                            },
-                            offset: None,
-                            timestamp: None,
-                        },
-                    ));
-
+                Err(response) => {
+                    responses.push((topition.to_owned(), response));
                     continue;
                 }
             };
@@ -3177,7 +3495,7 @@ impl Storage for DynoStore {
                             ListOffsetResponse {
                                 error_code: match error {
                                     Error::Api(error_code) => error_code,
-                                    _ => ErrorCode::UnknownServerError,
+                                    _ => ErrorCode::KafkaStorageError,
                                 },
                                 offset: None,
                                 ..Default::default()
@@ -3351,6 +3669,40 @@ impl Storage for DynoStore {
         }
 
         Ok(responses)
+    }
+
+    /// A `TxnOffsetCommit` holds its offsets in the detail of the producer's current epoch,
+    /// and the completed end of the transaction clears them. A new epoch leaves the earlier
+    /// epoch's detail in place, so an earlier epoch counts only while its end is prepared
+    /// and waits behind an older open transaction.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .values()
+                    .flat_map(|txn| {
+                        let current = txn.epochs.last_key_value().map(|(epoch, _)| *epoch);
+
+                        txn.epochs.iter().filter_map(move |(epoch, txn_detail)| {
+                            (Some(*epoch) == current
+                                || txn_detail.state.is_some_and(|state| state.is_prepared()))
+                            .then_some(txn_detail)
+                        })
+                    })
+                    .filter_map(|txn_detail| txn_detail.offsets.get(group_id))
+                    .flat_map(|topics| {
+                        topics.iter().flat_map(|(topic, partitions)| {
+                            partitions
+                                .keys()
+                                .map(|partition| Topition::new(topic.to_owned(), *partition))
+                        })
+                    })
+                    .collect())
+            })
+            .await
+            .inspect(|pending| debug!(group_id, ?pending))
+            .inspect_err(|error| error!(?error, group_id))
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

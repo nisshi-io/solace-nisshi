@@ -17,10 +17,10 @@ use std::{collections::HashMap, error::Error, str::FromStr};
 use crate::Result;
 use clap::Subcommand;
 use nisshi_sans_io::ErrorCode;
-use nisshi_topic::Topic;
+use nisshi_topic::{Format, Topic};
 use url::Url;
 
-use super::DEFAULT_BROKER;
+use super::{DEFAULT_BROKER, output::Output};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -62,6 +62,10 @@ pub(super) enum Command {
         /// Broker URL
         #[arg(long, default_value = DEFAULT_BROKER)]
         broker: Url,
+
+        /// Print a table of topics and partition counts, or the broker's metadata as JSON
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
     },
 }
 
@@ -84,7 +88,13 @@ impl From<Command> for Topic {
 
             Command::Delete { broker, name } => Topic::delete().broker(broker).name(name).build(),
 
-            Command::List { broker } => Topic::list().broker(broker).build(),
+            Command::List { broker, output } => Topic::list()
+                .broker(broker)
+                .format(match output {
+                    Output::Table => Format::Table,
+                    Output::Json => Format::Json,
+                })
+                .build(),
         }
     }
 }
@@ -111,7 +121,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use super::{Command, Output};
     use clap::Parser;
 
     #[derive(Parser)]
@@ -135,5 +145,34 @@ mod tests {
     fn create_prints_its_confirmation_unless_silent() {
         assert!(!create_is_silent(&["create", "test"]));
         assert!(create_is_silent(&["create", "test", "--silent"]));
+    }
+
+    fn list_output(args: &[&str]) -> Result<Output, clap::Error> {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))?;
+
+        match command {
+            Command::List { output, .. } => Ok(output),
+            Command::Create { .. } | Command::Delete { .. } => panic!("expected list: {args:?}"),
+        }
+    }
+
+    #[test]
+    fn list_prints_a_table_unless_asked_for_json() {
+        assert_eq!(Output::Table, list_output(&["list"]).unwrap());
+        assert_eq!(
+            Output::Json,
+            list_output(&["list", "--output", "json"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_rejects_an_unknown_output() {
+        assert_eq!(
+            clap::error::ErrorKind::InvalidValue,
+            list_output(&["list", "--output", "yaml"])
+                .unwrap_err()
+                .kind()
+        );
     }
 }

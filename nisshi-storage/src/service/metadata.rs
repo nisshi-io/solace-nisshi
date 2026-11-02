@@ -22,17 +22,23 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
+pub use auto_create_refusals::AutoCreateRefusals;
+
 use super::create_topics::validation::ValidatedCreateTopicsRequest;
 use crate::{
     CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, TopicCreationConfig,
     TopicId,
 };
 
+mod auto_create_refusals;
+
 /// A [`Service`] using its [`Storage`] taking [`MetadataRequest`] returning [`MetadataResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::MetadataRequest;
-/// use nisshi_storage::{Error, MetadataService, StorageContainer, TopicCreationConfig};
+/// use nisshi_storage::{
+///     AutoCreateRefusals, Error, MetadataService, StorageContainer, TopicCreationConfig,
+/// };
 /// use url::Url;
 ///
 /// # #[tokio::main]
@@ -52,6 +58,7 @@ use crate::{
 /// let service = MetadataService {
 ///     storage,
 ///     topic_creation: TopicCreationConfig::default(),
+///     auto_create_refusals: AutoCreateRefusals::default(),
 /// };
 ///
 /// let response = service
@@ -77,6 +84,10 @@ use crate::{
 pub struct MetadataService<G> {
     pub storage: G,
     pub topic_creation: TopicCreationConfig,
+
+    /// The names that auto-creation refused recently. Give each service of a broker a clone of
+    /// one store, so that a refusal on one connection counts on every connection.
+    pub auto_create_refusals: AutoCreateRefusals,
 }
 
 impl<G> ApiKey for MetadataService<G> {
@@ -117,6 +128,13 @@ where
                 .filter(|topic| topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition))
                 .filter_map(|topic| topic.name.clone())
                 .filter(|name| is_valid_topic_name(name))
+                .filter(|name| {
+                    let refused = self.auto_create_refusals.is_refused(name);
+                    if refused {
+                        debug!(topic = name, "not auto-creating a recently refused topic");
+                    }
+                    !refused
+                })
                 .collect::<BTreeSet<_>>();
 
             // We create the unknown topics with one `CreateTopics` that asks for the broker
@@ -172,6 +190,12 @@ where
             let mut created = false;
 
             for result in &results {
+                // `unknown` holds only valid names, so `CreateTopics` refuses one of them with
+                // INVALID_TOPIC_EXCEPTION only for colliding with an existing topic.
+                if result.error_code == i16::from(ErrorCode::InvalidTopicException) {
+                    self.auto_create_refusals.refuse(&result.name);
+                }
+
                 created |= topic_exists_after(result);
             }
 
@@ -259,10 +283,160 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use nisshi_sans_io::{ErrorCode, create_topics_response::CreatableTopicResult};
+    use nisshi_sans_io::{
+        ErrorCode, MetadataRequest, create_topics_response::CreatableTopicResult,
+        metadata_request::MetadataRequestTopic,
+    };
+    use rama::Service as _;
+    use tokio::time::advance;
     use tracing::Level;
 
-    use super::topic_exists_after;
+    use super::{
+        AutoCreateRefusals, MetadataService, auto_create_refusals::REFUSAL_TTL, topic_exists_after,
+    };
+    use crate::{
+        Result, TopicCreationConfig,
+        service::counting_storage::{CountingStorage, Listing},
+    };
+
+    fn service(
+        storage: &CountingStorage,
+        refusals: &AutoCreateRefusals,
+    ) -> MetadataService<CountingStorage> {
+        MetadataService {
+            storage: storage.clone(),
+            topic_creation: TopicCreationConfig::default(),
+            auto_create_refusals: refusals.clone(),
+        }
+    }
+
+    /// Sends a Metadata request that allows auto-creation for `names`, and returns the error
+    /// code of each topic in the response.
+    async fn metadata(
+        service: &MetadataService<CountingStorage>,
+        names: &[&str],
+    ) -> Result<Vec<(String, ErrorCode)>> {
+        let response = service
+            .serve(
+                MetadataRequest::default()
+                    .allow_auto_topic_creation(Some(true))
+                    .topics(Some(
+                        names
+                            .iter()
+                            .map(|name| MetadataRequestTopic::default().name(Some((*name).into())))
+                            .collect(),
+                    )),
+            )
+            .await?;
+
+        response
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic| {
+                Ok((
+                    topic.name.unwrap_or_default(),
+                    ErrorCode::try_from(topic.error_code)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn unknown(name: &str) -> (String, ErrorCode) {
+        (name.to_owned(), ErrorCode::UnknownTopicOrPartition)
+    }
+
+    /// A producer retries Metadata for a name that collides with an existing topic. Only the
+    /// first request lists every topic for the collision check. Each request still looks up its
+    /// names once.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_colliding_name_lists_topics_once() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        for _ in 0..5 {
+            assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+        }
+
+        assert_eq!(1, storage.listings());
+        assert_eq!(5, storage.lookups());
+        assert!(storage.created().is_empty());
+        Ok(())
+    }
+
+    /// The broker gives the service of each connection a clone of one store, so a refusal on
+    /// one connection saves the listing on another.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_shared_by_clones() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
+        let refusals = AutoCreateRefusals::default();
+
+        for service in [service(&storage, &refusals), service(&storage, &refusals)] {
+            assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+        }
+
+        assert_eq!(1, storage.listings());
+        Ok(())
+    }
+
+    /// Once the colliding topic is deleted, the name is created when its refusal expires, and
+    /// not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_name_is_created_once_its_refusal_expires() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+        storage.delete("a.b");
+
+        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+        assert!(storage.created().is_empty());
+        assert_eq!(1, storage.listings());
+
+        advance(REFUSAL_TTL).await;
+
+        assert_eq!(
+            vec![(String::from("a_b"), ErrorCode::None)],
+            metadata(&service, &["a_b"]).await?
+        );
+        assert_eq!(vec![String::from("a_b")], storage.created());
+        assert_eq!(2, storage.listings());
+        Ok(())
+    }
+
+    /// A failed listing is the broker's failure, not a refusal, so the next request tries again.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_listing_is_not_remembered() -> Result<()> {
+        for listing in [Listing::Error, Listing::NamelessTopic] {
+            let storage = CountingStorage::new(listing, &[]);
+            let service = service(&storage, &AutoCreateRefusals::default());
+
+            for _ in 0..2 {
+                assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+            }
+
+            assert_eq!(2, storage.listings(), "{listing:?}");
+        }
+
+        Ok(())
+    }
+
+    /// A refused name is left out of auto-creation, and the other names of the request are
+    /// still created.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_name_does_not_block_others() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
+
+        assert_eq!(
+            vec![unknown("a_b"), (String::from("c_d"), ErrorCode::None)],
+            metadata(&service, &["a_b", "c_d"]).await?
+        );
+        assert_eq!(vec![String::from("c_d")], storage.created());
+        Ok(())
+    }
 
     /// The log lines written at `warn` or above.
     #[derive(Clone, Default)]

@@ -1337,6 +1337,12 @@ impl Storage for Engine {
         Ok(topitions)
     }
 
+    /// SlateDB is deprecated and takes only security fixes, so it keeps its earlier answer
+    /// to `require_stable`: it reports no pending transactional offset.
+    async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
+        Ok(BTreeSet::new())
+    }
+
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,

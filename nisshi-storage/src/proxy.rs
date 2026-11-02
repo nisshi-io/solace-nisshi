@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
@@ -280,6 +280,17 @@ where
             )
         })?;
         self.storage.committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+        let _permit = self.semaphore.acquire().await.inspect(|_| {
+            SEMAPHORE_ACQUIRE_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
+            )
+        })?;
+        self.storage.pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

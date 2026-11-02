@@ -21,8 +21,8 @@
 use std::{net::IpAddr, time::Duration};
 
 use nisshi_smoke_test::{
-    BackgroundTool, GROUP_ID_NOT_FOUND_EXCEPTION, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets,
-    GroupState, KafkaCli, VerifiableConsume, unique,
+    BackgroundTool, GROUP_NOT_EMPTY_EXCEPTION, GroupOffsets, GroupState, KafkaCli,
+    VerifiableConsume, unique,
 };
 
 /// How long a consumer has to join its group and get its partitions.
@@ -210,15 +210,18 @@ fn state_is_stable_while_consuming_and_empty_after() {
 
 /// Describing a group that never existed must say that it doesn't exist. Showing an empty group
 /// instead hides a mistyped group name. The broker must answer `DescribeGroups` for an unknown
-/// group with `GROUP_ID_NOT_FOUND`.
+/// group with the error NONE and the state `Dead`, as Kafka does up to v5, and the tool then
+/// reports the group as missing. An answer of `GROUP_ID_NOT_FOUND` fails the tool with an
+/// unexpected error.
 #[test]
 fn describe_of_unknown_group_says_it_does_not_exist() {
     let cli = KafkaCli::shared();
 
     let described = cli.consumer_groups().describe(&unique::name("never-used"));
 
+    assert!(described.mentions("does not exist"), "{described}");
     assert!(
-        described.mentions(GROUP_ID_NOT_FOUND_EXCEPTION),
+        !described.mentions("GroupIdNotFoundException"),
         "{described}"
     );
 }

@@ -42,7 +42,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage, TopicCreationConfig};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use rsasl::{
@@ -61,6 +61,7 @@ where
         FrameRouteService::<Error>::builder(),
         storage,
         TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
     )
     .and_then(auth::services)
     .and_then(|builder| builder.build().map_err(Into::into))

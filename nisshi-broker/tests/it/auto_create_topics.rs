@@ -21,7 +21,7 @@ use nisshi_sans_io::{
     ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
     metadata_request::MetadataRequestTopic,
 };
-use nisshi_storage::{MetadataService, Storage, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, MetadataService, Storage, TopicCreationConfig};
 use rama::{Service as _, extensions::Extensions};
 
 /// Sends one `Metadata` request for `names`, with `allow_auto_topic_creation` as given.
@@ -73,6 +73,7 @@ async fn switched_off_creates_nothing(storage: impl Storage + Clone) -> Result<(
             auto_create_topics_enable: false,
             ..TopicCreationConfig::default()
         },
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     for allow_auto_topic_creation in [Some(true), None] {
@@ -101,6 +102,7 @@ async fn over_the_cap_creates_nothing(storage: impl Storage + Clone) -> Result<(
             num_partitions: 5_000,
             ..TopicCreationConfig::default()
         },
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let names = [
@@ -127,6 +129,7 @@ async fn at_the_cap_creates_each_topic(storage: impl Storage + Clone) -> Result<
             num_partitions: 5_000,
             ..TopicCreationConfig::default()
         },
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let names = [alphanumeric_string(15), alphanumeric_string(15)];
@@ -151,6 +154,7 @@ async fn duplicate_name_counts_once(storage: impl Storage + Clone) -> Result<()>
             num_partitions: 5_001,
             ..TopicCreationConfig::default()
         },
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = alphanumeric_string(15);
@@ -169,6 +173,7 @@ async fn num_partitions_sets_the_partition_count(storage: impl Storage + Clone) 
             num_partitions: 7,
             ..TopicCreationConfig::default()
         },
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = alphanumeric_string(15);
@@ -193,6 +198,7 @@ async fn num_partitions_below_one_creates_nothing(storage: impl Storage + Clone)
                 num_partitions,
                 ..TopicCreationConfig::default()
             },
+            auto_create_refusals: AutoCreateRefusals::default(),
         };
 
         let name = alphanumeric_string(15);
@@ -213,6 +219,7 @@ async fn colliding_name_is_not_created(storage: impl Storage + Clone) -> Result<
     let service = MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let suffix = alphanumeric_string(15);
@@ -222,8 +229,11 @@ async fn colliding_name_is_not_created(storage: impl Storage + Clone) -> Result<
     let response = metadata(&service, &[&existing], Some(true)).await?;
     assert_each_topic(&response, ErrorCode::None)?;
 
-    let response = metadata(&service, &[&colliding], Some(true)).await?;
-    assert_each_topic(&response, ErrorCode::UnknownTopicOrPartition)?;
+    // A producer retries, and each retry after the first takes the remembered refusal.
+    for _ in 0..3 {
+        let response = metadata(&service, &[&colliding], Some(true)).await?;
+        assert_each_topic(&response, ErrorCode::UnknownTopicOrPartition)?;
+    }
 
     let response = metadata(&service, &[&colliding], Some(false)).await?;
     assert_each_topic(&response, ErrorCode::UnknownTopicOrPartition)?;
@@ -260,6 +270,7 @@ mod in_memory {
             FrameRouteService::<Error>::builder(),
             storage,
             topic_creation,
+            AutoCreateRefusals::default(),
         )
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {
@@ -400,6 +411,12 @@ mod lite {
         let _guard = init_tracing()?;
         super::num_partitions_sets_the_partition_count(storage().await?).await
     }
+
+    #[tokio::test]
+    async fn colliding_name_is_not_created() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::colliding_name_is_not_created(storage().await?).await
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -429,5 +446,11 @@ mod pg {
     async fn num_partitions_sets_the_partition_count() -> Result<()> {
         let _guard = init_tracing()?;
         super::num_partitions_sets_the_partition_count(storage().await?).await
+    }
+
+    #[tokio::test]
+    async fn colliding_name_is_not_created() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::colliding_name_is_not_created(storage().await?).await
     }
 }

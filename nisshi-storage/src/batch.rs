@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     pin::Pin,
     sync::{Arc, LazyLock, Mutex},
@@ -615,6 +615,10 @@ where
         self.storage.committed_offset_topitions(group_id).await
     }
 
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.storage.pending_txn_offsets(group_id).await
+    }
+
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         self.storage.metadata(topics).await
     }
@@ -1034,6 +1038,10 @@ mod tests {
             &self,
             _group_id: &str,
         ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+            unimplemented!()
+        }
+
+        async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
             unimplemented!()
         }
 

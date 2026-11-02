@@ -87,6 +87,10 @@ pub fn epoch_is_exhausted(epoch: i16) -> bool {
     epoch >= i16::MAX - 1
 }
 
+/// The error that answers an idempotent batch whose epoch is older than the epoch its partition
+/// holds for the producer, as Kafka answers.
+pub const OLDER_EPOCH_ERROR: ErrorCode = ErrorCode::InvalidProducerEpoch;
+
 /// The epochs stored for a producer, which a produced batch's epoch is checked against.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredEpochs {
@@ -131,9 +135,10 @@ impl StoredEpochs {
     /// producer ID that a transactional ID owns, so that a non-transactional batch cannot
     /// move a transactional producer's epoch.
     ///
+    /// Returns [`OLDER_EPOCH_ERROR`] for an epoch lower than the partition's, as Kafka answers
+    /// for a client's batch ([ProducerAppendInfo.java]).
+    ///
     /// Returns [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch) for:
-    /// - an epoch lower than the partition's, as Kafka answers for a client's batch
-    ///   ([ProducerAppendInfo.java]).
     /// - a transactional producer's epoch other than its newest. Kafka's coordinator answers
     ///   PRODUCER_FENCED for that epoch, and the broker answers the Produce request with
     ///   INVALID_PRODUCER_EPOCH instead ([AddPartitionsToTxnManager.scala]).
@@ -178,7 +183,7 @@ impl StoredEpochs {
             .map(|partition| producer_epoch.cmp(&partition))
         {
             Some(Ordering::Equal) => Ok(ProduceEpoch::Continue),
-            Some(Ordering::Less) => Err(ErrorCode::InvalidProducerEpoch),
+            Some(Ordering::Less) => Err(OLDER_EPOCH_ERROR),
             Some(Ordering::Greater) | None if epoch_is_exhausted(producer_epoch) => {
                 Err(ErrorCode::InvalidProducerEpoch)
             }
@@ -187,6 +192,17 @@ impl StoredEpochs {
             }
             Some(Ordering::Greater) | None => Ok(ProduceEpoch::Start),
         }
+    }
+
+    /// Whether the partition has moved an idempotent producer on from a batch's epoch: the
+    /// producer is not transactional, its producer ID is not retired, and the partition holds
+    /// a newer epoch for it.
+    pub fn is_superseded(&self, producer_epoch: i16) -> bool {
+        !self.transactional
+            && self.newest != i16::MAX
+            && self
+                .partition
+                .is_some_and(|partition| partition > producer_epoch)
     }
 }
 
@@ -270,10 +286,40 @@ mod tests {
 
     #[test]
     fn idempotent_below_partition_epoch_is_invalid() {
-        assert_eq!(
-            Err(ErrorCode::InvalidProducerEpoch),
-            IDEMPOTENT.check_batch(2, 0)
-        );
+        assert_eq!(Err(OLDER_EPOCH_ERROR), IDEMPOTENT.check_batch(2, 0));
+    }
+
+    #[test]
+    fn idempotent_below_partition_epoch_is_superseded() {
+        assert!(IDEMPOTENT.is_superseded(2));
+        assert!(!IDEMPOTENT.is_superseded(3));
+        assert!(!IDEMPOTENT.is_superseded(4));
+    }
+
+    #[test]
+    fn unwritten_partition_supersedes_nothing() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert!(!unwritten.is_superseded(0));
+    }
+
+    #[test]
+    fn transactional_mismatch_is_not_superseded() {
+        assert!(!TRANSACTIONAL.is_superseded(2));
+        assert!(!TRANSACTIONAL.is_superseded(4));
+    }
+
+    #[test]
+    fn retired_producer_id_supersedes_nothing() {
+        let retired = StoredEpochs {
+            newest: i16::MAX,
+            ..IDEMPOTENT
+        };
+
+        assert!(!retired.is_superseded(2));
     }
 
     #[test]

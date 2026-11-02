@@ -66,6 +66,17 @@ const PARIATUR_EXCEPTEUR: Bytes =
 const CULPA_QUI: Bytes =
     Bytes::from_static(b"culpa qui officia deserunt mollit anim id est laborum.");
 
+/// The values that the fetch tests produce, one record to a batch, in offset order.
+const MESSAGES: [Bytes; 7] = [
+    LOREM_IPSUM,
+    EIUSMOD_TEMPOR,
+    MINIM_VENIAM,
+    ALIQUIP_EX,
+    REPREHENDERIT_IN,
+    PARIATUR_EXCEPTEUR,
+    CULPA_QUI,
+];
+
 #[derive(Clone)]
 pub(crate) struct LatencyIntroducingObjectStore<O> {
     object_store: O,
@@ -440,15 +451,7 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(RequestInput {
                 request: ProduceRequest::default().topic_data(topic_data(
@@ -635,8 +638,10 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
     Ok(())
 }
 
+/// A `max_wait` as short as the object store's latency does not cut the read short: the client's
+/// byte limits, not its `max_wait`, decide how much a fetch returns, as in Kafka.
 #[tokio::test]
-async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
+async fn fetch_1_min_bytes_max_wait_of_1x_latency_reads_every_batch() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
@@ -697,15 +702,7 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(RequestInput {
                 request: ProduceRequest::default().topic_data(topic_data(
@@ -768,30 +765,31 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
         .map(|frame| &frame.batches[..])
         .unwrap_or_default();
 
-    assert_eq!(1, batches.len());
+    assert_eq!(MESSAGES.len(), batches.len());
 
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
+    let values = batches
+        .iter()
+        .map(|batch| {
+            inflated::Batch::try_from(batch).map(|inflated| {
+                assert_eq!(1, inflated.records.len());
+                inflated
+                    .records
+                    .first()
+                    .cloned()
+                    .and_then(|record| record.value)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    assert_eq!(MESSAGES.map(Some).to_vec(), values);
 
     Ok(())
 }
 
+/// A `max_wait` as short as the object store's latency does not cut the read short: the client's
+/// byte limits, not its `max_wait`, decide how much a fetch returns, as in Kafka.
 #[tokio::test]
-async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
+async fn fetch_1_min_bytes_max_wait_of_2x_latency_reads_every_batch() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
@@ -852,15 +850,7 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(RequestInput {
                 request: ProduceRequest::default().topic_data(topic_data(
@@ -923,41 +913,23 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
         .map(|frame| &frame.batches[..])
         .unwrap_or_default();
 
-    assert_eq!(2, batches.len());
+    assert_eq!(MESSAGES.len(), batches.len());
 
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
+    let values = batches
+        .iter()
+        .map(|batch| {
+            inflated::Batch::try_from(batch).map(|inflated| {
+                assert_eq!(1, inflated.records.len());
+                inflated
+                    .records
+                    .first()
+                    .cloned()
+                    .and_then(|record| record.value)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(1)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(EIUSMOD_TEMPOR),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    assert_eq!(MESSAGES.map(Some).to_vec(), values);
 
     Ok(())
 }
@@ -1021,15 +993,7 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(ProduceRequest::default().topic_data(topic_data(
                 name,
@@ -1170,15 +1134,7 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(ProduceRequest::default().topic_data(topic_data(
                 name,
@@ -1320,15 +1276,7 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(ProduceRequest::default().topic_data(topic_data(
                 name,
@@ -1425,8 +1373,10 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
     Ok(())
 }
 
+/// A `max_wait` shorter than the object store's latency does not cut the read short: the fetch
+/// returns as many batches as `max_bytes` allows, as in Kafka.
 #[tokio::test]
-async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
+async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let advertised_listener = Url::parse("tcp://localhost:9092")?;
@@ -1484,15 +1434,7 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
 
     const PARTITION: i32 = 0;
 
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
+    for value in MESSAGES {
         let response = produce
             .serve(ProduceRequest::default().topic_data(topic_data(
                 name,
@@ -1553,23 +1495,25 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
         .map(|frame| &frame.batches[..])
         .unwrap_or_default();
 
-    assert_eq!(1, batches.len());
+    assert_eq!(2, batches.len());
 
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
+    let values = batches
+        .iter()
+        .map(|batch| {
+            inflated::Batch::try_from(batch).map(|inflated| {
+                assert_eq!(1, inflated.records.len());
+                inflated
+                    .records
+                    .first()
+                    .cloned()
+                    .and_then(|record| record.value)
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
+        MESSAGES[..2].iter().cloned().map(Some).collect::<Vec<_>>(),
+        values
     );
 
     Ok(())

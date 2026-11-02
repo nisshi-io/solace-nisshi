@@ -464,7 +464,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         future::pending,
         sync::{Arc, Mutex},
         time::SystemTime,
@@ -717,6 +717,10 @@ mod tests {
             &self,
             _group_id: &str,
         ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+            unimplemented!()
+        }
+
+        async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
             unimplemented!()
         }
 

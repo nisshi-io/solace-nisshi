@@ -640,33 +640,26 @@ mod pg {
     #[tokio::test]
     async fn success_is_not_written() -> Result<()> {
         let _guard = init_tracing()?;
-        acks_zero_success_is_not_written(Url::parse("postgres://postgres:postgres@localhost")?)
-            .await
+        acks_zero_success_is_not_written(Url::parse(&crate::common::postgres_url())?).await
     }
 
     #[tokio::test]
     async fn acks_zero_then_acks_one() -> Result<()> {
         let _guard = init_tracing()?;
-        acks_zero_then_acks_one_on_one_connection(Url::parse(
-            "postgres://postgres:postgres@localhost",
-        )?)
-        .await
+        acks_zero_then_acks_one_on_one_connection(Url::parse(&crate::common::postgres_url())?).await
     }
 
     #[tokio::test]
     async fn failure_closes_connection() -> Result<()> {
         let _guard = init_tracing()?;
-        acks_zero_failure_closes_connection(Url::parse("postgres://postgres:postgres@localhost")?)
-            .await
+        acks_zero_failure_closes_connection(Url::parse(&crate::common::postgres_url())?).await
     }
 
     #[tokio::test]
     async fn storage_failure_closes_connection() -> Result<()> {
         let _guard = init_tracing()?;
-        acks_zero_storage_failure_closes_connection(Url::parse(
-            "postgres://postgres:postgres@localhost",
-        )?)
-        .await
+        acks_zero_storage_failure_closes_connection(Url::parse(&crate::common::postgres_url())?)
+            .await
     }
 }
 

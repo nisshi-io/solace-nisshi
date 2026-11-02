@@ -31,7 +31,9 @@ use nisshi_sans_io::{
     ScramMechanism,
 };
 use nisshi_service::DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE;
-use nisshi_storage::{ArcDynStorage, ScramCredential, Storage as _, TopicCreationConfig};
+use nisshi_storage::{
+    ArcDynStorage, AutoCreateRefusals, ScramCredential, Storage as _, TopicCreationConfig,
+};
 use rama::{Service as _, extensions::Extensions, tcp::TcpStream as RamaTcpStream};
 use rand::{RngExt as _, rng};
 use rsasl::{
@@ -117,6 +119,7 @@ async fn spawn_broker(sasl: bool) -> Result<RunningBroker> {
                 coordinator.clone(),
                 storage.clone(),
                 TopicCreationConfig::default(),
+                AutoCreateRefusals::default(),
                 sasl_config.clone(),
             ) else {
                 return;

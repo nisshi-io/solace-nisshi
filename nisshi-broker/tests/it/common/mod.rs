@@ -42,9 +42,7 @@ use rand::{
     prelude::*,
     rng,
 };
-#[cfg(feature = "dynostore")]
-use std::sync::Arc;
-use std::{env, io::ErrorKind, thread};
+use std::{env, io::ErrorKind, sync::Arc, thread};
 use tokio::fs::remove_file;
 use tracing::{debug, subscriber::DefaultGuard};
 use tracing_subscriber::EnvFilter;
@@ -77,8 +75,13 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
     ))
 }
 
-/// The PostgreSQL database that [`StorageType::Postgres`] stores to.
-pub(crate) const POSTGRES_URL: &str = "postgres://postgres:postgres@localhost";
+/// Returns the URL of the PostgreSQL database that [`StorageType::Postgres`]
+/// stores to: `NISSHI_TEST_DATABASE_URL`, or else the `db` service of
+/// compose.yaml on its default port.
+pub(crate) fn postgres_url() -> String {
+    env::var("NISSHI_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| String::from("postgres://postgres:postgres@localhost"))
+}
 
 pub(crate) enum StorageType {
     InMemory,
@@ -133,7 +136,7 @@ pub(crate) async fn storage_container(
                 .node_id(node)
                 .advertised_listener(advertised_listener)
                 .schema_registry(schemas)
-                .storage(Url::parse(POSTGRES_URL)?)
+                .storage(Url::parse(&postgres_url())?)
                 .build()
                 .await
         }

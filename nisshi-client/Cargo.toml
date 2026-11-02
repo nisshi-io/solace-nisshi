@@ -16,11 +16,11 @@ backoff.workspace = true
 bytes.workspace = true
 deadpool = { workspace = true, features = ["rt_tokio_1"] }
 humantime.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-service.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true
-nisshi-sans-io.workspace = true
-nisshi-service.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true

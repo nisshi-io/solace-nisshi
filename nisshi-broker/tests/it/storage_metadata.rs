@@ -17,7 +17,9 @@ use nisshi_broker::Result;
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, NULL_TOPIC_ID, RequestInput, metadata_request::MetadataRequestTopic,
 };
-use nisshi_storage::{ArcDynStorage, MetadataService, Storage, TopicCreationConfig};
+use nisshi_storage::{
+    ArcDynStorage, AutoCreateRefusals, MetadataService, Storage, TopicCreationConfig,
+};
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use uuid::Uuid;
@@ -26,6 +28,7 @@ async fn simple(storage: impl Storage + Clone, broker_id: i32) -> Result<()> {
     let service = MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let response = service
@@ -51,6 +54,7 @@ async fn auto_create_topic(storage: impl Storage + Clone) -> Result<()> {
     let service = MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = "auto-created";
@@ -80,6 +84,7 @@ async fn auto_create_topic_invalid_name(storage: impl Storage + Clone) -> Result
     let service = MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = "not a valid topic name";
@@ -109,6 +114,7 @@ async fn auto_create_topic_not_allowed(storage: impl Storage + Clone) -> Result<
     let service = MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = "not-auto-created";

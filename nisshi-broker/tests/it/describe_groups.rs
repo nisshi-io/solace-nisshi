@@ -102,12 +102,11 @@ async fn found_group_answers_supported_operations_when_asked(
     Ok(())
 }
 
-/// An engine answers an unknown group with an error row or with an empty group. Kafka answers
-/// an unknown group with error NONE and state `Dead`, and reports the operations on every row
-/// whose error is NONE.
-async fn unknown_group_answers_operations_only_on_a_row_without_error(
-    storage: impl Storage + Clone,
-) -> Result<()> {
+/// `DescribeGroups` v0 to v5 describes a group that does not exist with the error NONE and the
+/// state `Dead`, as Kafka does. A client reads the group as missing from that state, but fails on
+/// `GROUP_ID_NOT_FOUND`. Requires an engine that stores the groups that it describes.
+#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
+async fn unknown_group_answers_dead(storage: impl Storage + Clone) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
             storage.clone(),
@@ -116,36 +115,16 @@ async fn unknown_group_answers_operations_only_on_a_row_without_error(
         )
         .await?;
         assert_eq!(1, groups.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+        assert_eq!("Dead", groups[0].group_state);
+        assert!(groups[0].members.as_deref().unwrap_or_default().is_empty());
 
-        let expected = if include_authorized_operations
-            && ErrorCode::try_from(groups[0].error_code)? == ErrorCode::None
-        {
+        let expected = if include_authorized_operations {
             SUPPORTED_GROUP_OPERATIONS
         } else {
             i32::MIN
         };
         assert_eq!(Some(expected), groups[0].authorized_operations);
-    }
-
-    Ok(())
-}
-
-/// Requires an engine that answers an unknown group with `GROUP_ID_NOT_FOUND`.
-#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
-async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) -> Result<()> {
-    for include_authorized_operations in [false, true] {
-        let groups = describe(
-            storage.clone(),
-            &[alphanumeric_string(15)],
-            include_authorized_operations,
-        )
-        .await?;
-        assert_eq!(1, groups.len());
-        assert_eq!(
-            ErrorCode::GroupIdNotFound,
-            ErrorCode::try_from(groups[0].error_code)?
-        );
-        assert_eq!(Some(i32::MIN), groups[0].authorized_operations);
     }
 
     Ok(())
@@ -458,12 +437,9 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let groups = response.groups.unwrap_or_default();
     assert_eq!(1, groups.len());
 
-    assert_matches!(
-        ErrorCode::try_from(groups[0].error_code)?,
-        ErrorCode::None | ErrorCode::GroupIdNotFound
-    );
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
     assert_eq!(group_id, groups[0].group_id.as_str());
-    assert_matches!(groups[0].group_state.as_str(), "Empty" | "Unknown");
+    assert_matches!(groups[0].group_state.as_str(), "Empty" | "Dead");
 
     Ok(())
 }
@@ -510,15 +486,9 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
+    async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
+        super::unknown_group_answers_dead(storage().await?).await
     }
 
     #[tokio::test]
@@ -588,14 +558,9 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
+    async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
+        super::unknown_group_answers_dead(storage().await?).await
     }
 
     #[tokio::test]
@@ -691,14 +656,9 @@ mod pg {
     }
 
     #[tokio::test]
-    async fn unknown_group_answers_operations_only_on_a_row_without_error() -> Result<()> {
+    async fn unknown_group_answers_dead() -> Result<()> {
         let _guard = init_tracing()?;
-        super::unknown_group_answers_operations_only_on_a_row_without_error(storage().await?).await
-    }
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
+        super::unknown_group_answers_dead(storage().await?).await
     }
 
     #[tokio::test]

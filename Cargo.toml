@@ -81,6 +81,11 @@ arbitrary = { version = "1", features = ["derive"] }
 arrow = { version = "58" }
 async-trait = "0.1.86"
 backoff = {version = "0.4.0", features = ["tokio"]}
+# Pinned: buoyant_kernel 0.22.2 depends on "^1", which resolves to 1.2.0
+# by default, but 1.2.0 renamed the `parse_column_name` macro to
+# `column_name_segments`, breaking the version deltalake 0.32.4 actually
+# builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
+buoyant_kernel_derive = "=1.1.0"
 bytes = { version = "1", features = ["serde"] }
 cached = "4.0.1"
 chrono = "0.4"
@@ -93,11 +98,6 @@ criterion = { version = "0.8.2", features = ["async_tokio", "html_reports"] }
 datafusion = "53"
 deadpool = "0.13.1"
 deadpool-postgres = "0.14.2"
-# Pinned: buoyant_kernel 0.22.2 depends on "^1", which resolves to 1.2.0
-# by default, but 1.2.0 renamed the `parse_column_name` macro to
-# `column_name_segments`, breaking the version deltalake 0.32.4 actually
-# builds against. Pin to 1.1.0 until deltalake bumps its buoyant_kernel dep.
-buoyant_kernel_derive = "=1.1.0"
 deltalake = { version = "0.32", features = ["datafusion", "s3"] }
 dotenv = "0.15.0"
 fake = "5.1.0"
@@ -118,13 +118,33 @@ iceberg-catalog-rest = "0.10.1"
 iceberg-datafusion = "0.10.1"
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
-jsonschema = "0.59.0"
+jsonschema = "0.60.0"
 lazy_static = "1.4.0"
 libc = "0.2.189"
 libfuzzer-sys = "0.4"
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.5.0"
+nisshi = { version = "0.8.1", path = "nisshi", default-features = false }
+nisshi-auth = { version = "0.8.1", path = "nisshi-auth", default-features = false }
+nisshi-broker = { version = "0.8.1", path = "nisshi-broker", default-features = false }
+nisshi-cat = { version = "0.8.1", path = "nisshi-cat", default-features = false }
+nisshi-cli = { version = "0.8.1", path = "nisshi-cli", default-features = false }
+nisshi-client = { version = "0.8.1", path = "nisshi-client", default-features = false }
+nisshi-generator = { version = "0.8.1", path = "nisshi-generator", default-features = false }
+nisshi-model = { version = "0.8.1", path = "nisshi-model", default-features = false }
+nisshi-otel = { version = "0.8.1", path = "nisshi-otel", default-features = false }
+nisshi-perf = { version = "0.8.1", path = "nisshi-perf", default-features = false }
+nisshi-proxy = { version = "0.8.1", path = "nisshi-proxy", default-features = false }
+nisshi-sans-io = { version = "0.8.1", path = "nisshi-sans-io", default-features = false }
+nisshi-schema = { version = "0.8.1", path = "nisshi-schema", default-features = false }
+nisshi-service = { version = "0.8.1", path = "nisshi-service", default-features = false }
+nisshi-storage = { version = "0.8.1", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.8.1", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.8.1", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.8.1", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.8.1", path = "nisshi-storage-sql", default-features = false }
+nisshi-topic = { version = "0.8.1", path = "nisshi-topic", default-features = false }
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
@@ -164,26 +184,6 @@ slatedb = "0.17.0"
 snap = "1.1.1"
 socket2 = "0.6.5"
 syn = { version = "3.0.3", features = ["extra-traits", "full"] }
-nisshi = { version = "0.8.1", path = "nisshi", default-features = false }
-nisshi-auth = { version = "0.8.1", path = "nisshi-auth", default-features = false }
-nisshi-broker = { version = "0.8.1", path = "nisshi-broker", default-features = false }
-nisshi-cat = { version = "0.8.1", path = "nisshi-cat", default-features = false }
-nisshi-cli = { version = "0.8.1", path = "nisshi-cli", default-features = false }
-nisshi-client = { version = "0.8.1", path = "nisshi-client", default-features = false }
-nisshi-generator = { version = "0.8.1", path = "nisshi-generator", default-features = false }
-nisshi-model = { version = "0.8.1", path = "nisshi-model", default-features = false }
-nisshi-otel = { version = "0.8.1", path = "nisshi-otel", default-features = false }
-nisshi-perf = { version = "0.8.1", path = "nisshi-perf", default-features = false }
-nisshi-proxy = { version = "0.8.1", path = "nisshi-proxy", default-features = false }
-nisshi-sans-io = { version = "0.8.1", path = "nisshi-sans-io", default-features = false }
-nisshi-schema = { version = "0.8.1", path = "nisshi-schema", default-features = false }
-nisshi-service = { version = "0.8.1", path = "nisshi-service", default-features = false }
-nisshi-storage = { version = "0.8.1", path = "nisshi-storage", default-features = false }
-nisshi-storage-dynostore = { version = "0.8.1", path = "nisshi-storage-dynostore", default-features = false }
-nisshi-storage-null = { version = "0.8.1", path = "nisshi-storage-null", default-features = false }
-nisshi-storage-slatedb = { version = "0.8.1", path = "nisshi-storage-slatedb", default-features = false }
-nisshi-storage-sql = { version = "0.8.1", path = "nisshi-storage-sql", default-features = false }
-nisshi-topic = { version = "0.8.1", path = "nisshi-topic", default-features = false }
 temp-env = "0.3"
 tempfile = "3"
 thiserror = "2.0"
@@ -200,8 +200,8 @@ tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turso = "0.8.2"
 url = { version = "2.5.4", features = ["serde"] }
-zeroize = "1"
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
+zeroize = "1"
 zstd = "0.14.0"
 
 # Line tables keep file:line in workspace backtraces; full debug info costs

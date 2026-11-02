@@ -28,7 +28,10 @@ services:
     environment:
       PGUSER: postgres
       POSTGRES_PASSWORD: postgres
-    # nisshi-smoke-test/run.sh sets NISSHI_DB_PORTS, so that Docker picks the host port.
+    # The default of 100 is too few for a test run, whose tests each open a
+    # pool of connections, beside the lakehouse catalog's own pool.
+    command: postgres -c max_connections=300
+    # nisshi-smoke-test/run.sh and etc/worktree-services.sh set NISSHI_DB_PORTS, so that Docker picks the host port.
     ports:
       - ${NISSHI_DB_PORTS:-127.0.0.1:5432:5432}
     volumes:
@@ -49,7 +52,7 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data
-    # nisshi-smoke-test/run.sh sets these variables, so that Docker picks the host ports.
+    # nisshi-smoke-test/run.sh and etc/worktree-services.sh set these variables, so that Docker picks the host ports.
     ports:
       - ${NISSHI_MINIO_PORTS:-127.0.0.1:9000:9000}
       - ${NISSHI_MINIO_CONSOLE_PORTS:-127.0.0.1:9001:9001}
@@ -109,7 +112,7 @@ services:
       - 127.0.0.1:5778:5778
       - 127.0.0.1:9411:9411
   prometheus:
-    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
     ports:
       - 127.0.0.1:9090:9090
     command: --web.enable-otlp-receiver
@@ -122,8 +125,14 @@ services:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
       - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
-      - RUST_LOG=trace,axum=trace,sqlx=trace,iceberg-catalog=trace
+      - RUST_LOG=info
     command: ["serve"]
+    # The catalog opens a file per client connection and per database
+    # connection, and a test run can open more than the default limit of 1024.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "/home/nonroot/iceberg-catalog", "healthcheck"]
       interval: 1s
@@ -137,8 +146,9 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # etc/worktree-services.sh sets NISSHI_LAKEHOUSE_PORTS, so that Docker picks the host port.
     ports:
-      - 127.0.0.1:8181:8181
+      - ${NISSHI_LAKEHOUSE_PORTS:-127.0.0.1:8181:8181}
   lakehouse-migrate:
     image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
     environment:

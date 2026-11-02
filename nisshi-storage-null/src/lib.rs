@@ -23,7 +23,7 @@
     )
 )]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -214,6 +214,12 @@ impl Storage for Engine {
         _group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         Ok(BTreeMap::new())
+    }
+
+    /// The null engine keeps no transactional offsets, so none is pending.
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
+        Ok(BTreeSet::new())
     }
 
     #[instrument(skip_all)]

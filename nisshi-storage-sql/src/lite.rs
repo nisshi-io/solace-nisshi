@@ -18,8 +18,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_produce_partition_check,
-        txn_produce_partition_select, watermark_select_for_write,
+        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -2107,6 +2107,17 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+        self.inner.pending_txn_offsets(group_id).await.inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
+            )
+        })
+    }
+
+    #[instrument(skip_all)]
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
@@ -3683,6 +3694,44 @@ impl Storage for Delegate {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
                 &[KeyValue::new("operation", "committed_offset_topitions")],
+            )
+        })
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                txn_offset_commit_tp_select_pending::QUERY,
+                (self.cluster.as_str(), group_id),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
+
+        let columns = ResultColumns::libsql(txn_offset_commit_tp_select_pending::QUERY, &rows);
+        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)? as i32;
+        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)? as i32;
+
+        let mut pending = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            _ = pending.insert(Topition::new(
+                row.get_str(topic)?,
+                row.get::<i32>(partition)?,
+            ));
+        }
+
+        debug!(cluster = self.cluster, group_id, ?pending);
+
+        Ok(pending).inspect(|_| {
+            DELEGATE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
             )
         })
     }
@@ -6550,6 +6599,114 @@ mod tests {
              (last_stable={}, high_watermark={})",
             stage.last_stable,
             stage.high_watermark,
+        );
+
+        Ok(())
+    }
+
+    /// DeleteRecords can move the log start past the first offset of an open
+    /// transaction. The last stable offset then answers the log start, as
+    /// Kafka raises it, and not the transaction's first offset below it.
+    #[tokio::test]
+    async fn delete_records_past_open_transaction_raises_last_stable_to_log_start() -> Result<()> {
+        use nisshi_sans_io::{
+            add_partitions_to_txn_request::AddPartitionsToTxnTopic,
+            delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
+        };
+
+        let _guard = init_tracing()?;
+
+        let db_file = "delete-records-past-open-transaction-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let storage = Url::parse(&format!("file:///{db_file}"))?;
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        // a transaction opens at offset 0 and stays open
+        let producer = engine
+            .init_producer(Some("tx"), 0, Some(-1), Some(-1))
+            .await?;
+
+        _ = engine
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: "tx".into(),
+                producer_id: producer.id,
+                producer_epoch: 0,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name("t".into())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        assert_eq!(
+            0,
+            engine
+                .produce(Some("tx"), &topition, txn_batch(producer.id))
+                .await?
+        );
+
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"after").into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+        assert_eq!(1, engine.produce(None, &topition, batch).await?);
+
+        let log_start = 1;
+
+        let results = engine
+            .delete_records(&[DeleteRecordsTopic::default()
+                .name("t".into())
+                .partitions(Some(vec![
+                    DeleteRecordsPartition::default()
+                        .partition_index(0)
+                        .offset(log_start),
+                ]))])
+            .await?;
+        assert_eq!(
+            log_start,
+            results[0].partitions.as_deref().unwrap_or_default()[0].low_watermark
+        );
+
+        assert_eq!(
+            OffsetStage {
+                last_stable: log_start,
+                high_watermark: 2,
+                log_start,
+            },
+            engine.offset_stage(&topition).await?
         );
 
         Ok(())

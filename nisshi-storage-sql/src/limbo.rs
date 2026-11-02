@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::Debug,
     marker::PhantomData,
@@ -29,8 +29,8 @@ use crate::{
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_produce_partition_check,
-        txn_produce_partition_select, watermark_select_for_write,
+        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -2246,6 +2246,52 @@ impl Storage for Engine {
         }
 
         Ok(results)
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup(txn_offset_commit_tp_select_pending::QUERY)?,
+                (self.cluster.as_str(), group_id),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
+
+        let columns = ResultColumns::turso(txn_offset_commit_tp_select_pending::QUERY, &rows);
+        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)?;
+        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)?;
+
+        let mut pending = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
+                value
+                    .as_text()
+                    .cloned()
+                    .ok_or(Error::UnexpectedValue(value))
+            })?;
+
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+            _ = pending.insert(Topition::new(topic, partition));
+        }
+
+        debug!(cluster = self.cluster, group_id, ?pending);
+
+        Ok(pending)
     }
 
     async fn offset_fetch(

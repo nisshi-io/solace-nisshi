@@ -1,3 +1,31 @@
+experimental = ["setup-scripts"]
+
+# A test still running after 5 minutes is killed, locally as in CI, so a test
+# that hangs doesn't hold its database and catalog connections until someone
+# stops the run.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# In a linked worktree, the tests that use PostgreSQL, MinIO or the lakehouse
+# catalog run against the worktree's own compose project, which this script
+# starts and writes to .env. In the main checkout and in CI, the script does
+# nothing, and the tests use the services that `just ci` started.
+[scripts.setup.worktree-services]
+command = "etc/worktree-services.sh up"
+# A cold start of the services on a loaded machine takes minutes, and a start
+# still running after 10 minutes is killed instead of holding the run.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.scripts]]
+filter = "package(nisshi-broker) | package(nisshi-storage-sql) | package(nisshi-schema)"
+setup = "worktree-services"
+
+# Each Iceberg test runs a query engine and opens connections to the catalog
+# and to MinIO, so a run starts at most 4 of them at once.
+[[profile.default.overrides]]
+filter = "package(nisshi-schema) & binary(berg)"
+test-group = "berg"
+
 # CI selects this profile with NEXTEST_PROFILE=ci; local runs keep the
 # default profile. A test still running after 5 minutes is killed rather
 # than holding the runner until the job times out. The slowest test,
@@ -17,6 +45,7 @@ path = "junit.xml"
 [test-groups]
 durability = { max-threads = 1 }
 consumer-group-members = { max-threads = 1 }
+berg = { max-threads = 4 }
 
 # The settings of the smoke suite (nisshi-smoke-test). Each Kafka CLI call has
 # its own timeout, and `slow-timeout` stops a test that hangs anywhere else.
@@ -46,3 +75,20 @@ success-output = "immediate"
 [profile.smoke-s3]
 inherits = "smoke"
 default-filter = "test(/^topic_admin::topic_lifecycle::/) | test(=every_test_file_is_declared)"
+
+# `just test-fast` selects this profile: the tests that need no docker compose
+# service, for a checkout without the services. The recipe also sets
+# NISSHI_WORKTREE_SERVICES=0, so the worktree-services setup script, which this
+# profile inherits from the default one, starts nothing. It leaves out the
+# nisshi-broker tests that need Postgres (the `pg` modules, and three files that
+# use Postgres throughout) and the nisshi-schema tests that need the Iceberg
+# catalog and MinIO. The nisshi-storage-sql Postgres tests stay in, because they
+# skip themselves when Postgres is down. CI runs the full suite.
+[profile.fast]
+default-filter = """
+not (
+    (binary_id(nisshi-broker::it) & test(/(^|::)pg(_|::|$)|^produce_idempotent_race::|^produce_row_locks::|^authentication_storage::postgres_starts$/))
+  | binary_id(nisshi-schema::berg)
+  | (package(nisshi-schema) & kind(lib) & test(/^lake::berg::tests::create_(duplicate_)?(namespace|table)$/))
+)
+"""

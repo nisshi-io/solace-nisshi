@@ -30,7 +30,7 @@ use tracing::{debug, error, instrument};
 use crate::{
     ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result, TimestampType,
     record::{
-        Header, Record,
+        Record,
         codec::{
             DecodeBudget, MAX_DECODED_BATCH_BYTES, MAX_PREALLOCATED_ELEMENTS,
             MIN_ENCODED_RECORD_SIZE, exceeds_decoded_batch_limit,
@@ -612,7 +612,7 @@ fn decode_records(
 
     for _ in 0..record_count {
         let record = Record::decode(&mut record_data)?;
-        budget.charge(allocated_size(&record))?;
+        budget.charge(record.allocated_size())?;
         records.push(record);
     }
 
@@ -621,15 +621,6 @@ fn decode_records(
     }
 
     Ok(records)
-}
-
-/// What decoding a record allocates beyond the record data it was decoded
-/// from: the `Record` itself and its `Vec<Header>`. Keys and values are
-/// slices of the record data, so the caller charges the record data once
-/// instead: `inflate_records` does so for a compressed batch, and the frame
-/// size bounds an uncompressed one.
-fn allocated_size(record: &Record) -> usize {
-    size_of::<Record>() + record.headers.len() * size_of::<Header>()
 }
 
 impl TryFrom<&Batch> for Vec<Record> {
@@ -705,7 +696,7 @@ mod tests {
         BatchAttribute, ControlBatch, EndTransactionMarker,
         de::BatchDecoder,
         primitive::varint::{LongVarInt, VarInt},
-        record::inflated,
+        record::{Header, inflated},
     };
 
     use super::*;
@@ -2118,6 +2109,210 @@ mod tests {
 
         assert!(matches!(err, Error::ApiError(ErrorCode::CorruptMessage)));
         assert_eq!(damaged, batch);
+
+        Ok(())
+    }
+
+    /// Decodes the records of `batch`, compressed with `compression`, against a decode budget of
+    /// `limit` bytes, as `Vec::<Record>::try_from` does against `MAX_DECODED_BATCH_BYTES`.
+    fn decode_within(
+        batch: &Batch,
+        compression: &Compression,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        let record_count = usize::try_from(batch.record_count)?;
+
+        if *compression == Compression::None {
+            decode_records(
+                batch.record_data.clone(),
+                record_count,
+                &mut DecodeBudget::new(limit),
+            )
+        } else {
+            inflate_records(
+                compression.clone(),
+                batch.record_data.clone().reader(),
+                record_count,
+                limit,
+                limit,
+            )
+        }
+    }
+
+    /// Asserts that `inflated`, encoded with `compression`, decodes within a budget of exactly
+    /// its `decoded_size` and not within a byte less.
+    fn assert_decodes_at_exactly_its_decoded_size(
+        inflated: &inflated::Batch,
+        compression: &Compression,
+    ) -> Result<()> {
+        let size = inflated.decoded_size(compression)?;
+
+        let mut encoded = inflated.clone();
+        encoded.attributes = BatchAttribute::try_from(encoded.attributes)
+            .map(|attribute| attribute.compression(compression.clone()).into())?;
+        let batch = Batch::try_from(encoded)?;
+
+        // A rebased record keeps the `length` that it was decoded with, and encoding computes
+        // the length from the fields, so the records are compared as encoded.
+        let encoded = |records: &[Record]| {
+            records
+                .iter()
+                .map(Encode::encode)
+                .collect::<Result<Vec<_>>>()
+        };
+
+        assert_eq!(
+            encoded(&inflated.records)?,
+            encoded(&decode_within(&batch, compression, size)?)?,
+            "{compression:?}: decodes within its decoded size, {size}"
+        );
+
+        assert_matches!(
+            decode_within(&batch, compression, size - 1),
+            Err(Error::MessageMaxSizeExceeded(_)),
+            "{compression:?}: does not decode within a byte less than its decoded size, {size}"
+        );
+
+        Ok(())
+    }
+
+    fn records_to_measure() -> Result<Vec<Record>> {
+        Ok(vec![
+            Record::builder()
+                .key(Some(Bytes::from_static(b"key")))
+                .value(Some(Bytes::from_static(LOREM)))
+                .header(
+                    Header::builder()
+                        .key(Bytes::from_static(b"format"))
+                        .value(Bytes::from_static(b"text")),
+                )
+                .header(Header::builder().key(Bytes::from_static(b"empty")))
+                .build()?,
+            Record::builder().offset_delta(1).build()?,
+            Record::builder()
+                .offset_delta(2)
+                .timestamp_delta(7)
+                .key(Some(Bytes::new()))
+                .value(Some(Bytes::from(vec![0xa5; 4096])))
+                .build()?,
+        ])
+    }
+
+    /// `decoded_size` is exactly what the decoder charges to the decode budget, for every codec.
+    #[test]
+    fn decoded_size_is_what_decoding_charges_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let inflated = inflated::Batch {
+            records: records_to_measure()?,
+            last_offset_delta: 2,
+            ..Default::default()
+        };
+
+        for compression in EVERY_CODEC {
+            assert_decodes_at_exactly_its_decoded_size(&inflated, &compression)?;
+        }
+
+        Ok(())
+    }
+
+    /// A gzip batch whose `decoded_size` is exactly `MAX_DECODED_BATCH_BYTES` decodes through the
+    /// production conversion, and one a byte larger does not.
+    #[test]
+    fn gzip_batch_decodes_at_the_decoded_limit_and_not_a_byte_over() -> Result<()> {
+        let batch_of = |len: usize| -> Result<inflated::Batch> {
+            Ok(inflated::Batch {
+                attributes: BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+                records: vec![Record {
+                    value: Some(Bytes::from(vec![0u8; len])),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+
+        // The length varint of the value is the same width throughout, so each byte of value
+        // adds one byte of decoded size.
+        let mut len = MAX_DECODED_BATCH_BYTES - 1024;
+        len += MAX_DECODED_BATCH_BYTES - batch_of(len)?.decoded_size(&Compression::Gzip)?;
+
+        let at_the_limit = batch_of(len)?;
+        assert_eq!(
+            MAX_DECODED_BATCH_BYTES,
+            at_the_limit.decoded_size(&Compression::Gzip)?
+        );
+        assert_eq!(
+            1,
+            Vec::<Record>::try_from(Batch::try_from(at_the_limit)?)?.len()
+        );
+
+        let over_the_limit = batch_of(len + 1)?;
+        assert_eq!(
+            MAX_DECODED_BATCH_BYTES + 1,
+            over_the_limit.decoded_size(&Compression::Gzip)?
+        );
+        assert_matches!(
+            Vec::<Record>::try_from(Batch::try_from(over_the_limit)?),
+            Err(Error::MessageMaxSizeExceeded(_))
+        );
+
+        Ok(())
+    }
+
+    /// `appended_decoded_size` is exactly how much `decoded_size` grows when `append_rebased`
+    /// appends a batch, for every codec, including when the rebase widens the varints of the
+    /// offset and timestamp deltas.
+    #[test]
+    fn appended_decoded_size_is_the_growth_of_the_merged_decoded_size_for_every_codec() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        // Offset delta 64 is the first that zigzag-encodes in two bytes, so the appended records
+        // move from one-byte to two-byte offset deltas.
+        let sink_records = (0..64)
+            .map(|offset_delta| Record::builder().offset_delta(offset_delta).build())
+            .collect::<Result<Vec<_>>>()?;
+
+        let sink = inflated::Batch {
+            base_timestamp: 1_000,
+            max_timestamp: 1_000,
+            records: sink_records,
+            last_offset_delta: 63,
+            ..Default::default()
+        };
+
+        // A base timestamp a long way after the sink's widens the appended timestamp deltas.
+        let appended = inflated::Batch {
+            base_timestamp: 1_000 + (1 << 40),
+            max_timestamp: 1_000 + (1 << 40) + 7,
+            records: records_to_measure()?,
+            last_offset_delta: 2,
+            ..Default::default()
+        };
+
+        for compression in EVERY_CODEC {
+            let growth = sink.appended_decoded_size(&appended, &compression)?;
+
+            let mut merged = sink.clone();
+            merged.append_rebased(appended.clone())?;
+
+            assert_eq!(
+                sink.decoded_size(&compression)? + growth,
+                merged.decoded_size(&compression)?,
+                "{compression:?}"
+            );
+
+            if compression != Compression::None {
+                assert!(
+                    growth > appended.decoded_size(&compression)?,
+                    "{compression:?}: the rebase widens the varints of the appended records"
+                );
+            }
+
+            assert_decodes_at_exactly_its_decoded_size(&merged, &compression)?;
+        }
 
         Ok(())
     }

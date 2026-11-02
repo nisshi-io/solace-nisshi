@@ -49,7 +49,7 @@ fn protocols(metadata: &'static [u8]) -> Vec<JoinGroupRequestProtocol> {
     ]
 }
 
-async fn null_storage() -> Result<ArcDynStorage> {
+pub(super) async fn null_storage() -> Result<ArcDynStorage> {
     let mut builder = StorageContainer::builder();
     builder.with_factory(Arc::new(nisshi_storage_null::EngineFactory));
 
@@ -1134,6 +1134,7 @@ fn offset_commit(generation_id: Option<i32>, member_id: Option<&str>) -> OffsetC
         group_instance_id: None,
         retention_time_ms: None,
         topics: None,
+        is_transactional: false,
     }
 }
 

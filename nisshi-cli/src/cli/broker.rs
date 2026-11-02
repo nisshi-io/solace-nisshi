@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -546,54 +548,83 @@ impl Arg {
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
         let broker = broker.lake_house(lake_house);
 
-        if !self.silent {
-            let sheet = Sheet::default();
+        // The broker prints the banner once its listener is bound, so that a broker that
+        // fails to start prints only the error.
+        let banner = (!self.silent).then(|| {
+            banner(
+                &listener,
+                &advertised_listener,
+                &storage_engine,
+                schema_registry_url.as_ref(),
+                self.cert.as_deref(),
+            )
+        });
 
-            println!(
-                "nisshi {} {}",
-                "broker".if_supports_color(Stream::Stdout, |text| text.style(sheet.headline)),
-                env!("CARGO_PKG_VERSION")
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.version))
-            );
-
-            println!(
-                "listener: {} (advertised: {})",
-                listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
-                advertised_listener.if_supports_color(Stream::Stdout, |text| text
-                    .style(sheet.advertised_listener))
-            );
-
-            println!(
-                "storage: {} {:?}",
-                redact_url(&storage_engine)
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
-                storage_engines()
-                    .iter()
-                    .map(|storage_engine| storage_engine
-                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
-                    .collect::<Vec<_>>()
-            );
-
-            if let Some(schema_registry) = schema_registry_url {
-                println!(
-                    "schema registry: {}",
-                    redact_url(&schema_registry).if_supports_color(Stream::Stdout, |text| text
-                        .style(sheet.schema_registry))
-                );
-            }
-
-            if let Some(cert) = self.cert.as_deref() {
-                println!(
-                    "tls: {} ({})",
-                    "enabled".if_supports_color(Stream::Stdout, |text| text.style(sheet.tls)),
-                    cert.display()
-                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.tls))
-                );
-            }
-        }
-
-        broker.build().await.map_err(Into::into)
+        broker.banner(banner).build().await.map_err(Into::into)
     }
+}
+
+/// Returns the lines that the broker prints when it starts listening: its version, listener,
+/// storage, and the schema registry and TLS certificate when it has them.
+fn banner(
+    listener: &Url,
+    advertised_listener: &Url,
+    storage_engine: &Url,
+    schema_registry: Option<&Url>,
+    cert: Option<&Path>,
+) -> String {
+    let sheet = Sheet::default();
+    let mut banner = String::new();
+
+    // Writing to a String can't fail.
+    _ = writeln!(
+        banner,
+        "nisshi {} {}",
+        "broker".if_supports_color(Stream::Stdout, |text| text.style(sheet.headline)),
+        env!("CARGO_PKG_VERSION")
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.version))
+    );
+
+    _ = writeln!(
+        banner,
+        "listener: {} (advertised: {})",
+        listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
+        advertised_listener
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.advertised_listener))
+    );
+
+    _ = writeln!(
+        banner,
+        "storage: {} {:?}",
+        redact_url(storage_engine)
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
+        storage_engines()
+            .iter()
+            .map(|storage_engine| storage_engine
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
+            .collect::<Vec<_>>()
+    );
+
+    if let Some(schema_registry) = schema_registry {
+        _ = writeln!(
+            banner,
+            "schema registry: {}",
+            redact_url(schema_registry)
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.schema_registry))
+        );
+    }
+
+    if let Some(cert) = cert {
+        _ = writeln!(
+            banner,
+            "tls: {} ({})",
+            "enabled".if_supports_color(Stream::Stdout, |text| text.style(sheet.tls)),
+            cert.display()
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.tls))
+        );
+    }
+
+    banner
 }
 
 struct Sheet {
