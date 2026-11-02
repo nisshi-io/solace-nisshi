@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "fuzz",
     "nisshi",
+    "nisshi-fuzz-harness",
     "nisshi-auth",
     "nisshi-broker",
     "nisshi-cat",
@@ -131,6 +132,7 @@ nisshi-broker = { version = "0.8.2", path = "nisshi-broker", default-features = 
 nisshi-cat = { version = "0.8.2", path = "nisshi-cat", default-features = false }
 nisshi-cli = { version = "0.8.2", path = "nisshi-cli", default-features = false }
 nisshi-client = { version = "0.8.2", path = "nisshi-client", default-features = false }
+nisshi-fuzz-harness = { version = "0.8.2", path = "nisshi-fuzz-harness", default-features = false }
 nisshi-generator = { version = "0.8.2", path = "nisshi-generator", default-features = false }
 nisshi-model = { version = "0.8.2", path = "nisshi-model", default-features = false }
 nisshi-otel = { version = "0.8.2", path = "nisshi-otel", default-features = false }

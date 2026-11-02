@@ -264,6 +264,7 @@ pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
 
 pub use version_gate::{
     CAPPED_API_VERSIONS, VersionGateLayer, VersionGateService, capped_range, routable_max_version,
+    routable_range,
 };
 
 pub use input::TcpListenerInput;

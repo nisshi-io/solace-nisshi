@@ -4118,11 +4118,10 @@ dependencies = [
 name = "fuzz"
 version = "0.8.2"
 dependencies = [
- "arbitrary",
  "bytes",
  "libfuzzer-sys",
+ "nisshi-fuzz-harness",
  "nisshi-sans-io",
- "nisshi-service",
  "nisshi-storage",
  "nisshi-storage-dynostore",
  "rama",
@@ -6042,6 +6041,20 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "nisshi-fuzz-harness"
+version = "0.8.2"
+dependencies = [
+ "arbitrary",
+ "nisshi-sans-io",
+ "nisshi-service",
+ "nisshi-storage",
+ "nisshi-storage-dynostore",
+ "rama",
+ "tokio",
+ "url",
 ]
 
 [[package]]

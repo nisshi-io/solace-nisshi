@@ -25,8 +25,8 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{api_version, check_request, check_response};
 use libfuzzer_sys::fuzz_target;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::CreateTopicsRequest;
 use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;

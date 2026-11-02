@@ -1,0 +1,27 @@
+[package]
+name = "nisshi-fuzz-harness"
+description = "The checks that the fuzz targets and their tests share"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
+nisshi-service.workspace = true
+
+[dev-dependencies]
+arbitrary.workspace = true
+nisshi-storage.workspace = true
+nisshi-storage-dynostore.workspace = true
+rama.workspace = true
+tokio.workspace = true
+url.workspace = true

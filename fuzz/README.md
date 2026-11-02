@@ -26,7 +26,9 @@ The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each. `just f
 
 ## Versions
 
-A `fuzz_<api>_storage` target takes a `u16` beside the request. `fuzz::api_version` maps it onto one of the API's valid versions, and the target encodes the request and the response at that version, so old, non-flexible encodings are fuzzed too. `fuzz/tests/versions.rs` runs the same check over every version of several APIs from fixed pseudo-random inputs, without libFuzzer: `cargo test -p fuzz`.
+A `fuzz_<api>_storage` target takes a `u16` beside the request. `nisshi_fuzz_harness::api_version` maps it onto one of the versions of the API that nisshi routes, and the target encodes the request and the response at that version, so old, non-flexible encodings are fuzzed too. Produce v0-2, ListOffsets v7-9 and AddPartitionsToTxn v4-5 are not routed, so they are not fuzzed. The checks live in the `nisshi-fuzz-harness` crate, whose `tests/versions.rs` runs them over every routed version of every storage target's API from fixed pseudo-random inputs, without libFuzzer. `just test-workspace` runs those tests, and so does `cargo test -p nisshi-fuzz-harness`.
+
+The version selector is read before the request, so a crash artifact in `artifacts/<target>/`, or a corpus entry, saved before a storage target took it decodes to a different request, and replaying it passes. Replay such an artifact on a checkout from before the change. The `fuzz-corpus-*` cache that the nightly run restores starts these targets over for the same reason.
 
 ## Adding a target
 

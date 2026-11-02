@@ -28,8 +28,8 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{api_version, check_request, check_response};
 use libfuzzer_sys::fuzz_target;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::FindCoordinatorRequest;
 use nisshi_storage::{FindCoordinatorService, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
