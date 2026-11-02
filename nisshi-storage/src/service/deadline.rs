@@ -46,6 +46,25 @@ use crate::METER;
 /// [#L144-L149]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L144-L149
 pub(crate) const LIST_OFFSETS_READ_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long DeleteRecords may spend in storage, for the whole request.
+///
+/// A partition still unanswered at this deadline answers `REQUEST_TIMED_OUT`
+/// with a low watermark of -1. A retry is safe, because a cut at or below
+/// the log start changes nothing.
+///
+/// The bound is this constant, not the request's `timeout_ms`. Kafka cuts
+/// the logs first and then waits at most `timeout_ms` for its replicas to
+/// advance the low watermark ([ReplicaManager.scala#L1317-L1336]), and
+/// answers `REQUEST_TIMED_OUT` only for a partition still waiting at the
+/// end ([DelayedDeleteRecords.scala#L55-L56]). Nisshi has no replicas, so
+/// a client's short `timeout_ms` must not cut work that Kafka completes.
+/// The value is the one of [`LIST_OFFSETS_READ_DEADLINE`], under the Java
+/// admin client's 30s `request.timeout.ms`.
+///
+/// [ReplicaManager.scala#L1317-L1336]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1317-L1336
+/// [DelayedDeleteRecords.scala#L55-L56]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedDeleteRecords.scala#L55-L56
+pub(crate) const DELETE_RECORDS_DEADLINE: Duration = Duration::from_secs(5);
+
 static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_storage_read_deadline_exceeded")
