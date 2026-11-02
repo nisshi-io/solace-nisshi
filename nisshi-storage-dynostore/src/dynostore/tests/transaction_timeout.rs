@@ -264,6 +264,131 @@ async fn timed_out_transaction_that_produced_is_aborted() -> Result<(), Error> {
     Ok(())
 }
 
+/// Starts the transaction `transaction` with one data record in the partition, and returns its
+/// producer.
+async fn produce_in(
+    storage: &DynoStore,
+    transaction: &str,
+    timeout_ms: i32,
+) -> Result<ProducerIdResponse, Error> {
+    let producer = storage
+        .init_producer(Some(transaction), timeout_ms, Some(-1), Some(-1))
+        .await?;
+    assert_eq!(ErrorCode::None, producer.error);
+
+    let TxnAddPartitionsResponse::VersionZeroToThree(results) = storage
+        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: transaction.into(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: vec![
+                AddPartitionsToTxnTopic::default()
+                    .name(TOPIC.into())
+                    .partitions(Some(vec![0])),
+            ],
+        })
+        .await?
+    else {
+        unreachable!("version zero to three request")
+    };
+    assert!(results.iter().all(|topic| {
+        topic
+            .results_by_partition
+            .iter()
+            .flatten()
+            .all(|partition| partition.partition_error_code == i16::from(ErrorCode::None))
+    }));
+
+    let batch = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from_static(b"abc"))))
+        .attributes(BatchAttribute::default().transaction(true).into())
+        .producer_id(producer.id)
+        .producer_epoch(producer.epoch)
+        .base_sequence(0)
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    _ = storage
+        .produce(Some(transaction), &Topition::new(TOPIC, 0), batch)
+        .await?;
+
+    Ok(producer)
+}
+
+/// An abort that waits behind another producer's ongoing transaction on the partition is swept
+/// on every tick, and each sweep leaves the log as it is: the markers are written once.
+#[tokio::test]
+async fn waiting_abort_writes_its_markers_once() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let storage = storage().await?;
+    let topition = Topition::new(TOPIC, 0);
+
+    // The other producer's transaction starts first and outlives the sweep.
+    let other = produce_in(&storage, "other", 3_600_000).await?;
+    _ = produce_in(&storage, TRANSACTION, TIMEOUT_MS).await?;
+
+    storage.maintain_transactions(after_timeout()).await?;
+
+    // One record for each producer, and the abort marker of the swept one.
+    let stage = storage.offset_stage(&topition).await?;
+    assert_eq!(3, stage.high_watermark());
+
+    for _ in 0..3 {
+        storage.maintain_transactions(after_timeout()).await?;
+    }
+
+    let stage = storage.offset_stage(&topition).await?;
+    assert_eq!(3, stage.high_watermark());
+
+    // The other transaction ends, and the waiting abort finishes with it.
+    assert_eq!(
+        ErrorCode::None,
+        storage
+            .txn_end("other", other.id, other.epoch, true)
+            .await?
+    );
+
+    let stage = storage.offset_stage(&topition).await?;
+    assert_eq!(stage.high_watermark(), stage.last_stable());
+
+    Ok(())
+}
+
+/// The sweep read the transaction before it ended it, so the sweep ends it only if it has timed
+/// out at the time it ends it: a client can have started its next transaction in between.
+#[tokio::test]
+async fn sweep_leaves_a_transaction_that_has_not_timed_out() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let storage = storage().await?;
+    let producer = init(&storage, TIMEOUT_MS).await?;
+
+    commit_offset(&storage, &producer).await?;
+
+    assert_matches!(
+        storage
+            .end_transaction(
+                TRANSACTION,
+                producer.id,
+                producer.epoch,
+                false,
+                Some(SystemTime::now())
+            )
+            .await,
+        Err(Error::Api(ErrorCode::InvalidTxnState))
+    );
+
+    // The producer is not fenced, and its offset is still pending.
+    assert_eq!(pending(), storage.pending_txn_offsets(GROUP).await?);
+    assert_eq!(
+        ErrorCode::None,
+        storage
+            .txn_end(TRANSACTION, producer.id, producer.epoch, true)
+            .await?
+    );
+
+    Ok(())
+}
+
 /// A timeout of 0 never expires, and a transaction that has not started
 /// has nothing to expire.
 #[tokio::test]

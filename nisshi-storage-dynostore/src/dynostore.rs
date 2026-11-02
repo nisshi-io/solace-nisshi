@@ -814,6 +814,13 @@ struct TxnDetail {
     state: Option<TxnState>,
     produces: BTreeMap<Topic, BTreeMap<Partition, Option<TxnProduceOffset>>>,
     offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>>,
+
+    /// Whether the end-of-transaction marker is stored in every partition that the transaction
+    /// produced to. A prepared end that waits behind an overlapping transaction is retried, and
+    /// the retry skips the markers once this is set, because a second set only extends the
+    /// ranges in `produces`.
+    #[serde(default)]
+    markers_written: bool,
 }
 
 impl Txn {
@@ -840,6 +847,7 @@ impl TxnDetail {
         ) {
             self.started_at = Some(now);
             self.state = Some(TxnState::Begin);
+            self.markers_written = false;
         }
     }
 
@@ -847,10 +855,11 @@ impl TxnDetail {
     /// with a timeout of 0 never times out.
     ///
     /// Kafka sweeps only an ongoing transaction. This also sweeps an abort that is prepared in
-    /// an epoch that is no longer the newest, which only a sweep leaves, because it fences the
-    /// producer: the abort stopped part way, and no client can retry it. A client's own abort
-    /// that waits behind an older transaction is in the newest epoch, and is left alone, or the
-    /// sweep would fence a producer that only waits.
+    /// an epoch that is no longer the newest, which a sweep and a rollback in `InitProducerId`
+    /// leave, because each fences the producer: the abort stopped part way or waits behind an
+    /// older transaction, and no client can retry it. A client's own abort that waits behind an
+    /// older transaction is in the newest epoch, and is left alone, or the sweep would fence a
+    /// producer that only waits.
     ///
     /// <https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionStateManager.scala#L120-L139>
     fn timed_out(&self, now: SystemTime, newest_epoch: bool) -> bool {
@@ -2313,17 +2322,22 @@ impl DynoStore {
         }
     }
 
-    /// Ends the transaction. A `fence` ends a timed out transaction on the broker's own account:
-    /// it also fences the producer, so that it cannot add to the transaction after it ended, and
-    /// can end the transaction of an epoch that it fenced on an earlier attempt.
+    /// Ends the transaction. A `sweep_at` ends a timed out transaction on the broker's own
+    /// account: it also fences the producer, so that it cannot add to the transaction after it
+    /// ended, and can end the transaction of an epoch that it fenced on an earlier attempt. It
+    /// ends the transaction only if the transaction has timed out at that time, because the
+    /// sweep chose it from an earlier read, and the client can have ended it and started the
+    /// next one since.
     async fn end_transaction(
         &self,
         transaction_id: &str,
         producer_id: i64,
         producer_epoch: i16,
         committed: bool,
-        fence: bool,
+        sweep_at: Option<SystemTime>,
     ) -> Result<ErrorCode> {
+        let fence = sweep_at.is_some();
+
         let produced = self
             .meta
             .with_mut(&self.object_store, |meta| {
@@ -2341,9 +2355,21 @@ impl DynoStore {
                     return Err(Error::Api(ErrorCode::ProducerFenced));
                 }
 
+                let newest_epoch = transaction
+                    .epochs
+                    .last_key_value()
+                    .is_some_and(|(newest, _)| *newest == producer_epoch);
+
                 let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch) else {
                     return Err(Error::Api(ErrorCode::ProducerFenced));
                 };
+
+                if let Some(now) = sweep_at
+                    && !txn_detail.timed_out(now, newest_epoch)
+                {
+                    debug!(state = ?txn_detail.state, "transaction is not timed out");
+                    return Err(Error::Api(ErrorCode::InvalidTxnState));
+                }
 
                 // A retry must repeat the decision that was prepared:
                 // markers of the opposite kind after the first would
@@ -2383,11 +2409,14 @@ impl DynoStore {
                 // never marked. Retrying a partition whose marker already
                 // landed just writes a second, harmless marker at a new
                 // offset - strictly better than one that's missing
-                // forever.
-                if matches!(
-                    txn_detail.state,
-                    Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
-                ) {
+                // forever. Once every marker is written, a retry that only
+                // waits for an overlapping transaction skips them.
+                if !txn_detail.markers_written
+                    && matches!(
+                        txn_detail.state,
+                        Some(TxnState::PrepareCommit) | Some(TxnState::PrepareAbort)
+                    )
+                {
                     for (topic, partitions) in &txn_detail.produces {
                         for (partition, offset_range) in partitions {
                             debug!(?topic, partition, ?offset_range);
@@ -2498,6 +2527,12 @@ impl DynoStore {
                     return Err(Error::Api(ErrorCode::ProducerFenced));
                 }
 
+                if let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch)
+                    && txn_detail.state.is_some_and(|state| state.is_prepared())
+                {
+                    txn_detail.markers_written = true;
+                }
+
                 let mut overlaps =
                     meta.overlapping_transactions(transaction_id, producer_id, producer_epoch)?;
                 debug!(?overlaps);
@@ -2569,6 +2604,7 @@ impl DynoStore {
 
                             txn_detail.produces.clear();
                             txn_detail.offsets.clear();
+                            txn_detail.markers_written = false;
                             _ = txn_detail.started_at.take();
                         }
                     }
@@ -4852,14 +4888,21 @@ impl Storage for DynoStore {
                     producer_id: rollback_producer_id,
                     producer_epoch: rollback_producer_epoch,
                 } => {
-                    let error_code = self
+                    // The sweep can fence this epoch between the read that chose the rollback
+                    // and this call. It then has aborted the transaction already, as the
+                    // rollback would, and the next attempt finds the newer epoch.
+                    let error_code = match self
                         .txn_end(
                             transaction_id,
                             rollback_producer_id,
                             rollback_producer_epoch,
                             false,
                         )
-                        .await?;
+                        .await
+                    {
+                        Err(Error::Api(ErrorCode::ProducerFenced)) => ErrorCode::None,
+                        otherwise => otherwise?,
+                    };
 
                     debug!(?rollback_producer_id, ?rollback_producer_epoch, ?error_code);
 
@@ -4930,6 +4973,32 @@ impl Storage for DynoStore {
         // Kafka starts the transaction, and so its timeout, at AddOffsetsToTxn, as it does at
         // AddPartitionsToTxn: the offsets partition of the group joins the transaction.
         // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2728-L2733
+        //
+        // An ongoing transaction does not change, so the read that finds it ongoing avoids a
+        // write of `meta.json`. The read can be stale, and the first stored TxnOffsetCommit
+        // starts the transaction then.
+        let starts = self
+            .meta
+            .with(&self.object_store, |meta| {
+                Ok(meta
+                    .transactions
+                    .get(transaction_id)
+                    .filter(|txn| txn.producer == producer_id)
+                    .and_then(|txn| txn.epochs.last_key_value())
+                    .is_some_and(|(epoch, detail)| {
+                        *epoch == producer_epoch
+                            && matches!(
+                                detail.state,
+                                None | Some(TxnState::Committed) | Some(TxnState::Aborted)
+                            )
+                    }))
+            })
+            .await?;
+
+        if !starts {
+            return Ok(ErrorCode::None);
+        }
+
         self.meta
             .with_mut(&self.object_store, |meta| {
                 if let Some(txn) = meta.transactions.get_mut(transaction_id)
@@ -5199,14 +5268,8 @@ impl Storage for DynoStore {
         producer_epoch: i16,
         committed: bool,
     ) -> Result<ErrorCode> {
-        self.end_transaction(
-            transaction_id,
-            producer_id,
-            producer_epoch,
-            committed,
-            false,
-        )
-        .await
+        self.end_transaction(transaction_id, producer_id, producer_epoch, committed, None)
+            .await
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
@@ -5242,31 +5305,53 @@ impl Storage for DynoStore {
                             .filter(move |(epoch, detail)| {
                                 detail.timed_out(now, Some(**epoch) == newest)
                             })
-                            .map(|(epoch, _)| (transaction_id.clone(), txn.producer, *epoch))
+                            .map(|(epoch, detail)| {
+                                (
+                                    transaction_id.clone(),
+                                    txn.producer,
+                                    *epoch,
+                                    detail.transaction_timeout_ms,
+                                    detail.state,
+                                )
+                            })
                     })
                     .collect::<Vec<_>>())
             })
             .await?;
 
-        for (transaction_id, producer_id, producer_epoch) in timed_out {
+        for (transaction_id, producer_id, producer_epoch, transaction_timeout_ms, state) in
+            timed_out
+        {
             match self
-                .end_transaction(&transaction_id, producer_id, producer_epoch, false, true)
+                .end_transaction(
+                    &transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    false,
+                    Some(now),
+                )
                 .await
             {
-                Ok(ErrorCode::None) => {
-                    debug!(
-                        transaction_id,
-                        producer_id, producer_epoch, "timed out transaction aborted"
-                    )
-                }
+                // Only the sweep that finds the transaction ongoing aborts it and fences the
+                // producer. A later sweep of an abort that still waits behind an overlapping
+                // transaction repeats every 10 s, and logs at debug.
+                Ok(ErrorCode::None) if state == Some(TxnState::Begin) => info!(
+                    transaction_id,
+                    producer_id,
+                    producer_epoch,
+                    transaction_timeout_ms,
+                    "timed out transaction aborted and its producer fenced"
+                ),
 
-                // The sweep lost a race against the client's own EndTxn.
+                // The transaction is no longer timed out, because the client ended it, or ended
+                // it and started the next one, since the sweep read it. A marker that could not
+                // be written also answers here, and the next sweep retries it.
                 Ok(error_code) | Err(Error::Api(error_code)) => debug!(
                     ?error_code,
                     transaction_id,
                     producer_id,
                     producer_epoch,
-                    "timed out transaction not aborted"
+                    "timed out transaction swept, not ended"
                 ),
 
                 Err(ref err) => error!(
