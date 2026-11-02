@@ -68,7 +68,8 @@ fn cat_error_message(error: &nisshi_cat::Error) -> String {
         nisshi_cat::Error::InvalidJson { .. }
         | nisshi_cat::Error::MessageWithoutKeyOrValue { .. }
         | nisshi_cat::Error::NoMessages { .. }
-        | nisshi_cat::Error::NotAnArray { .. } => error.to_string(),
+        | nisshi_cat::Error::NotAnArray { .. }
+        | nisshi_cat::Error::Fetch { .. } => error.to_string(),
         _ => format!("Unknown error occurred during command: {error}"),
     }
 }
