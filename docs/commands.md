@@ -194,6 +194,16 @@ over plain TCP without SASL. So the origin listener must not require
 authentication, as with a Kafka `PLAINTEXT` listener. Every client that can
 reach the proxy listener gets the proxy's access to the origin.
 
+The proxy is for development and demos, not for production, and that includes
+a proxy in front of a broker on PostgreSQL. A Postgres broker limits each
+connection to its share of the Fetch and ListOffsets reads in flight, so one
+consumer's abandoned reads cannot hold back the others. The proxy takes an
+origin connection from its pool for each request, so behind it the share
+bounds no single client: one client's abandoned reads can spread over many
+origin connections and take up to the broker's whole limit, and other
+clients' reads then wait. Nisshi does not isolate proxied clients from each
+other here.
+
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
 forward them to the origin. So a client configured for SASL fails to connect.

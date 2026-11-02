@@ -42,6 +42,22 @@
 //! still hold the engine's permits. Kafka has no such carry-over, because
 //! none of a request's work outlives its response.
 //!
+//! That is a decision, not an oversight: the proxy is for development and
+//! demos, so a proxy in front of a broker on PostgreSQL is not a supported
+//! production setup. Behind the proxy the share bounds no single client. The
+//! proxy takes an origin connection from its pool for each request, so one
+//! client's abandoned reads can spread over many origin connections' shares,
+//! up to the engine's whole limit. The engine's own limit still bounds all
+//! reads together.
+//!
+//! Keying the share on `client_id` would work without a proxy change,
+//! because the proxy forwards a client's `client_id` on Fetch and
+//! ListOffsets. It is not done because `client_id` is chosen by the client
+//! and not authenticated, so it is no isolation boundary and clients
+//! collide on its defaults, and because the share would then need a
+//! broker-wide map with eviction instead of a per-connection extension, for
+//! a setup that is not for production.
+//!
 //! [`Storage`]: crate::Storage
 
 use std::sync::{Arc, OnceLock};
