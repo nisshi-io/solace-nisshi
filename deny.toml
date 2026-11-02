@@ -30,7 +30,6 @@ ignore = [
     { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 has no fixed release, and apache-avro, iceberg, datafusion and foyer require it; none of them calls the affected with_context constructors" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release; the affected code needs the seekable feature, which nothing enables" },
     { id = "RUSTSEC-2026-0403", reason = "zstd-safe 7 (via zstd 0.13) has no fixed release, and apache-avro, iceberg, datafusion and foyer require zstd 0.13" },
-    { id = "RUSTSEC-2026-0435", reason = "thrift 0.17 unbounded allocation in TBinaryInputProtocol::read_bytes; fixed in thrift 0.23, with no 0.17.x backport. parquet 58 is the only dependent and requires ^0.17. Nothing in the graph uses the binary protocol: parquet decodes metadata with its own compact-protocol reader and uses the thrift crate only for its deprecated `format` module, which no dependent calls. parquet 59 drops thrift, but moving to it is blocked on the same datafusion, deltalake and iceberg releases as RUSTSEC-2026-0194" },
 ]
 # RUSTSEC-2026-0258 (h2) and RUSTSEC-2026-0285 (rustls) were on this list too,
 # but both had semver-compatible fixed versions available (h2 0.4.15->0.4.19,
