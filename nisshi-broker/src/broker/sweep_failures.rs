@@ -18,6 +18,9 @@
 //! persistent fault fails every tick. The log carries the first failure and then at most one line
 //! per [`REPEAT_INTERVAL`], for failures and recoveries together, and the metric counts every
 //! sweep.
+//!
+//! A recovery always gets its line. When a sweep succeeds before a line is due, the broker keeps
+//! the run of failures open and logs the recovery on the first success after the line is due.
 
 use std::{
     fmt::Display,
@@ -45,8 +48,9 @@ static SWEEPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 #[derive(Debug, Default)]
 struct State {
-    /// Failed sweeps since the last success.
-    consecutive: u64,
+    /// Failed sweeps since the last recovery line. A success that comes before a line is due does
+    /// not end the run, so this count can include sweeps that succeeded in between.
+    failed_sweeps: u64,
 
     /// Failures since the last log line.
     unlogged: u64,
@@ -118,27 +122,32 @@ impl SweepFailures {
 
         match outcome {
             Ok(()) => {
-                let failed_sweeps = std::mem::take(&mut state.consecutive);
-                state.unlogged = 0;
-
-                // The recovery line counts against the same limit as the failure lines. A sweep that
-                // alternates between failing and succeeding would otherwise log two lines per cycle.
-                if failed_sweeps > 0 && state.log_is_due(now) {
-                    // At warn, the level of the failure, so that an operator at the default level
-                    // sees it end.
-                    warn!(
-                        sweep = self.sweep,
-                        engine = %self.engine,
-                        failed_sweeps,
-                        "storage maintenance sweep succeeded again"
-                    );
-
-                    state.last_logged = Some(now);
+                // The recovery line counts against the same limit as the failure lines, because a
+                // sweep that alternates between failing and succeeding would otherwise log two
+                // lines per cycle. The run of failures stays open until the line is written, so
+                // the recovery is not lost and a failure that comes in the meantime continues the
+                // run.
+                if state.failed_sweeps == 0 || !state.log_is_due(now) {
+                    return;
                 }
+
+                // At warn, the level of the failure, so that an operator at the default level
+                // sees it end.
+                warn!(
+                    sweep = self.sweep,
+                    engine = %self.engine,
+                    failed_sweeps = state.failed_sweeps,
+                    failures_since_last_log = state.unlogged,
+                    "storage maintenance sweep succeeded again"
+                );
+
+                state.failed_sweeps = 0;
+                state.unlogged = 0;
+                state.last_logged = Some(now);
             }
 
             Err(error) => {
-                state.consecutive += 1;
+                state.failed_sweeps += 1;
                 state.unlogged += 1;
 
                 if !state.log_is_due(now) {
@@ -148,7 +157,7 @@ impl SweepFailures {
                 warn!(
                     sweep = self.sweep,
                     engine = %self.engine,
-                    consecutive_failures = state.consecutive,
+                    failed_sweeps = state.failed_sweeps,
                     failures_since_last_log = state.unlogged,
                     stopped = self.stopped,
                     %error,
@@ -273,7 +282,7 @@ mod tests {
         let logs = captured(|| failures.record(Err("disk full"), start + REPEAT_INTERVAL));
 
         assert_eq!(1, logs.matches("disk full").count(), "{logs}");
-        assert!(logs.contains("consecutive_failures=31"), "{logs}");
+        assert!(logs.contains("failed_sweeps=31"), "{logs}");
         assert!(logs.contains("failures_since_last_log=30"), "{logs}");
     }
 
@@ -299,17 +308,43 @@ mod tests {
     }
 
     #[test]
-    fn a_success_inside_the_interval_is_not_logged() {
+    fn a_sweep_that_fails_once_and_then_succeeds_logs_its_recovery_once() {
+        let failures = SweepFailures::maintain_transactions("sqlite");
+        let start = Instant::now();
+
+        let logs = captured(|| {
+            failures.record(Err("boom"), start);
+
+            // The sweep succeeds on every tick for the next 10 minutes.
+            for tick in 1..=60 {
+                failures.record(Ok::<(), &str>(()), start + Duration::from_secs(10 * tick));
+            }
+        });
+
+        // The failure at 0 and the recovery on the first success after the interval.
+        assert_eq!(2, logs.lines().count(), "{logs}");
+        assert_eq!(1, logs.matches("succeeded again").count(), "{logs}");
+        assert!(logs.contains("failed_sweeps=1"), "{logs}");
+    }
+
+    #[test]
+    fn a_failure_that_comes_before_a_held_recovery_is_logged_continues_the_run() {
         let failures = SweepFailures::maintain("memory");
         let start = Instant::now();
 
         _ = captured(|| failures.record(Err("boom"), start));
 
+        // Both of these are inside the interval, so the success is held and the failure joins the run.
         let logs = captured(|| {
             failures.record(Ok::<(), &str>(()), start + Duration::from_secs(10));
             failures.record(Err("boom"), start + Duration::from_secs(20));
         });
         assert!(logs.is_empty(), "{logs}");
+
+        let logs = captured(|| failures.record(Ok::<(), &str>(()), start + REPEAT_INTERVAL));
+        assert!(logs.contains("succeeded again"), "{logs}");
+        assert!(logs.contains("failed_sweeps=2"), "{logs}");
+        assert!(logs.contains("failures_since_last_log=1"), "{logs}");
     }
 
     #[test]
@@ -331,7 +366,17 @@ mod tests {
         });
 
         // One line at 0, 5 and 10 minutes.
-        assert_eq!(3, logs.lines().count(), "{logs}");
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(3, lines.len(), "{logs}");
+
+        // The sweep failed on ticks 2, 4 and so on up to 30 since the line at 0: 15 failures. The
+        // run counts the failure at 0 as well, and the successes in between do not end it.
+        assert!(lines[1].contains("failed_sweeps=16"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("failures_since_last_log=15"),
+            "{}",
+            lines[1]
+        );
     }
 
     /// Sums the `nisshi_storage_maintenance_sweeps` counter for `outcome`.
