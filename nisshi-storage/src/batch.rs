@@ -325,31 +325,41 @@ where
         let queued_as_sent = queued.clone();
         let decoded_limit = self.decoded_limit;
 
-        let runs = match offload(move || combine(queued, decoded_limit)).await {
-            Ok(runs) => runs,
+        let Combined { runs, rejected } =
+            match offload(move || combine(queued, decoded_limit)).await {
+                Ok(combined) => combined,
 
-            // One of the merged offset deltas overflows an `i32`. Kafka checks and stores each
-            // batch as sent, and each one may be valid, so we write each one on its own.
-            Err(Error::SansIo(nisshi_sans_io::Error::OffsetDeltaOverflow(_))) => {
-                let responses_by_owner = self
-                    .write_each_as_sent(transaction_id, topition, queued_as_sent, &attributes)
-                    .await;
+                // One of the merged offset deltas overflows an `i32`. Kafka checks and stores each
+                // batch as sent, and each one may be valid, so we write each one on its own.
+                Err(Error::SansIo(nisshi_sans_io::Error::OffsetDeltaOverflow(_))) => {
+                    let responses_by_owner = self
+                        .write_each_as_sent(transaction_id, topition, queued_as_sent, &attributes)
+                        .await;
 
-                return self.respond(responses_by_owner, &attributes);
-            }
+                    return self.respond(responses_by_owner, &attributes);
+                }
 
-            // Every queued request shares the fate of a merge that fails, for example on a batch
-            // that does not decode, so every owner, not just the one that called `send_queued`, is
-            // told the outcome.
-            Err(error) => {
-                let responses_by_owner = queued_as_sent
-                    .into_iter()
-                    .map(|owner| (owner.id, Err(error.clone())))
-                    .collect();
+                // Every queued request shares the fate of a merge that fails, so every owner, not
+                // just the one that called `send_queued`, is told the outcome.
+                Err(error) => {
+                    let responses_by_owner = queued_as_sent
+                        .into_iter()
+                        .map(|owner| (owner.id, Err(error.clone())))
+                        .collect();
 
-                return self.respond(responses_by_owner, &attributes);
-            }
-        };
+                    return self.respond(responses_by_owner, &attributes);
+                }
+            };
+
+        // A batch that does not decode fails only its own producer. The others in the flush are
+        // written as if the bad batch had not been queued.
+        self.respond(
+            rejected
+                .into_iter()
+                .map(|(owner, error)| (owner, Err(error)))
+                .collect(),
+            &attributes,
+        )?;
 
         debug!(runs = runs.len());
 
@@ -856,6 +866,16 @@ fn shares_one_log_append_time(batches: &[&deflated::Batch]) -> bool {
         .is_none_or(|first| log_append_times.all(|log_append_time| log_append_time == first))
 }
 
+/// What [`combine`] made of a queue.
+#[derive(Debug, Default)]
+struct Combined {
+    /// The batches that decoded, merged into runs, in queue order.
+    runs: Vec<Run>,
+
+    /// The owner and the error of each batch that does not decode.
+    rejected: Vec<(Uuid, Error)>,
+}
+
 /// Merges the batches of `queued`, which share one codec, into runs. A run is one batch of
 /// consecutive queued batches, in queue order, whose decoded size is at most `limit`, so that the
 /// merged batch decodes. A run closes before the next batch would take it over `limit`.
@@ -863,30 +883,49 @@ fn shares_one_log_append_time(batches: &[&deflated::Batch]) -> bool {
 /// A batch whose own decoded size is over `limit` is a run on its own. The decoder accepted it
 /// as sent, so the storage can too.
 ///
-/// A batch that does not decode, or an offset delta that overflows an `i32`, fails the merge of
-/// the whole queue.
+/// A batch that does not decode is rejected with its own error, and the other batches merge as if
+/// it had not been queued, so that one producer's bad batch fails only that producer. Kafka
+/// validates each batch on its own ([`UnifiedLog.analyzeAndValidateRecords`]) and has no
+/// cross-request coalescing.
+///
+/// An offset delta that overflows an `i32`, or another error from the merge itself, fails the
+/// merge of the whole queue.
+///
+/// [`UnifiedLog.analyzeAndValidateRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1181-L1187
 #[instrument(skip_all)]
-fn combine(queued: Vec<BatchRequest>, limit: usize) -> Result<Vec<Run>> {
+fn combine(queued: Vec<BatchRequest>, limit: usize) -> Result<Combined> {
     debug!(len = queued.len(), limit);
 
-    let Some(first) = queued.first() else {
-        return Ok(Vec::new());
-    };
-
-    // Inflating clears the codec, so we cache it to measure and compress each run the same way.
-    let compression = BatchAttribute::try_from(first.batch.attributes)?.compression;
-
     let mut runs = Vec::new();
+    let mut rejected = Vec::new();
     let mut open: Option<OpenRun> = None;
 
+    // Inflating clears the codec, so we cache the codec of the first batch that decodes, to measure
+    // and compress each run the same way.
+    let mut compression: Option<Compression> = None;
+
     for request in queued {
-        let batch = inflate_produced(request.batch.clone())?;
+        let decoded = BatchAttribute::try_from(request.batch.attributes)
+            .map(|attributes| attributes.compression)
+            .map_err(Error::from)
+            .and_then(|codec| inflate_produced(request.batch.clone()).map(|batch| (codec, batch)));
+
+        let (codec, batch) = match decoded {
+            Ok(decoded) => decoded,
+
+            Err(error) => {
+                rejected.push((request.id, error));
+                continue;
+            }
+        };
+
+        let compression = compression.get_or_insert(codec);
 
         open = Some(match open.take() {
-            None => OpenRun::new(batch, request, &compression)?,
+            None => OpenRun::new(batch, request, compression)?,
 
             Some(mut run) => {
-                let appended = run.sink.appended_decoded_size(&batch, &compression)?;
+                let appended = run.sink.appended_decoded_size(&batch, compression)?;
 
                 match run
                     .decoded_size
@@ -902,19 +941,19 @@ fn combine(queued: Vec<BatchRequest>, limit: usize) -> Result<Vec<Run>> {
 
                     None => {
                         debug!(run.decoded_size, appended, limit);
-                        runs.push(run.close(&compression)?);
-                        OpenRun::new(batch, request, &compression)?
+                        runs.push(run.close(compression)?);
+                        OpenRun::new(batch, request, compression)?
                     }
                 }
             }
         });
     }
 
-    if let Some(run) = open {
+    if let (Some(run), Some(compression)) = (open, compression) {
         runs.push(run.close(&compression)?);
     }
 
-    Ok(runs)
+    Ok(Combined { runs, rejected })
 }
 
 /// A run that [`combine`] is still adding batches to.
@@ -974,7 +1013,7 @@ mod tests {
     const MAX_MESSAGE_BYTES: usize = 1_000;
 
     /// Merges `batches` as [`combine`] does at the production limit, and returns the one merged
-    /// batch, or `None` for no batches.
+    /// batch, or `None` for no batches. The batches must all decode.
     fn combine_into_one(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
         let queued = batches
             .into_iter()
@@ -984,7 +1023,8 @@ mod tests {
             })
             .collect();
 
-        let mut runs = combine(queued, MAX_DECODED_BATCH_BYTES)?;
+        let Combined { mut runs, rejected } = combine(queued, MAX_DECODED_BATCH_BYTES)?;
+        assert!(rejected.is_empty(), "{rejected:?}");
         assert!(runs.len() <= 1, "{} runs", runs.len());
 
         Ok(runs.pop().map(|run| run.batch))
@@ -2046,12 +2086,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn coalesced_combine_failure_is_delivered_to_every_producer() -> Result<()> {
-        // `combine` itself (not just the underlying storage write) can fail
-        // to merge a coalesced batch, e.g. if one producer's batch carries
-        // a corrupt/reserved compression attribute. That failure must also
-        // be delivered to every coalesced producer, not just whichever one
-        // triggered the flush.
+    async fn undecodable_batch_fails_alone_and_the_others_in_the_flush_are_written() -> Result<()> {
+        // One producer's batch carries a reserved compression attribute, so it does not decode.
+        // Kafka validates each batch on its own, so that producer gets its own error and the other
+        // producers in the flush still get their offsets.
         const MINIMUM_DELAY: Duration = Duration::from_secs(1);
         const ADVANCE_DELAY: Duration = Duration::from_secs(5);
 
@@ -2124,24 +2162,66 @@ mod tests {
 
         let response_a = tokio::time::timeout(Duration::from_secs(60), batch_a)
             .await
-            .expect("producer A must not hang waiting for the combine failure's outcome")
+            .expect("producer A must not hang")
             .expect("join_handle");
-        assert!(
-            response_a.is_err(),
-            "expected producer A to observe the combine failure, got {response_a:?}"
-        );
+        assert_matches!(response_a, Ok(0));
 
         let response_b = tokio::time::timeout(Duration::from_secs(60), batch_b)
             .await
-            .expect("producer B must not hang waiting for the combine failure's outcome")
+            .expect("producer B must not hang")
             .expect("join_handle");
-        assert!(
-            response_b.is_err(),
-            "expected producer B to observe the combine failure, got {response_b:?}"
+        assert!(response_b.is_err(), "{response_b:?}");
+
+        // Only the good batch landed in storage.
+        assert_eq!(
+            1,
+            recorder.produced(&abc0)?.map_or(0, |batches| batches.len())
         );
 
-        // Nothing should have actually landed in storage.
-        assert_eq!(None, recorder.produced(&abc0)?);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn head_of_queue_batch_with_truncated_records_fails_alone() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)));
+
+        let attributes: i16 = BatchAttribute::default().into();
+        let abc0 = Topition::new("abc", 0);
+
+        let mut batches = vec![
+            into_batch(attributes, -1, -1, 0, &[Bytes::from_static(b"a")])?,
+            into_batch(attributes, -1, -1, 0, &[Bytes::from_static(b"b")])?,
+            into_batch(attributes, -1, -1, 0, &[Bytes::from_static(b"c")])?,
+        ];
+
+        // The first batch is the head of the queue, and half of its records are missing.
+        let len = batches[0].record_data.len();
+        batches[0].record_data = batches[0].record_data.slice(0..len / 2);
+
+        let mut produces = Vec::new();
+        for batch in batches {
+            // Each request joins the queue before the next, so their order in it is fixed.
+            produces.push(spawn_produce(&batcher, &abc0, batch));
+            yield_now().await;
+        }
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        let mut responses = Vec::new();
+        for produce in produces {
+            responses.push(produce.await.expect("join_handle"));
+        }
+
+        assert_matches!(responses[0], Err(Error::Api(ErrorCode::InvalidRecord)));
+        assert_matches!(responses[1], Ok(0));
+        assert_matches!(responses[2], Ok(1));
+        assert_eq!(
+            1,
+            recorder.produced(&abc0)?.map_or(0, |batches| batches.len())
+        );
 
         Ok(())
     }
@@ -2212,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn combine_rejects_an_undecodable_batch() -> Result<()> {
+    fn combine_rejects_only_the_undecodable_batch() -> Result<()> {
         let attributes: i16 = BatchAttribute::default().into();
 
         let mut batches = into_batches(
@@ -2223,16 +2303,34 @@ mod tests {
             &[
                 vec![Bytes::from_static(b"a")],
                 vec![Bytes::from_static(b"b")],
+                vec![Bytes::from_static(b"c")],
             ],
         )?;
 
         let len = batches[1].record_data.len();
         batches[1].record_data = batches[1].record_data.slice(0..len / 2);
 
-        assert!(matches!(
-            combine_into_one(batches),
-            Err(Error::Api(ErrorCode::InvalidRecord))
-        ));
+        let queued = batches
+            .into_iter()
+            .map(|batch| BatchRequest {
+                id: Uuid::now_v7(),
+                batch,
+            })
+            .collect::<Vec<_>>();
+        let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
+
+        let Combined { runs, rejected } = combine(queued, MAX_DECODED_BATCH_BYTES)?;
+
+        assert_matches!(
+            rejected.as_slice(),
+            [(owner, Error::Api(ErrorCode::InvalidRecord))] if *owner == ids[1]
+        );
+
+        // The batches on either side of the rejected one merge into one run.
+        assert_eq!(
+            vec![vec![ids[0], ids[2]]],
+            runs.iter().map(owner_ids).collect::<Vec<_>>()
+        );
 
         Ok(())
     }
@@ -2631,13 +2729,15 @@ mod tests {
         // Control: at the production limit the three batches merge into one run.
         assert_eq!(
             1,
-            combine(queued(&[&first, &second, &third]), MAX_DECODED_BATCH_BYTES)?.len()
+            combine(queued(&[&first, &second, &third]), MAX_DECODED_BATCH_BYTES)?
+                .runs
+                .len()
         );
 
         let queued = queued(&[&first, &second, &third]);
         let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
 
-        let runs = combine(queued, limit)?;
+        let runs = combine(queued, limit)?.runs;
 
         assert_eq!(2, runs.len());
         assert_eq!(ids[..2], owner_ids(&runs[0]));
@@ -2690,7 +2790,7 @@ mod tests {
         let queued = queued(&[&before, &over_the_limit, &after]);
         let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
 
-        let runs = combine(queued, limit)?;
+        let runs = combine(queued, limit)?.runs;
 
         assert_eq!(
             vec![vec![ids[0]], vec![ids[1]], vec![ids[2]]],
