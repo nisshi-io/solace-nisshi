@@ -4118,6 +4118,7 @@ dependencies = [
 name = "fuzz"
 version = "0.8.2"
 dependencies = [
+ "arbitrary",
  "bytes",
  "libfuzzer-sys",
  "nisshi-sans-io",

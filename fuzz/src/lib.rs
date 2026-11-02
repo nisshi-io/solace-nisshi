@@ -1,128 +1,111 @@
-use bytes::Bytes;
 use nisshi_sans_io::{ApiKey, Error, Frame, Header, Request, Response, RootMessageMeta};
+use nisshi_service::capped_range;
 
-fn api_version<T>(_: &T) -> i16
+/// The versions of `T`'s API that a client can reach: the range nisshi routes for it, which is
+/// narrower than the protocol's own for the APIs in `CAPPED_API_VERSIONS`, since
+/// `VersionGateLayer` rejects any other version before a handler sees the request.
+fn valid_versions<T>() -> std::ops::RangeInclusive<i16>
 where
     T: ApiKey,
 {
-    RootMessageMeta::messages()
-        .requests()
-        .iter()
-        .find(|(api_key, _)| **api_key == T::KEY)
-        .map(|(_, meta)| meta.version.valid.end)
-        .expect("missing metadata")
+    capped_range(T::KEY).unwrap_or_else(|| {
+        RootMessageMeta::messages()
+            .requests()
+            .get(&T::KEY)
+            .map(|meta| meta.version.valid.start..=meta.version.valid.end)
+            .expect("missing metadata")
+    })
 }
 
-/// Round-trips `request` through encode/decode twice at the request's
-/// `api_version`, and asserts the two decodes agree with each other, rather
-/// than asserting the first decode matches the pre-encode value.
+/// Maps a fuzzed `selector` onto one of the versions of `T`'s API that a client can reach, so that every
+/// target reaches every version, not only the latest.
 ///
-/// A correct encoder/decoder pair is not required to be lossless against an
-/// arbitrary in-memory value: a service may legitimately populate fields
-/// spanning several version eras at once (trusting the encoder to drop
-/// whatever doesn't apply at the negotiated version - e.g.
-/// `FindCoordinatorResponse`'s v0-3 scalar fields alongside its v4+
-/// `coordinators`), and every sequence field is generated as
-/// `Option<Vec<T>>` regardless of whether it's actually nullable on the
-/// wire, so a mandatory array left at `None` is wire-equivalent to
-/// `Some(vec![])` but not `PartialEq`. Both legitimately make the first
-/// decode differ from the original value without indicating a bug.
+/// A request and the response to it are encoded at the same version, so pick it once and pass it
+/// to both [`check_request`] and [`check_response`].
+pub fn api_version<T>(selector: u16) -> i16
+where
+    T: ApiKey,
+{
+    let versions = valid_versions::<T>();
+    let count = u16::try_from(versions.end() - versions.start() + 1).expect("a few versions");
+
+    versions.start() + i16::try_from(selector % count).expect("fits: below the version count")
+}
+
+/// Encodes `request` at `api_version`, decodes it, and asserts that encoding the decoded request
+/// gives the same bytes again. Returns the decoded request, or `None` when `request` has no
+/// encoding at that version.
 ///
-/// The first decode *is* a fixed point, though: re-encoding what the
-/// decoder already normalized for this version must decode back to exactly
-/// the same thing, which is the round-trip property a sans-io codec
-/// actually has to satisfy.
-pub fn check_request<T>(request: T) -> Result<(), Error>
+/// The check is on bytes, not on the values. A fuzzed request is an arbitrary in-memory value,
+/// and a codec isn't lossless against one: a service may fill in fields from several version eras
+/// at once and trust the encoder to drop whatever doesn't apply, and a mandatory array left at
+/// `None` is wire-equivalent to `Some(vec![])` but not `PartialEq`. What a codec does have to
+/// satisfy is that the decoder's output is a fixed point: the bytes of what it decoded must
+/// decode and encode back to those same bytes. A field the encoder skipped or wrote at the wrong
+/// width shows as different bytes the second time, where comparing two decodes can't see it.
+///
+/// `None` means the encoder refused with [`Error::MandatoryFieldUnset`]: the value leaves a
+/// field unset that is mandatory at `api_version` and nullable only at later versions, which no
+/// client could have sent at this version, so there is nothing to compare. Any other error is
+/// returned, and so is a mismatch, which panics.
+///
+/// The decoded request is what a broker would be served: a mandatory array left at `None` arrives
+/// as `Some(vec![])`, and fields outside the version's range arrive at their defaults.
+pub fn check_request<T>(request: T, api_version: i16) -> Result<Option<T>, Error>
 where
     T: Request,
 {
     let header = Header::Request {
         api_key: T::KEY,
-        api_version: api_version(&request),
+        api_version,
         correlation_id: 0,
         client_id: Some("fuzzer".into()),
     };
 
-    let once = Frame::request(header.clone(), request.into())
-        .and_then(Frame::request_from_bytes)
-        .map(|frame| frame.body)?;
-
-    let twice = Frame::request(header, once.clone())
-        .and_then(Frame::request_from_bytes)
-        .map(|frame| frame.body)?;
-
-    assert_eq!(once, twice);
-
-    Ok(())
-}
-
-/// Encodes `request` at its `api_version` and decodes it again, returning the decoded request.
-///
-/// A fuzzed request is an arbitrary in-memory value, but a broker only ever serves what came off
-/// the wire. Feeding a service the decoded request keeps the inputs to shapes a client can
-/// actually send, e.g. a mandatory array left at `None` arrives as `Some(vec![])`, and fields
-/// outside the version's range arrive at their defaults.
-pub fn normalize_request<T>(request: T) -> Result<T, Error>
-where
-    T: Request,
-{
-    let header = Header::Request {
-        api_key: T::KEY,
-        api_version: api_version(&request),
-        correlation_id: 0,
-        client_id: Some("fuzzer".into()),
+    let once = match Frame::request(header.clone(), request.into()) {
+        Err(Error::MandatoryFieldUnset(_)) => return Ok(None),
+        encoded => encoded?,
     };
 
-    let body = Frame::request(header, request.into())
-        .and_then(Frame::request_from_bytes)
-        .map(|frame| frame.body)?;
+    let body = Frame::request_from_bytes(once.clone())?.body;
 
-    T::try_from(body).map_err(|_| Error::Message("decoded the wrong request type".into()))
+    // Everything the decoder returns has an encoding at this version, so this one can't refuse.
+    let twice = Frame::request(header, body.clone())?;
+
+    assert_eq!(
+        once, twice,
+        "re-encoding the decoded request changed its bytes"
+    );
+
+    T::try_from(body)
+        .map(Some)
+        .map_err(|_| Error::Message("decoded the wrong request type".into()))
 }
 
-pub fn encode<T>(request: T) -> Result<Bytes, Error>
-where
-    T: Request,
-{
-    Frame::request(
-        Header::Request {
-            api_key: T::KEY,
-            api_version: api_version(&request),
-            correlation_id: 0,
-            client_id: Some("fuzzer".into()),
-        },
-        request.into(),
-    )
-}
-
-/// The response counterpart of [`check_request`]; see its doc comment for
-/// why this compares two decodes against each other rather than the first
-/// decode against the pre-encode value.
-pub fn check_response<T>(response: T) -> Result<(), Error>
+/// The response counterpart of [`check_request`], with one difference: a response comes out of a
+/// service, not out of a fuzzer, so [`Error::MandatoryFieldUnset`] is an error here. It is a
+/// service that answers a client at `api_version` with a field that version requires left unset.
+pub fn check_response<T>(response: T, api_version: i16) -> Result<(), Error>
 where
     T: Response,
 {
-    let api_version = api_version(&response);
+    let encode = |body| {
+        Frame::response(
+            Header::Response { correlation_id: 0 },
+            body,
+            T::KEY,
+            api_version,
+        )
+    };
 
-    let once = Frame::response(
-        Header::Response { correlation_id: 0 },
-        response.into(),
-        T::KEY,
-        api_version,
-    )
-    .and_then(|encoded| Frame::response_from_bytes(encoded, T::KEY, api_version))
-    .map(|frame| frame.body)?;
+    let once = encode(response.into())?;
+    let body = Frame::response_from_bytes(once.clone(), T::KEY, api_version)?.body;
+    let twice = encode(body)?;
 
-    let twice = Frame::response(
-        Header::Response { correlation_id: 0 },
-        once.clone(),
-        T::KEY,
-        api_version,
-    )
-    .and_then(|encoded| Frame::response_from_bytes(encoded, T::KEY, api_version))
-    .map(|frame| frame.body)?;
-
-    assert_eq!(once, twice);
+    assert_eq!(
+        once, twice,
+        "re-encoding the decoded response changed its bytes"
+    );
 
     Ok(())
 }

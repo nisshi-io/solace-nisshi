@@ -226,4 +226,7 @@ test = false
 doc = false
 bench = false
 
+[dev-dependencies]
+arbitrary.workspace = true
+
 [lints]

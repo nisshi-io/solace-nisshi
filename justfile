@@ -129,6 +129,13 @@ release-sqlite: (cargo-build "--release" "--bin" "nisshi" "--no-default-features
 test: test-workspace test-doc
 
 test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" "--exclude" "nisshi-smoke-test" args)
+    {{ just_executable() }} test-fuzz-harness
+
+# the fuzz harness's own tests, which run without libFuzzer; test-workspace excludes
+# the fuzz crate, so it runs them after the workspace. Plain `cargo test`, not nextest:
+# a second nextest run would overwrite the workspace run's JUnit report
+test-fuzz-harness:
+    cargo test --package fuzz --test versions
 
 # the tests that need no docker compose service (no Postgres, MinIO or Iceberg catalog);
 # NISSHI_WORKTREE_SERVICES=0 stops nextest's setup script starting this worktree's services

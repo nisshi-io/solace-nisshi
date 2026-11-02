@@ -434,8 +434,10 @@ fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
 
 /// An `#[arbitrary(..)]` field attribute that makes a fuzzed struct match the
 /// shape a real request/response can actually have at `latest` (the
-/// containing message's highest `validVersions` entry) — the version that
-/// `fuzz/src/lib.rs::api_version` and every fuzz target implicitly target.
+/// containing message's highest `validVersions` entry), and, for a field
+/// that a later version dropped, at the versions that still have it. The
+/// fuzz targets encode at every version of an API, picked by
+/// `fuzz/src/lib.rs::api_version`.
 ///
 /// A field whose Rust type is `Option`-wrapped only because it isn't present
 /// in every version (see [`kind`]) is otherwise filled in by the derive with
@@ -446,12 +448,16 @@ fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
 /// its version-gated `topic`/`topic_id` fields, or both at once). This
 /// function closes that gap:
 ///
-/// - Not present in `latest`'s version range at all: always `None`, via
-///   `#[arbitrary(default)]` (sound regardless of kind, since `Option<T>`'s
-///   `Default` is `None` for every `T`).
-/// - Present in `latest`'s range, untagged, and not nullable there: a
-///   wire-valid message at `latest` always carries a value, so only the
-///   `Some` arm is ever generated.
+/// - Tagged and not present in `latest`'s version range at all: always
+///   `None`, via `#[arbitrary(default)]` (sound regardless of kind, since
+///   `Option<T>`'s `Default` is `None` for every `T`).
+/// - Untagged, and not nullable at `latest` (which includes every field that
+///   a later version dropped): a wire-valid message at a version that has the
+///   field always carries a value, so only the `Some` arm is ever generated.
+///   A dropped field that was nullable at the older versions is never `None`
+///   either, so that no value is generated that a client could not send at
+///   some version that has the field. Only `FindCoordinatorResponse`'s
+///   `error_message` is such a field, and it is in a response.
 /// - Otherwise (tagged, or nullable at `latest`): both arms are legitimate
 ///   wire shapes at `latest`, so the derive's own `Option` generation is left
 ///   alone.
@@ -477,7 +483,10 @@ fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
 fn arbitrary_field_attribute(parent: Option<&Field>, latest: i16, field: &Field) -> TokenStream {
     let is_opt = is_optional(parent, field);
 
-    if is_opt && !field.versions().within(latest) {
+    // A tagged field is `None` unless a tag says otherwise, so the default is sound for it. An
+    // untagged field that a later version dropped is not: it is mandatory at the versions that
+    // have it, and the fuzzers encode at all of them (see below).
+    if is_opt && field.tag().is_some() && !field.versions().within(latest) {
         return quote! {
             #[cfg_attr(feature = "arbitrary", arbitrary(default))]
         };

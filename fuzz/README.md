@@ -24,6 +24,10 @@ The fuzz recipes in the `justfile` build with `CARGO_PROFILE_RELEASE_LTO=false`,
 
 The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each. `just fuzz-ci pr` builds only the targets of the `pr` tier, because a storage target links the whole storage stack and takes several minutes to build, which the `pr` job's timeout can't afford for all of them.
 
+## Versions
+
+A `fuzz_<api>_storage` target takes a `u16` beside the request. `fuzz::api_version` maps it onto one of the API's valid versions, and the target encodes the request and the response at that version, so old, non-flexible encodings are fuzzed too. `fuzz/tests/versions.rs` runs the same check over every version of several APIs from fixed pseudo-random inputs, without libFuzzer: `cargo test -p fuzz`.
+
 ## Adding a target
 
 1. Add `fuzz_targets/<name>.rs` and a `[[bin]]` entry in `Cargo.toml` (copy an existing one).
