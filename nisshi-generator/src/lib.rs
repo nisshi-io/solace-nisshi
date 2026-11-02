@@ -28,7 +28,7 @@ use std::{
 };
 
 use governor::{InsufficientCapacity, Jitter, Quota, RateLimiter};
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
     Ack, ByteSize, ErrorCode, ProduceRequest,
@@ -113,6 +113,7 @@ pub enum CancelKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     topic: String,
     partition: i32,
     schema_registry: Url,
@@ -328,6 +329,7 @@ impl Generate {
         let token = CancellationToken::new();
 
         let client = ConnectionManager::builder(self.configuration.broker)
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -477,6 +479,7 @@ impl Generate {
 #[derive(Clone, Debug)]
 pub struct Builder<B, T, P, S> {
     broker: B,
+    security: Security,
     topic: T,
     partition: P,
     schema_registry: S,
@@ -494,6 +497,7 @@ impl Default
     fn default() -> Self {
         Self {
             broker: Default::default(),
+            security: Default::default(),
             topic: Default::default(),
             partition: Default::default(),
             schema_registry: Default::default(),
@@ -508,9 +512,15 @@ impl Default
 }
 
 impl<B, T, P, S> Builder<B, T, P, S> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T, P, S> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -526,6 +536,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String, P, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -541,6 +552,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn partition(self, partition: i32) -> Builder<B, T, i32, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition,
             schema_registry: self.schema_registry,
@@ -556,6 +568,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn schema_registry(self, schema_registry: Url) -> Builder<B, T, P, Url> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry,
@@ -600,6 +613,7 @@ impl Builder<Url, String, i32, Url> {
     pub fn build(self) -> Result<Generate> {
         Generate::try_from(Configuration {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,

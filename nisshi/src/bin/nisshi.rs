@@ -38,6 +38,23 @@ const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
 /// the option and the environment variable that give the command its broker.
 fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
     match error {
+        _ if error.login_failure().is_some() => format!(
+            "The broker refused the login: {}. Check --sasl-username, the password in \
+            SASL_PASSWORD (or --sasl-password-file) and --sasl-mechanism.",
+            error.login_failure().unwrap_or_default()
+        ),
+        nisshi_client::Error::TlsConfiguration(reason) => format!(
+            "The TLS options can't be used: {reason}. Check --tls-ca-file, --tls-cert-file, \
+            --tls-key-file and --tls-server-name."
+        ),
+        _ if error.tls_failure().is_some() => format!(
+            "The TLS handshake with the broker failed: {}. Without --tls the command connects \
+            in plaintext. With it, add --tls-ca-file for a broker certificate that the system \
+            doesn't trust, --tls-server-name (or --tls-no-hostname-check) when the certificate \
+            is for another name, and --tls-cert-file with --tls-key-file when the broker asks \
+            for a client certificate.",
+            error.tls_failure().unwrap_or_default()
+        ),
         nisshi_client::Error::Pool(cause) if error.is_connect_failure() => format!(
             "Could not connect to the broker: {cause}. Check that it is running (nisshi broker) \
             and that {broker_option} points at it."
@@ -51,10 +68,11 @@ fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> St
             ) =>
         {
             format!(
-                "Connected to the broker, but it closed the connection: {cause}. This command \
-                connects in plaintext and does not authenticate, so it can't use a broker that \
-                serves only TLS (--cert and --key) or that requires authentication \
-                (--authentication)."
+                "Connected to the broker, but it closed the connection: {cause}. Without \
+                --tls (or another --tls-* option) this command connects in plaintext, so it \
+                can't use a broker that serves only TLS (--cert and --key). Without \
+                --sasl-username it does not log in, so it can't use a broker that requires \
+                authentication (--authentication)."
             )
         }
         _ => format!("The request to the broker failed: {error}"),
@@ -334,6 +352,10 @@ fn report_error(err: &nisshi_cli::Error) {
         | nisshi_cli::Error::TlsKeyLegacyEncrypted { .. }
         | nisshi_cli::Error::TlsKeyPassphraseFile { .. }
         | nisshi_cli::Error::TlsRequiresCertAndKey
+        | nisshi_cli::Error::SaslPasswordAmbiguous
+        | nisshi_cli::Error::SaslPasswordFile { .. }
+        | nisshi_cli::Error::SaslPasswordMissing
+        | nisshi_cli::Error::SaslPasswordNotUnicode
         | nisshi_cli::Error::LakeRequiresSchemaRegistry { .. } => report_failure!("{err}"),
         nisshi_cli::Error::Tls(error) => report_failure!(
             "TLS configuration rejected: {error}. Check that --key is the private key for the \

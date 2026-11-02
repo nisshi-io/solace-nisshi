@@ -3,11 +3,11 @@
 Nisshi is a single statically linked binary containing the following:
 
 - [broker](#broker) — an Apache Kafka®-compatible broker and schema registry
-- [topic](#topic) — create, list or delete topics (development and demos; plaintext only: no TLS or SASL)
-- [user](security.md#authentication) — create, list or delete users (development and demos; plaintext only: no TLS or SASL)
-- [cat](#cat) — consume or produce Avro, JSON or Protobuf messages to a topic (development and demos; plaintext only: no TLS or SASL)
-- generator — generate fake messages for schema-backed topics (development and demos; plaintext only: no TLS or SASL)
-- perf — measure produce and consume throughput against a broker (development and demos; plaintext only: no TLS or SASL)
+- [topic](#topic) — create, list or delete topics
+- [user](security.md#authentication) — create, list or delete users
+- [cat](#cat) — consume or produce Avro, JSON or Protobuf messages to a topic
+- generator — generate fake messages for schema-backed topics (development and demos)
+- perf — measure produce and consume throughput against a broker (development and demos)
 - [proxy](#proxy) — an Apache Kafka®-compatible proxy (development and demos, not production)
 
 ## broker
@@ -20,12 +20,12 @@ Usage: nisshi [OPTIONS]
 
 Commands:
   broker     Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
-  cat        Consume or produce Avro, JSON or Protobuf messages to a topic (development and demos)
+  cat        Consume or produce Avro, JSON or Protobuf messages to a topic
   generator  Generate fake messages for schema-backed topics (development and demos)
   perf       Measure produce and consume throughput against a broker (development and demos)
   proxy      Apache Kafka®-compatible proxy (development and demos)
-  topic      Create, list or delete topics managed by the broker (development and demos)
-  user       Create, list or delete users managed by the broker (development and demos)
+  topic      Create, list or delete topics managed by the broker
+  user       Create, list or delete users managed by the broker
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -157,6 +157,43 @@ Results in the following output:
 |         1 | 1000374 |           8.4 |       42.13 |             1 |
 |-----------+---------+---------------+-------------+---------------|
 ```
+
+## Connecting to a broker with TLS or SASL
+
+`topic`, `user`, `cat`, `generator` and `perf` connect in plaintext and don't log in, unless
+you give them the options below. They share these options, and each reads the matching
+environment variable when the option is absent. The `.env` file is read too.
+
+| Option | Environment variable | |
+| --- | --- | --- |
+| `--tls` | | Connect over TLS, trusting the system's CA certificates (`SSL_CERT_FILE` or `SSL_CERT_DIR` replace them). Each `--tls-*` option below also turns TLS on |
+| `--tls-ca-file <PEM>` | `TLS_CA_FILE` | The CA certificates that sign the broker's certificate, in place of the system's |
+| `--tls-cert-file <PEM>`, `--tls-key-file <PEM>` | `TLS_CERT_FILE`, `TLS_KEY_FILE` | The client certificate chain and private key, for a broker that asks for one. Give both |
+| `--tls-key-passphrase-file <file>` | `TLS_KEY_PASSPHRASE_FILE` | The passphrase of an encrypted PKCS#8 key, as for the broker's `--key-passphrase-file` |
+| `--tls-server-name <name>` | `TLS_SERVER_NAME` | Check the broker's certificate against this name instead of the host of `--broker` |
+| `--tls-no-hostname-check` | | Accept a certificate for another name. The certificate chain is still checked. This is Kafka's empty `ssl.endpoint.identification.algorithm` |
+| `--sasl-username <name>` | `SASL_USERNAME` | Log in with SASL as this user |
+| | `SASL_PASSWORD` | The password |
+| `--sasl-password-file <file>` | `SASL_PASSWORD_FILE` | A file with the password (a trailing newline is not part of it), in place of `SASL_PASSWORD`. Setting both is an error |
+| `--sasl-mechanism <mechanism>` | `SASL_MECHANISM` | `plain`, `scram-sha-256` or `scram-sha-512` (the default) |
+
+There is no option for the password itself, because an option is in your shell history and
+in the process list. `SASL_PASSWORD` and `SASL_USERNAME` together are Kafka's `SASL_SSL` with
+`--tls`, and `SASL_PLAINTEXT` without it.
+
+```shell
+read -rs SASL_PASSWORD && export SASL_PASSWORD
+nisshi topic list --broker tcp://broker.example.com:9092 \
+  --tls-ca-file ca.pem --sasl-username alice --sasl-mechanism scram-sha-256
+```
+
+Nisshi's own broker enables SCRAM-SHA-256 and SCRAM-SHA-512 only. `plain` is for another
+Kafka broker that enables it, and only with TLS, because PLAIN sends the password in clear text. Each connection
+logs in once, as it opens, and a broker that limits the session lifetime has the command open a
+new connection, which logs in again, a little before the limit. `proxy` has none of these
+options.
+
+If the TLS handshake or the login fails, the command says so, and which option to check.
 
 ## proxy
 

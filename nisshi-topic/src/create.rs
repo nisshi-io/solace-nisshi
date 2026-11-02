@@ -18,7 +18,7 @@ use std::{
     io::{self, Write},
 };
 
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     CreateTopicsRequest, CreateTopicsResponse, ErrorCode,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
@@ -34,6 +34,7 @@ use super::Topic;
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N, P> {
     broker: B,
+    security: Security,
     name: N,
     partitions: P,
     configs: HashMap<String, String>,
@@ -41,9 +42,15 @@ pub struct Builder<B, N, P> {
 }
 
 impl<B, N, P> Builder<B, N, P> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: Url) -> Builder<Url, N, P> {
         Builder {
             broker,
+            security: self.security,
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
@@ -54,6 +61,7 @@ impl<B, N, P> Builder<B, N, P> {
     pub fn name(self, name: impl Into<String>) -> Builder<B, String, P> {
         Builder {
             broker: self.broker,
+            security: self.security,
             name: name.into(),
             partitions: self.partitions,
             configs: self.configs,
@@ -64,6 +72,7 @@ impl<B, N, P> Builder<B, N, P> {
     pub fn partitions(self, partitions: i32) -> Builder<B, N, i32> {
         Builder {
             broker: self.broker,
+            security: self.security,
             name: self.name,
             partitions,
             configs: self.configs,
@@ -85,6 +94,7 @@ impl Builder<Url, String, i32> {
     pub fn build(self) -> Topic {
         Topic::Create(Configuration {
             broker: self.broker,
+            security: self.security,
             name: self.name,
             partitions: self.partitions,
             configs: self.configs,
@@ -96,6 +106,7 @@ impl Builder<Url, String, i32> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     name: String,
     partitions: i32,
     configs: HashMap<String, String>,
@@ -118,6 +129,7 @@ impl TryFrom<Configuration> for Create {
 impl Create {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

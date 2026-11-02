@@ -155,7 +155,7 @@ pub(super) struct Arg {
     silent: bool,
 }
 
-fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
+pub(super) fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(filename)
         .and_then(|der| der.collect::<Result<Vec<_>, TlsPkiPemError>>())
         .and_then(|certs| {
@@ -177,7 +177,7 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
 /// editors and `echo`) is not part of the passphrase. An empty file means
 /// "no passphrase", matching how OpenSSL reads a `file:` password source and
 /// how mounted secrets behave.
-fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>> {
+pub(super) fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let Some(filename) = filename else {
         return Ok(None);
     };
@@ -250,7 +250,10 @@ fn unsupported_encryption(error: &pkcs8::Error) -> Option<String> {
     }
 }
 
-fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKeyDer<'static>> {
+pub(super) fn load_private_key(
+    filename: &Path,
+    passphrase: Option<&[u8]>,
+) -> Result<PrivateKeyDer<'static>> {
     let key_error = |cause| Error::TlsPrivateKey {
         path: filename.to_path_buf(),
         cause,

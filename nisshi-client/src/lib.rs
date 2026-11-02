@@ -115,7 +115,7 @@ use std::{
     collections::BTreeMap,
     error, fmt, io,
     sync::{Arc, LazyLock, PoisonError},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 use backoff::{ExponentialBackoffBuilder, future::retry};
@@ -148,12 +148,17 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 
 mod consumer;
+mod security;
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
+pub use security::{Sasl, SaslMechanism, Security, Tls, TlsOptions};
+use security::{Session, Stream};
 
 /// Client Errors
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum Error {
+    /// The broker refused the SASL login, or does not offer the mechanism. The message says why.
+    Authentication(String),
     DeadPoolBuild(#[from] BuildError),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
@@ -165,27 +170,68 @@ pub enum Error {
     Protocol(#[from] nisshi_sans_io::Error),
     Service(#[from] nisshi_service::Error),
     Timeout(Duration),
+    /// The TLS options can't be used: a certificate, the private key or the server name. Nothing
+    /// has connected yet.
+    TlsConfiguration(String),
+    /// The TLS handshake with the broker failed: its certificate is not trusted or is not valid
+    /// for its name, it wants a client certificate, or its listener does not use TLS.
+    Tls(String),
     UnknownApiKey(i16),
     UnknownHost(Url),
 }
 
 impl Error {
+    fn tls(error: impl fmt::Display) -> Self {
+        Self::TlsConfiguration(error.to_string())
+    }
+
     /// Returns whether the client failed to open a connection to the broker, as opposed to
     /// failing after it connected. A pool error that comes from a refused, failed or timed out
     /// connection attempt is a connect failure, and a pool error that comes from waiting for a
     /// free connection is not.
     pub fn is_connect_failure(&self) -> bool {
         match self {
-            Self::Pool(cause) => !matches!(
-                cause.downcast_ref::<PoolError<Error>>(),
-                Some(
-                    PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
-                        | PoolError::Closed
-                        | PoolError::NoRuntimeSpecified
-                )
-            ),
+            Self::Pool(cause) => {
+                self.login_failure().is_none()
+                    && self.tls_failure().is_none()
+                    && !matches!(
+                        cause.downcast_ref::<PoolError<Error>>(),
+                        Some(
+                            PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
+                                | PoolError::Closed
+                                | PoolError::NoRuntimeSpecified
+                        )
+                    )
+            }
             Self::UnknownHost(_) => true,
             _ => false,
+        }
+    }
+
+    /// Returns why the TLS handshake with the broker failed, when the client connected and the
+    /// handshake then failed: the broker's certificate is not trusted or is not valid for the
+    /// broker's name, the broker wants a client certificate, or its listener does not use TLS.
+    pub fn tls_failure(&self) -> Option<&str> {
+        match self {
+            Self::Tls(message) => Some(message),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Tls(message))) => Some(message),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns why the broker refused the SASL login, when the client connected and the
+    /// broker then refused it or does not offer the mechanism.
+    pub fn login_failure(&self) -> Option<&str> {
+        match self {
+            Self::Authentication(message) => Some(message),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Authentication(message))) => Some(message),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -241,8 +287,14 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 ///  Broker connection stream with [`correlation id`][`Header#variant.Request.field.correlation_id`]
 #[derive(Debug)]
 pub struct Connection {
-    stream: TcpStream,
+    stream: Stream,
     correlation_id: i32,
+
+    /// When the broker stops accepting requests on this connection until it logs in again,
+    /// after the session lifetime that its SaslAuthenticate response sets. The client doesn't
+    /// re-authenticate: the pool discards the connection a little before then, and a new one
+    /// logs in.
+    session_expires: Option<Instant>,
 
     /// True from the write of a request until its complete response is read. A request
     /// that fails or is cancelled leaves it true, and the pool then discards the
@@ -255,6 +307,7 @@ pub struct Connection {
 pub struct ConnectionManager {
     broker: Url,
     client_id: Option<String>,
+    security: Security,
     versions: BTreeMap<i16, i16>,
     connect_timeout: Duration,
     max_idle: Duration,
@@ -302,7 +355,7 @@ impl managed::Manager for ConnectionManager {
         let backoff = ExponentialBackoffBuilder::new()
             .with_max_elapsed_time(Some(self.connect_timeout))
             .build();
-        retry(backoff, || async {
+        let stream = retry(backoff, || async {
             Ok(timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr))
                 .await
                 .unwrap_or_else(|_elapsed| Err(io::ErrorKind::TimedOut.into()))
@@ -317,15 +370,32 @@ impl managed::Manager for ConnectionManager {
                 .inspect_err(|err| {
                     debug!(broker = %self.broker, ?err, elapsed = start.elapsed().map_or(0, |duration| duration.as_millis() as u64));
                     TCP_CONNECT_ERRORS.add(1, &attributes);
-                })
-                .map(|stream| Connection {
-                    stream,
-                    correlation_id: 0,
-                    in_flight: false,
                 })?)
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+
+        // A refused TLS handshake or SASL login is not retried: the same credentials fail
+        // the same way, so the caller gets the reason at once.
+        let mut stream = match self.security.tls_config() {
+            Some(tls) => tls.connect(&self.broker, stream).await?,
+            None => Stream::Plain(stream),
+        };
+
+        let mut correlation_id = 0;
+        let mut session = Session::default();
+
+        if let Some(sasl) = self.security.sasl_config() {
+            session = sasl
+                .login(&mut stream, self.client_id.as_deref(), &mut correlation_id)
+                .await?;
+        }
+
+        Ok(Connection {
+            stream,
+            correlation_id,
+            session_expires: session.expires(Instant::now()),
+            in_flight: false,
+        })
     }
 
     async fn recycle(
@@ -359,9 +429,19 @@ impl ConnectionManager {
             return Err("idle");
         }
 
+        if obj
+            .session_expires
+            .is_some_and(|expires| Instant::now() >= expires)
+        {
+            return Err("session expiring");
+        }
+
         // An idle connection has nothing to read. Reading one byte is safe, because the
-        // pool discards the connection whenever the read returns anything.
-        match obj.stream.try_read(&mut [0u8; 1]) {
+        // pool discards the connection whenever the read returns anything. On a TLS
+        // connection it reads from the TCP socket under the TLS session, where an idle
+        // connection has nothing either, and a close_notify or an unread record is also
+        // a reason to discard.
+        match obj.stream.tcp().try_read(&mut [0u8; 1]) {
             Ok(0) => Err("closed by broker"),
             Ok(_) => Err("unread bytes"),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
@@ -419,6 +499,7 @@ async fn pool_get(pool: &Pool) -> Result<Object<ConnectionManager>, PoolError<Er
 pub struct Builder {
     broker: Url,
     client_id: Option<String>,
+    security: Security,
     max_size: Option<usize>,
     wait_timeout: Duration,
     connect_timeout: Duration,
@@ -447,6 +528,7 @@ impl Builder {
         Self {
             broker,
             client_id: None,
+            security: Security::default(),
             max_size: None,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -459,6 +541,14 @@ impl Builder {
     /// Client id used when making requests to the broker
     pub fn client_id(self, client_id: Option<String>) -> Self {
         Self { client_id, ..self }
+    }
+
+    /// How the connections are secured, by default not at all. With
+    /// [`Tls`] each connection completes a TLS handshake before anything else, and with [`Sasl`]
+    /// each connection then logs in before it carries a request, so a pool that logs in with SCRAM
+    /// pays for a login whenever it opens a connection.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
     }
 
     /// Maximum number of connections in the pool, by default twice the number of CPUs
@@ -515,10 +605,11 @@ impl Builder {
         }
     }
 
-    fn pool(&self, versions: BTreeMap<i16, i16>) -> Result<Pool, Error> {
+    fn pool(&self, versions: BTreeMap<i16, i16>, security: Security) -> Result<Pool, Error> {
         let builder = Pool::builder(ConnectionManager {
             broker: self.broker.clone(),
             client_id: self.client_id.clone(),
+            security,
             versions,
             connect_timeout: self.connect_timeout,
             max_idle: self.max_idle,
@@ -549,7 +640,10 @@ impl Builder {
             .client_software_name(Some(env!("CARGO_PKG_NAME").into()))
             .client_software_version(Some(env!("CARGO_PKG_VERSION").into()));
 
-        let client = self.pool(versions).map(Client::new)?;
+        // A broker answers ApiVersions before a login, so this pool only needs TLS.
+        let client = self
+            .pool(versions, self.security.without_sasl())
+            .map(Client::new)?;
 
         let supported = RootMessageMeta::messages().requests();
 
@@ -578,7 +672,7 @@ impl Builder {
     pub async fn build(self) -> Result<Pool, Error> {
         self.bootstrap()
             .await
-            .and_then(|versions| self.pool(versions))
+            .and_then(|versions| self.pool(versions, self.security.clone()))
     }
 }
 
@@ -959,9 +1053,9 @@ fn response_timeout(manager: &ConnectionManager, body: &Body) -> Duration {
 pub struct BytesConnectionService;
 
 impl BytesConnectionService {
-    async fn write(
+    pub(crate) async fn write(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Stream,
         frame: Bytes,
         attributes: &[KeyValue],
     ) -> Result<(), Error> {
@@ -988,7 +1082,11 @@ impl BytesConnectionService {
             .map_err(Into::into)
     }
 
-    async fn read(&self, stream: &mut TcpStream, attributes: &[KeyValue]) -> Result<Bytes, Error> {
+    pub(crate) async fn read(
+        &self,
+        stream: &mut Stream,
+        attributes: &[KeyValue],
+    ) -> Result<Bytes, Error> {
         let start = SystemTime::now();
 
         let mut size = [0u8; 4];
@@ -1029,8 +1127,8 @@ impl Service<BytesConnection> for BytesConnectionService {
             ..
         } = req;
 
-        let local = connection.stream.local_addr()?;
-        let peer = connection.stream.peer_addr()?;
+        let local = connection.stream.tcp().local_addr()?;
+        let peer = connection.stream.tcp().peer_addr()?;
 
         let attributes = [KeyValue::new("peer", peer.to_string())];
 
@@ -1345,6 +1443,7 @@ mod tests {
         Ok(ConnectionManager {
             broker: Url::parse("tcp://localhost:9092")?,
             client_id: None,
+            security: Security::default(),
             versions: BTreeMap::new(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_idle: DEFAULT_MAX_IDLE,

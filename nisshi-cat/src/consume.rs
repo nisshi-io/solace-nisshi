@@ -18,7 +18,7 @@ use crate::{Error, Result};
 
 use bytes::Bytes;
 use futures::SinkExt;
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, NULL_TOPIC_ID,
     fetch_request::{FetchPartition, FetchRequest, FetchTopic, ReplicaState},
@@ -35,6 +35,7 @@ use url::Url;
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, T, P, S> {
     broker: B,
+    security: Security,
     topic: T,
     partition: P,
     schema_registry: S,
@@ -49,9 +50,15 @@ pub(crate) type PhantomBuilder =
     Builder<PhantomData<Url>, PhantomData<String>, PhantomData<i32>, PhantomData<Option<Url>>>;
 
 impl<B, T, P, S> Builder<B, T, P, S> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T, P, S> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -66,6 +73,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String, P, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -80,6 +88,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn partition(self, partition: i32) -> Builder<B, T, i32, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition,
             schema_registry: self.schema_registry,
@@ -94,6 +103,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn schema_registry(self, schema_registry: Option<Url>) -> Builder<B, T, P, Option<Url>> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry,
@@ -145,6 +155,7 @@ impl From<Builder<Url, String, i32, Option<Url>>> for Configuration {
     fn from(builder: Builder<Url, String, i32, Option<Url>>) -> Self {
         Self {
             broker: builder.broker,
+            security: builder.security,
             topic: builder.topic,
             partition: builder.partition,
             schema_registry: builder.schema_registry,
@@ -160,6 +171,7 @@ impl From<Builder<Url, String, i32, Option<Url>>> for Configuration {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     topic: String,
     partition: i32,
     schema_registry: Option<Url>,
@@ -209,6 +221,7 @@ impl Consume {
         };
 
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -408,6 +421,7 @@ mod tests {
     fn consume(fetch_offset: i64, partition_max_bytes: i32) -> Consume {
         Consume::try_from(Configuration {
             broker: Url::parse("tcp://127.0.0.1:9092").unwrap(),
+            security: nisshi_client::Security::default(),
             topic: "taxi".into(),
             partition: 2,
             schema_registry: None,

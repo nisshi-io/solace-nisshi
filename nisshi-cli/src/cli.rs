@@ -30,6 +30,7 @@ use tracing::debug;
 
 mod broker;
 mod cat;
+mod client_security;
 mod generator;
 mod missing_feature;
 mod output;
@@ -106,7 +107,7 @@ pub struct Cli {
 }
 
 /// The `--help` note of each tool that connects to a broker as a Kafka client.
-const CLIENT_TOOL_NOTE: &str = "For development and demos. Connects in plaintext only, so it can't reach a broker listener that requires TLS or SASL.";
+const CLIENT_TOOL_NOTE: &str = "Connects in plaintext and does not log in, unless given the --tls options (TLS) or --sasl options (SASL PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512). Without them it can't reach a broker listener that requires TLS or SASL. The SASL password comes from the SASL_PASSWORD environment variable or --sasl-password-file, not from an option.";
 
 /// The `--help` note of `nisshi proxy`.
 const PROXY_NOTE: &str = "For development and demos, not production.";
@@ -116,7 +117,7 @@ enum Command {
     /// Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
     Broker(Box<broker::Arg>),
 
-    /// Consume or produce Avro, JSON or Protobuf messages to a topic (development and demos)
+    /// Consume or produce Avro, JSON or Protobuf messages to a topic
     #[command(after_help = CLIENT_TOOL_NOTE)]
     Cat {
         #[command(subcommand)]
@@ -135,14 +136,14 @@ enum Command {
     #[command(after_help = PROXY_NOTE)]
     Proxy(Box<proxy::Arg>),
 
-    /// Create, list or delete topics managed by the broker (development and demos)
+    /// Create, list or delete topics managed by the broker
     #[command(after_help = CLIENT_TOOL_NOTE)]
     Topic {
         #[command(subcommand)]
         command: topic::Command,
     },
 
-    /// Create, list or delete users managed by the broker (development and demos)
+    /// Create, list or delete users managed by the broker
     #[command(after_help = CLIENT_TOOL_NOTE)]
     User {
         #[command(subcommand)]

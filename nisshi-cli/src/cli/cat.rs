@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::DEFAULT_BROKER;
+use super::{DEFAULT_BROKER, client_security::ClientSecurity};
 use crate::{EnvVarExp, Result};
 use clap::Subcommand;
 use nisshi_cat::Cat;
@@ -46,6 +46,8 @@ pub(super) enum Command {
         /// Print no confirmation on success (errors still print)
         #[arg(long)]
         silent: bool,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// Consume Avro/JSON/Protobuf messages from a topic
@@ -85,12 +87,16 @@ pub(super) enum Command {
         /// The maximum bytes to fetch from the partition
         #[arg(long, default_value = "1048576")]
         partition_max_bytes: i32,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 }
 
-impl From<Command> for Cat {
-    fn from(value: Command) -> Self {
-        match value {
+impl TryFrom<Command> for Cat {
+    type Error = crate::Error;
+
+    fn try_from(value: Command) -> Result<Self> {
+        Ok(match value {
             Command::Produce {
                 broker,
                 topic,
@@ -98,8 +104,10 @@ impl From<Command> for Cat {
                 partition,
                 schema_registry,
                 silent,
+                security,
             } => Cat::produce()
                 .broker(broker)
+                .security(security.build()?)
                 .topic(topic)
                 .partition(partition)
                 .schema_registry(schema_registry.map(EnvVarExp::into_inner))
@@ -117,8 +125,10 @@ impl From<Command> for Cat {
                 max_bytes,
                 fetch_offset,
                 partition_max_bytes,
+                security,
             } => Cat::consume()
                 .broker(broker)
+                .security(security.build()?)
                 .topic(topic)
                 .partition(partition)
                 .schema_registry(schema_registry.map(EnvVarExp::into_inner))
@@ -128,13 +138,13 @@ impl From<Command> for Cat {
                 .fetch_offset(fetch_offset)
                 .partition_max_bytes(partition_max_bytes)
                 .build(),
-        }
+        })
     }
 }
 
 impl Command {
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        Cat::from(self).main().await.map_err(Into::into)
+        Cat::try_from(self)?.main().await.map_err(Into::into)
     }
 }
 
