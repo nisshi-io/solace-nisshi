@@ -56,29 +56,36 @@ impl AsRef<str> for MessageKind {
     }
 }
 
+/// Parses the key or value of a record, which the schema has a schema for, as JSON.
+///
+/// A record that is missing or not JSON is `INVALID_RECORD`, and the error holds no part of the
+/// record. [`validate`] and [`json_value`] both parse through this function, so that a produce and
+/// a consume refuse the same records.
+fn parse(encoded: Option<Bytes>) -> Result<Value> {
+    encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
+        serde_json::from_slice(&encoded[..]).map_err(|err| {
+            warn!(?err, len = encoded.len());
+            Error::Api(ErrorCode::InvalidRecord)
+        })
+    })
+}
+
 fn validate(validator: Option<&jsonschema::Validator>, encoded: Option<Bytes>) -> Result<()> {
     debug!(validator = ?validator, len = ?encoded.as_ref().map(Bytes::len));
 
     validator
         .map_or(Ok(()), |validator| {
-            encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
-                serde_json::from_reader(&encoded[..])
-                    .map_err(|err| {
-                        warn!(?err, len = encoded.len());
-                        Error::Api(ErrorCode::InvalidRecord)
+            parse(encoded).and_then(|instance| {
+                validator
+                    .validate(&instance)
+                    .inspect_err(|err| {
+                        warn!(
+                            instance_path = %err.instance_path(),
+                            schema_path = %err.schema_path(),
+                            ?validator
+                        );
                     })
-                    .and_then(|instance| {
-                        validator
-                            .validate(&instance)
-                            .inspect_err(|err| {
-                                warn!(
-                                    instance_path = %err.instance_path(),
-                                    schema_path = %err.schema_path(),
-                                    ?validator
-                                );
-                            })
-                            .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
-                    })
+                    .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
             })
         })
         .inspect(|r| debug!(?r))
@@ -165,18 +172,11 @@ impl Generator for Schema {
 
 /// The JSON value of a record's key or value, or `Null` when the schema has no schema for it.
 ///
-/// A record that the schema has a schema for but that is missing or not JSON is
-/// `INVALID_RECORD`, as it is when [`validate`] refuses it. The error holds no part of the
-/// record.
+/// This function parses the record but does not validate it against the schema, because a
+/// consumer prints what the topic holds. Avro and Protobuf cannot print a record that breaks its
+/// schema, since they decode it with the schema.
 fn json_value(validator: Option<&jsonschema::Validator>, encoded: Option<Bytes>) -> Result<Value> {
-    validator.map_or(Ok(Value::Null), |_| {
-        encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
-            serde_json::from_slice(&encoded[..]).map_err(|err| {
-                warn!(?err, len = encoded.len());
-                Error::Api(ErrorCode::InvalidRecord)
-            })
-        })
-    })
+    validator.map_or(Ok(Value::Null), |_| parse(encoded))
 }
 
 impl AsJsonValue for Schema {

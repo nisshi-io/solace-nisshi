@@ -622,19 +622,28 @@ fn json_value(value: Value) -> Result<JsonValue> {
             timestamp(&value, Some(DateTime::from_timestamp_nanos(inner)))
         }
 
+        // A local timestamp has no zone, and the string above has none either, so a local
+        // timestamp prints in the same form as a UTC one.
+        Value::LocalTimestampMillis(inner) => {
+            timestamp(&value, DateTime::from_timestamp_millis(inner))
+        }
+        Value::LocalTimestampMicros(inner) => {
+            timestamp(&value, DateTime::from_timestamp_micros(inner))
+        }
+        Value::LocalTimestampNanos(inner) => {
+            timestamp(&value, Some(DateTime::from_timestamp_nanos(inner)))
+        }
+
         // The other logical types are written as their underlying type, as the Avro
         // specification's JSON encoding does.
         Value::Date(inner) | Value::TimeMillis(inner) => Ok(JsonValue::Number(Number::from(inner))),
 
-        Value::TimeMicros(inner)
-        | Value::LocalTimestampMillis(inner)
-        | Value::LocalTimestampMicros(inner)
-        | Value::LocalTimestampNanos(inner) => Ok(JsonValue::Number(Number::from(inner))),
+        Value::TimeMicros(inner) => Ok(JsonValue::Number(Number::from(inner))),
 
         Value::BigDecimal(inner) => Ok(JsonValue::String(inner.to_string())),
 
-        // A decimal's scale is in the schema, which isn't here, and a duration has no JSON
-        // encoding. Refuse the record rather than guess.
+        // A decimal's scale is in the schema, which this function is not given, and a duration
+        // has no JSON encoding. Refuse the record rather than guess.
         Value::Decimal(_) | Value::Duration(_) => Err(Error::AvroToJson(SchemaKind::from(&value))),
 
         Value::Uuid(uuid) => json_value(Value::String(uuid.to_string())),
@@ -1568,6 +1577,56 @@ mod tests {
             )
             .await?
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_json_value_prints_each_timestamp_precision_and_a_negative_one() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for (logical_type, value, printed) in [
+            (
+                "timestamp-micros",
+                Value::TimestampMicros(86_400_123_456),
+                "1970-01-02T00:00:00.123456",
+            ),
+            (
+                "timestamp-nanos",
+                Value::TimestampNanos(86_400_123_456_789),
+                "1970-01-02T00:00:00.123456789",
+            ),
+            (
+                "timestamp-millis",
+                Value::TimestampMillis(-1),
+                "1969-12-31T23:59:59.999",
+            ),
+            (
+                "local-timestamp-millis",
+                Value::LocalTimestampMillis(86_400_123),
+                "1970-01-02T00:00:00.123",
+            ),
+            (
+                "local-timestamp-micros",
+                Value::LocalTimestampMicros(86_400_123_456),
+                "1970-01-02T00:00:00.123456",
+            ),
+            (
+                "local-timestamp-nanos",
+                Value::LocalTimestampNanos(86_400_123_456_789),
+                "1970-01-02T00:00:00.123456789",
+            ),
+        ] {
+            assert_eq!(
+                json!([{"key": 1, "value": printed}]),
+                as_json_value_of(
+                    (json!("int"), Value::Int(1)),
+                    (json!({"type": "long", "logicalType": logical_type}), value),
+                )
+                .await?,
+                "{logical_type}"
+            );
+        }
 
         Ok(())
     }
