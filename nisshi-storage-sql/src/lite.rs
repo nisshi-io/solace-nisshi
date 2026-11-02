@@ -6698,6 +6698,70 @@ mod tests {
         Ok(())
     }
 
+    /// `PoolConnection::execute` runs a parameterised write key through the cache. A second call
+    /// reuses the first call's statement and binds its own values.
+    #[tokio::test]
+    async fn execute_reuses_the_cached_statement_and_binds_each_call() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let key = "scram_credential_insert.sql";
+
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let db = libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        let pool = Pool::builder(ConnectionManager {
+            db: Arc::new(Mutex::new(db)),
+            busy_timeout: Duration::from_millis(100),
+        })
+        .build()?;
+
+        let connection = pool.get().await?;
+
+        assert_eq!(1, connection.execute("register_broker.sql", ["c"]).await?);
+
+        let insert = |user: &'static str, salt: &'static [u8], iterations: i32| {
+            connection.execute(
+                key,
+                (
+                    "c",
+                    user,
+                    1_i32,
+                    salt,
+                    iterations,
+                    &b"stored"[..],
+                    &b"server"[..],
+                ),
+            )
+        };
+
+        assert_eq!(1, insert("alice", b"salt-a", 4096).await?);
+        let first_statement = connection.statements.lock().unwrap().get(key).cloned();
+        assert!(first_statement.is_some());
+
+        assert_eq!(1, insert("bob", b"salt-b", 8192).await?);
+        let second_statement = connection.statements.lock().unwrap().get(key).cloned();
+        assert!(Arc::ptr_eq(
+            &first_statement.unwrap(),
+            &second_statement.unwrap()
+        ));
+
+        let credential = async |user: &str| -> Result<(Vec<u8>, i32)> {
+            let row = connection
+                .query_one("scram_credential_select.sql", ("c", user, 1_i32))
+                .await?;
+            Ok((row.get::<Vec<u8>>(0)?, row.get::<i32>(1)?))
+        };
+
+        assert_eq!((b"salt-a".to_vec(), 4096), credential("alice").await?);
+        assert_eq!((b"salt-b".to_vec(), 8192), credential("bob").await?);
+
+        Ok(())
+    }
+
     /// A connection returned to the pool inside an open transaction holds
     /// SQLite's write lock. The pool discards it on its next checkout of that
     /// object, not on return: `recycle` rejects it, dropping it closes the
