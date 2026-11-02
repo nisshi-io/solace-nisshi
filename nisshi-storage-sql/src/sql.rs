@@ -188,6 +188,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/nisshi_schema_version_insert.sql"),
         ),
         (
+            "nisshi_schema_version_update.sql",
+            include_sql!("sql/nisshi_schema_version_update.sql"),
+        ),
+        (
             "nisshi_schema_version_select.sql",
             include_sql!("sql/nisshi_schema_version_select.sql"),
         ),

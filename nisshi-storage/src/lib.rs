@@ -329,8 +329,11 @@ pub enum Error {
         schema_version: i32,
     },
 
-    /// The database records schema `recorded_version`, which is older than `schema_version`. A
-    /// broker of `schema_version` can't upgrade the recorded schema.
+    /// The database records schema `recorded_version`, which is older than `schema_version`, and
+    /// a broker of `schema_version` has no step that upgrades it. Every version from 1 has one, so
+    /// the recorded version is below 1. A `recorded_version` of 0 means that the database has
+    /// tables but records no version, and a broker of a schema newer than version 1 can't tell
+    /// which tables it lacks.
     OutdatedSchema {
         recorded_version: i32,
         schema_version: i32,

@@ -110,7 +110,7 @@ use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
-    schema::{RecordedSchema, should_create_schema},
+    schema::{Action, Migration, RecordedSchema, Schema, plan, upgraded_compatibility},
     sql::{
         consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
@@ -536,14 +536,29 @@ const SCHEMA: &str = include_str!("pg/schema.sql");
 /// schema in its `nisshi_schema_version` table.
 const SCHEMA_VERSION: i32 = 1;
 
-// The build fails here when someone changes `SCHEMA_VERSION`. In a database with tables but no
-// recorded version, `ensure_schema` creates only the missing tables, and then records
-// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a database has the
-// tables of version 1.
-const _: () = assert!(SCHEMA_VERSION == 1);
-
 /// The oldest schema version whose broker can use the schema that [`SCHEMA`] creates.
 const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
+/// The steps that upgrade a database of an earlier schema version to [`SCHEMA_VERSION`], one for
+/// each version after 1.
+///
+/// A change to [`SCHEMA`] needs a step here that makes the same change to a database of the
+/// version before it, and a new [`SCHEMA_VERSION`]. A step is a file in `pg/migrations/`.
+///
+/// A step runs in the transaction that holds the schema lock, so it can't use `create index
+/// concurrently`, and it must finish within the setup's 5 minute `statement_timeout`, or set its
+/// own with `SET LOCAL`. A step that fails rolls the whole upgrade back and stops the broker.
+const MIGRATIONS: &[Migration] = &[];
+
+/// The schema that this release creates, and the way to upgrade each earlier one to it.
+const RELEASE_SCHEMA: Schema = Schema {
+    version: SCHEMA_VERSION,
+    oldest_compatible_version: OLDEST_COMPATIBLE_SCHEMA_VERSION,
+    migrations: MIGRATIONS,
+};
+
+// The build fails here when `SCHEMA_VERSION` and `MIGRATIONS` disagree.
+const _: () = assert!(RELEASE_SCHEMA.is_consistent());
 
 /// The key of the advisory lock that [`Postgres::ensure_schema`] holds. Advisory locks share one
 /// key space per database. The key spells `nisshi`, so that it is unlikely to match another
@@ -2056,21 +2071,29 @@ impl Postgres {
     /// Makes sure that the database has the broker's schema before the broker serves a request.
     ///
     /// When the database records no schema version, this function creates the missing tables and
-    /// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+    /// records [`SCHEMA_VERSION`]. When the database records an older version, it runs the steps
+    /// of [`MIGRATIONS`] that bring the database to [`SCHEMA_VERSION`], in one transaction. It
+    /// leaves existing tables and their data as they are, except for what a step changes.
     ///
-    /// This function runs no DDL on a database that records a version. A database user that cannot
-    /// create tables can therefore start a broker on a database that records a version.
+    /// This function runs no DDL on a database that records a version that it can use as it is.
+    /// A database user that cannot create or alter tables can therefore start a broker on such a
+    /// database.
     pub(crate) async fn ensure_schema(&self) -> Result<()> {
+        self.ensure_schema_of(&RELEASE_SCHEMA, SCHEMA).await
+    }
+
+    /// Makes `ensure_schema` do its work for `schema`, whose new databases start from `create`.
+    async fn ensure_schema_of(&self, schema: &Schema, create: &str) -> Result<()> {
         let mut c = self.connection().await?;
 
         // The broker reads the version without the lock first, because a broker that holds the
         // lock and then stops answering blocks every broker that waits for it. A recorded version
-        // means a complete schema, because the transaction that creates the schema also records
-        // the version.
+        // means a complete schema, because the transaction that creates or upgrades the schema
+        // also records the version.
         {
             let tx = c.transaction().await?;
             let recorded = self.recorded_schema(&tx).await?;
-            if !should_create_schema(recorded, SCHEMA_VERSION)? {
+            if plan(recorded, schema)? == Action::Keep {
                 return tx.commit().await.map_err(Into::into);
             }
         }
@@ -2101,7 +2124,8 @@ impl Postgres {
 
         // This lock makes a second broker wait until the first broker commits the schema. The
         // second broker then finds the recorded version. Without the lock, PostgreSQL fails one of
-        // two concurrent `create table if not exists` statements with a unique violation.
+        // two concurrent `create table if not exists` statements with a unique violation, and two
+        // upgrades of one database would run each step twice.
         let locked_at_once = tx
             .query_one(
                 &format!("select pg_try_advisory_xact_lock({SCHEMA_LOCK})"),
@@ -2116,7 +2140,8 @@ impl Postgres {
         }
 
         let recorded = self.recorded_schema(&tx).await?;
-        if !should_create_schema(recorded, SCHEMA_VERSION)? {
+        let action = plan(recorded, schema)?;
+        if action == Action::Keep {
             return tx.commit().await.map_err(Into::into);
         }
 
@@ -2124,7 +2149,8 @@ impl Postgres {
         // path, for this transaction. PostgreSQL calls a namespace a schema. An unqualified `create
         // table` creates its table in the first namespace on the search path. That namespace can
         // differ from the one that holds the existing tables. The broker then finds new, empty
-        // tables instead of its data. The query returns a row only when `cluster` exists.
+        // tables instead of its data. The query returns a row only when `cluster` exists. An upgrade needs it as much as a creation,
+        // because an unqualified `alter table` finds the first table of that name on the path.
         let has_tables = tx
             .query_opt(
                 self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
@@ -2133,13 +2159,37 @@ impl Postgres {
             .await?
             .is_some();
 
+        if let (Action::Upgrade(steps), Some(recorded)) = (action, recorded) {
+            self.upgrade_schema(&tx, recorded, steps).await?;
+            tx.commit().await?;
+
+            info!(
+                from_version = recorded.version,
+                schema_version = schema.version,
+                "upgraded the schema"
+            );
+            return Ok(());
+        }
+
+        // The tables that an earlier release created without recording a version may lack tables
+        // of schema version 1, which `create` would add with `if not exists`. When this release's
+        // schema is newer, `create` would add the tables of that newer version instead, and a
+        // step would then change tables that don't match what it expects. The release refuses
+        // such a database, and the operator starts a release that records version 1 first.
+        if has_tables && !schema.migrations.is_empty() {
+            return Err(Error::OutdatedSchema {
+                recorded_version: 0,
+                schema_version: schema.version,
+            });
+        }
+
         tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
             .await?;
-        tx.batch_execute(SCHEMA).await?;
+        tx.batch_execute(create).await?;
         _ = tx
             .execute(
                 self.sql_lookup("nisshi_schema_version_insert.sql")?,
-                &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+                &[&schema.version, &schema.oldest_compatible_version],
             )
             .await?;
 
@@ -2147,13 +2197,39 @@ impl Postgres {
 
         if has_tables {
             warn!(
-                schema_version = SCHEMA_VERSION,
+                schema_version = schema.version,
                 "recorded the schema version in a database whose tables an earlier release created"
             );
         } else {
-            info!(schema_version = SCHEMA_VERSION, "created the schema");
+            info!(schema_version = schema.version, "created the schema");
         }
 
+        Ok(())
+    }
+
+    /// Runs `steps` in `tx`, which holds the schema lock, and records the version that the last
+    /// one leaves. `recorded` is what the database recorded before the first step.
+    async fn upgrade_schema(
+        &self,
+        tx: &Transaction<'_>,
+        recorded: RecordedSchema,
+        steps: &[Migration],
+    ) -> Result<()> {
+        for step in steps {
+            debug!(to_version = step.to_version);
+            tx.batch_execute(step.sql).await?;
+        }
+
+        let Some(last) = steps.last() else {
+            return Ok(());
+        };
+
+        _ = tx
+            .execute(
+                self.sql_lookup("nisshi_schema_version_update.sql")?,
+                &[&last.to_version, &upgraded_compatibility(recorded, steps)],
+            )
+            .await?;
         Ok(())
     }
 
@@ -13173,6 +13249,257 @@ mod tests {
                 assert_eq!(tables_in_first_on_path, 0);
                 assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
                 assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that upgrades a database of version 1 to version 2. It adds a table and a row, so
+    /// that a step that runs twice fails on the row, and a step that runs in part leaves the table.
+    const UPGRADE_TO_2: &[Migration] = &[Migration {
+        to_version: 2,
+        oldest_compatible_version: 1,
+        sql: "create table upgrade_marker (id int primary key); \
+              insert into upgrade_marker (id) values (1);",
+    }];
+
+    const SCHEMA_2: Schema = Schema {
+        version: 2,
+        oldest_compatible_version: 1,
+        migrations: UPGRADE_TO_2,
+    };
+
+    /// Returns the number of rows in `table` in `storage`'s database.
+    async fn count(storage: &Postgres, table: &str) -> Result<i64> {
+        storage
+            .connection()
+            .await?
+            .query_one(&format!("select count(*) from {table}"), &[])
+            .await?
+            .try_get::<_, i64>(0)
+            .map_err(Into::into)
+    }
+
+    /// A database of version 1 holds a topic and a record. A release of version 2 must upgrade it
+    /// at startup, keep the data, record version 2, and then produce and fetch.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_a_version_1_database_then_produces_and_fetches() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_a_version_1_database_then_produces_and_fetches",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                register(&storage).await?;
+
+                let topic = alphanumeric_string(15);
+                _ = storage
+                    .create_topic(
+                        CreatableTopic::default()
+                            .name(topic.clone())
+                            .num_partitions(1)
+                            .replication_factor(0)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into())),
+                        false,
+                    )
+                    .await?;
+                let topition = Topition::new(topic, 0);
+
+                let batch = || -> Result<deflated::Batch> {
+                    Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"r").into()))
+                        .build()
+                        .and_then(TryInto::try_into)
+                        .map_err(Into::into)
+                };
+                assert_eq!(0, storage.produce(None, &topition, batch()?).await?);
+                assert_eq!(recorded_version(&storage).await?, Some(1));
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                assert_eq!(count(&storage, "upgrade_marker").await?, 1);
+                assert_eq!(count(&storage, "record").await?, 1);
+
+                assert_eq!(1, storage.produce(None, &topition, batch()?).await?);
+                let fetched = storage
+                    .fetch(
+                        &topition,
+                        0,
+                        0,
+                        1_000_000,
+                        IsolationLevel::ReadUncommitted,
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .await?;
+                assert!(!fetched.is_empty());
+                assert_eq!(count(&storage, "record").await?, 2);
+
+                // The release of version 1, which a rollback runs, finds version 2 with
+                // `oldest_compatible_version` 1, and leaves the database as it is.
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Four brokers of version 2 run `ensure_schema` at the same time on one database of version
+    /// 1. Each one must succeed, and the database must run each step once: a second run of the step
+    /// in `UPGRADE_TO_2` fails on its row.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_once_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        with_empty_database(
+            "ensure_schema_upgrades_once_for_brokers_that_start_together",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                let storages = (0..BROKERS)
+                    .map(|_| database.storage())
+                    .collect::<Result<Vec<_>>>()?;
+
+                for result in future::join_all(
+                    storages
+                        .iter()
+                        .map(|storage| storage.ensure_schema_of(&SCHEMA_2, SCHEMA)),
+                )
+                .await
+                {
+                    result?;
+                }
+
+                assert_eq!(recorded_version(&storages[0]).await?, Some(2));
+                assert_eq!(count(&storages[0], "upgrade_marker").await?, 1);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails must leave the database as it was: version 1, and none of the step's
+    /// earlier statements, so the next start runs the step again.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_an_upgrade_that_fails() -> Result<()> {
+        const BROKEN: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                sql: "create table upgrade_marker (id int primary key); \
+                      insert into no_such_table (id) values (1);",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_rolls_back_an_upgrade_that_fails",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                assert_matches!(storage.ensure_schema_of(&BROKEN, SCHEMA).await, Err(_));
+
+                assert_eq!(recorded_version(&storage).await?, Some(1));
+                assert_matches!(count(&storage, "upgrade_marker").await, Err(_));
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// An earlier release created the tables in this database without recording a version, and
+    /// they may lack tables of version 1. A release of version 2 must refuse the database and
+    /// leave it as it was, so that a release of version 1 can still record its version.
+    #[tokio::test]
+    async fn ensure_schema_refuses_a_database_created_without_a_version_to_upgrade() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_refuses_a_database_created_without_a_version_to_upgrade",
+            async |database| {
+                let storage = database.storage()?;
+                database.execute(SCHEMA).await?;
+                register(&storage).await?;
+
+                assert_matches!(
+                    storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
+                    Err(Error::OutdatedSchema {
+                        recorded_version: 0,
+                        schema_version: 2,
+                    })
+                );
+
+                assert_matches!(count(&storage, "nisshi_schema_version").await, Err(_));
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The upgrade must keep a stricter `oldest_compatible_version` that the database already
+    /// records.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_never_lowers_oldest_compatible_version() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_never_lowers_oldest_compatible_version",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                database.record_schema_version(1, 2).await?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                let oldest = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select oldest_compatible_version from nisshi_schema_version",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i32>(0)?;
+                assert_eq!(oldest, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// When an existing deployment keeps its tables in the `public` namespace and the broker's
+    /// search path puts another, empty namespace first, the upgrade must change the tables in
+    /// `public`, as the creation of the version table does.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_the_namespace_that_holds_the_existing_tables() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_the_namespace_that_holds_the_existing_tables",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.execute("create schema first_on_path").await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                let marker_namespaces = storage
+                    .connection()
+                    .await?
+                    .query(
+                        "select schemaname from pg_tables where tablename = 'upgrade_marker'",
+                        &[],
+                    )
+                    .await?
+                    .iter()
+                    .map(|row| row.try_get::<_, String>(0))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(marker_namespaces, ["public"]);
                 Ok(())
             },
         )
