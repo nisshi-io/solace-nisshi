@@ -1656,7 +1656,7 @@ impl Storage for Engine {
                                         .name(config.name.clone())
                                         .value(config.value.clone())
                                         .read_only(false)
-                                        .is_default(None)
+                                        .is_default(Some(false))
                                         .config_source(Some(ConfigSource::DefaultConfig.into()))
                                         .is_sensitive(false)
                                         .synonyms(Some([].into()))

@@ -214,7 +214,11 @@ impl Proxy {
                 FrameRequestLayer::<FindCoordinatorRequest>::new(),
                 MapInputLayer::new(move |input: RequestInput<FindCoordinatorRequest>| {
                     FindCoordinatorRequest::default()
-                        .key_type(input.request.key_type)
+                        .key_type(
+                            // A v0 request has no key type and the origin may be asked at v1+,
+                            // which needs one: v0 coordinators are group coordinators.
+                            input.request.key_type.or(Some(0)),
+                        )
                         .coordinator_keys(
                             input
                                 .request

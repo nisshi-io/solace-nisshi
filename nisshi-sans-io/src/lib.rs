@@ -360,6 +360,11 @@ pub enum Error {
     Io(Arc<io::Error>),
     Message(String),
     MessageMaxSizeExceeded(usize),
+    /// A field that is mandatory and not nullable at the encoded version was left unset (`None`).
+    ///
+    /// The encoder has no bytes to write for it, and skipping it would shift every later field.
+    /// The value is the field's path, e.g. `Frame.FetchRequest.FetchTopic.FetchPartition.current_leader_epoch`.
+    MandatoryFieldUnset(String),
     NoSuchField(&'static str),
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
@@ -401,6 +406,9 @@ impl Display for Error {
             }
             Error::FromUtf8 { len, error } => {
                 write!(f, "string of {len} bytes is not valid UTF-8: {error}")
+            }
+            Error::MandatoryFieldUnset(field) => {
+                write!(f, "field {field} is mandatory at this version but unset")
             }
             Error::OffsetDeltaOverflow(sum) => {
                 write!(f, "{sum} overflows i32 when a batch is appended")

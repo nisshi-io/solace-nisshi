@@ -187,8 +187,9 @@ fn storage_error(name: String, error: &Error) -> CreatableTopicResult {
                 .then(|| "The storage is temporarily unavailable.".to_owned()),
         )
         .topic_config_error_code(None)
-        .num_partitions(None)
-        .replication_factor(None)
+        // Kafka's defaults for both: the topic was not created, so neither is known.
+        .num_partitions(Some(-1))
+        .replication_factor(Some(-1))
         .configs(Some([].into()))
 }
 

@@ -4288,7 +4288,7 @@ impl Storage for Delegate {
                         .name(name.to_owned())
                         .value(value)
                         .read_only(false)
-                        .is_default(None)
+                        .is_default(Some(false))
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
