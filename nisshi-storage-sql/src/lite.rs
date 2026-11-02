@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::header_cursor::HeaderCursor;
 use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
@@ -97,6 +98,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub mod factory;
+mod header_cursor;
 
 macro_rules! include_sql {
     ($e: expr) => {
@@ -3220,6 +3222,22 @@ impl Storage for Delegate {
             .inspect_err(|err| error!(?err))?
         };
 
+        // The topic is the base topic: a keyed fetch has a name that is not a topic.
+        let mut headers = HeaderCursor::new(
+            c.query(
+                "lite/header_fetch_range.sql",
+                (
+                    self.cluster.as_str(),
+                    base_topic,
+                    topition.partition(),
+                    offset,
+                    high_watermark,
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?,
+        );
+
         let mut batches = vec![];
 
         if let Some(row) = records.next().await? {
@@ -3248,33 +3266,15 @@ impl Storage for Delegate {
                             .inspect_err(|err| error!(?err))?,
                     );
 
-                let mut headers = c
-                    .query(
-                        "header_fetch.sql",
-                        (
-                            self.cluster.as_str(),
-                            topition.topic(),
-                            topition.partition(),
-                            base_offset,
-                        ),
-                    )
-                    .await?;
-
-                while let Some(header) = headers.next().await? {
+                for (key, value) in headers.take(base_offset).await? {
                     let mut header_builder = Header::builder();
 
-                    if let Some(k) = header
-                        .get::<Option<Vec<u8>>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
+                    if let Some(key) = key {
+                        header_builder = header_builder.key(Bytes::from(key));
                     }
 
-                    if let Some(v) = header
-                        .get::<Option<Vec<u8>>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
+                    if let Some(value) = value {
+                        header_builder = header_builder.value(Bytes::from(value));
                     }
 
                     record_builder = record_builder.header(header_builder);
@@ -3390,33 +3390,15 @@ impl Storage for Delegate {
                                 .inspect_err(|err| error!(?err))?,
                         );
 
-                    let mut headers = c
-                        .query(
-                            "header_fetch.sql",
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
+                    for (key, value) in headers.take(offset).await? {
                         let mut header_builder = Header::builder();
 
-                        if let Some(k) = header
-                            .get::<Option<Vec<u8>>>(0)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(Bytes::from(k));
+                        if let Some(key) = key {
+                            header_builder = header_builder.key(Bytes::from(key));
                         }
 
-                        if let Some(v) = header
-                            .get::<Option<Vec<u8>>>(1)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(Bytes::from(v));
+                        if let Some(value) = value {
+                            header_builder = header_builder.value(Bytes::from(value));
                         }
 
                         record_builder = record_builder.header(header_builder);
@@ -6758,6 +6740,145 @@ mod tests {
 
         assert_eq!((ErrorCode::None, record_count), delete_up_to(-1).await?);
         assert_eq!((0, None), stored_rows().await?);
+
+        Ok(())
+    }
+
+    /// A fetch returns the headers of each record on that record, in their order, whatever
+    /// the headers of the records around it: a repeated key, a header with no value, and a
+    /// record with no headers between records that have some.
+    #[tokio::test]
+    async fn fetch_returns_each_records_headers() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "fetch-returns-each-records-headers-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let cluster = "nisshi";
+        let node = 12321;
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!("file:///{db_file}"))?)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("t", 0);
+
+        let header = |key: &'static str, value: Option<&'static str>| {
+            let builder = Header::builder().key(Bytes::from_static(key.as_bytes()));
+
+            match value {
+                Some(value) => builder.value(Bytes::from_static(value.as_bytes())),
+                None => builder,
+            }
+        };
+
+        let record = |value: &'static str,
+                      headers: Vec<nisshi_sans_io::record::header::Builder>| {
+            headers.into_iter().fold(
+                Record::builder().value(Some(Bytes::from_static(value.as_bytes()))),
+                nisshi_sans_io::record::Builder::header,
+            )
+        };
+
+        let batch = inflated::Batch::builder()
+            .record(record(
+                "r0",
+                vec![header("k", Some("first")), header("k", Some("second"))],
+            ))
+            .record(record("r1", vec![]))
+            .record(record("r2", vec![header("empty", None)]))
+            .record(record(
+                "r3",
+                vec![
+                    header("a", Some("1")),
+                    header("b", Some("2")),
+                    header("c", Some("3")),
+                ],
+            ))
+            .record(record("r4", vec![]))
+            .last_offset_delta(4)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = engine.produce(None, &topition, batch).await?;
+
+        type KeyValues = Vec<(Bytes, Bytes)>;
+
+        let headers_from = async |offset: i64| -> Result<Vec<(Bytes, KeyValues)>> {
+            let mut fetched = vec![];
+
+            for batch in engine
+                .fetch(
+                    &topition,
+                    offset,
+                    0,
+                    1_000_000,
+                    IsolationLevel::ReadUncommitted,
+                    Duration::from_secs(1),
+                )
+                .await?
+            {
+                for record in inflated::Batch::try_from(&batch)?.records {
+                    fetched.push((
+                        record.value.unwrap_or_default(),
+                        record
+                            .headers
+                            .into_iter()
+                            .map(|header| {
+                                (
+                                    header.key.unwrap_or_default(),
+                                    header.value.unwrap_or_default(),
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+
+            Ok(fetched)
+        };
+
+        let pair = |key: &'static str, value: &'static str| {
+            (
+                Bytes::from_static(key.as_bytes()),
+                Bytes::from_static(value.as_bytes()),
+            )
+        };
+        let expected = [
+            ("r0", vec![pair("k", "first"), pair("k", "second")]),
+            ("r1", vec![]),
+            ("r2", vec![pair("empty", "")]),
+            ("r3", vec![pair("a", "1"), pair("b", "2"), pair("c", "3")]),
+            ("r4", vec![]),
+        ]
+        .map(|(value, headers)| (Bytes::from_static(value.as_bytes()), headers));
+
+        assert_eq!(expected.to_vec(), headers_from(0).await?);
+        assert_eq!(expected[2..].to_vec(), headers_from(2).await?);
 
         Ok(())
     }

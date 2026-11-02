@@ -175,6 +175,10 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("lite/policy_delete.sql"),
         ),
         (
+            "lite/header_fetch_range.sql",
+            include_sql!("lite/header_fetch_range.sql"),
+        ),
+        (
             "lite/policy_delete_bytes.sql",
             include_sql!("lite/policy_delete_bytes.sql"),
         ),
