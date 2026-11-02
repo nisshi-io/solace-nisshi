@@ -670,7 +670,38 @@ fn validate_timestamps(
     inflated.max_timestamp = batch.max_timestamp;
     inflated.crc = batch.crc;
 
+    // A header rewrite that this copy does not know leaves the stored header and the decoded
+    // batch apart, and a backend that stores the decoded batch's header then stores the wrong one.
+    debug_assert!(
+        headers_agree(batch, &inflated),
+        "the decoded batch's header differs from the stored batch's header: {batch:?} and {inflated:?}"
+    );
+
     Ok(Ok(inflated))
+}
+
+/// Returns whether `inflated` has every header field of `deflated`, apart from the compression
+/// bits of the attributes, which a decode clears, and the record bytes.
+fn headers_agree(deflated: &deflated::Batch, inflated: &inflated::Batch) -> bool {
+    let without_compression = |attributes: i16| {
+        BatchAttribute::try_from(attributes)
+            .map(|attributes| i16::from(attributes.compression(Compression::None)))
+    };
+
+    deflated.base_offset == inflated.base_offset
+        && deflated.batch_length == inflated.batch_length
+        && deflated.partition_leader_epoch == inflated.partition_leader_epoch
+        && deflated.magic == inflated.magic
+        && deflated.crc == inflated.crc
+        && without_compression(deflated.attributes).ok()
+            == without_compression(inflated.attributes).ok()
+        && deflated.last_offset_delta == inflated.last_offset_delta
+        && deflated.base_timestamp == inflated.base_timestamp
+        && deflated.max_timestamp == inflated.max_timestamp
+        && deflated.producer_id == inflated.producer_id
+        && deflated.producer_epoch == inflated.producer_epoch
+        && deflated.base_sequence == inflated.base_sequence
+        && usize::try_from(deflated.record_count).is_ok_and(|count| count == inflated.records.len())
 }
 
 /// Runs [`validate_timestamps`] on Tokio's blocking thread pool, because it decodes the batch, and
@@ -1235,7 +1266,7 @@ mod produce_service_tests {
     use rama::extensions::Extensions;
 
     use super::*;
-    use crate::service::counting_storage::{CountingStorage, Listing};
+    use crate::service::counting_storage::{CountingStorage, Listing, Lookup};
 
     const TOPIC: &str = "abc";
 
@@ -1363,6 +1394,43 @@ mod produce_service_tests {
             ErrorCode::UnknownTopicOrPartition
         );
         assert!(storage.produced().is_empty());
+
+        Ok(())
+    }
+
+    /// A lookup that fails does not say whether the partition exists, so the rejection stands.
+    #[tokio::test]
+    async fn a_failed_metadata_lookup_keeps_the_rejection() -> Result<()> {
+        // The topic does not exist, so a lookup that worked would replace the rejection.
+        let storage = CountingStorage::new(Listing::Topics, &[]).with_lookup(Lookup::Error);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_matches!(
+            ErrorCode::try_from(response.error_code)?,
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(1, storage.lookups());
+
+        Ok(())
+    }
+
+    /// A lookup that answers for another topic does not say whether this partition exists, so the
+    /// rejection stands.
+    #[tokio::test]
+    async fn a_metadata_lookup_that_answers_for_another_topic_keeps_the_rejection() -> Result<()> {
+        // The topic exists. The lookup lists one topic with no name and an unknown-topic error,
+        // as the null engine's listing does, which the service takes for this topic if it does not
+        // match by name.
+        let storage =
+            CountingStorage::new(Listing::NamelessTopic, &[TOPIC]).with_lookup(Lookup::Listed);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_matches!(
+            ErrorCode::try_from(response.error_code)?,
+            ErrorCode::InvalidRecord
+        );
 
         Ok(())
     }
@@ -1544,11 +1612,33 @@ where
     /// The lookup is the one that Fetch makes: every engine numbers a topic's partitions from 0,
     /// so the count of partitions bounds the valid indexes.
     async fn partition_is_missing(&self, topition: &Topition) -> bool {
-        let Ok(metadata) = self.storage.metadata(Some(&[topition.into()])).await else {
+        let Ok(metadata) = self
+            .storage
+            .metadata(Some(&[topition.into()]))
+            .await
+            .inspect_err(|error| {
+                debug!(
+                    ?error,
+                    topic = topition.topic(),
+                    "the metadata lookup for a rejected batch failed"
+                )
+            })
+        else {
             return false;
         };
 
-        let Some(topic) = metadata.topics().first() else {
+        // The null engine lists every topic whatever the lookup names, so only the entry with
+        // this topic's name answers for it.
+        let Some(topic) = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name.as_deref() == Some(topition.topic()))
+        else {
+            debug!(
+                topic = topition.topic(),
+                "the metadata lookup for a rejected batch did not answer for the topic"
+            );
+
             return false;
         };
 
@@ -1559,7 +1649,15 @@ where
 
                 !usize::try_from(topition.partition()).is_ok_and(|index| index < count)
             }
-            _ => false,
+            error_code => {
+                debug!(
+                    ?error_code,
+                    topic = topition.topic(),
+                    "the metadata lookup for a rejected batch answered an error code that does not say whether the partition exists"
+                );
+
+                false
+            }
         }
     }
 
@@ -1582,6 +1680,16 @@ where
         rejection: Rejection,
     ) -> PartitionProduceResponse {
         let rejection = if self.partition_is_missing(topition).await {
+            // The client gets the replacement, so the log keeps the reason that the batch was
+            // rejected. Once the partition exists, the same batch is rejected with that reason.
+            debug!(
+                topic = topition.topic(),
+                partition = topition.partition(),
+                error_code = ?rejection.error_code,
+                reason = %rejection.message,
+                "the rejection is replaced, because the partition does not exist"
+            );
+
             Rejection::new(
                 ErrorCode::UnknownTopicOrPartition,
                 "this server does not host this topic-partition",

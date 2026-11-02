@@ -65,9 +65,23 @@ pub(crate) enum Listing {
     NamelessTopic,
 }
 
+/// How the `metadata` lookup of named topics answers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum Lookup {
+    /// Answers for each topic that the lookup names.
+    #[default]
+    Named,
+    /// Fails with an error.
+    Error,
+    /// Answers as the `Listing` does, whatever topics the lookup names: the null engine lists every
+    /// topic.
+    Listed,
+}
+
 /// A batch that [`CountingStorage`] was asked to produce, and the method that it was asked with.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Produced {
+    pub(crate) transaction_id: Option<String>,
     pub(crate) topition: Topition,
     pub(crate) deflated: deflated::Batch,
     /// The batch that the caller decoded: `Some` when the call was `produce_inflated`, and `None`
@@ -79,6 +93,7 @@ pub(crate) struct Produced {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountingStorage {
     listing: Listing,
+    lookup: Lookup,
     topics: Arc<Mutex<BTreeSet<String>>>,
     created: Arc<Mutex<Vec<String>>>,
     listings: Arc<Mutex<usize>>,
@@ -115,6 +130,11 @@ impl CountingStorage {
             create_topic_failure: Some((name.to_owned(), error)),
             ..Self::default()
         }
+    }
+
+    /// Returns this storage, with the lookup of named topics answering as `lookup`.
+    pub(crate) fn with_lookup(self, lookup: Lookup) -> Self {
+        Self { lookup, ..self }
     }
 
     /// Deletes the topic `name`.
@@ -164,6 +184,12 @@ impl CountingStorage {
     }
 
     fn lookup(&self, ids: &[TopicId]) -> Result<Vec<MetadataResponseTopic>> {
+        match self.lookup {
+            Lookup::Named => {}
+            Lookup::Error => return Err(Error::Message("lookup failed".into())),
+            Lookup::Listed => return self.list(),
+        }
+
         let topics = self.topics.lock()?;
 
         Ok(ids
@@ -262,11 +288,12 @@ impl Storage for CountingStorage {
 
     async fn produce(
         &self,
-        _transaction_id: Option<&str>,
+        transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
         self.produced.lock()?.push(Produced {
+            transaction_id: transaction_id.map(str::to_owned),
             topition: topition.clone(),
             deflated,
             inflated: None,
@@ -277,12 +304,13 @@ impl Storage for CountingStorage {
 
     async fn produce_inflated(
         &self,
-        _transaction_id: Option<&str>,
+        transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
         self.produced.lock()?.push(Produced {
+            transaction_id: transaction_id.map(str::to_owned),
             topition: topition.clone(),
             deflated,
             inflated: Some(inflated),

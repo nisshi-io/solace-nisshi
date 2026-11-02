@@ -2615,6 +2615,18 @@ impl DynoStore {
             .map_err(unretriable_after_write)
     }
 
+    /// Returns `inflated` when the schema registry or the lake reads it, and drops it otherwise.
+    ///
+    /// [`Self::produce_with`] first reads the partition from the object store. The produce drops a
+    /// decoded batch that nothing reads only after that request, so a batch kept until then is
+    /// held, up to [`MAX_DECODED_BATCH_BYTES`], for the length of an object store round trip. We
+    /// drop it before that request instead.
+    ///
+    /// [`MAX_DECODED_BATCH_BYTES`]: nisshi_sans_io::record::MAX_DECODED_BATCH_BYTES
+    fn inflated_if_read(&self, inflated: inflated::Batch) -> Option<inflated::Batch> {
+        (self.schemas.is_some() || self.lake.is_some()).then_some(inflated)
+    }
+
     /// Returns `inflated`, or decodes `deflated` on the blocking pool when the caller passed none.
     async fn decoded(
         inflated: Option<inflated::Batch>,
@@ -3486,7 +3498,9 @@ impl Storage for DynoStore {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        self.produce_with(transaction_id, topition, deflated, Some(inflated))
+        let inflated = self.inflated_if_read(inflated);
+
+        self.produce_with(transaction_id, topition, deflated, inflated)
             .await
     }
 

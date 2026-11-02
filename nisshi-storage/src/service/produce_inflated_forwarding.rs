@@ -33,11 +33,12 @@ use crate::{
 async fn through(wrapper: impl Storage, storage: &CountingStorage) -> Result<()> {
     let deflated = deflated::Batch::default();
     let inflated = inflated::Batch::default();
+    let topition = Topition::new("abc", 0);
 
     let base_offset = wrapper
         .produce_inflated(
             Some("transaction"),
-            &Topition::new("abc", 0),
+            &topition,
             deflated.clone(),
             inflated.clone(),
         )
@@ -46,6 +47,18 @@ async fn through(wrapper: impl Storage, storage: &CountingStorage) -> Result<()>
 
     let produced = storage.produced();
     assert_eq!(1, produced.len());
+
+    // A produce that loses its transaction id is stored as a non-transactional batch, which a
+    // `read_committed` consumer reads before the transaction commits.
+    assert_eq!(
+        Some("transaction"),
+        produced[0].transaction_id.as_deref(),
+        "the wrapper did not forward the transaction id"
+    );
+    assert_eq!(
+        topition, produced[0].topition,
+        "the wrapper did not forward the topition"
+    );
     assert_eq!(deflated, produced[0].deflated);
     assert_eq!(
         Some(inflated),
