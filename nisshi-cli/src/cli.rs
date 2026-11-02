@@ -238,4 +238,43 @@ mod tests {
         assert!(!broker.contains(CLIENT_TOOL_NOTE), "{broker}");
         assert!(!broker.contains(PROXY_NOTE), "{broker}");
     }
+
+    const REGISTRY: &str = "file://./etc/schema";
+
+    /// Parses `nisshi <args>` with `SCHEMA_REGISTRY` set to `env`, or unset.
+    fn parses(env: Option<&str>, args: &[&str]) {
+        temp_env::with_var("SCHEMA_REGISTRY", env, || {
+            if let Err(e) =
+                Cli::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+            {
+                panic!("{args:?} with SCHEMA_REGISTRY={env:?}: {e}");
+            }
+        })
+    }
+
+    /// The broker's `--schema-registry` is `global`, so clap merges the matches of a tool that
+    /// declares its own into the flattened broker arguments. Parsing only `cat`'s arguments
+    /// hides that: it has to go through `Cli`.
+    #[test]
+    fn cat_parses_schema_registry_from_flag_and_environment() {
+        for args in [["cat", "produce", "t"], ["cat", "consume", "t"]] {
+            let with_flag = [&args[..], &["--schema-registry", REGISTRY]].concat();
+            parses(None, &with_flag);
+            parses(Some(REGISTRY), &args);
+            parses(None, &args);
+        }
+    }
+
+    #[test]
+    fn generator_parses_schema_registry_from_flag_and_environment() {
+        parses(None, &["generator", "t", "--schema-registry", REGISTRY]);
+        parses(Some(REGISTRY), &["generator", "t"]);
+    }
+
+    #[test]
+    fn broker_parses_schema_registry_before_and_after_a_subcommand() {
+        parses(None, &["--schema-registry", REGISTRY]);
+        parses(None, &["broker", "--schema-registry", REGISTRY]);
+        parses(Some(REGISTRY), &["broker"]);
+    }
 }

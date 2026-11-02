@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::DEFAULT_BROKER;
-use crate::Result;
+use crate::{EnvVarExp, Result};
 use clap::Subcommand;
 use nisshi_cat::Cat;
 use nisshi_sans_io::ErrorCode;
@@ -41,7 +41,7 @@ pub(super) enum Command {
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
         #[arg(long, env = "SCHEMA_REGISTRY")]
-        schema_registry: Option<Url>,
+        schema_registry: Option<EnvVarExp<Url>>,
 
         /// Print no confirmation on success (errors still print)
         #[arg(long)]
@@ -64,7 +64,7 @@ pub(super) enum Command {
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
         #[arg(long, env = "SCHEMA_REGISTRY")]
-        schema_registry: Option<Url>,
+        schema_registry: Option<EnvVarExp<Url>>,
 
         /// The maximum time in milliseconds to wait for a message
         #[arg(long, default_value = "5000")]
@@ -102,7 +102,7 @@ impl From<Command> for Cat {
                 .broker(broker)
                 .topic(topic)
                 .partition(partition)
-                .schema_registry(schema_registry)
+                .schema_registry(schema_registry.map(EnvVarExp::into_inner))
                 .file_name(file)
                 .confirm(!silent)
                 .build(),
@@ -121,7 +121,7 @@ impl From<Command> for Cat {
                 .broker(broker)
                 .topic(topic)
                 .partition(partition)
-                .schema_registry(schema_registry)
+                .schema_registry(schema_registry.map(EnvVarExp::into_inner))
                 .max_wait_time_ms(max_wait_time_ms)
                 .min_bytes(min_bytes)
                 .max_bytes(max_bytes)
