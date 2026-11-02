@@ -196,13 +196,21 @@ reach the proxy listener gets the proxy's access to the origin.
 
 The proxy is for development and demos, not for production, and that includes
 a proxy in front of a broker on PostgreSQL. A Postgres broker limits each
-connection to its share of the Fetch and ListOffsets reads in flight, so one
-consumer's abandoned reads cannot hold back the others. The proxy takes an
-origin connection from its pool for each request, so behind it the share
-bounds no single client: one client's abandoned reads can spread over many
-origin connections and take up to the broker's whole limit, and other
-clients' reads then wait. Nisshi does not isolate proxied clients from each
-other here.
+connection to its share of the Fetch and ListOffsets reads in flight. An
+abandoned read is one that its client no longer waits for, but that the
+database is still running, and it counts against its connection's share until
+the statement ends. So one connection's abandoned reads are limited to its
+share. The proxy takes an origin connection from its pool for each request,
+so behind it the share bounds no single client: one client's abandoned reads
+can spread over many origin connections and take up to the broker's whole
+limit, and other clients' reads then wait. Nisshi does not isolate proxied
+clients from each other here.
+
+Behind the proxy, this shows as reads that miss their deadline: Fetch
+responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
+partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
+`stage` set to `queued` and `limit` set to `engine`. A larger `pool_max_size`
+does not fix this, because one client can still take the whole limit.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
