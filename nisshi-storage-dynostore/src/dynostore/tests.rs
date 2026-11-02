@@ -280,6 +280,7 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         high: Some(66),
         time_index: TimeIndex::complete(),
         producer_epochs: BTreeMap::new(),
+        reclaimed: None,
     })?;
     assert!(!written.contains("timestamps"), "{written}");
     let round_trip: Watermark = serde_json::from_str(&written)?;

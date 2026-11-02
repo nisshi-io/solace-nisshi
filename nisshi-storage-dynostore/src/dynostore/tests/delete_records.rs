@@ -12,10 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::SystemTime,
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
@@ -23,7 +31,10 @@ use nisshi_sans_io::{
     record::{Record, inflated},
 };
 use nisshi_storage::{Error, Storage as _, Topition};
-use object_store::{ObjectStore as _, memory::InMemory, path::Path};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+};
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
@@ -77,6 +88,194 @@ async fn delete_records_partition(
         ErrorCode::try_from(partitions[0].error_code)?,
         partitions[0].low_watermark,
     ))
+}
+
+/// An object store that counts the listings of batch objects, and can fail
+/// every delete.
+#[derive(Clone, Debug, Default)]
+struct Counting {
+    inner: Arc<InMemory>,
+    batch_lists: Arc<AtomicUsize>,
+    deletes_fail: Arc<AtomicBool>,
+}
+
+impl Counting {
+    fn batch_lists(&self) -> usize {
+        self.batch_lists.load(Ordering::SeqCst)
+    }
+}
+
+impl Display for Counting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Counting").finish()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Counting {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        if self.deletes_fail.load(Ordering::SeqCst) {
+            return locations
+                .map(|_| {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "forced failure".into(),
+                    })
+                })
+                .boxed();
+        }
+
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        if prefix.is_some_and(|prefix| prefix.as_ref().ends_with("/records")) {
+            _ = self.batch_lists.fetch_add(1, Ordering::SeqCst);
+        }
+
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// DeleteRecords moves the low watermark and lists no batch objects, however
+/// many the partition holds, and a retry that moves nothing lists none
+/// either. `maintain` removes the objects with one listing, and lists
+/// nothing for the partition once it has reclaimed up to the cut.
+#[tokio::test]
+async fn delete_records_lists_no_batch_objects() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "many";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..50 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    counting.batch_lists.store(0, Ordering::SeqCst);
+
+    assert_eq!(
+        (ErrorCode::None, 40),
+        delete_records_partition(&storage, name, 40).await?
+    );
+    // The retry moves nothing.
+    assert_eq!(
+        (ErrorCode::None, 40),
+        delete_records_partition(&storage, name, 40).await?
+    );
+    assert_eq!(0, counting.batch_lists());
+    assert_eq!(
+        50,
+        stored_base_offsets(&counting.inner, &topition).await?.len()
+    );
+
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(1, counting.batch_lists());
+    assert_eq!(
+        (40..50).collect::<Vec<_>>(),
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(1, counting.batch_lists());
+
+    // A cut that moves lists again, once.
+    assert_eq!(
+        (ErrorCode::None, 50),
+        delete_records_partition(&storage, name, -1).await?
+    );
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(2, counting.batch_lists());
+    assert_eq!(
+        Vec::<i64>::new(),
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A reclaim that fails leaves the objects and is retried by the next
+/// `maintain`, which then cleans up.
+#[tokio::test]
+async fn maintain_retries_a_failed_reclaim() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "retry";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    counting.deletes_fail.store(false, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    Ok(())
 }
 
 /// A DeleteRecords cut removes the batch objects that lie wholly below it,
@@ -153,6 +352,7 @@ async fn delete_records_removes_batch_objects_below_the_cut() -> Result<(), Erro
         (ErrorCode::None, 4),
         delete_records_partition(&storage, name, 4).await?
     );
+    storage.maintain(SystemTime::now()).await?;
     assert_eq!(vec![3, 5], stored_base_offsets(&bucket, &topition).await?);
     assert_eq!(4, storage.offset_stage(&topition).await?.log_start());
 
@@ -162,6 +362,7 @@ async fn delete_records_removes_batch_objects_below_the_cut() -> Result<(), Erro
         (ErrorCode::None, 6),
         delete_records_partition(&storage, name, -1).await?
     );
+    storage.maintain(SystemTime::now()).await?;
     assert_eq!(
         Vec::<i64>::new(),
         stored_base_offsets(&bucket, &topition).await?
@@ -241,6 +442,7 @@ async fn delete_records_keeps_a_last_batch_that_straddles_the_cut() -> Result<()
         (ErrorCode::None, 2),
         delete_records_partition(&storage, name, 2).await?
     );
+    storage.maintain(SystemTime::now()).await?;
     assert_eq!(vec![0], stored_base_offsets(&bucket, &topition).await?);
 
     Ok(())
@@ -265,9 +467,36 @@ async fn delete_records_keeps_a_batch_written_at_the_cut() -> Result<(), Error> 
 
     // The delete read a high watermark of 6, and the batch at 6 was written
     // after that.
-    storage.delete_records_batches(&topition, 6, 6).await;
+    assert!(storage.delete_records_batches(&topition, 6, 6).await);
 
     assert_eq!(vec![6], stored_base_offsets(&bucket, &topition).await?);
+
+    Ok(())
+}
+
+/// A produce that lands after a cut at the high watermark, and before
+/// `maintain`, keeps its batch.
+#[tokio::test]
+async fn maintain_keeps_a_batch_produced_after_the_cut() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = Arc::new(InMemory::new());
+    let storage = DynoStore::new("nisshi", 1, bucket.clone())?;
+
+    let name = "after";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    assert_eq!(0, produce_batch(&storage, &topition, 3).await?);
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, -1).await?
+    );
+    assert_eq!(3, produce_batch(&storage, &topition, 2).await?);
+
+    storage.maintain(SystemTime::now()).await?;
+
+    assert_eq!(vec![3], stored_base_offsets(&bucket, &topition).await?);
 
     Ok(())
 }
