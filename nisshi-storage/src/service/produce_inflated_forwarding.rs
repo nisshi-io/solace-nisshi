@@ -19,14 +19,21 @@
 
 use nisshi_sans_io::record::{deflated, inflated};
 use rama::{Layer as _, Service as _};
-use std::{sync::Arc, time::Duration};
-use tokio::task::JoinSet;
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
+use tokio::task::{JoinSet, yield_now};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     ChannelRequestLayer, LatencyIntroducingStorage, ProduceRequestBatcher, RequestChannelService,
     RequestStorageService, Result, SemaphoreProxy, Storage, Topition, bounded_channel,
-    service::counting_storage::{CountingStorage, Listing},
+    decoded_batch_probe::probe,
+    service::{
+        ChannelRequest, Request, Response,
+        counting_storage::{CountingStorage, Listing},
+    },
 };
 
 /// Produces through `wrapper` with the decoded batch, and returns what `storage` got.
@@ -131,6 +138,68 @@ async fn request_channel_forwards_the_decoded_batch() -> Result<()> {
     _ = serving.join_all().await;
 
     outcome
+}
+
+/// A produce that waits for a slot in the channel holds only its compressed bytes, so a queue of
+/// waiting produces does not hold a decoded batch each.
+#[tokio::test]
+async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Result<()> {
+    let (sender, mut receiver) = bounded_channel(1);
+    let channel = RequestChannelService::new(sender);
+
+    let (inflated, dropped) = probe();
+    let topition = Topition::new("abc", 0);
+
+    // The first produce takes the channel's only slot, and nothing receives it yet.
+    let first = channel.produce(None, &topition, deflated::Batch::default());
+
+    let second = async {
+        yield_now().await;
+
+        channel
+            .produce_inflated(None, &topition, deflated::Batch::default(), inflated)
+            .await
+    };
+
+    let serve = async {
+        // Every branch has been polled once after these yields, so the second produce is waiting.
+        for _ in 0..4 {
+            yield_now().await;
+        }
+        let held = !dropped.load(Ordering::SeqCst);
+
+        let mut sent_without = true;
+        for offset in 0..2 {
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = receiver.recv().await.expect("a produce request");
+
+            let Request::Produce { inflated, .. } = request else {
+                panic!("{request:?}");
+            };
+            sent_without &= inflated.is_none();
+
+            reply
+                .send(Ok(Response::Produce(Ok(offset))))
+                .expect("the producer");
+        }
+
+        (held, sent_without)
+    };
+
+    let (first, second, (held, sent_without)) = tokio::join!(first, second, serve);
+
+    assert_eq!(0, first?);
+    assert_eq!(1, second?);
+    assert!(!held, "the waiting produce still held the decoded batch");
+    assert!(
+        sent_without,
+        "a produce reached storage with a decoded batch"
+    );
+
+    Ok(())
 }
 
 /// `produce` without a decoded batch still reaches storage without one.

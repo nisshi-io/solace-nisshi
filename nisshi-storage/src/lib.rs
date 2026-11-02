@@ -203,6 +203,8 @@ mod assignment;
 mod authorized_operations;
 mod batch;
 pub mod config;
+#[cfg(test)]
+mod decoded_batch_probe;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
@@ -2091,8 +2093,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// A caller that cannot promise that calls [`Storage::produce`].
     ///
     /// A wrapper must forward this method as well as [`Storage::produce`], or the default
-    /// discards the decoded batch and the inner backend decodes it again. The result and the
-    /// errors are those of [`Storage::produce`].
+    /// discards the decoded batch and the inner backend decodes it again. A wrapper that would
+    /// make the produce wait for a permit or a slot calls [`Storage::produce`] instead, so that a
+    /// waiting produce holds its compressed bytes only. The result and the errors are those of
+    /// [`Storage::produce`].
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,

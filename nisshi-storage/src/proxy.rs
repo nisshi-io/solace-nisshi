@@ -196,13 +196,21 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
+        // A produce that waits for the permit holds only its compressed bytes, so the one decoded
+        // batch that the proxy holds is the batch of the produce that has the permit. The produce
+        // then reaches the storage without the decoded batch, which decodes it again.
         let start = SystemTime::now();
-        let _permit = self.semaphore.acquire().await.inspect(|_| {
-            SEMAPHORE_ACQUIRE_DURATION.record(
-                elapsed_millis(start),
-                &[KeyValue::new("operation", "produce")],
-            )
-        })?;
+        let Ok(_permit) = self.semaphore.try_acquire() else {
+            drop(inflated);
+
+            return self.produce(transaction_id, topition, deflated).await;
+        };
+
+        SEMAPHORE_ACQUIRE_DURATION.record(
+            elapsed_millis(start),
+            &[KeyValue::new("operation", "produce")],
+        );
+
         self.storage
             .produce_inflated(transaction_id, topition, deflated, inflated)
             .await
@@ -642,14 +650,109 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nisshi_sans_io::IsolationLevel;
-    use tokio::time::{Duration, Instant, advance};
+    use std::sync::atomic::Ordering;
+
+    use nisshi_sans_io::{IsolationLevel, record::deflated};
+    use tokio::{
+        task::yield_now,
+        time::{Duration, Instant, advance},
+    };
 
     use super::SemaphoreProxy;
     use crate::{
         Result, Storage, Topition,
+        decoded_batch_probe::probe,
         service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };
+
+    /// A produce that gets the permit at once passes its decoded batch on.
+    #[tokio::test]
+    async fn an_uncontended_produce_keeps_the_decoded_batch() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
+
+        let (inflated, _dropped) = probe();
+        let tp = Topition::new("abc", 0);
+
+        let produce = proxy.produce_inflated(None, &tp, deflated::Batch::default(), inflated);
+
+        let answer = async {
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = rx.recv().await.expect("a produce request");
+
+            let Request::Produce { inflated, .. } = request else {
+                panic!("{request:?}");
+            };
+
+            reply
+                .send(Ok(Response::Produce(Ok(0))))
+                .expect("the producer");
+
+            inflated.is_some()
+        };
+
+        let (offset, kept) = tokio::join!(produce, answer);
+
+        assert_eq!(0, offset?);
+        assert!(kept, "the proxy dropped the decoded batch");
+
+        Ok(())
+    }
+
+    /// A produce that waits for the permit holds only its compressed bytes, so a queue of waiting
+    /// produces does not hold a decoded batch each.
+    #[tokio::test]
+    async fn a_produce_that_waits_for_the_permit_holds_no_decoded_batch() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
+
+        // The permit is taken, so the produce below has to wait for it.
+        let permit = proxy.semaphore.clone().acquire_owned().await?;
+
+        let (inflated, dropped) = probe();
+        let tp = Topition::new("abc", 0);
+
+        let produce = proxy.produce_inflated(None, &tp, deflated::Batch::default(), inflated);
+
+        let release = async {
+            // Every branch has been polled once after this yield, so the produce is waiting.
+            yield_now().await;
+            let held = !dropped.load(Ordering::SeqCst);
+
+            drop(permit);
+
+            held
+        };
+
+        let answer = async {
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = rx.recv().await.expect("a produce request");
+
+            let Request::Produce { inflated, .. } = request else {
+                panic!("{request:?}");
+            };
+
+            reply
+                .send(Ok(Response::Produce(Ok(0))))
+                .expect("the producer");
+
+            inflated.is_none()
+        };
+
+        let (offset, held, sent_without) = tokio::join!(produce, release, answer);
+
+        assert_eq!(0, offset?);
+        assert!(!held, "the waiting produce still held the decoded batch");
+        assert!(sent_without, "the produce reached storage with the batch");
+
+        Ok(())
+    }
 
     /// A read that waits for the permit gives storage the same deadline that it was given, so the
     /// time spent waiting counts against that deadline.
