@@ -340,8 +340,9 @@ async fn failed_batch_write_leaves_an_offset_gap_that_fetch_skips() -> Result<()
     object_store.fail_next_batch();
 
     let failed = produce(&storage, &["lost", "lost", "lost"]).await?;
+    // The object store failed the write, which a producer retries.
     assert_eq!(
-        ErrorCode::UnknownServerError,
+        ErrorCode::KafkaStorageError,
         ErrorCode::try_from(failed.error_code)?
     );
 

@@ -318,23 +318,19 @@ pub enum Response {
 }
 
 /// Returns the error code that a partition answers when storage fails for
-/// it: the code of an [`Error::Api`], and `KAFKA_STORAGE_ERROR` for every
-/// other error.
+/// it: [`Error::error_code`], with `KAFKA_STORAGE_ERROR` for an error that a
+/// retry may fix.
 ///
-/// Kafka answers `UNKNOWN_SERVER_ERROR` for an exception that it does not
-/// map to a code ([KafkaApis.scala#L1228-L1251]). We answer
-/// `KAFKA_STORAGE_ERROR` instead, because these errors come from the storage
-/// engine (a database or object store that times out or is unavailable), and
-/// Kafka answers that code for a log that it cannot read. A client retries
-/// `KAFKA_STORAGE_ERROR` after a metadata refresh, and gives up on
-/// `UNKNOWN_SERVER_ERROR`.
+/// Kafka answers `KAFKA_STORAGE_ERROR` for a log that it cannot read, and
+/// `UNKNOWN_SERVER_ERROR` for an exception that it does not map to a code
+/// ([KafkaApis.scala#L1228-L1251]). A transient storage error, such as a
+/// database or object store that times out or is unavailable, is the first,
+/// and a client retries it after a metadata refresh. Any other error is the
+/// second: a retry does not fix it.
 ///
 /// [KafkaApis.scala#L1228-L1251]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1228-L1251
 pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
-    match error {
-        Error::Api(error_code) => *error_code,
-        _ => ErrorCode::KafkaStorageError,
-    }
+    error.error_code(ErrorCode::KafkaStorageError)
 }
 
 pub type RequestSender = mpsc::Sender<(Request, oneshot::Sender<Response>)>;

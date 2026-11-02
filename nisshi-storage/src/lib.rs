@@ -478,18 +478,105 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
-    /// reports when storage fails with this error.
+    /// Returns whether a retry of the failed operation may succeed.
     ///
-    /// A storage error that carries a code keeps that code. Any other storage error is treated as
-    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
-    /// [retry].
+    /// A failure of the storage backend, such as an object store, PostgreSQL, the connection
+    /// pool, libSQL, Turso or I/O, may clear on its own, so it is transient. Everything else is
+    /// permanent: a value that can't be decoded, a request that the storage rejects, or a broken
+    /// invariant fails the same way on every retry.
     ///
-    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
-    pub fn group_request_error_code(&self) -> ErrorCode {
+    /// Two backend errors are permanent because a retry can't fix them. An object store error
+    /// that names a missing object, a rejected credential or an unsupported operation, and a
+    /// PostgreSQL error whose SQLSTATE is a data exception, an integrity violation or a syntax
+    /// or access rule violation (classes 22, 23 and 42).
+    ///
+    /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
+    /// batch took its offset, so a retry can store the batch twice.
+    ///
+    /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
+    /// [`Error::error_code`] keeps.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Io(_) => true,
+
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::ObjectStore(error) => !matches!(
+                error.as_ref(),
+                object_store::Error::NotFound { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+                    | object_store::Error::InvalidPath { .. }
+                    | object_store::Error::NotSupported { .. }
+                    | object_store::Error::NotImplemented { .. }
+                    | object_store::Error::UnknownConfigurationKey { .. }
+            ),
+
+            // A credential provider that returned nothing may recover. A misconfigured one
+            // fails at startup, before any client request.
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::NoCredentials(_) => true,
+
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            Self::Pool(_) => true,
+
+            #[cfg(feature = "postgres")]
+            Self::TokioPostgres(error) => match error.as_db_error() {
+                // The server answered with a SQLSTATE. Only the classes that the server uses
+                // for a state that clears are transient: connection exceptions (08),
+                // transaction rollback, which includes serialization failures and deadlocks
+                // (40), insufficient resources (53), operator intervention (57) and system
+                // errors (58).
+                Some(db_error) => {
+                    matches!(
+                        db_error.code().code().get(..2),
+                        Some("08" | "40" | "53" | "57" | "58")
+                    )
+                }
+
+                // Without a SQLSTATE the error is the client's. A closed connection and an I/O
+                // error clear on a retry. A value that doesn't convert to its Rust type, a
+                // query that found no row, and a protocol mismatch do not.
+                None => {
+                    error.is_closed()
+                        || error::Error::source(error.as_ref())
+                            .is_some_and(|source| source.is::<io::Error>())
+                }
+            },
+
+            #[cfg(feature = "libsql")]
+            Self::LibSql(_) => true,
+
+            #[cfg(feature = "turso")]
+            Self::Turso(_) => true,
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(_) => true,
+
+            _ => false,
+        }
+    }
+
+    /// Returns the error code that a request reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. A transient error, see
+    /// [`Error::is_transient`], answers `retriable`: the code that Kafka clients retry for the
+    /// API that is answering. Any other error is permanent and answers `UNKNOWN_SERVER_ERROR`,
+    /// which clients report at once, because a retry can't fix it. Kafka's group coordinator
+    /// answers the same way: its [`handleOperationException`] maps a timeout or an unavailable
+    /// log to a retriable code and every other exception to `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// Each API passes the retriable code that its Kafka clients handle:
+    /// `COORDINATOR_NOT_AVAILABLE` for the group APIs, `KAFKA_STORAGE_ERROR` for Produce, and so
+    /// on. This method is the only place that picks between the retriable code and
+    /// `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1170
+    pub fn error_code(&self, retriable: ErrorCode) -> ErrorCode {
         match self {
             Self::Api(error_code) => *error_code,
-            _ => ErrorCode::CoordinatorNotAvailable,
+            error if error.is_transient() => retriable,
+            _ => ErrorCode::UnknownServerError,
         }
     }
 }
@@ -3333,16 +3420,53 @@ mod tests {
     fn storage_error_with_a_code_keeps_that_code() {
         assert_eq!(
             ErrorCode::UnknownServerError,
-            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+            Error::Api(ErrorCode::UnknownServerError)
+                .error_code(ErrorCode::CoordinatorNotAvailable)
         );
     }
 
     #[test]
-    fn other_storage_error_answers_coordinator_not_available() {
+    fn transient_storage_error_answers_the_retriable_code() {
+        let error = Error::Io(Arc::new(io::Error::other("connection reset")));
+
+        assert!(error.is_transient());
         assert_eq!(
             ErrorCode::CoordinatorNotAvailable,
-            Error::Message("connection refused".into()).group_request_error_code()
+            error.error_code(ErrorCode::CoordinatorNotAvailable)
         );
+    }
+
+    #[test]
+    fn permanent_storage_error_answers_unknown_server_error() {
+        for error in [
+            Error::Message("connection refused".into()),
+            Error::Poison,
+            Error::Decode(Bytes::new()),
+        ] {
+            assert!(!error.is_transient(), "{error:?}");
+            assert_eq!(
+                ErrorCode::UnknownServerError,
+                error.error_code(ErrorCode::CoordinatorNotAvailable),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn object_store_error_is_transient_unless_a_retry_cannot_fix_it() {
+        let generic = object_store::Error::Generic {
+            store: "S3",
+            source: "timed out".into(),
+        };
+
+        let not_found = object_store::Error::NotFound {
+            path: "a".into(),
+            source: "missing".into(),
+        };
+
+        assert!(Error::from(generic).is_transient());
+        assert!(!Error::from(not_found).is_transient());
     }
 
     #[test]

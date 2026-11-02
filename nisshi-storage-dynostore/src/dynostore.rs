@@ -3483,10 +3483,7 @@ impl Storage for DynoStore {
                 error!(?error, ?topition, "list offsets");
 
                 ListOffsetResponse {
-                    error_code: match error {
-                        Error::Api(error_code) => error_code,
-                        _ => ErrorCode::KafkaStorageError,
-                    },
+                    error_code: error.error_code(ErrorCode::KafkaStorageError),
                     offset: None,
                     timestamp: None,
                 }
@@ -3557,10 +3554,7 @@ impl Storage for DynoStore {
                             error!(?error, ?topition, target, "list offsets by timestamp");
 
                             ListOffsetResponse {
-                                error_code: match error {
-                                    Error::Api(error_code) => error_code,
-                                    _ => ErrorCode::KafkaStorageError,
-                                },
+                                error_code: error.error_code(ErrorCode::KafkaStorageError),
                                 offset: None,
                                 ..Default::default()
                             }
@@ -3704,9 +3698,9 @@ impl Storage for DynoStore {
             for topition in topics {
                 let location = self.committed_offset_location(group_id, topition)?;
 
-                // An object store failure may clear on a retry, so it stays a
-                // plain error. An offset that doesn't decode won't, so it is
-                // UNKNOWN_SERVER_ERROR.
+                // Both failures stay plain errors, and the service that answers
+                // sorts them with `Error::error_code`: an object store failure
+                // may clear on a retry, and an offset that doesn't decode won't.
                 let committed = match self.object_store.get(&location).await {
                     Ok(get_result) => {
                         let encoded = get_result
@@ -3717,7 +3711,7 @@ impl Storage for DynoStore {
                         serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
                             .map(CommittedOffset::from)
                             .inspect_err(|error| error!(?error, ?group_id, ?topition))
-                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                            .map_err(Error::from)
                     }
 
                     Err(object_store::Error::NotFound { .. }) => Ok(CommittedOffset::uncommitted()),
@@ -4208,26 +4202,19 @@ impl Storage for DynoStore {
                                 error!(?err, group_id);
                                 results.push(NamedGroupDetail::error_code(
                                     group_id.into(),
-                                    ErrorCode::CoordinatorNotAvailable,
+                                    Error::from(err).error_code(ErrorCode::CoordinatorNotAvailable),
                                 ));
                             }
                         }
                     }
 
-                    // An object store error is usually transient. Kafka clients retry
-                    // `COORDINATOR_NOT_AVAILABLE`, and fail on `UNKNOWN_SERVER_ERROR`.
-                    Err(Error::ObjectStore(_)) => {
+                    // A transient error answers `COORDINATOR_NOT_AVAILABLE`, which Kafka
+                    // clients retry, and any other error, such as a stored group that can't be
+                    // decoded, answers `UNKNOWN_SERVER_ERROR`.
+                    Err(error) => {
                         results.push(NamedGroupDetail::error_code(
                             group_id.into(),
-                            ErrorCode::CoordinatorNotAvailable,
-                        ));
-                    }
-
-                    // A retry does not fix a stored group that can't be decoded.
-                    Err(_) => {
-                        results.push(NamedGroupDetail::error_code(
-                            group_id.into(),
-                            ErrorCode::UnknownServerError,
+                            error.error_code(ErrorCode::CoordinatorNotAvailable),
                         ));
                     }
                 }

@@ -163,11 +163,22 @@ impl TopicsWithCollisionChars {
 
 /// Builds the [`CreatableTopicResult`] for a topic whose create failed with a storage error that
 /// is not a Kafka error code.
-fn unknown_server_error(name: String) -> CreatableTopicResult {
+///
+/// A transient error answers `NOT_CONTROLLER`. The Java admin client retries a create that
+/// fails with it: it refreshes its metadata, which names this broker as the controller, and
+/// sends the request again until `default.api.timeout.ms`. `REQUEST_TIMED_OUT` would not do:
+/// librdkafka turns it into a success when the request has an `operation_timeout` of 0, because
+/// Kafka answers it for a topic that it created and has not yet propagated
+/// ([rdkafka_admin.c#L2047-L2056]). A permanent error answers `UNKNOWN_SERVER_ERROR`.
+///
+/// [rdkafka_admin.c#L2047-L2056]: https://github.com/confluentinc/librdkafka/blob/v2.3.0/src/rdkafka_admin.c#L2047-L2056
+fn storage_error(name: String, error: &Error) -> CreatableTopicResult {
+    let error_code = error.error_code(ErrorCode::NotController);
+
     CreatableTopicResult::default()
         .name(name)
         .topic_id(Some(NULL_TOPIC_ID))
-        .error_code(ErrorCode::UnknownServerError.into())
+        .error_code(error_code.into())
         .error_message(None)
         .topic_config_error_code(None)
         .num_partitions(None)
@@ -228,8 +239,8 @@ where
 
                 // A rejected topic keeps its own error. A valid topic fails, instead of being
                 // created without the check.
-                Err(_) => matches!(topic, ValidatedTopic::Valid(_))
-                    .then(|| unknown_server_error(topic.name().to_owned())),
+                Err(error) => matches!(topic, ValidatedTopic::Valid(_))
+                    .then(|| storage_error(topic.name().to_owned(), error)),
             };
 
             if let Some(result) = collision {
@@ -301,7 +312,7 @@ where
                 Err(error) => {
                     debug!(?error);
 
-                    topics.push(unknown_server_error(name))
+                    topics.push(storage_error(name, &error))
                 }
             }
         }
@@ -407,6 +418,31 @@ mod tests {
             );
             assert_eq!(vec![String::from("ab")], storage.created(), "{listing:?}");
         }
+
+        Ok(())
+    }
+
+    /// A listing that fails with an error that a retry may fix answers `NOT_CONTROLLER`, which
+    /// the Java admin client retries, instead of `UNKNOWN_SERVER_ERROR`, which it reports at once.
+    #[tokio::test]
+    async fn transient_failed_listing_is_not_controller() -> Result<()> {
+        let storage = CountingStorage::new(Listing::TransientError, &[]);
+        let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+            storage: storage.clone(),
+        });
+
+        let response = service
+            .serve(CreateTopicsRequest::default().topics(Some(vec![topic("a.b", 1)])))
+            .await?;
+
+        let error_codes = response
+            .topics
+            .unwrap_or_default()
+            .iter()
+            .map(|topic| ErrorCode::try_from(topic.error_code))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(vec![ErrorCode::NotController], error_codes);
 
         Ok(())
     }

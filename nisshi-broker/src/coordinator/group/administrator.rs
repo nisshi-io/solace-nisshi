@@ -3908,20 +3908,23 @@ fn fetched_offsets(
         .collect()
 }
 
-/// Returns the error code that an `OffsetFetch` reports when storage fails
-/// with `error`.
+/// Returns the error code that an `OffsetFetch` reports when it fails with
+/// `error`.
 ///
-/// A storage error that carries a code keeps that code. Each storage engine
-/// reports a committed offset that it can't decode as `UNKNOWN_SERVER_ERROR`,
-/// because a retry can't fix it. Any other storage error is treated as
-/// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka
-/// clients [retry].
+/// A storage error answers [`nisshi_storage::Error::error_code`]: the code it
+/// carries, `COORDINATOR_NOT_AVAILABLE` if a retry may succeed, which Kafka
+/// clients [retry], and `UNKNOWN_SERVER_ERROR` otherwise, such as for a
+/// committed offset that can't be decoded. A client that gets
+/// `COORDINATOR_NOT_AVAILABLE` for a permanent failure keeps retrying until its
+/// API timeout, and then reports a `TimeoutException` instead of the error.
+/// Any other broker error carries a code or is not one that a retry fixes.
 ///
 /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464
 fn offset_fetch_error_code(error: &Error) -> ErrorCode {
     match error {
-        Error::Storage(nisshi_storage::Error::Api(error_code)) => *error_code,
-        _ => ErrorCode::CoordinatorNotAvailable,
+        Error::Storage(error) => error.error_code(ErrorCode::CoordinatorNotAvailable),
+        Error::Api(error_code) => *error_code,
+        _ => ErrorCode::UnknownServerError,
     }
 }
 
