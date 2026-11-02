@@ -4516,8 +4516,8 @@ mod tests {
 
     /// The fetch statements count a record's headers toward `max_bytes`: three records with a
     /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
-    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine, because it rejects some SQL that
-    /// SQLite takes.
+    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
+    /// because it rejects some SQL that SQLite takes.
     #[tokio::test]
     async fn fetch_counts_header_bytes() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4525,6 +4525,97 @@ mod tests {
         let db = turso::Builder::new_local(":memory:").build().await?;
         let connection = db.connect()?;
 
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(
+            &connection,
+            &[(Value::Blob(b"h".to_vec()), Value::Blob(vec![0; 99]))],
+        )
+        .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            for (max_bytes, expected) in [(250, vec![0, 1]), (50, vec![0]), (1_000, vec![0, 1, 2])]
+            {
+                assert_eq!(
+                    expected,
+                    fetched_offsets(&connection, statement, key, max_bytes).await?,
+                    "{statement} within {max_bytes}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Each header costs 2 bytes of framing, even when its key is empty and its value is null: 50
+    /// such headers and a one byte key cost a record 101 bytes, so a budget of 150 bytes returns
+    /// one record. A fetch that dropped the framing, or that took the largest header of a record
+    /// instead of the sum of its headers, would count 1 to 3 bytes for a record and return all
+    /// three.
+    #[tokio::test]
+    async fn fetch_counts_the_framing_of_every_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(&connection, &vec![(Value::Blob(vec![]), Value::Null); 50])
+            .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0],
+                fetched_offsets(&connection, statement, key, 150).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A header costs the length of its key and the length of its value. Each record has one
+    /// header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
+    /// and so costs 85 bytes with its own key, and a budget of 100 bytes returns one record. A
+    /// fetch that left out the key, or the value, or took the larger header of the two, would
+    /// count 43 to 45 bytes and return two.
+    #[tokio::test]
+    async fn fetch_counts_the_key_and_the_value_of_every_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(
+            &connection,
+            &[
+                (Value::Blob(vec![0; 40]), Value::Null),
+                (Value::Null, Value::Blob(vec![0; 40])),
+            ],
+        )
+        .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0],
+                fetched_offsets(&connection, statement, key, 100).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The fetch statements, each with the key that it filters on: `record_fetch_keyed.sql` reads
+    /// the records of a virtual topic by their key.
+    const FETCH_STATEMENTS: [(&str, Option<&[u8]>); 2] = [
+        ("record_fetch.sql", None),
+        ("record_fetch_keyed.sql", Some(b"k")),
+    ];
+
+    /// Creates the tables that the fetch statements read, and partition 0 of topic `t` in
+    /// cluster `c`.
+    async fn create_fetch_tables(connection: &Connection) -> Result<()> {
         for ddl in [
             "010-cluster.sql",
             "030-topition.sql",
@@ -4551,6 +4642,15 @@ mod tests {
             _ = connection.execute(sql, ()).await?;
         }
 
+        Ok(())
+    }
+
+    /// Stores three records at offsets 0 to 2 of partition 0, each with the key `k`, no value and
+    /// the given headers as `(key, value)` pairs.
+    async fn insert_records_with_headers(
+        connection: &Connection,
+        headers: &[(Value, Value)],
+    ) -> Result<()> {
         for offset in 0..3 {
             _ = connection
                 .execute(
@@ -4558,44 +4658,53 @@ mod tests {
                     [offset],
                 )
                 .await?;
-            _ = connection
-                .execute(
-                    "insert into header (topition, offset_id, ordinal, k, v)
-                        values (1, ?1, 0, x'68', zeroblob(99))",
-                    [offset],
-                )
-                .await?;
-        }
 
-        for (statement, extra) in [
-            ("record_fetch.sql", None),
-            ("record_fetch_keyed.sql", Some(Value::Blob(b"k".to_vec()))),
-        ] {
-            let sql = sql_lookup(statement)?;
-
-            for (max_bytes, expected) in [(250, vec![0, 1]), (50, vec![0]), (1_000, vec![0, 1, 2])]
-            {
-                let mut params = vec![
-                    Value::from("c"),
-                    Value::from("t"),
-                    Value::from(0),
-                    Value::from(0),
-                    Value::from(max_bytes),
-                    Value::from(3),
-                ];
-                params.extend(extra.clone());
-
-                let mut rows = connection.prepare(&sql).await?.query(params).await?;
-                let mut offsets = vec![];
-                while let Some(row) = rows.next().await? {
-                    offsets.push(row.get::<i64>(0)?);
-                }
-
-                assert_eq!(expected, offsets, "{statement} within {max_bytes}");
+            for (ordinal, (key, value)) in headers.iter().enumerate() {
+                _ = connection
+                    .execute(
+                        "insert into header (topition, offset_id, ordinal, k, v)
+                            values (1, ?1, ?2, ?3, ?4)",
+                        vec![
+                            Value::from(offset),
+                            Value::from(i64::try_from(ordinal)?),
+                            key.clone(),
+                            value.clone(),
+                        ],
+                    )
+                    .await?;
             }
         }
 
         Ok(())
+    }
+
+    /// Returns the offsets that `statement` selects when it reads partition 0 from offset 0
+    /// within `max_bytes`, up to a high watermark of 3. `key` is the key that a keyed statement
+    /// filters on.
+    async fn fetched_offsets(
+        connection: &Connection,
+        statement: &str,
+        key: Option<&[u8]>,
+        max_bytes: i64,
+    ) -> Result<Vec<i64>> {
+        let mut params = vec![
+            Value::from("c"),
+            Value::from("t"),
+            Value::from(0),
+            Value::from(0),
+            Value::from(max_bytes),
+            Value::from(3),
+        ];
+        params.extend(key.map(|key| Value::Blob(key.to_vec())));
+
+        let sql = sql_lookup(statement)?;
+        let mut rows = connection.prepare(&sql).await?.query(params).await?;
+        let mut offsets = vec![];
+        while let Some(row) = rows.next().await? {
+            offsets.push(row.get::<i64>(0)?);
+        }
+
+        Ok(offsets)
     }
 
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the

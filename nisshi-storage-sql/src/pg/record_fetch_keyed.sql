@@ -32,7 +32,8 @@
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
 -- The header table is probed by its primary key for each candidate, so a record that holds only
--- headers still spends the budget, and a read stops at $5 bytes instead of at the row limit.
+-- headers still spends the budget. The rows that the read returns stop at $5 bytes, but the
+-- read still covers up to $8 rows, and probes the header table once for each.
 -- The headers of the rows that the read returns are fetched afterwards, so their memory follows
 -- the same bound.
 with candidates as (
