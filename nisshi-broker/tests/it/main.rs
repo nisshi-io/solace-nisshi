@@ -81,6 +81,7 @@ pub mod produce_idempotent_epoch_bump;
 pub mod produce_idempotent_first_sequence;
 #[cfg(feature = "postgres")]
 pub mod produce_idempotent_race;
+pub mod produce_inflated;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
@@ -88,6 +89,7 @@ pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
 #[cfg(feature = "postgres")]
 pub mod produce_row_locks;
+pub mod produce_unknown_partition_order;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;

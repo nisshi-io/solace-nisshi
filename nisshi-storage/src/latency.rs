@@ -22,13 +22,17 @@ use std::{
 use async_trait::async_trait;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
@@ -152,6 +156,21 @@ where
 
         self.storage
             .produce(transaction_id, topition, deflated)
+            .await
+    }
+
+    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .produce_inflated(transaction_id, topition, deflated, inflated)
             .await
     }
 

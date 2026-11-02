@@ -537,6 +537,28 @@ where
         self.storage.brokers().await
     }
 
+    /// Without a `maximum_delay` the batcher queues nothing, so the decoded batch goes straight
+    /// to the storage. With one, the batch joins a queue and is combined with others, which
+    /// decodes it again: the default drops the decoded batch.
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        if self.maximum_delay.is_none() {
+            return self
+                .storage
+                .produce_inflated(transaction_id, topition, deflated, inflated)
+                .await;
+        }
+
+        drop(inflated);
+
+        self.produce(transaction_id, topition, deflated).await
+    }
+
     #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,

@@ -37,6 +37,8 @@ mod list_offsets;
 mod list_partition_reassignments;
 mod metadata;
 mod produce;
+#[cfg(test)]
+mod produce_inflated_forwarding;
 pub mod read_deadline;
 pub mod read_share;
 mod txn;
@@ -86,13 +88,17 @@ pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::{AutoCreateRefusals, MetadataService};
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -140,6 +146,8 @@ pub enum Request {
         transaction_id: Option<String>,
         topition: Topition,
         batch: deflated::Batch,
+        /// `batch` decoded, when the caller has done that: see [`Storage::produce_inflated`].
+        inflated: Option<inflated::Batch>,
     },
     Fetch {
         topition: Topition,
@@ -678,6 +686,30 @@ impl Storage for RequestChannelService {
                 transaction_id,
                 topition,
                 batch,
+                inflated: None,
+            },
+            Produce
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        let transaction_id = transaction_id.map(|s| s.to_string());
+        let topition = topition.to_owned();
+
+        serve_and_extract!(
+            self,
+            Request::Produce {
+                transaction_id,
+                topition,
+                batch: deflated,
+                inflated: Some(inflated),
             },
             Produce
         )
@@ -1342,11 +1374,19 @@ where
                 transaction_id,
                 topition,
                 batch,
-            } => Ok(Response::Produce(
-                self.storage
-                    .produce(transaction_id.as_deref(), &topition, batch)
-                    .await,
-            )),
+                inflated,
+            } => Ok(Response::Produce(match inflated {
+                Some(inflated) => {
+                    self.storage
+                        .produce_inflated(transaction_id.as_deref(), &topition, batch, inflated)
+                        .await
+                }
+                None => {
+                    self.storage
+                        .produce(transaction_id.as_deref(), &topition, batch)
+                        .await
+                }
+            })),
             Request::Fetch {
                 topition,
                 offset,

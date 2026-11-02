@@ -2614,6 +2614,471 @@ impl DynoStore {
             })
             .map_err(unretriable_after_write)
     }
+
+    /// Returns `inflated`, or decodes `deflated` on the blocking pool when the caller passed none.
+    async fn decoded(
+        inflated: Option<inflated::Batch>,
+        deflated: &deflated::Batch,
+    ) -> Result<inflated::Batch> {
+        match inflated {
+            Some(inflated) => Ok(inflated),
+            None => {
+                let deflated = deflated.clone();
+                offload(move || inflate_produced(&deflated)).await
+            }
+        }
+    }
+
+    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
+    ///
+    /// The produce takes its offsets in the watermark document of the
+    /// partition, before the writes that follow: the transaction metadata,
+    /// the lake table and the batch object. If one of those writes
+    /// fails, the client gets an error and the taken offsets hold no batch.
+    /// The produce does not move the high watermark back, because a rollback
+    /// is another conditional write that can fail in the same way, and a
+    /// concurrent produce can already hold the next offset. A fetch skips the
+    /// gap, and the time index backfill settles it as a failed produce after
+    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
+    /// gap.
+    ///
+    /// Kafka does not use an offset for an append that it rejects. After it
+    /// appends to the log, Kafka does not move the log end offset back, also
+    /// when the transaction index write that follows fails
+    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
+    /// watermark write, so a failed batch write leaves a gap that Kafka does
+    /// not have.
+    ///
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
+    async fn produce_with(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        // Decoded by the caller, as `Storage::produce_inflated` requires, or `None` to decode here,
+        // for the backends that need it.
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        // Checked before any key is built, so a produce to a topic or
+        // partition that does not exist writes nothing, as in Kafka.
+        let metadata = self.ensure_partition_exists(topition).await?;
+
+        let limit = max_message_bytes::limit(
+            topition.topic(),
+            metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        );
+        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
+
+        let config = metadata.describe_configs_result(topition.topic());
+
+        if self.lake.is_some()
+            && config
+                .configs
+                .as_ref()
+                .map(|configs| {
+                    topic_config::lookup(
+                        configs
+                            .iter()
+                            .inspect(|config| debug!(?config))
+                            .filter_map(|config| {
+                                Some((config.name.as_str(), config.value.as_deref()?))
+                            }),
+                        topic_config::LAKE_SINK,
+                    )
+                    .and_then(|value| bool::from_str(value).ok())
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        {
+            // Keep in step with the check on the non-lake path below.
+            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
+                .await?;
+
+            // Decode and validate before the high watermark moves, so that a
+            // batch rejected here leaves no state behind.
+            let inflated = if let Some(ref registry) = self.schemas {
+                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
+                    .inspect(|batch_attribute| debug!(?batch_attribute))
+                    .inspect_err(|err| debug!(?err))?;
+
+                if batch_attribute.control {
+                    drop(inflated);
+                    None
+                } else {
+                    let inflated = Self::decoded(inflated, &deflated)
+                        .await
+                        .inspect(|inflated| debug!(?inflated))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect(|validation| debug!(?validation))
+                        .inspect_err(|err| debug!(?err))?;
+
+                    Some(inflated)
+                }
+            } else {
+                drop(inflated);
+                None
+            };
+
+            let transactional = transaction_id.is_some() || deflated.is_transactional();
+            let idempotent = IdempotentBatch::of(&deflated);
+
+            // A client retries an idempotent batch that got no answer, so this branch checks
+            // the sequence as the other branch does. Without the check, the retry takes a new
+            // offset range and stores its rows in the lake a second time.
+            if let Some(ref idempotent) = idempotent
+                && let SequenceCheck::Duplicate { base_offset } = self
+                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
+                    .await?
+            {
+                return Ok(base_offset);
+            }
+
+            // Get watermark to calculate proper offset for lake sink
+            let watermark = self.watermark_for(topition)?;
+
+            let offset = watermark
+                .with_mut(&self.object_store, |watermark| {
+                    debug!(?watermark);
+
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
+
+                    let offset = watermark.high.unwrap_or_default();
+                    watermark.high = watermark.high.map_or_else(
+                        || Some(deflated.last_offset_delta as i64 + 1i64),
+                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
+                    );
+
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
+
+                    // Deliberately not touched: this branch (`nisshi.lake.sink`)
+                    // never writes a `records/*.batch` object, so there is
+                    // nothing for a `time_index` entry here to point at. A
+                    // sequential scan starting from such an entry would list
+                    // nothing and must handle that cleanly (see
+                    // `DynoStore::sequential_timestamp_scan`), but the
+                    // simpler fix is to just never create the entry.
+
+                    debug!(?watermark);
+
+                    Ok(offset)
+                })
+                .await
+                .inspect(|offset| debug!(offset, transaction_id, ?topition))
+                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
+            {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
+            }
+
+            if let Some(idempotent) = idempotent {
+                self.advance_idempotent_sequence(
+                    transaction_id,
+                    topition,
+                    idempotent,
+                    transactional,
+                    offset,
+                    None,
+                )
+                .await?;
+            }
+
+            Ok(offset)
+        } else {
+            let attributes =
+                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
+
+            // Decode and validate before the producer's sequence or the high
+            // watermark moves, so that a batch rejected here leaves no state
+            // behind. A producer can reuse a rejected batch's sequence for its
+            // next batch. If the stored sequence had moved, that batch would
+            // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
+            // although nothing was stored.
+            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
+            {
+                let inflated = Self::decoded(inflated, &deflated)
+                    .await
+                    .inspect_err(|err| debug!(?err))?;
+
+                if let Some(ref registry) = self.schemas {
+                    registry
+                        .validate(topition.topic(), &inflated)
+                        .await
+                        .inspect_err(|err| debug!(?err))?;
+                }
+
+                // Only the lake reads the decoded batch after this point.
+                // Dropping it here, rather than at the end of the function,
+                // frees its memory before the object store writes.
+                self.lake.is_some().then_some(inflated)
+            } else {
+                // Not decoded here, so a batch that the caller decoded is not held across the
+                // writes below.
+                drop(inflated);
+                None
+            };
+
+            let transactional = transaction_id.is_some() || deflated.is_transactional();
+            let idempotent = IdempotentBatch::of(&deflated);
+
+            if let Some(ref idempotent) = idempotent
+                && let SequenceCheck::Duplicate { base_offset } = self
+                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
+                    .await?
+            {
+                return Ok(base_offset);
+            }
+
+            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
+                .await?;
+
+            if let Some(transaction_id) = transaction_id
+                && attributes.transaction
+            {
+                // This costs a `meta.json` write on the transaction's first batch to the
+                // partition, and a cached read on each later batch. Recording the bound in
+                // AddPartitionsToTxn instead would ride on that call's `meta.json` write, but
+                // the end of the transaction writes a marker to each partition with a recorded
+                // range, so an added partition that gets no batch would get a marker too.
+                self.record_transaction_start(transaction_id, deflated.producer_epoch, topition)
+                    .await?;
+            }
+
+            let watermark = self.watermark_for(topition)?;
+
+            let offset = watermark
+                .with_mut(&self.object_store, |watermark| {
+                    debug!(?watermark);
+
+                    // with_mut stores each change that this closure makes, also when it then
+                    // answers an error, so the fence runs before any change. A refused batch
+                    // still costs one get and one put of an unchanged watermark.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.fence_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        )?;
+                    }
+
+                    let offset = watermark.high.unwrap_or_default();
+                    let is_new_partition = watermark.high.is_none();
+
+                    watermark.high = watermark.high.map_or_else(
+                        || Some(deflated.last_offset_delta as i64 + 1i64),
+                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
+                    );
+
+                    if is_new_partition {
+                        watermark.time_index.mark_complete();
+                    }
+
+                    // The index is appended to whether or not it is complete.
+                    // A produce that waited for a concurrent backfill would
+                    // leave a gap: the backfill reads the index before this
+                    // entry exists, and merges nothing in for it.
+                    watermark.time_index.append(
+                        deflated.max_timestamp,
+                        offset,
+                        u64::try_from(deflated.batch_length).unwrap_or_default(),
+                    );
+
+                    // The epoch is recorded before the record write. When that write fails,
+                    // the partition refuses the older epoch although it stores nothing at the
+                    // newer one. The client has already moved to the newer epoch, so it does
+                    // not send the older one again.
+                    if let Some(ref idempotent) = idempotent {
+                        watermark.record_producer_epoch(
+                            idempotent.producer_id,
+                            idempotent.producer_epoch,
+                        );
+                    }
+
+                    debug!(?watermark);
+
+                    Ok(offset)
+                })
+                .await
+                .inspect(|offset| debug!(offset, transaction_id, ?topition))
+                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+
+            if let Some(transaction_id) = transaction_id
+                && attributes.transaction
+            {
+                self.meta
+                    .with_mut(&self.object_store, |meta| {
+                        // The check before the write is a read that can go stale. This one
+                        // runs on the version of `meta.json` that the write below replaces,
+                        // so it decides, and the bookkeeping never adds a partition itself.
+                        //
+                        // A refusal here leaves the offset reserved above empty. The lake
+                        // write runs after this update, so a refused batch does not reach a
+                        // lake table.
+                        if !deflated.is_control() {
+                            meta.ensure_partition_in_transaction(
+                                transaction_id,
+                                deflated.producer_id,
+                                deflated.producer_epoch,
+                                topition,
+                            )?;
+                        }
+
+                        if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
+                            debug!(?transaction);
+
+                            if let Some(txn_detail) =
+                                transaction.epochs.get_mut(&deflated.producer_epoch)
+                            {
+                                debug!(?txn_detail);
+
+                                let offset_end = offset + deflated.last_offset_delta as i64;
+
+                                _ = txn_detail
+                                    .produces
+                                    .get_mut(&topition.topic)
+                                    .and_then(|partitions| partitions.get_mut(&topition.partition))
+                                    .map(|entry| {
+                                        let range = entry.get_or_insert(TxnProduceOffset {
+                                            offset_start: offset,
+                                            offset_end,
+                                        });
+
+                                        // The start only moves down (a defensive
+                                        // guard: the high watermark never falls, so
+                                        // the recorded bound is normally at or below
+                                        // every attempt's offset). It is not raised
+                                        // from the lower bound that
+                                        // `record_transaction_start` wrote: an attempt
+                                        // can hold a lower offset that it has not
+                                        // recorded yet. A concurrent retry of a batch
+                                        // can raise the high watermark after the first
+                                        // attempt did, and record its range first. The
+                                        // first attempt's records still go in the log
+                                        // (it then answers DUPLICATE_SEQUENCE_NUMBER),
+                                        // and raising the start to the retry's offset
+                                        // would let the last stable offset pass them.
+                                        if offset < range.offset_start {
+                                            range.offset_start = offset;
+                                        }
+
+                                        if offset_end > range.offset_end {
+                                            range.offset_end = offset_end;
+                                        }
+                                    });
+                            }
+                        }
+
+                        Ok(())
+                    })
+                    .await
+                    .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
+                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+            }
+
+            if let Some(ref lake) = self.lake
+                && let Some(ref inflated) = inflated
+            {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
+            }
+
+            let location = batch_path(&self.cluster, topition, offset);
+
+            let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
+
+            _ = self
+                .object_store
+                .put_opts(
+                    &location,
+                    payload,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        attributes: Attributes::new(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
+                .inspect_err(|error| {
+                    error!(
+                        ?error,
+                        transaction_id,
+                        ?topition,
+                        offset,
+                        ?location,
+                        ?idempotent
+                    )
+                })
+                .map_err(|error| {
+                    let error = Error::from(error);
+
+                    // Every transient error of this write answers UNKNOWN_SERVER_ERROR for an
+                    // idempotent batch, also one where the store refused the write, such as a
+                    // throttle. The error does not tell whether the write completed, and a
+                    // retry of a stored batch stores it twice. A HEAD request on `location`
+                    // would tell, and this code does not send one.
+                    if idempotent.is_some() {
+                        unretriable_after_write(error)
+                    } else {
+                        error
+                    }
+                })?;
+
+            if let Some(idempotent) = idempotent {
+                self.advance_idempotent_sequence(
+                    transaction_id,
+                    topition,
+                    idempotent,
+                    transactional,
+                    offset,
+                    Some(&location),
+                )
+                .await?;
+            }
+
+            Ok(offset)
+        }
+    }
 }
 
 #[async_trait]
@@ -3001,453 +3466,28 @@ impl Storage for DynoStore {
         ])
     }
 
-    /// Appends `deflated` to `topition`, and returns the base offset of the batch.
-    ///
-    /// The produce takes its offsets in the watermark document of the
-    /// partition, before the writes that follow: the transaction metadata,
-    /// the lake table and the batch object. If one of those writes
-    /// fails, the client gets an error and the taken offsets hold no batch.
-    /// The produce does not move the high watermark back, because a rollback
-    /// is another conditional write that can fail in the same way, and a
-    /// concurrent produce can already hold the next offset. A fetch skips the
-    /// gap, and the time index backfill settles it as a failed produce after
-    /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
-    /// gap.
-    ///
-    /// Kafka does not use an offset for an append that it rejects. After it
-    /// appends to the log, Kafka does not move the log end offset back, also
-    /// when the transaction index write that follows fails
-    /// ([`UnifiedLog.append`]). This engine takes its offsets earlier, at the
-    /// watermark write, so a failed batch write leaves a gap that Kafka does
-    /// not have.
-    ///
-    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
+    /// Appends `deflated` to `topition`, decoding the batch here when the backend needs it.
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // Checked before any key is built, so a produce to a topic or
-        // partition that does not exist writes nothing, as in Kafka.
-        let metadata = self.ensure_partition_exists(topition).await?;
+        self.produce_with(transaction_id, topition, deflated, None)
+            .await
+    }
 
-        let limit = max_message_bytes::limit(
-            topition.topic(),
-            metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .find(|config| config.name == max_message_bytes::KEY)
-                .and_then(|config| config.value.as_deref()),
-        );
-        max_message_bytes::ensure_batch_fits(&deflated, limit)?;
-
-        let config = metadata.describe_configs_result(topition.topic());
-
-        if self.lake.is_some()
-            && config
-                .configs
-                .as_ref()
-                .map(|configs| {
-                    topic_config::lookup(
-                        configs
-                            .iter()
-                            .inspect(|config| debug!(?config))
-                            .filter_map(|config| {
-                                Some((config.name.as_str(), config.value.as_deref()?))
-                            }),
-                        topic_config::LAKE_SINK,
-                    )
-                    .and_then(|value| bool::from_str(value).ok())
-                    .unwrap_or(false)
-                })
-                .unwrap_or(false)
-        {
-            // Keep in step with the check on the non-lake path below.
-            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
-                .await?;
-
-            // Decode and validate before the high watermark moves, so that a
-            // batch rejected here leaves no state behind.
-            let inflated = if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect(|batch_attribute| debug!(?batch_attribute))
-                    .inspect_err(|err| debug!(?err))?;
-
-                if batch_attribute.control {
-                    None
-                } else {
-                    let inflated = {
-                        let deflated = deflated.clone();
-                        offload(move || inflate_produced(&deflated))
-                    }
-                    .await
-                    .inspect(|inflated| debug!(?inflated))
-                    .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    Some(inflated)
-                }
-            } else {
-                None
-            };
-
-            let transactional = transaction_id.is_some() || deflated.is_transactional();
-            let idempotent = IdempotentBatch::of(&deflated);
-
-            // A client retries an idempotent batch that got no answer, so this branch checks
-            // the sequence as the other branch does. Without the check, the retry takes a new
-            // offset range and stores its rows in the lake a second time.
-            if let Some(ref idempotent) = idempotent
-                && let SequenceCheck::Duplicate { base_offset } = self
-                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
-                    .await?
-            {
-                return Ok(base_offset);
-            }
-
-            // Get watermark to calculate proper offset for lake sink
-            let watermark = self.watermark_for(topition)?;
-
-            let offset = watermark
-                .with_mut(&self.object_store, |watermark| {
-                    debug!(?watermark);
-
-                    // with_mut stores each change that this closure makes, also when it then
-                    // answers an error, so the fence runs before any change.
-                    if let Some(ref idempotent) = idempotent {
-                        watermark.fence_producer_epoch(
-                            idempotent.producer_id,
-                            idempotent.producer_epoch,
-                        )?;
-                    }
-
-                    let offset = watermark.high.unwrap_or_default();
-                    watermark.high = watermark.high.map_or_else(
-                        || Some(deflated.last_offset_delta as i64 + 1i64),
-                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
-                    );
-
-                    if let Some(ref idempotent) = idempotent {
-                        watermark.record_producer_epoch(
-                            idempotent.producer_id,
-                            idempotent.producer_epoch,
-                        );
-                    }
-
-                    // Deliberately not touched: this branch (`nisshi.lake.sink`)
-                    // never writes a `records/*.batch` object, so there is
-                    // nothing for a `time_index` entry here to point at. A
-                    // sequential scan starting from such an entry would list
-                    // nothing and must handle that cleanly (see
-                    // `DynoStore::sequential_timestamp_scan`), but the
-                    // simpler fix is to just never create the entry.
-
-                    debug!(?watermark);
-
-                    Ok(offset)
-                })
-                .await
-                .inspect(|offset| debug!(offset, transaction_id, ?topition))
-                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-
-            if let Some(ref lake) = self.lake
-                && let Some(ref inflated) = inflated
-            {
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    inflated,
-                    config,
-                )
-                .await
-                .inspect(|store| debug!(?store))
-                .inspect_err(|err| debug!(?err))?;
-            }
-
-            if let Some(idempotent) = idempotent {
-                self.advance_idempotent_sequence(
-                    transaction_id,
-                    topition,
-                    idempotent,
-                    transactional,
-                    offset,
-                    None,
-                )
-                .await?;
-            }
-
-            Ok(offset)
-        } else {
-            let attributes =
-                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
-
-            // Decode and validate before the producer's sequence or the high
-            // watermark moves, so that a batch rejected here leaves no state
-            // behind. A producer can reuse a rejected batch's sequence for its
-            // next batch. If the stored sequence had moved, that batch would
-            // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
-            // although nothing was stored.
-            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
-            {
-                let inflated = {
-                    let deflated = deflated.clone();
-                    offload(move || inflate_produced(&deflated))
-                }
-                .await
-                .inspect_err(|err| debug!(?err))?;
-
-                if let Some(ref registry) = self.schemas {
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
-
-                // Only the lake reads the decoded batch after this point.
-                // Dropping it here, rather than at the end of the function,
-                // frees its memory before the object store writes.
-                self.lake.is_some().then_some(inflated)
-            } else {
-                None
-            };
-
-            let transactional = transaction_id.is_some() || deflated.is_transactional();
-            let idempotent = IdempotentBatch::of(&deflated);
-
-            if let Some(ref idempotent) = idempotent
-                && let SequenceCheck::Duplicate { base_offset } = self
-                    .check_idempotent_sequence(transaction_id, topition, idempotent, transactional)
-                    .await?
-            {
-                return Ok(base_offset);
-            }
-
-            self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
-                .await?;
-
-            if let Some(transaction_id) = transaction_id
-                && attributes.transaction
-            {
-                // This costs a `meta.json` write on the transaction's first batch to the
-                // partition, and a cached read on each later batch. Recording the bound in
-                // AddPartitionsToTxn instead would ride on that call's `meta.json` write, but
-                // the end of the transaction writes a marker to each partition with a recorded
-                // range, so an added partition that gets no batch would get a marker too.
-                self.record_transaction_start(transaction_id, deflated.producer_epoch, topition)
-                    .await?;
-            }
-
-            let watermark = self.watermark_for(topition)?;
-
-            let offset = watermark
-                .with_mut(&self.object_store, |watermark| {
-                    debug!(?watermark);
-
-                    // with_mut stores each change that this closure makes, also when it then
-                    // answers an error, so the fence runs before any change. A refused batch
-                    // still costs one get and one put of an unchanged watermark.
-                    if let Some(ref idempotent) = idempotent {
-                        watermark.fence_producer_epoch(
-                            idempotent.producer_id,
-                            idempotent.producer_epoch,
-                        )?;
-                    }
-
-                    let offset = watermark.high.unwrap_or_default();
-                    let is_new_partition = watermark.high.is_none();
-
-                    watermark.high = watermark.high.map_or_else(
-                        || Some(deflated.last_offset_delta as i64 + 1i64),
-                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
-                    );
-
-                    if is_new_partition {
-                        watermark.time_index.mark_complete();
-                    }
-
-                    // The index is appended to whether or not it is complete.
-                    // A produce that waited for a concurrent backfill would
-                    // leave a gap: the backfill reads the index before this
-                    // entry exists, and merges nothing in for it.
-                    watermark.time_index.append(
-                        deflated.max_timestamp,
-                        offset,
-                        u64::try_from(deflated.batch_length).unwrap_or_default(),
-                    );
-
-                    // The epoch is recorded before the record write. When that write fails,
-                    // the partition refuses the older epoch although it stores nothing at the
-                    // newer one. The client has already moved to the newer epoch, so it does
-                    // not send the older one again.
-                    if let Some(ref idempotent) = idempotent {
-                        watermark.record_producer_epoch(
-                            idempotent.producer_id,
-                            idempotent.producer_epoch,
-                        );
-                    }
-
-                    debug!(?watermark);
-
-                    Ok(offset)
-                })
-                .await
-                .inspect(|offset| debug!(offset, transaction_id, ?topition))
-                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-
-            if let Some(transaction_id) = transaction_id
-                && attributes.transaction
-            {
-                self.meta
-                    .with_mut(&self.object_store, |meta| {
-                        // The check before the write is a read that can go stale. This one
-                        // runs on the version of `meta.json` that the write below replaces,
-                        // so it decides, and the bookkeeping never adds a partition itself.
-                        //
-                        // A refusal here leaves the offset reserved above empty. The lake
-                        // write runs after this update, so a refused batch does not reach a
-                        // lake table.
-                        if !deflated.is_control() {
-                            meta.ensure_partition_in_transaction(
-                                transaction_id,
-                                deflated.producer_id,
-                                deflated.producer_epoch,
-                                topition,
-                            )?;
-                        }
-
-                        if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
-                            debug!(?transaction);
-
-                            if let Some(txn_detail) =
-                                transaction.epochs.get_mut(&deflated.producer_epoch)
-                            {
-                                debug!(?txn_detail);
-
-                                let offset_end = offset + deflated.last_offset_delta as i64;
-
-                                _ = txn_detail
-                                    .produces
-                                    .get_mut(&topition.topic)
-                                    .and_then(|partitions| partitions.get_mut(&topition.partition))
-                                    .map(|entry| {
-                                        let range = entry.get_or_insert(TxnProduceOffset {
-                                            offset_start: offset,
-                                            offset_end,
-                                        });
-
-                                        // The start only moves down (a defensive
-                                        // guard: the high watermark never falls, so
-                                        // the recorded bound is normally at or below
-                                        // every attempt's offset). It is not raised
-                                        // from the lower bound that
-                                        // `record_transaction_start` wrote: an attempt
-                                        // can hold a lower offset that it has not
-                                        // recorded yet. A concurrent retry of a batch
-                                        // can raise the high watermark after the first
-                                        // attempt did, and record its range first. The
-                                        // first attempt's records still go in the log
-                                        // (it then answers DUPLICATE_SEQUENCE_NUMBER),
-                                        // and raising the start to the retry's offset
-                                        // would let the last stable offset pass them.
-                                        if offset < range.offset_start {
-                                            range.offset_start = offset;
-                                        }
-
-                                        if offset_end > range.offset_end {
-                                            range.offset_end = offset_end;
-                                        }
-                                    });
-                            }
-                        }
-
-                        Ok(())
-                    })
-                    .await
-                    .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-            }
-
-            if let Some(ref lake) = self.lake
-                && let Some(ref inflated) = inflated
-            {
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    inflated,
-                    config,
-                )
-                .await
-                .inspect(|store| debug!(?store))
-                .inspect_err(|err| debug!(?err))?;
-            }
-
-            let location = batch_path(&self.cluster, topition, offset);
-
-            let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
-
-            _ = self
-                .object_store
-                .put_opts(
-                    &location,
-                    payload,
-                    PutOptions {
-                        mode: PutMode::Create,
-                        attributes: Attributes::new(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                .inspect_err(|error| {
-                    error!(
-                        ?error,
-                        transaction_id,
-                        ?topition,
-                        offset,
-                        ?location,
-                        ?idempotent
-                    )
-                })
-                .map_err(|error| {
-                    let error = Error::from(error);
-
-                    // Every transient error of this write answers UNKNOWN_SERVER_ERROR for an
-                    // idempotent batch, also one where the store refused the write, such as a
-                    // throttle. The error does not tell whether the write completed, and a
-                    // retry of a stored batch stores it twice. A HEAD request on `location`
-                    // would tell, and this code does not send one.
-                    if idempotent.is_some() {
-                        unretriable_after_write(error)
-                    } else {
-                        error
-                    }
-                })?;
-
-            if let Some(idempotent) = idempotent {
-                self.advance_idempotent_sequence(
-                    transaction_id,
-                    topition,
-                    idempotent,
-                    transactional,
-                    offset,
-                    Some(&location),
-                )
-                .await?;
-            }
-
-            Ok(offset)
-        }
+    /// Appends `deflated` to `topition`, with the batch that the caller decoded, so that the
+    /// backend does not decode it again.
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.produce_with(transaction_id, topition, deflated, Some(inflated))
+            .await
     }
 
     async fn fetch(

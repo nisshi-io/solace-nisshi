@@ -162,7 +162,7 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     offset_commit_request::OffsetCommitRequestPartition,
-    record::deflated,
+    record::{deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -2078,6 +2078,33 @@ pub trait Storage: Debug + Send + Sync + 'static {
         batch: deflated::Batch,
     ) -> Result<i64>;
 
+    /// Produce a batch that the caller has already decoded.
+    ///
+    /// [`ProduceService`] decodes every client batch to validate it, and then hands the decoded
+    /// batch down so that a backend which needs one does not decode the same bytes again. A
+    /// backend that has no use for the decoded batch keeps this default, which drops `inflated`
+    /// before it calls [`Storage::produce`], so that it holds no decoded records while it waits
+    /// for storage.
+    ///
+    /// `inflated` must be `deflated` decoded with [`inflate_produced`], including the timestamp
+    /// type, `base_timestamp`, `max_timestamp` and `crc` that [`ProduceService`] set on `deflated`.
+    /// A caller that cannot promise that calls [`Storage::produce`].
+    ///
+    /// A wrapper must forward this method as well as [`Storage::produce`], or the default
+    /// discards the decoded batch and the inner backend decodes it again. The result and the
+    /// errors are those of [`Storage::produce`].
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        drop(inflated);
+
+        self.produce(transaction_id, topition, deflated).await
+    }
+
     /// Fetch deflated batches from storage.
     ///
     /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
@@ -2398,6 +2425,18 @@ where
         self.as_ref().produce(transaction_id, topition, batch).await
     }
 
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2685,6 +2724,18 @@ where
         batch: deflated::Batch,
     ) -> Result<i64> {
         self.as_ref().produce(transaction_id, topition, batch).await
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
     }
 
     async fn fetch(
