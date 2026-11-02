@@ -31,7 +31,7 @@ use nisshi_sans_io::{
     ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest,
     DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest,
     DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
-    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, FetchRequest,
+    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, ErrorCode, FetchRequest,
     FindCoordinatorRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
     ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
     ProduceRequest, Request, metadata_request::MetadataRequestTopic,
@@ -61,7 +61,9 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
 /// The harness decides which unset fields the encoder may refuse, and fails on any other refusal,
 /// so an input that is skipped here is one that the harness allows to be skipped. At least one
 /// input per version has to reach the byte comparison, or that version isn't fuzzed.
-fn check_every_version<T>(inputs: u64)
+///
+/// Returns the decoded requests that reached the byte comparison, for each version.
+fn compared_at_every_version<T>(inputs: u64) -> Vec<(i16, Vec<T>)>
 where
     T: Request + for<'a> Arbitrary<'a>,
 {
@@ -76,37 +78,49 @@ where
         T::KEY,
     );
 
-    for version in reached {
-        let mut built = 0;
-        let mut skipped = 0;
+    reached
+        .into_iter()
+        .map(|version| {
+            let mut built = 0;
+            let mut compared = Vec::new();
 
-        for seed in 0..inputs {
-            let data = bytes(seed, 4096);
+            for seed in 0..inputs {
+                let data = bytes(seed, 4096);
 
-            let Ok(request) = T::arbitrary(&mut Unstructured::new(&data)) else {
-                continue;
-            };
+                let Ok(request) = T::arbitrary(&mut Unstructured::new(&data)) else {
+                    continue;
+                };
 
-            built += 1;
+                built += 1;
 
-            let checked = catch_unwind(AssertUnwindSafe(|| check_request(request, version)))
-                .unwrap_or_else(|panic| {
-                    eprintln!("api key {} v{version}: seed {seed}", T::KEY);
-                    resume_unwind(panic)
-                })
-                .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
+                let checked = catch_unwind(AssertUnwindSafe(|| check_request(request, version)))
+                    .unwrap_or_else(|panic| {
+                        eprintln!("api key {} v{version}: seed {seed}", T::KEY);
+                        resume_unwind(panic)
+                    })
+                    .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
 
-            if checked.is_none() {
-                skipped += 1;
+                compared.extend(checked);
             }
-        }
 
-        assert!(
-            built > skipped,
-            "api key {} v{version}: no input reached the byte comparison ({built} built, {skipped} skipped)",
-            T::KEY,
-        );
-    }
+            assert!(
+                !compared.is_empty(),
+                "api key {} v{version}: no input reached the byte comparison ({built} built, {} skipped)",
+                T::KEY,
+                built - compared.len(),
+            );
+
+            (version, compared)
+        })
+        .collect()
+}
+
+/// [`compared_at_every_version`] for a test that needs only its checks.
+fn check_every_version<T>(inputs: u64)
+where
+    T: Request + for<'a> Arbitrary<'a>,
+{
+    drop(compared_at_every_version::<T>(inputs));
 }
 
 /// The APIs that nisshi routes at fewer versions than the protocol has are fuzzed at the routed
@@ -190,29 +204,64 @@ async fn metadata_response_encodes_at_every_routed_version() {
     }
 }
 
+/// Serves a request for `topic` at `version` and asserts that the answer encodes and matches the one
+/// that Kafka 3.9.1 gives to a request that it rejects.
+///
+/// Kafka rejects a Metadata request below v12 that has a null topic name or a non-zero topic ID
+/// with `InvalidRequestException` ([`KafkaApis.handleTopicMetadataRequest`]). It then answers each
+/// topic of the request with `INVALID_REQUEST`, the name of the request (`""` for a null name),
+/// and the topic ID of the request ([`MetadataRequest.getErrorResponse`]).
+///
+/// [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1320-L1329
+/// [`MetadataRequest.getErrorResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L142-L160
+async fn assert_answered_as_kafka_rejects(topic: MetadataRequestTopic, version: i16) {
+    let topic_id = topic.topic_id;
+    let name = topic.name.clone().unwrap_or_default();
+
+    let request = check_request(metadata_request_for(topic), version)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .expect("the topic encodes from v10");
+
+    let response = serve_metadata(request)
+        .await
+        .unwrap_or_else(|error| panic!("v{version}: {error}"));
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len(), "v{version}: one answer for the one topic");
+    assert_eq!(
+        i16::from(ErrorCode::InvalidRequest),
+        topics[0].error_code,
+        "v{version}"
+    );
+    assert_eq!(Some(name), topics[0].name, "v{version}");
+    assert_eq!(topic_id, topics[0].topic_id, "v{version}");
+
+    check_response(response, version).unwrap_or_else(|error| panic!("{error}"));
+}
+
 /// A topic `Name` is nullable from Metadata v10, but a response's topic `Name` only from v12. The
 /// memory engine answers an unnamed topic with an unnamed topic, which v10 and v11 can't encode.
-/// Kafka 3.9.1 rejects such a request with `InvalidRequestException`.
+/// Kafka rejects such a request, and a request with a topic ID next to a name, which Nisshi
+/// accepts by preferring the name.
 #[tokio::test]
 #[ignore = "the Metadata service answers an unnamed topic at v10 and v11 with a response that those versions can't encode"]
 async fn metadata_unnamed_topic_response_encodes_at_v10_and_v11() {
     for version in 10..=11 {
-        let request = check_request(
-            metadata_request_for(
-                MetadataRequestTopic::default()
-                    .topic_id(Some([0; 16]))
-                    .name(None),
-            ),
+        assert_answered_as_kafka_rejects(
+            MetadataRequestTopic::default()
+                .topic_id(Some([0; 16]))
+                .name(None),
             version,
         )
-        .unwrap_or_else(|error| panic!("{error}"))
-        .expect("an unnamed topic encodes from v10");
+        .await;
 
-        let response = serve_metadata(request)
-            .await
-            .unwrap_or_else(|error| panic!("v{version}: {error}"));
-
-        check_response(response, version).unwrap_or_else(|error| panic!("{error}"));
+        assert_answered_as_kafka_rejects(
+            MetadataRequestTopic::default()
+                .topic_id(Some([1; 16]))
+                .name(Some("orders".into())),
+            version,
+        )
+        .await;
     }
 }
 
@@ -321,9 +370,21 @@ fn list_partition_reassignments() {
     check_every_version::<ListPartitionReassignmentsRequest>(200);
 }
 
+/// The harness skips a Metadata request that leaves a topic's `Name` unset below v10, so a version
+/// can pass the byte comparison with requests that name no topic at all. Each version has to
+/// compare a request that names one, or the target stops fuzzing named topics.
 #[test]
 fn metadata() {
-    check_every_version::<MetadataRequest>(200);
+    for (version, requests) in compared_at_every_version::<MetadataRequest>(200) {
+        assert!(
+            requests
+                .iter()
+                .filter_map(|request| request.topics.as_ref())
+                .flatten()
+                .any(|topic| topic.name.is_some()),
+            "v{version}: no compared request names a topic",
+        );
+    }
 }
 
 #[test]

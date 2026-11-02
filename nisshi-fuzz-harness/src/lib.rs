@@ -40,19 +40,21 @@ where
     versions.start() + i16::try_from(selector % count).expect("fits: below the version count")
 }
 
-/// Whether the encoder may refuse a fuzzed request of API `api_key` because it leaves `field`
-/// unset.
+/// Whether the encoder may refuse a fuzzed request of API `api_key` at `api_version` because it
+/// leaves `field` unset.
 ///
 /// The encoder refuses a field that is mandatory at the version and nullable only at a later one,
 /// and the generator leaves a field unset when it is nullable at the latest version. A refusal is
-/// right for the fields that this list names. Any other refusal means that a version stopped
-/// being fuzzed, or that the encoder rejects a request that it should encode, so
-/// [`check_request`] fails on it. A list of the refusals that are right keeps a refusal at one
-/// version from hiding behind a refusal at another.
-fn may_be_unset(api_key: i16, field: &str) -> bool {
+/// right for the fields that this list names, at the versions that it names. Any other refusal
+/// means that a version stopped being fuzzed, or that the encoder rejects a request that it should
+/// encode, so [`check_request`] fails on it. Naming the versions keeps a refusal at one version
+/// from hiding behind a refusal at another.
+fn may_be_unset(api_key: i16, api_version: i16, field: &str) -> bool {
     // A topic's `Name` is nullable from v10, so a request at an earlier version has no encoding
-    // when it leaves one unset.
-    api_key == MetadataRequest::KEY && field == "Frame.MetadataRequest.MetadataRequestTopic.name"
+    // when it leaves one unset. The version test makes a refusal at v10 or later fail.
+    api_key == MetadataRequest::KEY
+        && api_version < 10
+        && field == "Frame.MetadataRequest.MetadataRequestTopic.name"
 }
 
 fn at_version(error: Error, api_key: i16, api_version: i16) -> Error {
@@ -93,7 +95,7 @@ where
     let once = match Frame::request(header.clone(), request.into()) {
         Err(Error::MandatoryFieldUnset { field, .. }) => {
             assert!(
-                may_be_unset(T::KEY, &field),
+                may_be_unset(T::KEY, api_version, &field),
                 "api key {} v{api_version}: the encoder refused a request that leaves {field} unset",
                 T::KEY,
             );

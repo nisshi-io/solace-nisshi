@@ -437,7 +437,7 @@ fn is_optional(parent: Option<&Field>, f: &Field) -> bool {
 /// containing message's highest `validVersions` entry), and, for a field
 /// that a later version dropped, at the versions that still have it. The
 /// fuzz targets encode at every version of an API, picked by
-/// `fuzz/src/lib.rs::api_version`.
+/// `nisshi_fuzz_harness::api_version`.
 ///
 /// A field whose Rust type is `Option`-wrapped only because it isn't present
 /// in every version (see [`kind`]) is otherwise filled in by the derive with
