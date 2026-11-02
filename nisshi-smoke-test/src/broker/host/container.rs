@@ -213,9 +213,11 @@ impl BrokerContainer {
         // transiently. A broker that the harness killed may print nothing, so ask once.
         let attempts = if code.is_some() { LOG_ATTEMPTS } else { 1 };
 
-        let log_problem = collect_log(attempts, LOG_RETRY_DELAY, || self.save_logs(log))
-            .err()
-            .map(|problem| format!("{problem}; {}", self.log_context()));
+        let log_problem = collect_log(attempts, LOG_RETRY_DELAY, || {
+            self.save_logs_expecting_output(log)
+        })
+        .err()
+        .map(|problem| format!("{problem}; {}", self.log_context()));
 
         remove_container(&self.name);
         (code, log_problem)
@@ -268,9 +270,23 @@ impl BrokerContainer {
         metadata
     }
 
-    /// Writes what the container printed to `log`. Fails when `docker logs` fails, and when it
-    /// prints nothing, because a broker that started always prints something.
+    /// Writes what the container printed to `log`.
     fn save_logs(&self, log: &Path) -> Result<(), String> {
+        self.write_logs(log).map(drop)
+    }
+
+    /// Writes what the container printed to `log`, and fails when it printed nothing: a broker
+    /// that exited after a failed start always printed its error.
+    fn save_logs_expecting_output(&self, log: &Path) -> Result<(), String> {
+        if self.write_logs(log)? {
+            Ok(())
+        } else {
+            Err(format!("docker logs {} printed nothing", self.name))
+        }
+    }
+
+    /// Writes what the container printed to `log`. Returns whether it printed anything.
+    fn write_logs(&self, log: &Path) -> Result<bool, String> {
         let logs = docker::execute(&["logs", &self.name])?;
 
         if logs.code != Some(0) {
@@ -282,11 +298,7 @@ impl BrokerContainer {
         fs::write(log, &printed)
             .map_err(|err| format!("couldn't write {}: {err}", log.display()))?;
 
-        if printed.is_empty() {
-            return Err(format!("docker logs {} printed nothing", self.name));
-        }
-
-        Ok(())
+        Ok(!printed.is_empty())
     }
 }
 
