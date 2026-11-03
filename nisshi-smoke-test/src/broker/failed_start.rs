@@ -193,4 +193,38 @@ mod tests {
 
         assert_eq!(failed_start.error_lines().count(), 0);
     }
+
+    #[test]
+    fn from_log_says_it_couldnt_read_a_log_that_is_missing() {
+        let missing = std::env::temp_dir().join("nisshi-smoke-no-such-log");
+
+        let failed_start = FailedStart::from_log(
+            "nisshi broker".to_owned(),
+            Some(1),
+            &missing,
+            None,
+            "exited with 1".to_owned(),
+        );
+
+        let problem = failed_start.log_problem.expect("a log problem");
+        assert!(problem.starts_with("couldn't read "), "{problem}");
+    }
+
+    #[test]
+    fn from_log_keeps_the_docker_reason_over_the_missing_file() {
+        let missing = std::env::temp_dir().join("nisshi-smoke-no-such-log");
+
+        let failed_start = FailedStart::from_log(
+            "nisshi broker".to_owned(),
+            Some(1),
+            &missing,
+            Some("docker logs x: no such container".to_owned()),
+            "exited with 1".to_owned(),
+        );
+
+        assert_eq!(
+            failed_start.log_problem.as_deref(),
+            Some("docker logs x: no such container")
+        );
+    }
 }

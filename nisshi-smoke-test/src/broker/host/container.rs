@@ -32,11 +32,18 @@ use crate::{
 const CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many times to ask `docker logs` for the log of a broker that exited without printing, and
-/// how long to wait between asks, and when to stop asking whatever the count: a hung `docker logs`
-/// takes up to a minute, and the test must reach its failure report before nextest kills it.
+/// how long to wait between asks, and when to stop asking whatever the count. Each ask gets only
+/// the time left in the window, so one hung `docker logs` cannot hold the test for its usual
+/// minute: the test must reach its failure report before nextest kills it.
 const LOG_ATTEMPTS: u32 = 20;
 const LOG_WINDOW: Duration = Duration::from_secs(3);
 const LOG_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The least time that one `docker logs` gets, however little of the window is left.
+const LOG_MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long the `docker inspect` that describes a lost log has to finish.
+const LOG_CONTEXT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What `docker cp` prints when the file to copy isn't in the container.
 const DOCKER_CP_MISSING_FILE: &str = "Could not find the file";
@@ -197,30 +204,34 @@ impl BrokerContainer {
     /// to `log`, and removes it. Returns its exit code, or `None` if the harness killed it, and
     /// why the log is missing or empty, if it is.
     pub(super) fn stop_after_failed_start(&self, log: &Path) -> (Option<i32>, Option<String>) {
-        let code = match self.check_running() {
+        let (killed, code) = match self.check_running() {
             Ok(()) => {
                 _ = docker::execute(&["kill", &self.name]);
-                None
+                (true, None)
             }
 
-            Err(_) => docker::inspect(&self.name, "{{.State.ExitCode}}")
-                .ok()
-                .and_then(|code| code.parse().ok()),
+            Err(_) => (
+                false,
+                docker::inspect(&self.name, "{{.State.ExitCode}}")
+                    .ok()
+                    .and_then(|code| code.parse().ok()),
+            ),
         };
 
         // Save the container's output before removing the container deletes it.
         // `FailedStart` reads the broker's error from this log, so without it a test
         // that expects a refusal fails. A broker that exited has nothing more to print, so an
         // empty log is a lost one: ask again for a moment, in case `docker logs` failed
-        // transiently. A broker that the harness killed may print nothing, so ask once.
-        let log_problem = if code.is_some() {
-            collect_log(LOG_ATTEMPTS, LOG_RETRY_DELAY, LOG_WINDOW, || {
-                self.save_logs_expecting_output(log)
+        // transiently, also when `docker inspect` could not read the exit code. A broker that the
+        // harness killed may print nothing, so ask once.
+        let log_problem = if killed {
+            self.save_logs(log).err()
+        } else {
+            collect_log(LOG_ATTEMPTS, LOG_RETRY_DELAY, LOG_WINDOW, |timeout| {
+                self.save_logs_expecting_output(log, timeout)
             })
             .err()
             .map(|problem| format!("{problem}; {}", self.log_context()))
-        } else {
-            self.save_logs(log).err()
         };
 
         remove_container(&self.name);
@@ -230,9 +241,10 @@ impl BrokerContainer {
     /// Describes how the container logs and how long it lived, to tell a log lost in a
     /// short-lived container from one that `docker logs` couldn't read.
     fn log_context(&self) -> String {
-        match docker::inspect(
+        match docker::inspect_within(
             &self.name,
             "{{.HostConfig.LogConfig.Type}} started {{.State.StartedAt}} finished {{.State.FinishedAt}}",
+            LOG_CONTEXT_TIMEOUT,
         ) {
             Ok(context) => format!("log driver {context}"),
             Err(reason) => reason,
@@ -276,22 +288,23 @@ impl BrokerContainer {
 
     /// Writes what the container printed to `log`.
     fn save_logs(&self, log: &Path) -> Result<(), String> {
-        self.write_logs(log).map(drop)
+        self.write_logs(log, Duration::from_secs(60)).map(drop)
     }
 
     /// Writes what the container printed to `log`, and fails when it printed nothing: a broker
-    /// that exited after a failed start always printed its error.
-    fn save_logs_expecting_output(&self, log: &Path) -> Result<(), String> {
-        if self.write_logs(log)? {
+    /// that exited after a failed start always printed its error. `docker logs` gets `timeout`.
+    fn save_logs_expecting_output(&self, log: &Path, timeout: Duration) -> Result<(), String> {
+        if self.write_logs(log, timeout)? {
             Ok(())
         } else {
             Err(format!("docker logs {} printed nothing", self.name))
         }
     }
 
-    /// Writes what the container printed to `log`. Returns whether it printed anything.
-    fn write_logs(&self, log: &Path) -> Result<bool, String> {
-        let logs = docker::execute(&["logs", &self.name])?;
+    /// Writes what the container printed to `log`, and gives `docker logs` `timeout` to finish.
+    /// Returns whether the container printed anything.
+    fn write_logs(&self, log: &Path, timeout: Duration) -> Result<bool, String> {
+        let logs = docker::execute_within(&["logs", &self.name], timeout)?;
 
         if logs.code != Some(0) {
             return Err(format!("docker logs {}: {}", self.name, logs.stderr.trim()));
@@ -307,22 +320,39 @@ impl BrokerContainer {
 }
 
 /// Calls `fetch` up to `attempts` times, `delay` apart, until it succeeds, and stops asking once
-/// `window` has passed. Returns the last failure, with the number of attempts, if none succeeds.
+/// `window` has passed. Each call gets the time left in the window as its timeout.
+///
+/// Returns the first and the last failure, with the number of attempts, if none succeeds. When a
+/// call succeeds after a failure, prints the failures to stderr, which nextest keeps for a passing
+/// test, so that a recovery leaves a trace.
 fn collect_log(
     attempts: u32,
     delay: Duration,
     window: Duration,
-    mut fetch: impl FnMut() -> Result<(), String>,
+    mut fetch: impl FnMut(Duration) -> Result<(), String>,
 ) -> Result<(), String> {
     let started = Instant::now();
+    let mut first = None;
     let mut last = String::new();
     let mut made = 0;
 
     for attempt in 1..=attempts {
         made = attempt;
-        match fetch() {
-            Ok(()) => return Ok(()),
-            Err(reason) => last = reason,
+        match fetch(time_left(window, started.elapsed())) {
+            Ok(()) => {
+                if let Some(first) = first {
+                    eprintln!(
+                        "the broker's log was lost on {} attempt(s) and then collected on attempt \
+                         {attempt}: {first}; then {last}",
+                        attempt - 1
+                    );
+                }
+                return Ok(());
+            }
+            Err(reason) => {
+                _ = first.get_or_insert_with(|| reason.clone());
+                last = reason;
+            }
         }
 
         if started.elapsed() >= window {
@@ -334,7 +364,19 @@ fn collect_log(
         }
     }
 
-    Err(format!("{last} after {made} attempt(s)"))
+    let first = first.unwrap_or_default();
+
+    if first == last {
+        Err(format!("{last} after {made} attempt(s)"))
+    } else {
+        Err(format!("{first}; then {last} after {made} attempt(s)"))
+    }
+}
+
+/// Returns how long the next ask has: what is left of `window` after `elapsed`, and at least
+/// [`LOG_MIN_TIMEOUT`].
+fn time_left(window: Duration, elapsed: Duration) -> Duration {
+    window.saturating_sub(elapsed).max(LOG_MIN_TIMEOUT)
 }
 
 impl fmt::Display for BrokerContainer {
@@ -353,7 +395,7 @@ fn remove_container(name: &str) {
 mod tests {
     use std::time::Duration;
 
-    use super::collect_log;
+    use super::{LOG_MIN_TIMEOUT, collect_log, time_left};
 
     const WINDOW: Duration = Duration::from_secs(60);
 
@@ -361,7 +403,7 @@ mod tests {
     fn collect_log_asks_again_until_the_log_is_there() {
         let mut asked = 0;
 
-        let collected = collect_log(5, Duration::ZERO, WINDOW, || {
+        let collected = collect_log(5, Duration::ZERO, WINDOW, |_| {
             asked += 1;
             if asked < 3 {
                 Err("printed nothing".to_owned())
@@ -375,22 +417,37 @@ mod tests {
     }
 
     #[test]
-    fn collect_log_names_the_last_failure_and_the_attempts() {
+    fn collect_log_names_the_first_and_last_failure_and_the_attempts() {
         let mut asked = 0;
 
-        let collected = collect_log(3, Duration::ZERO, WINDOW, || {
+        let collected = collect_log(3, Duration::ZERO, WINDOW, |_| {
             asked += 1;
             Err(format!("failure {asked}"))
         });
 
-        assert_eq!(collected, Err("failure 3 after 3 attempt(s)".to_owned()));
+        assert_eq!(
+            collected,
+            Err("failure 1; then failure 3 after 3 attempt(s)".to_owned())
+        );
+    }
+
+    #[test]
+    fn collect_log_names_a_repeated_failure_once() {
+        let collected = collect_log(3, Duration::ZERO, WINDOW, |_| {
+            Err("printed nothing".to_owned())
+        });
+
+        assert_eq!(
+            collected,
+            Err("printed nothing after 3 attempt(s)".to_owned())
+        );
     }
 
     #[test]
     fn collect_log_stops_asking_when_the_window_has_passed() {
         let mut asked = 0;
 
-        let collected = collect_log(20, Duration::ZERO, Duration::ZERO, || {
+        let collected = collect_log(20, Duration::ZERO, Duration::ZERO, |_| {
             asked += 1;
             Err("timed out".to_owned())
         });
@@ -403,11 +460,43 @@ mod tests {
     fn collect_log_asks_once_when_given_one_attempt() {
         let mut asked = 0;
 
-        _ = collect_log(1, Duration::ZERO, WINDOW, || {
+        _ = collect_log(1, Duration::ZERO, WINDOW, |_| {
             asked += 1;
             Err("printed nothing".to_owned())
         });
 
         assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn collect_log_gives_each_ask_no_more_than_the_window() {
+        let mut timeouts = vec![];
+
+        _ = collect_log(2, Duration::ZERO, WINDOW, |timeout| {
+            timeouts.push(timeout);
+            Err("timed out".to_owned())
+        });
+
+        assert!(timeouts.iter().all(|timeout| *timeout <= WINDOW));
+    }
+
+    #[test]
+    fn time_left_is_what_remains_of_the_window() {
+        assert_eq!(
+            time_left(Duration::from_secs(3), Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn time_left_is_never_less_than_the_minimum() {
+        assert_eq!(
+            time_left(Duration::from_secs(3), Duration::from_millis(2900)),
+            LOG_MIN_TIMEOUT
+        );
+        assert_eq!(
+            time_left(Duration::from_secs(3), Duration::from_secs(10)),
+            LOG_MIN_TIMEOUT
+        );
     }
 }
