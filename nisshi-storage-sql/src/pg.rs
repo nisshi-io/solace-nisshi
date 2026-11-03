@@ -5445,9 +5445,10 @@ impl Storage for Postgres {
     /// Runs each maintenance step, whether or not the steps before it
     /// failed: retention, the removal of the records that DeleteRecords left
     /// below the log start, compaction and the lake. No step depends on
-    /// another, so one that fails, such as a retention sweep that times out
-    /// on a lock, does not hold back the others until the next run. Each
-    /// failure is logged, and the first is returned.
+    /// another, so one that fails, such as a retention sweep that hits a
+    /// deadlock or a `lock_timeout` set in the connection options, does not
+    /// hold back the others until the next run. Each failure is logged, and
+    /// the first is returned.
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         let deleted = self
             .policy_delete(now)
@@ -7507,161 +7508,165 @@ mod tests {
     /// failure.
     #[tokio::test]
     async fn maintain_runs_every_step_when_retention_fails() -> Result<()> {
-        use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
-        use tokio_postgres::NoTls;
-
-        let cluster = alphanumeric_string(15);
-
-        // Every connection of this storage gives up waiting for a lock after 500ms. The option is
-        // written by hand, because `Url::query_pairs_mut` writes a space as `+`, which
-        // tokio-postgres reads as itself.
-        let url = format!(
-            "{}{}options=-c%20lock_timeout%3D500",
-            *CONNECTION,
-            if CONNECTION.contains('?') { '&' } else { '?' }
-        );
-
-        let Some(storage) = storage_with_schema(
+        with_empty_database(
             "maintain_runs_every_step_when_retention_fails",
-            &url,
-            &cluster,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
+            async |database| {
+                use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
+                use tokio_postgres::NoTls;
 
-        storage
-            .register_broker(BrokerRegistrationRequest {
-                broker_id: 111,
-                cluster_id: cluster.clone(),
-                incarnation_id: Uuid::now_v7(),
-                rack: None,
-            })
-            .await?;
+                // The schema comes from a storage without the lock timeout, so that the timeout applies
+                // to the statements of the test only.
+                database.storage()?.ensure_schema().await?;
 
-        let create_topic = async |name: &str, configs: Vec<CreatableTopicConfig>| -> Result<()> {
-            storage
-                .create_topic(
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(1)
-                        .replication_factor(0)
-                        .assignments(Some([].into()))
-                        .configs(Some(configs)),
-                    false,
-                )
-                .await
-                .map(|_| ())
-        };
+                // Every connection of this storage gives up waiting for a lock after 500ms. The option is
+                // written by hand, because `Url::query_pairs_mut` writes a space as `+`, which
+                // tokio-postgres reads as itself.
+                let mut url = database.url()?;
+                let query = match url.query() {
+                    Some(query) => format!("{query}&options=-c%20lock_timeout%3D500"),
+                    None => "options=-c%20lock_timeout%3D500".to_owned(),
+                };
+                url.set_query(Some(&query));
 
-        let produce = async |name: &str, key: Option<Bytes>| -> Result<i64> {
-            let batch = Batch::builder()
-                .record(
-                    Record::builder()
-                        .key(key)
-                        .value(Bytes::from_static(b"r").into()),
-                )
-                .build()
-                .and_then(TryInto::try_into)?;
+                let storage = database.storage_at(&url)?;
+                let cluster = storage.cluster.clone();
 
-            storage.produce(None, &Topition::new(name, 0), batch).await
-        };
+                storage
+                    .register_broker(BrokerRegistrationRequest {
+                        broker_id: 111,
+                        cluster_id: cluster.clone(),
+                        incarnation_id: Uuid::now_v7(),
+                        rack: None,
+                    })
+                    .await?;
 
-        let stored = async |name: &str| -> Result<i64> {
-            let c = storage.connection().await?;
-            let row = c
-                .query_one(
-                    "select count(*) from record r \
+                let create_topic =
+                    async |name: &str, configs: Vec<CreatableTopicConfig>| -> Result<()> {
+                        storage
+                            .create_topic(
+                                CreatableTopic::default()
+                                    .name(name.into())
+                                    .num_partitions(1)
+                                    .replication_factor(0)
+                                    .assignments(Some([].into()))
+                                    .configs(Some(configs)),
+                                false,
+                            )
+                            .await
+                            .map(|_| ())
+                    };
+
+                let produce = async |name: &str, key: Option<Bytes>| -> Result<i64> {
+                    let batch = Batch::builder()
+                        .record(
+                            Record::builder()
+                                .key(key)
+                                .value(Bytes::from_static(b"r").into()),
+                        )
+                        .build()
+                        .and_then(TryInto::try_into)?;
+
+                    storage.produce(None, &Topition::new(name, 0), batch).await
+                };
+
+                let stored = async |name: &str| -> Result<i64> {
+                    let c = storage.connection().await?;
+                    let row = c
+                        .query_one(
+                            "select count(*) from record r \
                      join topition tp on r.topition = tp.id \
                      join topic t on tp.topic = t.id \
                      join cluster c on t.cluster = c.id \
                      where c.name = $1 and t.name = $2",
-                    &[&cluster, &name],
+                            &[&cluster, &name],
+                        )
+                        .await?;
+                    row.try_get::<_, i64>(0).map_err(Into::into)
+                };
+
+                // retained has the default cleanup.policy, delete
+                let retained = alphanumeric_string(15);
+                create_topic(&retained, vec![]).await?;
+
+                let record_count = 6i64;
+                for _ in 0..record_count {
+                    _ = produce(&retained, None).await?;
+                }
+
+                // the log start moves to 3, as a DeleteRecords whose removal failed leaves it
+                {
+                    let mut c = storage.connection().await?;
+                    let tx = c.transaction().await?;
+
+                    _ = storage
+                        .tx_prepare_execute(
+                            &tx,
+                            "watermark_update.sql",
+                            &[&cluster, &retained, &0i32, &3i64, &record_count],
+                        )
+                        .await?;
+
+                    tx.commit().await?;
+                }
+
+                // compacted holds three records with one key, of which compaction keeps the last
+                let compacted = alphanumeric_string(15);
+                create_topic(
+                    &compacted,
+                    vec![
+                        CreatableTopicConfig::default()
+                            .name("cleanup.policy".into())
+                            .value(Some("compact".into())),
+                    ],
                 )
                 .await?;
-            row.try_get::<_, i64>(0).map_err(Into::into)
-        };
 
-        // retained has the default cleanup.policy, delete
-        let retained = alphanumeric_string(15);
-        create_topic(&retained, vec![]).await?;
+                for _ in 0..3 {
+                    _ = produce(&compacted, Some(Bytes::from_static(b"k"))).await?;
+                }
 
-        let record_count = 6i64;
-        for _ in 0..record_count {
-            _ = produce(&retained, None).await?;
-        }
+                assert_eq!(record_count, stored(&retained).await?);
+                assert_eq!(3, stored(&compacted).await?);
 
-        // the log start moves to 3, as a DeleteRecords whose removal failed leaves it
-        {
-            let mut c = storage.connection().await?;
-            let tx = c.transaction().await?;
+                // Another session locks the record at offset 4, above the log start. Retention, a month
+                // after now, deletes every record of retained, so it waits on that lock and fails.
+                let (mut locker, connection) =
+                    tokio_postgres::connect(database.url()?.as_str(), NoTls).await?;
+                let connection = tokio::spawn(connection);
 
-            _ = storage
-                .tx_prepare_execute(
-                    &tx,
-                    "watermark_update.sql",
-                    &[&cluster, &retained, &0i32, &3i64, &record_count],
-                )
-                .await?;
-
-            tx.commit().await?;
-        }
-
-        // compacted holds three records with one key, of which compaction keeps the last
-        let compacted = alphanumeric_string(15);
-        create_topic(
-            &compacted,
-            vec![
-                CreatableTopicConfig::default()
-                    .name("cleanup.policy".into())
-                    .value(Some("compact".into())),
-            ],
-        )
-        .await?;
-
-        for _ in 0..3 {
-            _ = produce(&compacted, Some(Bytes::from_static(b"k"))).await?;
-        }
-
-        assert_eq!(record_count, stored(&retained).await?);
-        assert_eq!(3, stored(&compacted).await?);
-
-        // Another session locks the record at offset 4, above the log start. Retention, a month
-        // after now, deletes every record of retained, so it waits on that lock and fails.
-        let (mut locker, connection) = tokio_postgres::connect(&CONNECTION, NoTls).await?;
-        let connection = tokio::spawn(connection);
-
-        let lock = locker.transaction().await?;
-        _ = lock
-            .query_one(
-                "select r.offset_id from record r \
+                let lock = locker.transaction().await?;
+                _ = lock
+                    .query_one(
+                        "select r.offset_id from record r \
                  join topition tp on r.topition = tp.id \
                  join topic t on tp.topic = t.id \
                  join cluster c on t.cluster = c.id \
                  where c.name = $1 and t.name = $2 and r.offset_id = 4 \
                  for update of r",
-                &[&cluster, &retained],
-            )
-            .await?;
+                        &[&cluster, &retained],
+                    )
+                    .await?;
 
-        let a_month_later = SystemTime::now() + Duration::from_hours(30 * 24);
+                let a_month_later = SystemTime::now() + Duration::from_hours(30 * 24);
 
-        assert!(storage.maintain(a_month_later).await.is_err());
+                assert!(storage.maintain(a_month_later).await.is_err());
 
-        // the records below the log start are removed, and compaction ran
-        assert_eq!(record_count - 3, stored(&retained).await?);
-        assert_eq!(1, stored(&compacted).await?);
+                // the records below the log start are removed, and compaction ran
+                assert_eq!(record_count - 3, stored(&retained).await?);
+                assert_eq!(1, stored(&compacted).await?);
 
-        lock.rollback().await?;
-        drop(locker);
-        _ = connection.await;
+                lock.rollback().await?;
+                drop(locker);
+                _ = connection.await;
 
-        // with the lock released, retention deletes the rest
-        storage.maintain(a_month_later).await?;
-        assert_eq!(0, stored(&retained).await?);
+                // with the lock released, retention deletes the rest
+                storage.maintain(a_month_later).await?;
+                assert_eq!(0, stored(&retained).await?);
 
-        Ok(())
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// An open (uncommitted) transaction must pin the read_committed last stable
