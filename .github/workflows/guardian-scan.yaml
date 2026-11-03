@@ -404,7 +404,7 @@ jobs:
           poll-timeout: "1200"
           upload-logs: "true"
       - name: Guardian vulnerability gate
-        uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
