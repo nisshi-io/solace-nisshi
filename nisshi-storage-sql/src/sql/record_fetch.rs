@@ -21,19 +21,21 @@
 //! `$7`. A PostgreSQL version takes the most rows that it reads as its last parameter: `$7`, or
 //! `$8` in the keyed version.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "record_fetch.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("record_fetch.sql");
 
 /// The keyed version's name in the SQL cache. This version reads only the records with the key.
-pub(crate) const KEYED_QUERY: &str = "record_fetch_keyed.sql";
+pub(crate) const KEYED_QUERY: Query<Row> = Query::new("record_fetch_keyed.sql");
 
 /// The PostgreSQL version's name in the SQL cache. This version reads at most a given number of
 /// rows.
-pub(crate) const PG_QUERY: &str = "pg/record_fetch.sql";
+pub(crate) const PG_QUERY: Query<Row> = Query::new("pg/record_fetch.sql");
 
 /// The PostgreSQL keyed version's name in the SQL cache. This version reads at most a given number
 /// of rows with the key, and encodes the key as UTF-8, because PostgreSQL stores it as `bytea`.
-pub(crate) const PG_KEYED_QUERY: &str = "pg/record_fetch_keyed.sql";
+pub(crate) const PG_KEYED_QUERY: Query<Row> = Query::new("pg/record_fetch_keyed.sql");
 
 sql_row! {
     /// One record of the partition.

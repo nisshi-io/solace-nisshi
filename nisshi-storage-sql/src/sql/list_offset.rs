@@ -20,21 +20,26 @@
 //! latest versions return no row for a partition that does not exist. The timestamp version also
 //! returns no row when no record of the partition has a timestamp at or after `$4`.
 
+use super::Query;
+
 /// The earliest version's name in the SQL cache. This version answers the offset of the first
 /// stored record at or above the low watermark, or the high watermark when no such record exists.
-pub(crate) const EARLIEST_QUERY: &str = "list_earliest_offset.sql";
+pub(crate) const EARLIEST_QUERY: Query<Row> = Query::new("list_earliest_offset.sql");
 
 /// The `read_committed` latest version's name in the SQL cache. This version answers the last
 /// stable offset.
-pub(crate) const LATEST_COMMITTED_QUERY: &str = "list_latest_offset_committed.sql";
+pub(crate) const LATEST_COMMITTED_QUERY: Query<Row> =
+    Query::new("list_latest_offset_committed.sql");
 
 /// The timestamp version's name in the SQL cache. This version answers the first record whose
 /// timestamp is at or after `$4`.
-pub(crate) const LATEST_TIMESTAMP_QUERY: &str = "list_latest_offset_timestamp.sql";
+pub(crate) const LATEST_TIMESTAMP_QUERY: Query<Row> =
+    Query::new("list_latest_offset_timestamp.sql");
 
 /// The `read_uncommitted` latest version's name in the SQL cache. This version answers the high
 /// watermark.
-pub(crate) const LATEST_UNCOMMITTED_QUERY: &str = "list_latest_offset_uncommitted.sql";
+pub(crate) const LATEST_UNCOMMITTED_QUERY: Query<Row> =
+    Query::new("list_latest_offset_uncommitted.sql");
 
 sql_row! {
     /// The offset that answers the request.

@@ -17,8 +17,10 @@
 //!
 //! The query takes no parameters.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "nisshi_schema_version_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("nisshi_schema_version_select.sql");
 
 sql_row! {
     /// The schema version that the database records.

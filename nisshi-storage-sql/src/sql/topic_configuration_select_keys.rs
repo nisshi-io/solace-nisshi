@@ -19,8 +19,10 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the array of config keys to read.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "pg/topic_configuration_select_keys.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("pg/topic_configuration_select_keys.sql");
 
 sql_row! {
     /// One config among the requested keys that the topic sets, or the one row with a null name

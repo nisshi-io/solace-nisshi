@@ -33,7 +33,24 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    Api(ErrorCode),
+    /// The broker answered a fetch of `partition` of `topic` with an error code and no records.
+    /// A topic that doesn't exist is answered this way, which would otherwise look like an empty
+    /// topic.
+    Fetch {
+        topic: String,
+        partition: i32,
+        error_code: i16,
+    },
+
+    /// The broker answered the metadata lookup of `topic` with an error code. Kafka answers a
+    /// fetch by an unknown topic ID with `UNKNOWN_TOPIC_ID` before it checks authorization, so a
+    /// topic the user may not read would be reported as unknown. The metadata error code names
+    /// the real cause.
+    Metadata {
+        topic: String,
+        error_code: i16,
+    },
+
     Client(#[from] nisshi_client::Error),
     InvalidJson {
         location: Location,
@@ -96,8 +113,30 @@ impl fmt::Display for Error {
                     location.message_format()
                 )
             }
+            Self::Fetch {
+                topic,
+                partition,
+                error_code,
+            } => {
+                write!(
+                    f,
+                    "fetching partition {partition} of topic {topic:?} failed: "
+                )?;
+                write_error_code(f, *error_code)
+            }
+            Self::Metadata { topic, error_code } => {
+                write!(f, "looking up topic {topic:?} failed: ")?;
+                write_error_code(f, *error_code)
+            }
             _ => write!(f, "{self:?}"),
         }
+    }
+}
+
+fn write_error_code(f: &mut fmt::Formatter<'_>, error_code: i16) -> fmt::Result {
+    match ErrorCode::try_from(error_code) {
+        Ok(error_code) => write!(f, "{error_code:?} ({})", i16::from(error_code)),
+        Err(_) => write!(f, "unknown error code {error_code}"),
     }
 }
 

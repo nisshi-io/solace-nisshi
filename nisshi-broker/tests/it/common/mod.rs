@@ -42,9 +42,7 @@ use rand::{
     prelude::*,
     rng,
 };
-#[cfg(feature = "dynostore")]
-use std::sync::Arc;
-use std::{env, io::ErrorKind, thread};
+use std::{env, io::ErrorKind, sync::Arc, thread};
 use tokio::fs::remove_file;
 use tracing::{debug, subscriber::DefaultGuard};
 use tracing_subscriber::EnvFilter;

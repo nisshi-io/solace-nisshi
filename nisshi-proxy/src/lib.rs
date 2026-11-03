@@ -20,9 +20,8 @@ use nisshi_client::{
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
     ApiKey, DescribeConfigsRequest, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
-    MetadataRequest, MetadataResponse, NULL_TOPIC_ID, ProduceRequest, RequestInput,
-    find_coordinator_response::Coordinator, metadata_request::MetadataRequestTopic,
-    metadata_response::MetadataResponseBroker, topic_config,
+    MetadataRequest, ProduceRequest, RequestInput, find_coordinator_response::Coordinator,
+    topic_config,
 };
 use nisshi_service::{
     BytesFrameLayer, FrameApiKeyMatcher, FrameRequestLayer, TcpBytesLayer, TcpContextLayer,
@@ -57,6 +56,7 @@ use crate::{
 };
 
 mod acks_zero;
+mod metadata;
 mod produce;
 mod sasl;
 mod topic;
@@ -203,51 +203,7 @@ impl Proxy {
 
         let meta = HijackLayer::new(
             FrameApiKeyMatcher(MetadataRequest::KEY),
-            (
-                FrameRequestLayer::<MetadataRequest>::new(),
-                MapInputLayer::new(move |input: RequestInput<MetadataRequest>| {
-                    MetadataRequest::default()
-                        .topics(input.request.topics.map(|topics| {
-                            topics
-                                .into_iter()
-                                .map(|topic| {
-                                    MetadataRequestTopic::default()
-                                        .name(topic.name)
-                                        .topic_id(topic.topic_id.or(Some(NULL_TOPIC_ID)))
-                                })
-                                .collect()
-                        }))
-                        .allow_auto_topic_creation(
-                            input.request.allow_auto_topic_creation.or(Some(false)),
-                        )
-                        .include_cluster_authorized_operations(
-                            input.request.include_cluster_authorized_operations,
-                        )
-                        .include_topic_authorized_operations(
-                            input
-                                .request
-                                .include_topic_authorized_operations
-                                .or(Some(false)),
-                        )
-                }),
-                MapOutputLayer::new(move |response: MetadataResponse| {
-                    let brokers = response.brokers.as_ref().map(|brokers| {
-                        brokers
-                            .iter()
-                            .map(|broker| {
-                                MetadataResponseBroker::default()
-                                    .node_id(broker.node_id)
-                                    .host(host.clone())
-                                    .port(port)
-                                    .rack(broker.rack.clone())
-                            })
-                            .collect()
-                    });
-
-                    response.brokers(brokers)
-                }),
-            )
-                .into_layer(request_origin.clone()),
+            metadata::service(request_origin.clone(), host.clone(), port),
         );
 
         let host = String::from(self.advertised_listener.host_str().unwrap_or("localhost"));
@@ -408,7 +364,8 @@ mod tests {
     use std::{fs::File, sync::Arc, thread};
 
     use nisshi_sans_io::{
-        DescribeConfigsRequest, DescribeConfigsResponse, Frame, FrameInput, Header, ProduceResponse,
+        DescribeConfigsRequest, DescribeConfigsResponse, Frame, FrameInput, Header,
+        MetadataResponse, ProduceResponse,
     };
     use nisshi_service::{FrameService, RequestApiKeyMatcher, ResponseService};
     use rama::extensions::Extensions;

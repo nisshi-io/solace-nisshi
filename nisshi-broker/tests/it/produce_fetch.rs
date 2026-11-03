@@ -1310,7 +1310,6 @@ mod turso {
         .await
     }
 
-    #[ignore]
     #[tokio::test]
     async fn simple_non_txn() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1326,7 +1325,6 @@ mod turso {
         .await
     }
 
-    #[ignore]
     #[tokio::test]
     async fn with_txn() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1342,7 +1340,6 @@ mod turso {
         .await
     }
 
-    #[ignore]
     #[tokio::test]
     async fn with_multiple_txn() -> Result<()> {
         let _guard = init_tracing()?;

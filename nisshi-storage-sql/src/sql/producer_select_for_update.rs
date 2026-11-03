@@ -18,8 +18,10 @@
 //! The query takes five parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! partition's index, `$4` the producer ID, and `$5` the producer's epoch.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "producer_select_for_update.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("producer_select_for_update.sql");
 
 sql_row! {
     /// The next sequence of the producer's epoch on the partition.

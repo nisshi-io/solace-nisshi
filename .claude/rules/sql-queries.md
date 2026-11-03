@@ -16,13 +16,13 @@ changes.
 ## Rules
 
 - **Give each query that returns rows a module beside it.** `sql/topic_select.sql` gets
-  `sql/topic_select.rs`, declared in `sql.rs`. The module holds a `QUERY` constant with the
-  query's name in the SQL cache, and declares one row of the result with `sql_row!`, one line for
-  each column:
+  `sql/topic_select.rs`, declared in `sql.rs`. The module holds a `QUERY` constant, a `Query` of
+  the module's row with the query's name in the SQL cache, and declares one row of the result with
+  `sql_row!`, one line for each column:
 
   ```rust
   /// The query's name in the SQL cache.
-  pub(crate) const QUERY: &str = "topic_select.sql";
+  pub(crate) const QUERY: Query<Row> = Query::new("topic_select.sql");
 
   sql_row! {
       /// One topic of the cluster.
@@ -37,23 +37,20 @@ changes.
   ```
 
   A query whose engines read no column, because a row only means that something exists, needs
-  only `QUERY`. Variants of one query, such as a PostgreSQL version and a SQLite version, are
-  constants in one module.
+  only a `QUERY` that holds its name, as a `&str`. Variants of one query, such as a PostgreSQL
+  version and a SQLite version, are constants in one module.
 - **Name a field as its column, and rename a column in the SQL.** When the Rust name should differ
   from a table's column, the query renames the column with `as`, as in `p.id as producer_id`.
 - **Share one row type between the queries that return the same thing.** Declare it once, in an
   inline module of `sql/row.rs` named for what one row holds, and re-export it from each query's
   module with `pub(crate) use super::row::topic::Row;`. A row that only one query returns stays in
   that query's module.
-- **Read every row through the engine's helper.** The helper takes the row type in angle brackets
-  after its name, and returns rows of that type. Leave the type out when the code around the call
-  already names it. Never write the query's file name, a column's index or a `RowReader` at a call
-  site:
+- **Read every row through the engine's helper.** The helper takes the query's `QUERY` and
+  returns rows of its row type, so a call site can't pair a query with another query's row. Never
+  write the query's file name, a column's index or a `RowReader` at a call site:
 
   ```rust
-  let mut rows = connection
-      .query_rows::<topic_select::Row>(topic_select::QUERY, params)
-      .await?;
+  let mut rows = connection.query_rows(topic_select::QUERY, params).await?;
 
   while let Some(topic_select::Row { name, partitions }) = rows.next().await? {
       // ...

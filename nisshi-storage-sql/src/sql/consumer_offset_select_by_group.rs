@@ -16,8 +16,10 @@
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the group's name.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "consumer_offset_select_by_group.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("consumer_offset_select_by_group.sql");
 
 sql_row! {
     /// The committed offset of a consumer group on one partition.

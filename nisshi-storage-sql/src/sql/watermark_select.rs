@@ -19,8 +19,10 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "watermark_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("watermark_select.sql");
 
 sql_row! {
     /// A partition's watermarks.

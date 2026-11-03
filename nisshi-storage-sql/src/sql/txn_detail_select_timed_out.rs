@@ -17,8 +17,10 @@
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the current time.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_detail_select_timed_out.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_detail_select_timed_out.sql");
 
 sql_row! {
     /// One transaction whose transaction timeout has expired.

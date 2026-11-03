@@ -12,8 +12,8 @@ include.workspace = true
 
 [features]
 default = ["libsql", "postgres", "turso"]
-libsql = ["dep:libsql", "dep:deadpool"]
-postgres = ["dep:tokio-postgres", "dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres-rustls"]
+libsql = ["dep:libsql", "dep:deadpool", "nisshi-storage/libsql"]
+postgres = ["dep:tokio-postgres", "dep:deadpool", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "nisshi-storage/postgres"]
 turso = ["dep:turso", "nisshi-storage/turso"]
 test-support = []
 
@@ -36,7 +36,7 @@ human-units.workspace = true
 libsql = { workspace = true, optional = true }
 nisshi-sans-io.workspace = true
 nisshi-schema.workspace = true
-nisshi-storage = {workspace = true, features = ["libsql", "postgres"]}
+nisshi-storage.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true

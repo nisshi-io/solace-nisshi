@@ -16,8 +16,10 @@
 //!
 //! The query takes two parameters: `$1` is the partition's ID, and `$2` the key.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "lite/policy_compact_max_offset_id.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("lite/policy_compact_max_offset_id.sql");
 
 sql_row! {
     /// The newest offset of a key.

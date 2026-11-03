@@ -20,8 +20,10 @@
 //! and `$7` the offset. The result does not include the transaction that `$2`, `$3` and `$4`
 //! name.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_produce_offset_select_overlapping_txn.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_produce_offset_select_overlapping_txn.sql");
 
 sql_row! {
     /// One transaction that produced to the partition below the offset.

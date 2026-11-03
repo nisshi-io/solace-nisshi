@@ -16,8 +16,10 @@
 //!
 //! The query takes one parameter, `$1`: the cluster's name.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_by_cluster.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_by_cluster.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::topic::Row;

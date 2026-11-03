@@ -626,13 +626,24 @@ mod tests {
     struct Postgres;
 
     #[cfg(feature = "postgres")]
+    impl Postgres {
+        /// Returns whether the PostgreSQL server that the tests use can be reached. When it
+        /// can't, this prints that `test` is skipped, as the engine's PostgreSQL tests do, so
+        /// that a run without the server passes.
+        async fn is_reachable(test: &str) -> bool {
+            tokio_postgres::connect(&crate::pg::tests::CONNECTION, tokio_postgres::NoTls)
+                .await
+                .inspect_err(|err| eprintln!("skipping {test}: {err:?}"))
+                .is_ok()
+        }
+    }
+
+    #[cfg(feature = "postgres")]
     impl ProbeDriver for Postgres {
         async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
-            let (client, connection) = tokio_postgres::connect(
-                "host=localhost user=postgres password=postgres",
-                tokio_postgres::NoTls,
-            )
-            .await?;
+            let (client, connection) =
+                tokio_postgres::connect(&crate::pg::tests::CONNECTION, tokio_postgres::NoTls)
+                    .await?;
             let connection = tokio::spawn(connection);
 
             let statement = client.prepare(sql).await?;
@@ -816,6 +827,10 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn postgres_converted_columns_read_their_stored_forms() -> Result<()> {
+        if !Postgres::is_reachable("postgres_converted_columns_read_their_stored_forms").await {
+            return Ok(());
+        }
+
         converted_columns_read_their_stored_forms::<Postgres>(&POSTGRES_CONVERTED).await
     }
 
@@ -846,24 +861,40 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn postgres_reordered_select_reads_the_same_values() -> Result<()> {
+        if !Postgres::is_reachable("postgres_reordered_select_reads_the_same_values").await {
+            return Ok(());
+        }
+
         reordered_select_reads_the_same_values::<Postgres>(&POSTGRES).await
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn postgres_renamed_column_is_missing_without_rows() -> Result<()> {
+        if !Postgres::is_reachable("postgres_renamed_column_is_missing_without_rows").await {
+            return Ok(());
+        }
+
         renamed_column_is_missing_without_rows::<Postgres>(&POSTGRES).await
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn postgres_duplicate_column_is_an_error() -> Result<()> {
+        if !Postgres::is_reachable("postgres_duplicate_column_is_an_error").await {
+            return Ok(());
+        }
+
         duplicate_column_is_an_error::<Postgres>(&POSTGRES).await
     }
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn postgres_unreadable_value_names_its_column() -> Result<()> {
+        if !Postgres::is_reachable("postgres_unreadable_value_names_its_column").await {
+            return Ok(());
+        }
+
         unreadable_value_names_its_column::<Postgres>(&POSTGRES).await
     }
 

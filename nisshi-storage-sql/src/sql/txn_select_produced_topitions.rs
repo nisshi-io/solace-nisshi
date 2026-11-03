@@ -18,8 +18,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the transactional ID, `$3`
 //! the producer ID, and `$4` the producer's epoch.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_select_produced_topitions.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_select_produced_topitions.sql");
 
 sql_row! {
     /// One partition that the transaction produced to.

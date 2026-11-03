@@ -18,8 +18,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the transactional ID, `$3`
 //! the producer ID, and `$4` the producer's epoch.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_detail_select_status_for_update.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_detail_select_status_for_update.sql");
 
 sql_row! {
     /// The transaction's status.

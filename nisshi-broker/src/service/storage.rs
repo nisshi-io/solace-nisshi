@@ -21,7 +21,9 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
+use nisshi_service::{
+    FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, TransactionAbortableDowngradeLayer,
+};
 use nisshi_storage::{
     AlterUserScramCredentialsService, AutoCreateRefusals, ConsumerGroupDescribeService,
     CreateAclsService, CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService,
@@ -452,6 +454,7 @@ where
         .with_route(
             MetadataRequest::KEY,
             (
+                MetadataTopicIdLayer,
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
@@ -512,26 +515,6 @@ where
         .map_err(Into::into)
 }
 
-pub fn txn_offset_commit<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            TxnOffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
-            )
-                .into_layer(TxnOffsetCommitService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
 pub fn end_txn<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
@@ -547,6 +530,26 @@ where
                 FrameRequestLayer::<EndTxnRequest>::new(),
             )
                 .into_layer(TxnEndService { storage })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn txn_offset_commit<S>(
+    builder: FrameRouteBuilder<Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage,
+{
+    builder
+        .with_route(
+            TxnOffsetCommitRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
+            )
+                .into_layer(TxnOffsetCommitService { storage })
                 .boxed(),
         )
         .map_err(Into::into)

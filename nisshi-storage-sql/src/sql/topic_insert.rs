@@ -17,8 +17,10 @@
 //! The query takes five parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` its ID,
 //! `$4` its partition count, and `$5` its replication factor.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_insert.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_insert.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::topic_id::Row;

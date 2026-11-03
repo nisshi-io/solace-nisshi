@@ -93,6 +93,8 @@ use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod held;
 mod metadata;
 mod opticon;
 mod produced_batches;
@@ -322,6 +324,43 @@ impl OptiCon<Meta> {
 }
 
 impl Meta {
+    /// Returns the open transaction starts: for each partition with an open transaction, the
+    /// first offset of the earliest one.
+    fn open_transaction_starts(&self) -> BTreeMap<Topition, Offset> {
+        self.transactions
+            .values()
+            .flat_map(|txn| {
+                debug!(?txn);
+
+                txn.epochs
+                    .values()
+                    .filter(|detail| {
+                        detail.state.is_some_and(|state| {
+                            state != TxnState::Committed && state != TxnState::Aborted
+                        })
+                    })
+                    .map(BTreeMap::<Topition, Offset>::from)
+                    .collect::<Vec<_>>()
+            })
+            .reduce(|mut acc, e| {
+                debug!(?acc, ?e);
+
+                for (topition, offset_start) in e.iter() {
+                    _ = acc
+                        .entry(topition.to_owned())
+                        .and_modify(|existing_offset_start| {
+                            if *existing_offset_start > *offset_start {
+                                *existing_offset_start = *offset_start
+                            }
+                        })
+                        .or_insert(*offset_start);
+                }
+
+                acc
+            })
+            .unwrap_or(BTreeMap::new())
+    }
+
     /// Whether a transactional ID owns the producer ID.
     fn transactional_id_owns(&self, producer_id: ProducerId) -> bool {
         self.transactions
@@ -1245,41 +1284,10 @@ impl DynoStore {
     async fn open_transaction_starts(&self) -> Result<BTreeMap<Topition, Offset>> {
         let starts = self
             .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new()))
-            })
+            .with(
+                &self.object_store,
+                |meta| Ok(meta.open_transaction_starts()),
+            )
             .await?;
 
         debug!(?starts);
@@ -3378,6 +3386,62 @@ impl Storage for DynoStore {
         Ok(offset_stage_of(
             high_watermark,
             log_start,
+            open_transaction_starts.get(topition).copied(),
+        ))
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        // `offset_stage` can answer from `watermark.json` as another broker's write
+        // left it, up to the retention of the object store `Cache` (5s, on a store that
+        // reads its own writes). This reads the object itself, so that a client that is
+        // ahead of a stale high watermark is told so only when the log is behind it.
+        //
+        // The answer comes from the documents this call read, not from the copies the
+        // `OptiCon`s keep: a concurrent call can change a kept copy while this call waits
+        // for the store, and the answer would then come from a watermark other than the one
+        // this call read.
+        //
+        // There is no throttle. A throttle would answer some out-of-range fetches from the
+        // cache, and a stale answer here resets a consumer that is in range, so a client that
+        // fetches an offset above the log end at once pays for it, as it does for
+        // `below_log_start`, which also answers at round-trip speed.
+        let watermark = self.checked_watermark_for(topition).await?;
+        let held = watermark.version()?;
+        let fresh = watermark.fetch(&self.object_store).await?;
+
+        // The last stable offset comes from `meta.json`, which is read after the high
+        // watermark (see `Self::watermark_offsets`): a fresh high watermark with an older
+        // `meta.json` could miss the open transaction that raised it, and read committed
+        // would pass it.
+        //
+        // The GET of `meta.json` is the cost of that guarantee, and `meta.json` is the key
+        // that every idempotent and transactional produce writes. This call makes the GET
+        // only when the watermark it read is a newer version than the one this broker held
+        // when the call began. The unchanged watermark is the one that the cached
+        // `offset_stage` answered from, so the cached `meta.json` is as current as it is for
+        // any other fetch.
+        let open_transaction_starts = if fresh.document.version == held {
+            self.open_transaction_starts().await?
+        } else {
+            self.meta
+                .get(&self.object_store)
+                .await?
+                .data
+                .open_transaction_starts()
+        };
+
+        // The broker keeps the watermark only now that `meta.json` is read. A call that fails
+        // or is dropped between the two reads leaves the held version behind the store's, so
+        // the next call reads `meta.json` as well. A watermark kept earlier would let that
+        // call take the cached `meta.json`, which can be older than the transaction that
+        // raised the watermark.
+        if fresh.document.version != held {
+            watermark.keep(&fresh)?;
+        }
+
+        Ok(offset_stage_of(
+            fresh.document.data.high.unwrap_or(0),
+            fresh.document.data.low.unwrap_or(0),
             open_transaction_starts.get(topition).copied(),
         ))
     }

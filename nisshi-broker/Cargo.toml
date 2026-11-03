@@ -77,18 +77,18 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+crc-fast.workspace = true
+nisshi-schema.workspace = true
+nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+nisshi-storage-sql = { workspace = true, features = ["test-support"] }
+nisshi-storage.workspace = true
 object_store.workspace = true
 pbkdf2.workspace = true
+pretty_assertions.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
+slatedb.workspace = true
 snap.workspace = true
 tempfile.workspace = true
 tokio-postgres.workspace = true
-pretty_assertions.workspace = true
-slatedb.workspace = true
-nisshi-schema.workspace = true
-nisshi-storage.workspace = true
-crc-fast.workspace = true
-nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
-nisshi-storage-sql = { workspace = true, features = ["test-support"] }
 traceforge.workspace = true

@@ -17,8 +17,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! config's key, and `$4` its value.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_configuration_upsert.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_configuration_upsert.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::written_id::Row;

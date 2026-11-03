@@ -17,8 +17,10 @@
 //!
 //! The query takes no parameters.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "pg/nisshi_schema_version_exists.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("pg/nisshi_schema_version_exists.sql");
 
 sql_row! {
     /// Whether the `nisshi_schema_version` table exists.

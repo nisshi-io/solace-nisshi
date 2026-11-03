@@ -106,8 +106,8 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        self, QueryRow, consumer_group_select, default_hash, header_fetch_range,
-        idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        self, ColumnErrorCount, Query, QueryRow, consumer_group_select, default_hash,
+        header_fetch_range, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
         result_columns::ResultColumns, topic_by_cluster, topic_configuration_select,
@@ -1206,7 +1206,7 @@ impl Postgres {
                     _ = self
                         .prepare_query_opt(
                             &tx,
-                            topic_configuration_upsert::QUERY,
+                            topic_configuration_upsert::QUERY.key(),
                             &[&self.cluster, topic, &config.name, &value],
                         )
                         .await?;
@@ -1358,10 +1358,10 @@ impl Postgres {
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let (columns, rows) = if let Some(key) = key_filter {
+        let (columns, rows, column_errors) = if let Some(key) = key_filter {
             self.prepare_query_result(
                 &tx,
-                record_fetch::PG_KEYED_QUERY,
+                record_fetch::PG_KEYED_QUERY.key(),
                 &[
                     &self.cluster,
                     &base_topic,
@@ -1378,7 +1378,7 @@ impl Postgres {
         } else {
             self.prepare_query_result(
                 &tx,
-                record_fetch::PG_QUERY,
+                record_fetch::PG_QUERY.key(),
                 &[
                     &self.cluster,
                     &topition.topic(),
@@ -1393,14 +1393,19 @@ impl Postgres {
             .inspect_err(|err| error!(?err))?
         };
 
-        let reader = record_fetch::RowReader::new(&columns)?;
-        let offset_reader = record_fetch::offset::RowReader::new(&columns)?;
+        let reader =
+            record_fetch::RowReader::new(&columns).inspect_err(|err| column_errors.record(err))?;
+        let offset_reader = record_fetch::offset::RowReader::new(&columns)
+            .inspect_err(|err| column_errors.record(err))?;
 
         // The iterator reads each row only when the loop below reaches it, and the loop stops at
         // the deadline, so that a fetch does not copy a key or a value that it then drops.
-        let mut records = rows
-            .iter()
-            .map(|row| reader.read_row(row).inspect_err(|err| error!(?err)));
+        let mut records = rows.iter().map(|row| {
+            reader.read_row(row).inspect_err(|err| {
+                error!(?err);
+                column_errors.record(err);
+            })
+        });
 
         let mut batches = vec![];
 
@@ -1421,19 +1426,22 @@ impl Postgres {
             // One query for the headers of the returned records. A query per record costs a
             // round trip each, which capped a consumer at a few thousand records a second.
             // The topic is the base topic: a keyed fetch has a name that is not a topic.
-            let mut headers: BTreeMap<i64, Vec<header_fetch_range::Row>> = BTreeMap::new();
             let offsets = rows
                 .iter()
                 .map(|row| {
                     offset_reader
                         .read_row(row)
                         .map(|offset| offset.offset_id)
-                        .inspect_err(|err| error!(?err))
+                        .inspect_err(|err| {
+                            error!(?err);
+                            column_errors.record(err);
+                        })
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            let mut headers: BTreeMap<i64, Vec<header_fetch_range::Row>> = BTreeMap::new();
             for header in self
-                .prepare_query_rows::<header_fetch_range::Row>(
+                .prepare_query_rows(
                     &tx,
                     header_fetch_range::QUERY,
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
@@ -1784,11 +1792,13 @@ impl Postgres {
     /// Returns the schema version that the database records, or `None` when it records none.
     async fn recorded_schema(&self, tx: &Transaction<'_>) -> Result<Option<RecordedSchema>> {
         let statement = tx
-            .prepare(self.sql_lookup(sql::pg_nisshi_schema_version_exists::QUERY)?)
+            .prepare(self.sql_lookup(sql::pg_nisshi_schema_version_exists::QUERY.key())?)
             .await?;
-        let reader = sql::pg_nisshi_schema_version_exists::RowReader::new(
-            &ResultColumns::postgres(sql::pg_nisshi_schema_version_exists::QUERY, &statement),
-        )?;
+        let reader =
+            sql::pg_nisshi_schema_version_exists::RowReader::new(&ResultColumns::postgres(
+                sql::pg_nisshi_schema_version_exists::QUERY.key(),
+                &statement,
+            ))?;
         let sql::pg_nisshi_schema_version_exists::Row {
             version_table_exists,
         } = reader.read_row(&tx.query_one(&statement, &[]).await?)?;
@@ -1797,10 +1807,10 @@ impl Postgres {
         }
 
         let statement = tx
-            .prepare(self.sql_lookup(sql::nisshi_schema_version_select::QUERY)?)
+            .prepare(self.sql_lookup(sql::nisshi_schema_version_select::QUERY.key())?)
             .await?;
         let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::postgres(
-            sql::nisshi_schema_version_select::QUERY,
+            sql::nisshi_schema_version_select::QUERY.key(),
             &statement,
         ))?;
         let recorded = tx
@@ -1836,7 +1846,7 @@ impl Postgres {
         debug!(transaction_id, ?deflated);
 
         let epochs = self
-            .prepare_query_optional_row::<producer_epochs_select::Row>(
+            .prepare_query_optional_row(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -2075,7 +2085,7 @@ impl Postgres {
         // the broker reads `message.timestamp.type` through here for each topic of each produce
         // request.
         let rows = self
-            .prepare_query_rows::<topic_configuration_select_keys::Row>(
+            .prepare_query_rows(
                 c,
                 topic_configuration_select_keys::QUERY,
                 &[&self.cluster.as_str(), &name, &keys],
@@ -2112,7 +2122,7 @@ impl Postgres {
         }
 
         Ok(Some(
-            self.prepare_query_rows::<topic_configuration_select::Row>(
+            self.prepare_query_rows(
                 c,
                 topic_configuration_select::QUERY,
                 &[&self.cluster.as_str(), &name],
@@ -2214,7 +2224,7 @@ impl Postgres {
     }
 
     /// Runs the query that the SQL cache holds for `query`, and returns its rows with the names
-    /// of its result's columns.
+    /// of its result's columns, and the count of the query's column errors.
     ///
     /// Only a read of one result as two row types uses this, as a fetch does: it reads each
     /// record's offset first, and the record itself later. Every other read takes its row type
@@ -2225,13 +2235,26 @@ impl Postgres {
         client: &impl GenericClient,
         query: &'static str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<(ResultColumns, Vec<Row>)> {
+    ) -> Result<(ResultColumns, Vec<Row>, ColumnErrorCount)> {
         let (sql, statement) = self.prepare_statement(client, query).await?;
         let columns = ResultColumns::postgres(query, &statement);
+        let column_errors = self.column_error_count(sql);
 
         self.record_sql_metrics(sql, client.query(&statement, params))
             .await
-            .map(|rows| (columns, rows))
+            .map(|rows| (columns, rows, column_errors))
+    }
+
+    /// Returns the count of `sql`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, sql: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(
+            &SQL_ERROR,
+            vec![
+                KeyValue::new("sql", sql.to_owned()),
+                KeyValue::new("cluster_id", self.cluster.clone()),
+            ],
+        )
     }
 
     /// Runs the query that the SQL cache holds for `query`, and returns each row of its result
@@ -2240,13 +2263,18 @@ impl Postgres {
     async fn prepare_query_rows<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<T>> {
-        let (columns, rows) = self.prepare_query_result(client, query, params).await?;
-        let reader = T::reader(&columns)?;
+        let (columns, rows, column_errors) = self
+            .prepare_query_result(client, query.key(), params)
+            .await?;
+        let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
 
-        rows.iter().map(|row| T::read(&reader, row)).collect()
+        rows.iter()
+            .map(|row| T::read(&reader, row))
+            .collect::<Result<_>>()
+            .inspect_err(|err| column_errors.record(err))
     }
 
     /// Runs the query that the SQL cache holds for `query`, and returns its row as `T`, or `None`
@@ -2255,16 +2283,19 @@ impl Postgres {
     async fn prepare_query_optional_row<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<T>> {
+        let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
+        let reader = T::reader(&ResultColumns::postgres(query, &statement))
+            .inspect_err(|err| self.column_error_count(sql).record(err))?;
 
         self.record_sql_metrics(sql, client.query_opt(&statement, params))
             .await?
             .map(|row| T::read(&reader, &row))
             .transpose()
+            .inspect_err(|err| self.column_error_count(sql).record(err))
     }
 
     /// Runs the query that the SQL cache holds for `query`, and returns its row as `T`. A result
@@ -2273,17 +2304,19 @@ impl Postgres {
     async fn prepare_query_one_row<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<T> {
+        let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))?;
+        let reader = T::reader(&ResultColumns::postgres(query, &statement))
+            .inspect_err(|err| self.column_error_count(sql).record(err))?;
 
         let row = self
             .record_sql_metrics(sql, client.query_one(&statement, params))
             .await?;
 
-        T::read(&reader, &row)
+        T::read(&reader, &row).inspect_err(|err| self.column_error_count(sql).record(err))
     }
 
     #[instrument(skip(self, client, params))]
@@ -2703,7 +2736,7 @@ impl Postgres {
             _ = self
                 .prepare_query_opt(
                     tx,
-                    producer_epoch_insert::QUERY,
+                    producer_epoch_insert::QUERY.key(),
                     &[&self.cluster, &producer_id],
                 )
                 .await?;
@@ -3070,7 +3103,7 @@ impl Postgres {
         _ = self
             .prepare_query_opt(
                 tx,
-                producer_epoch_insert::QUERY,
+                producer_epoch_insert::QUERY.key(),
                 &[&self.cluster, &previous],
             )
             .await?;
@@ -3236,7 +3269,7 @@ impl Postgres {
                             _ = self
                                 .prepare_query_opt(
                                     &tx,
-                                    producer_epoch_insert::QUERY,
+                                    producer_epoch_insert::QUERY.key(),
                                     &[&self.cluster, &producer],
                                 )
                                 .await
@@ -3615,7 +3648,7 @@ impl Storage for Postgres {
         // statement is awaited before the next one is sent on this transaction's connection,
         // which keeps that order. A watermark insert that finds no topition row matches no
         // rows without an error, leaving a topic that rejects every produce.
-        for sql in [topition_insert::QUERY, watermark_insert::QUERY] {
+        for sql in [topition_insert::QUERY.key(), watermark_insert::QUERY.key()] {
             for partition in 0..topic.num_partitions {
                 let inserted = self
                     .prepare_execute(&tx, sql, &[&self.cluster, &topic.name, &partition])
@@ -3637,7 +3670,7 @@ impl Storage for Postgres {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        topic_configuration_upsert::QUERY,
+                        topic_configuration_upsert::QUERY.key(),
                         &[
                             &self.cluster,
                             &topic.name,
@@ -5191,24 +5224,45 @@ impl Storage for Postgres {
     }
 
     #[instrument(skip_all)]
+    /// Runs each maintenance step, whether or not the steps before it
+    /// failed: retention, the removal of the records that DeleteRecords left
+    /// below the log start, compaction and the lake. No step depends on
+    /// another, so one that fails, such as a retention sweep that hits a
+    /// deadlock or a `lock_timeout` set in the connection options, does not
+    /// hold back the others until the next run. Each failure is logged, and
+    /// the first is returned.
     async fn maintain(&self, now: SystemTime) -> Result<()> {
-        let deleted = self.policy_delete(now).await?;
-        debug!(deleted);
+        let deleted = self
+            .policy_delete(now)
+            .await
+            .inspect(|deleted| debug!(deleted))
+            .inspect_err(|err| warn!(?err, "retention failed"))
+            .map(|_| ());
 
-        // Best effort: a failure here must not stop compaction or the lake.
-        match self.record_delete_below_log_start().await {
-            Ok(below_log_start) => debug!(below_log_start),
-            Err(err) => warn!(?err),
-        }
+        let below_log_start = self
+            .record_delete_below_log_start()
+            .await
+            .inspect(|below_log_start| debug!(below_log_start))
+            .inspect_err(|err| warn!(?err, "removing records below the log start failed"))
+            .map(|_| ());
 
-        let compacted = self.policy_compact().await?;
-        debug!(compacted);
+        let compacted = self
+            .policy_compact()
+            .await
+            .inspect(|compacted| debug!(compacted))
+            .inspect_err(|err| warn!(?err, "compaction failed"))
+            .map(|_| ());
 
-        if let Some(ref lake) = self.lake {
-            return lake.maintain().await.map_err(Into::into);
-        }
+        let lake = match self.lake {
+            Some(ref lake) => lake
+                .maintain()
+                .await
+                .inspect_err(|err| warn!(?err, "lake maintenance failed"))
+                .map_err(Into::into),
+            None => Ok(()),
+        };
 
-        Ok(())
+        deleted.and(below_log_start).and(compacted).and(lake)
     }
 
     #[instrument(skip(self), ret)]
@@ -5385,7 +5439,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 });
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
@@ -5398,7 +5452,7 @@ mod tests {
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
     /// service of compose.yaml on its default port.
-    static CONNECTION: LazyLock<String> = LazyLock::new(|| {
+    pub(crate) static CONNECTION: LazyLock<String> = LazyLock::new(|| {
         std::env::var("NISSHI_TEST_DATABASE_URL")
             .unwrap_or_else(|_| String::from("postgres://postgres:postgres@localhost"))
     });
@@ -7185,6 +7239,147 @@ mod tests {
         Ok(())
     }
 
+    /// The `retention.bytes` sweep reads a partition from its newest record only until the bytes
+    /// pass the limit, so its cost follows what a partition may keep and not how many records it
+    /// holds, and it deletes the older records of every partition that has the limit.
+    #[tokio::test]
+    async fn retention_bytes_sweep_stops_reading_at_the_limit() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
+
+        const PARTITIONS: i32 = 2;
+        const ROWS: i64 = 20_000;
+        const VALUE_BYTES: i64 = 1_000;
+        const KEPT: i64 = 100;
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "retention_bytes_sweep_stops_reading_at_the_limit",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let configs = [
+            ("cleanup.policy", "delete".to_owned()),
+            ("retention.bytes", (KEPT * VALUE_BYTES).to_string()),
+        ];
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(PARTITIONS)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        configs
+                            .iter()
+                            .map(|(name, value)| {
+                                CreatableTopicConfig::default()
+                                    .name((*name).into())
+                                    .value(Some(value.as_str().into()))
+                            })
+                            .collect(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let mut c = storage.connection().await?;
+        let tx = c.transaction().await?;
+
+        // fill the partitions directly, which is far faster than producing
+        _ = tx
+            .execute(
+                "insert into record (topition, offset_id, v) \
+             select tp.id, g, decode(repeat('00', $2), 'hex') \
+             from topition tp \
+             join topic t on t.id = tp.topic \
+             cross join generate_series(0::bigint, $3) g \
+             where t.name = $1",
+                &[&topic_name, &i32::try_from(VALUE_BYTES)?, &(ROWS - 1)],
+            )
+            .await?;
+        _ = tx
+            .execute(
+                "update watermark set low = 0, high = $2 \
+             where topition in ( \
+                 select tp.id from topition tp join topic t on t.id = tp.topic where t.name = $1)",
+                &[&topic_name, &ROWS],
+            )
+            .await?;
+        tx.batch_execute("analyze record").await?;
+
+        // On a table this small, with no visibility map yet, the planner prefers to scan and sort.
+        // On the large partitions that a limit is for it walks the primary key, which is the case
+        // that this test is about.
+        tx.batch_execute("set local enable_seqscan = off; set local enable_bitmapscan = off")
+            .await?;
+
+        let sql = sql::SQL.get(sql::POLICY_DELETE_BYTES)?;
+        let plan = tx
+            .query(
+                &format!("explain (analyze, costs off, timing off, buffers off) {sql}"),
+                &[&cluster],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+
+        // the scan that reads each partition from its newest record, as the planner counts it:
+        // rows per loop times loops
+        let read = plan
+            .iter()
+            .find(|line| line.contains("Index Scan Backward"))
+            .and_then(|line| {
+                let rows = line.split("rows=").nth(1)?.split_whitespace().next()?;
+                let loops = line.split("loops=").nth(1)?.split(')').next()?;
+                Some(rows.parse::<f64>().ok()? * loops.parse::<f64>().ok()?)
+            })
+            .unwrap_or_else(|| panic!("no backward scan of the primary key in {plan:#?}"));
+
+        let remaining = tx
+            .query(
+                "select count(*) from record r \
+                 join topition tp on tp.id = r.topition \
+                 join topic t on t.id = tp.topic where t.name = $1 group by tp.id",
+                &[&topic_name],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect::<Vec<_>>();
+
+        _ = tx.rollback().await;
+
+        // each partition keeps its newest KEPT records
+        assert_eq!(vec![KEPT; PARTITIONS as usize], remaining, "{plan:#?}");
+
+        // and the sweep read about KEPT records of each, where it held ROWS
+        assert!(
+            read <= (PARTITIONS as f64) * (KEPT as f64 + 2.0),
+            "read {read} records of {} in {plan:#?}",
+            PARTITIONS as i64 * ROWS
+        );
+
+        Ok(())
+    }
+
     /// DeleteRecords commits the new log start before it removes the records
     /// below it. When that removal fails, `maintain` removes them.
     #[tokio::test]
@@ -7287,6 +7482,173 @@ mod tests {
         assert_eq!(Some(record_count), latest[0].1.offset);
 
         Ok(())
+    }
+
+    /// A retention sweep that fails, here on a lock it waits for past
+    /// `lock_timeout`, does not stop `maintain` from removing the records
+    /// below the log start, or from compacting. `maintain` still returns the
+    /// failure.
+    #[tokio::test]
+    async fn maintain_runs_every_step_when_retention_fails() -> Result<()> {
+        with_empty_database(
+            "maintain_runs_every_step_when_retention_fails",
+            async |database| {
+                use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
+                use tokio_postgres::NoTls;
+
+                // The schema comes from a storage without the lock timeout, so that the timeout applies
+                // to the statements of the test only.
+                database.storage()?.ensure_schema().await?;
+
+                // Every connection of this storage gives up waiting for a lock after 500ms. The option is
+                // written by hand, because `Url::query_pairs_mut` writes a space as `+`, which
+                // tokio-postgres reads as itself.
+                let mut url = database.url()?;
+                let query = match url.query() {
+                    Some(query) => format!("{query}&options=-c%20lock_timeout%3D500"),
+                    None => "options=-c%20lock_timeout%3D500".to_owned(),
+                };
+                url.set_query(Some(&query));
+
+                let storage = database.storage_at(&url)?;
+                let cluster = storage.cluster.clone();
+
+                storage
+                    .register_broker(BrokerRegistrationRequest {
+                        broker_id: 111,
+                        cluster_id: cluster.clone(),
+                        incarnation_id: Uuid::now_v7(),
+                        rack: None,
+                    })
+                    .await?;
+
+                let create_topic =
+                    async |name: &str, configs: Vec<CreatableTopicConfig>| -> Result<()> {
+                        storage
+                            .create_topic(
+                                CreatableTopic::default()
+                                    .name(name.into())
+                                    .num_partitions(1)
+                                    .replication_factor(0)
+                                    .assignments(Some([].into()))
+                                    .configs(Some(configs)),
+                                false,
+                            )
+                            .await
+                            .map(|_| ())
+                    };
+
+                let produce = async |name: &str, key: Option<Bytes>| -> Result<i64> {
+                    let batch = Batch::builder()
+                        .record(
+                            Record::builder()
+                                .key(key)
+                                .value(Bytes::from_static(b"r").into()),
+                        )
+                        .build()
+                        .and_then(TryInto::try_into)?;
+
+                    storage.produce(None, &Topition::new(name, 0), batch).await
+                };
+
+                let stored = async |name: &str| -> Result<i64> {
+                    let c = storage.connection().await?;
+                    let row = c
+                        .query_one(
+                            "select count(*) from record r \
+                     join topition tp on r.topition = tp.id \
+                     join topic t on tp.topic = t.id \
+                     join cluster c on t.cluster = c.id \
+                     where c.name = $1 and t.name = $2",
+                            &[&cluster, &name],
+                        )
+                        .await?;
+                    row.try_get::<_, i64>(0).map_err(Into::into)
+                };
+
+                // retained has the default cleanup.policy, delete
+                let retained = alphanumeric_string(15);
+                create_topic(&retained, vec![]).await?;
+
+                let record_count = 6i64;
+                for _ in 0..record_count {
+                    _ = produce(&retained, None).await?;
+                }
+
+                // the log start moves to 3, as a DeleteRecords whose removal failed leaves it
+                {
+                    let mut c = storage.connection().await?;
+                    let tx = c.transaction().await?;
+
+                    _ = storage
+                        .prepare_execute(
+                            &tx,
+                            sql::WATERMARK_UPDATE,
+                            &[&cluster, &retained, &0i32, &3i64, &record_count],
+                        )
+                        .await?;
+
+                    tx.commit().await?;
+                }
+
+                // compacted holds three records with one key, of which compaction keeps the last
+                let compacted = alphanumeric_string(15);
+                create_topic(
+                    &compacted,
+                    vec![
+                        CreatableTopicConfig::default()
+                            .name("cleanup.policy".into())
+                            .value(Some("compact".into())),
+                    ],
+                )
+                .await?;
+
+                for _ in 0..3 {
+                    _ = produce(&compacted, Some(Bytes::from_static(b"k"))).await?;
+                }
+
+                assert_eq!(record_count, stored(&retained).await?);
+                assert_eq!(3, stored(&compacted).await?);
+
+                // Another session locks the record at offset 4, above the log start. Retention, a month
+                // after now, deletes every record of retained, so it waits on that lock and fails.
+                let (mut locker, connection) =
+                    tokio_postgres::connect(database.url()?.as_str(), NoTls).await?;
+                let connection = tokio::spawn(connection);
+
+                let lock = locker.transaction().await?;
+                _ = lock
+                    .query_one(
+                        "select r.offset_id from record r \
+                 join topition tp on r.topition = tp.id \
+                 join topic t on tp.topic = t.id \
+                 join cluster c on t.cluster = c.id \
+                 where c.name = $1 and t.name = $2 and r.offset_id = 4 \
+                 for update of r",
+                        &[&cluster, &retained],
+                    )
+                    .await?;
+
+                let a_month_later = SystemTime::now() + Duration::from_hours(30 * 24);
+
+                assert!(storage.maintain(a_month_later).await.is_err());
+
+                // the records below the log start are removed, and compaction ran
+                assert_eq!(record_count - 3, stored(&retained).await?);
+                assert_eq!(1, stored(&compacted).await?);
+
+                lock.rollback().await?;
+                drop(locker);
+                _ = connection.await;
+
+                // with the lock released, retention deletes the rest
+                storage.maintain(a_month_later).await?;
+                assert_eq!(0, stored(&retained).await?);
+
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// An open (uncommitted) transaction must pin the read_committed last stable
@@ -10189,7 +10551,7 @@ mod tests {
         {
             let c = storage.connection().await?;
             _ = c
-                .prepare_cached(storage.sql_lookup(watermark_insert::QUERY)?)
+                .prepare_cached(storage.sql_lookup(watermark_insert::QUERY.key())?)
                 .await?;
         }
 

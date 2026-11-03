@@ -17,12 +17,14 @@
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the ID.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_select_uuid.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_select_uuid.sql");
 
 /// The PostgreSQL version's name in the SQL cache. This version decodes the virtual topic's key
 /// from UTF-8, because PostgreSQL stores the key as `bytea`.
-pub(crate) const PG_QUERY: &str = "pg/topic_select_uuid.sql";
+pub(crate) const PG_QUERY: Query<Row> = Query::new("pg/topic_select_uuid.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::topic::Row;

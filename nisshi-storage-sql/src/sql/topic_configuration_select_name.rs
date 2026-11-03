@@ -18,8 +18,10 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the config's key.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_configuration_select_name.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_configuration_select_name.sql");
 
 sql_row! {
     /// One config that the topic sets.

@@ -18,13 +18,15 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the partition's index.
 
+use super::Query;
+
 /// The PostgreSQL version's name in the SQL cache. This version locks the partition's watermark
 /// row.
-pub(crate) const QUERY: &str = "watermark_select_for_write.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("watermark_select_for_write.sql");
 
 /// The libSQL and Turso version's name in the SQL cache. This version does not lock rows, because
 /// SQLite does not lock rows.
-pub(crate) const LITE_QUERY: &str = "lite/watermark_select_for_write.sql";
+pub(crate) const LITE_QUERY: Query<Row> = Query::new("lite/watermark_select_for_write.sql");
 
 sql_row! {
     /// A partition's watermarks and its topic's stored `max.message.bytes`.

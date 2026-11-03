@@ -17,8 +17,10 @@
 //!
 //! The query takes two parameters: `$1` is the group's name, and `$2` the cluster's name.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "consumer_group_detail.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("consumer_group_detail.sql");
 
 sql_row! {
     /// The stored detail of a consumer group.

@@ -18,15 +18,28 @@ use crate::{common::timed_command, settings};
 
 /// Runs a short `docker` command, such as `docker inspect`, and kills it if it hangs.
 pub(crate) fn execute(args: &[&str]) -> Result<timed_command::Finished, String> {
-    timed_command::run(
-        Command::new("docker").args(args),
-        None,
-        Duration::from_secs(60),
-    )
+    execute_within(args, Duration::from_secs(60))
+}
+
+/// Runs a short `docker` command, and kills it if it takes longer than `timeout`.
+pub(crate) fn execute_within(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<timed_command::Finished, String> {
+    timed_command::run(Command::new("docker").args(args), None, timeout)
 }
 
 pub(crate) fn inspect(name: &str, format: &str) -> Result<String, String> {
-    match execute(&["inspect", "--format", format, name])? {
+    inspect_within(name, format, Duration::from_secs(60))
+}
+
+/// Like [`inspect`], and kills `docker inspect` if it takes longer than `timeout`.
+pub(crate) fn inspect_within(
+    name: &str,
+    format: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    match execute_within(&["inspect", "--format", format, name], timeout)? {
         inspected if inspected.code == Some(0) => Ok(inspected.stdout.trim().to_owned()),
         inspected => Err(format!(
             "docker inspect {name}: {}",

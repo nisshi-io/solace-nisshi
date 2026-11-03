@@ -17,8 +17,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! partition's index, and `$4` the record's offset.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "header_fetch.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("header_fetch.sql");
 
 sql_row! {
     /// One header of the record.

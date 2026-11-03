@@ -18,8 +18,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! virtual topic's key, and `$4` its ID.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "virtual_topic_upsert.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("virtual_topic_upsert.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::topic_id::Row;

@@ -19,8 +19,10 @@
 //! the producer ID, `$4` the producer's epoch, `$5` the topic's name, and `$6` the partition's
 //! index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_produce_offset_select_offset_range.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_produce_offset_select_offset_range.sql");
 
 sql_row! {
     /// The transaction's offsets on the partition.

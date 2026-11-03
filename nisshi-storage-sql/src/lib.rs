@@ -53,5 +53,5 @@ pub use pg::factory::PostgresFactory as PostgresEngineFactory;
 #[cfg(all(feature = "test-support", feature = "postgres"))]
 #[doc(hidden)]
 pub fn watermark_select_for_write() -> nisshi_storage::Result<&'static str> {
-    sql::SQL.get(sql::watermark_select_for_write::QUERY)
+    sql::SQL.get(sql::watermark_select_for_write::QUERY.key())
 }

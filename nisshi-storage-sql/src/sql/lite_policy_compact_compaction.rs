@@ -18,8 +18,10 @@
 //! The query takes three parameters: `$1` is the partition's ID, `$2` the key, and `$3` the
 //! offset, which is the key's newest offset.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "lite/policy_compact_compaction.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("lite/policy_compact_compaction.sql");
 
 /// One record that compaction deletes.
 pub(crate) use super::row::record_offset::Row;

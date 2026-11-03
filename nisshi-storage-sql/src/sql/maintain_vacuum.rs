@@ -17,8 +17,10 @@
 //!
 //! The query takes no parameters.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "maintain-vacuum.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("maintain-vacuum.sql");
 
 sql_row! {
     /// The database's count of unused pages and its page size.

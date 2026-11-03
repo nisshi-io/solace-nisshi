@@ -19,8 +19,10 @@
 //! The query takes five parameters: `$1` is the cluster's name, `$2` the group's name, `$3` the
 //! expected entity tag, `$4` the new entity tag, and `$5` the new detail.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "consumer_group_detail_insert.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("consumer_group_detail_insert.sql");
 
 sql_row! {
     /// The stored detail of a consumer group.

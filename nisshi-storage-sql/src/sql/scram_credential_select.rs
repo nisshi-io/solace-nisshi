@@ -18,8 +18,10 @@
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the user's name, and `$3`
 //! the mechanism's number.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "scram_credential_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("scram_credential_select.sql");
 
 sql_row! {
     /// A user's SCRAM credential.

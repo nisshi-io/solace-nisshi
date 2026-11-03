@@ -29,6 +29,7 @@ use crate::{
     service::{
         deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
         read_share::ListOffsetsReadShare,
+        storage_error_code,
     },
 };
 
@@ -128,7 +129,7 @@ where
     /// unanswered at the deadline gets `REQUEST_TIMED_OUT`, which clients
     /// retry, so one slow partition neither delays the others nor holds the
     /// request past the client's own timeout. A storage error answers in its
-    /// own partition (see [`Self::storage_error_code`]), and the other
+    /// own partition (see [`storage_error_code`]), and the other
     /// partitions still answer.
     async fn list_offsets(
         &self,
@@ -192,7 +193,7 @@ where
                 Ok(Ok(answer)) => answer,
 
                 Ok(Err(error)) => {
-                    let error_code = Self::storage_error_code(&error);
+                    let error_code = storage_error_code(&error);
                     debug!(?error, ?topition, ?error_code, "list offsets");
 
                     failed.push((topition, error_code));
@@ -259,26 +260,6 @@ where
         }
 
         responses.into_iter().flatten().collect()
-    }
-
-    /// Returns the error code that a partition answers when storage fails
-    /// to read its offset: the code of an [`Error::Api`], and
-    /// `KAFKA_STORAGE_ERROR` for every other error.
-    ///
-    /// Kafka answers `UNKNOWN_SERVER_ERROR` for an exception that it does
-    /// not map to a code ([KafkaApis.scala#L1228-L1251]). We answer
-    /// `KAFKA_STORAGE_ERROR` instead, because these errors come from the
-    /// storage engine (a database or object store that times out or is
-    /// unavailable), and Kafka answers that code for a log that it cannot
-    /// read. A client retries `KAFKA_STORAGE_ERROR` after a metadata
-    /// refresh, and gives up on `UNKNOWN_SERVER_ERROR`.
-    ///
-    /// [KafkaApis.scala#L1228-L1251]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1228-L1251
-    fn storage_error_code(error: &Error) -> ErrorCode {
-        match error {
-            Error::Api(error_code) => *error_code,
-            _ => ErrorCode::KafkaStorageError,
-        }
     }
 }
 

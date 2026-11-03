@@ -16,8 +16,10 @@
 //!
 //! The query takes one parameter, `$1`: the partition's ID.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "lite/policy_compact_distinct_k.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("lite/policy_compact_distinct_k.sql");
 
 sql_row! {
     /// One distinct key of the partition.

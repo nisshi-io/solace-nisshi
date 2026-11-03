@@ -22,8 +22,10 @@
 //! the batch's producer ID, `$4` its producer epoch, `$5` the topic's name, and `$6` the
 //! partition's index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_produce_partition_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_produce_partition_select.sql");
 
 sql_row! {
     /// The transactional ID's producer, and whether the batch's partition is in its transaction.

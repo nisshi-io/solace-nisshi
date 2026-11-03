@@ -17,8 +17,10 @@
 //!
 //! The query takes two parameters: `$1` is the cluster's name, and `$2` the producer ID.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "producer_epoch_insert.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("producer_epoch_insert.sql");
 
 /// One row of the query's result.
 pub(crate) use super::row::producer_epoch::Row;

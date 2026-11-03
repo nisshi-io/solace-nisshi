@@ -106,6 +106,18 @@ build-all profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgre
 
 build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="nisshi": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
+# Fails if a single-engine build compiles another engine's database client.
+# ci.yml's build-storage job runs the same check; the client of each engine is
+# listed in .github/scripts/check-storage-deps.sh.
+check-storage-deps: (storage-deps "dynostore") (storage-deps "libsql") (storage-deps "postgres") (storage-deps "slatedb") (storage-deps "turso")
+
+[private]
+storage-deps feature:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo tree -p nisshi --no-default-features --features {{ feature }} -e normal,build --prefix none -f '{p}' \
+      | bash .github/scripts/check-storage-deps.sh {{ feature }}
+
 build-storage: clean-workspace (build "dev" "libsql") (build "dev" "dynostore") (build "dev" "postgres") (build "dev" "slatedb") (build "dev" "turso")
 
 build-examples: (cargo-build "--examples")

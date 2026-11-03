@@ -17,8 +17,10 @@
 //!
 //! The query takes one parameter, `$1`: the cluster's name.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "lite/policy_compact_topitions.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("lite/policy_compact_topitions.sql");
 
 sql_row! {
     /// One partition that compaction applies to.
