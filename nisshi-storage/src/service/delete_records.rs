@@ -233,6 +233,9 @@ mod tests {
         /// Fails the call with an error that has no Kafka code and that a
         /// retry may fix, as an unavailable database or object store does.
         Fail,
+        /// Fails the call with an error that has no Kafka code and that a
+        /// retry can't fix.
+        FailPermanently,
         /// Fails the call with this code.
         Api(ErrorCode),
     }
@@ -305,6 +308,9 @@ mod tests {
                                     .error_code(ErrorCode::None.into())),
                                 Answer::Fail => {
                                     Err(Error::from(std::io::Error::other("unavailable")))
+                                }
+                                Answer::FailPermanently => {
+                                    Err(Error::Message(String::from("can't delete records")))
                                 }
                                 Answer::Api(error_code) => Err(Error::Api(error_code)),
                             }
@@ -639,14 +645,16 @@ mod tests {
     }
 
     /// A storage error answers in its own partition: `KAFKA_STORAGE_ERROR`
-    /// for a transient error without a Kafka code, the code of an `Error::Api`, and
-    /// the partitions around it still answer their cut.
+    /// for a transient error without a Kafka code, `UNKNOWN_SERVER_ERROR` for a
+    /// permanent one, the code of an `Error::Api`, and the partitions around it
+    /// still answer their cut.
     #[tokio::test]
     async fn storage_error_answers_in_its_partition() -> Result<()> {
         let stub = Stub::new(&[
             ("a", 0, Answer::Cut(5)),
             ("a", 1, Answer::Fail),
             ("a", 2, Answer::Api(ErrorCode::NotLeaderOrFollower)),
+            ("a", 3, Answer::FailPermanently),
             ("b", 0, Answer::Cut(7)),
         ]);
 
@@ -666,13 +674,18 @@ mod tests {
                             ErrorCode::NotLeaderOrFollower,
                             DELETE_RECORDS_INVALID_LOW_WATERMARK
                         ),
+                        (
+                            3,
+                            ErrorCode::UnknownServerError,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK
+                        ),
                     ])
                 ),
                 (String::from("b"), Some(vec![(0, ErrorCode::None, 7)])),
             ],
             delete_records(
                 &stub,
-                vec![topic("a", Some(&[0, 1, 2])), topic("b", Some(&[0]))]
+                vec![topic("a", Some(&[0, 1, 2, 3])), topic("b", Some(&[0]))]
             )
             .await?
         );
@@ -683,6 +696,7 @@ mod tests {
                 vec![(String::from("a"), vec![0])],
                 vec![(String::from("a"), vec![1])],
                 vec![(String::from("a"), vec![2])],
+                vec![(String::from("a"), vec![3])],
                 vec![(String::from("b"), vec![0])],
             ],
             stub.calls()
