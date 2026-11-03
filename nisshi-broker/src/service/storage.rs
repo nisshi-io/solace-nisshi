@@ -21,7 +21,9 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
+use nisshi_service::{
+    FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, TransactionAbortableDowngradeLayer,
+};
 use nisshi_storage::{
     AlterUserScramCredentialsService, AutoCreateRefusals, ConsumerGroupDescribeService,
     CreateAclsService, CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService,
@@ -452,6 +454,7 @@ where
         .with_route(
             MetadataRequest::KEY,
             (
+                MetadataTopicIdLayer,
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
