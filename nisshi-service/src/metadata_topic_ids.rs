@@ -15,11 +15,11 @@
 use std::fmt;
 
 use nisshi_sans_io::{
-    Body, ErrorCode, Frame, FrameInput, Header, MetadataRequest, MetadataResponse,
+    Body, ErrorCode, Frame, FrameInput, Header, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
     metadata_response::MetadataResponseTopic,
 };
 use rama::{Layer, Service};
-use tracing::{debug, instrument};
+use tracing::{instrument, warn};
 
 /// The first Metadata version whose request may name a topic by its ID, or leave its name null.
 const FIRST_TOPIC_ID_METADATA_VERSION: i16 = 12;
@@ -74,16 +74,26 @@ where
 
     #[instrument(skip_all)]
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
-        if let Body::MetadataRequest(ref request) = req.frame.body
-            && let Some(response) = refuse_topic_ids(req.frame.api_version()?, request)
-        {
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response {
-                    correlation_id: req.frame.correlation_id()?,
-                },
-                body: response.into(),
-            });
+        if let Body::MetadataRequest(ref request) = req.frame.body {
+            let api_version = req.frame.api_version()?;
+
+            if let Some(refusal) = refusal(api_version, request) {
+                let correlation_id = req.frame.correlation_id()?;
+
+                warn!(
+                    api_version,
+                    client_id = req.frame.client_id().ok().flatten(),
+                    correlation_id,
+                    ?refusal,
+                    "refusing a Metadata request before v12 that names a topic by its ID or leaves a topic name null"
+                );
+
+                return Ok(Frame {
+                    size: 0,
+                    header: Header::Response { correlation_id },
+                    body: invalid_request(request).into(),
+                });
+            }
         }
 
         self.inner.serve(req).await
@@ -93,29 +103,36 @@ where
 /// Returns the `INVALID_REQUEST` response that Kafka answers to `request` at `api_version`, or
 /// `None` when Kafka serves it.
 ///
-/// [`MetadataTopicIdLayer`] calls this, and a test that serves a Metadata request to
-/// `MetadataService` without the layer, as a fuzz target does, can call it first so that it
-/// sends only what the layer lets through.
+/// [`MetadataTopicIdLayer`] refuses a request on the same terms, and a test that serves a Metadata
+/// request to `MetadataService` without the layer, as a fuzz target does, can call this first so
+/// that it sends only what the layer lets through.
 pub fn refuse_topic_ids(api_version: i16, request: &MetadataRequest) -> Option<MetadataResponse> {
-    if api_version < FIRST_TOPIC_ID_METADATA_VERSION && names_by_id_or_null(request) {
-        debug!(
-            api_version,
-            "refusing a topic ID or null topic name before Metadata v12"
-        );
-
-        Some(invalid_request(request))
-    } else {
-        None
-    }
+    refusal(api_version, request).map(|_| invalid_request(request))
 }
 
-/// Whether any topic of `request` has no name, or a topic ID other than the zero one.
-fn names_by_id_or_null(request: &MetadataRequest) -> bool {
-    request
-        .topics
-        .iter()
-        .flatten()
-        .any(|topic| topic.name.is_none() || topic.topic_id.is_some_and(|id| id != [0; 16]))
+/// What the first refused topic of a Metadata request asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Refusal {
+    NullTopicName,
+    TopicId,
+}
+
+/// Returns why Kafka refuses `request` at `api_version`, from the first topic that it refuses:
+/// a null name, else a topic ID other than the zero one.
+fn refusal(api_version: i16, request: &MetadataRequest) -> Option<Refusal> {
+    if api_version >= FIRST_TOPIC_ID_METADATA_VERSION {
+        return None;
+    }
+
+    request.topics.iter().flatten().find_map(|topic| {
+        if topic.name.is_none() {
+            Some(Refusal::NullTopicName)
+        } else if topic.topic_id.is_some_and(|id| id != NULL_TOPIC_ID) {
+            Some(Refusal::TopicId)
+        } else {
+            None
+        }
+    })
 }
 
 /// Kafka's `MetadataRequest.getErrorResponse` for `INVALID_REQUEST`.
@@ -134,7 +151,7 @@ fn invalid_request(request: &MetadataRequest) -> MetadataResponse {
                     MetadataResponseTopic::default()
                         .error_code(ErrorCode::InvalidRequest.into())
                         .name(Some(topic.name.clone().unwrap_or_default()))
-                        .topic_id(Some(topic.topic_id.unwrap_or([0; 16])))
+                        .topic_id(Some(topic.topic_id.unwrap_or(NULL_TOPIC_ID)))
                         .is_internal(Some(false))
                         .partitions(Some(Vec::new()))
                         .topic_authorized_operations(Some(i32::MIN))
@@ -161,13 +178,20 @@ mod tests {
         async fn serve(&self, _req: FrameInput) -> Result<Self::Output, Self::Error> {
             Ok(Frame {
                 size: 0,
-                header: Header::Response { correlation_id: 6 },
+                header: Header::Response { correlation_id: 0 },
                 body: MetadataResponse::default().into(),
             })
         }
     }
 
-    async fn serve(api_version: i16, topic: MetadataRequestTopic) -> Result<Frame, Error> {
+    /// The correlation ID of the request that `serve` sends. It differs from the one that
+    /// `Pass` answers with, so a refusal shows that it echoes the request's.
+    const CORRELATION_ID: i32 = 6;
+
+    async fn serve(
+        api_version: i16,
+        topics: Option<Vec<MetadataRequestTopic>>,
+    ) -> Result<Frame, Error> {
         MetadataTopicIdLayer
             .layer(Pass)
             .serve(FrameInput {
@@ -176,10 +200,10 @@ mod tests {
                     header: Header::Request {
                         api_key: MetadataRequest::KEY,
                         api_version,
-                        correlation_id: 6,
+                        correlation_id: CORRELATION_ID,
                         client_id: None,
                     },
-                    body: MetadataRequest::default().topics(Some(vec![topic])).into(),
+                    body: MetadataRequest::default().topics(topics).into(),
                 },
                 extensions: Extensions::default(),
             })
@@ -210,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn an_unnamed_topic_is_invalid_at_v10_and_v11() -> Result<(), Error> {
         for api_version in [10, 11] {
-            let frame = serve(api_version, unnamed()).await?;
+            let frame = serve(api_version, Some(vec![unnamed()])).await?;
 
             let [topic] = topics(&frame).try_into().expect("one topic");
             assert_eq!(i16::from(ErrorCode::InvalidRequest), topic.error_code);
@@ -226,12 +250,34 @@ mod tests {
     #[tokio::test]
     async fn a_named_topic_with_an_id_is_invalid_at_v10_and_v11() -> Result<(), Error> {
         for api_version in [10, 11] {
-            let frame = serve(api_version, unnamed().name(Some("orders".into()))).await?;
+            let frame = serve(
+                api_version,
+                Some(vec![unnamed().name(Some("orders".into()))]),
+            )
+            .await?;
 
             let [topic] = topics(&frame).try_into().expect("one topic");
             assert_eq!(i16::from(ErrorCode::InvalidRequest), topic.error_code);
             assert_eq!(Some("orders".into()), topic.name);
             encodes(api_version, frame)?;
+        }
+
+        Ok(())
+    }
+
+    /// A v10 or v11 client writes the zero topic ID for a topic that it names, so this is the
+    /// request that decodes at these versions.
+    #[tokio::test]
+    async fn a_named_topic_with_the_zero_id_goes_through_at_v10_and_v11() -> Result<(), Error> {
+        for api_version in [10, 11] {
+            let named = MetadataRequestTopic::default()
+                .name(Some("orders".into()))
+                .topic_id(Some(NULL_TOPIC_ID));
+
+            assert_eq!(
+                Vec::<MetadataResponseTopic>::new(),
+                topics(&serve(api_version, Some(vec![named])).await?)
+            );
         }
 
         Ok(())
@@ -244,18 +290,66 @@ mod tests {
 
             assert_eq!(
                 Vec::<MetadataResponseTopic>::new(),
-                topics(&serve(api_version, named).await?)
+                topics(&serve(api_version, Some(vec![named])).await?)
             );
         }
 
         Ok(())
     }
 
+    /// Kafka skips the check when the request asks for all topics, and when it lists none.
+    #[tokio::test]
+    async fn all_topics_and_no_topics_go_through_at_v10_and_v11() -> Result<(), Error> {
+        for api_version in [10, 11] {
+            for requested in [None, Some(Vec::new())] {
+                assert_eq!(
+                    Vec::<MetadataResponseTopic>::new(),
+                    topics(&serve(api_version, requested).await?)
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Kafka answers a refused request with every topic that it names, in request order, and
+    /// not only the topics that it refuses.
+    #[tokio::test]
+    async fn a_refusal_answers_every_requested_topic_in_order() -> Result<(), Error> {
+        let good = MetadataRequestTopic::default()
+            .name(Some("orders".into()))
+            .topic_id(Some(NULL_TOPIC_ID));
+        let other = MetadataRequestTopic::default()
+            .name(Some("payments".into()))
+            .topic_id(Some([9; 16]));
+
+        let frame = serve(11, Some(vec![good, unnamed(), other])).await?;
+
+        assert_eq!(CORRELATION_ID, frame.correlation_id()?);
+
+        let answered = topics(&frame)
+            .iter()
+            .map(|topic| (topic.error_code, topic.name.clone(), topic.topic_id))
+            .collect::<Vec<_>>();
+
+        let invalid_request = i16::from(ErrorCode::InvalidRequest);
+        assert_eq!(
+            vec![
+                (invalid_request, Some("orders".into()), Some(NULL_TOPIC_ID)),
+                (invalid_request, Some(String::new()), Some([7; 16])),
+                (invalid_request, Some("payments".into()), Some([9; 16])),
+            ],
+            answered
+        );
+
+        encodes(11, frame)
+    }
+
     #[tokio::test]
     async fn v12_may_name_a_topic_by_its_id() -> Result<(), Error> {
         assert_eq!(
             Vec::<MetadataResponseTopic>::new(),
-            topics(&serve(12, unnamed()).await?)
+            topics(&serve(12, Some(vec![unnamed()])).await?)
         );
 
         Ok(())
