@@ -21,7 +21,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::{
-    io,
+    assert_matches, io,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -32,6 +32,7 @@ use std::{
 use bytes::Bytes;
 use nisshi_client::{
     Builder, Client, ConnectionManager, Error, Sasl, SaslMechanism, Security, Tls, TlsOptions,
+    TlsRejection,
 };
 use nisshi_sans_io::{
     ApiKey as _, ApiVersionsRequest, ApiVersionsResponse, Body, ErrorCode, Frame, Header,
@@ -214,6 +215,12 @@ struct Broker {
 
 impl Broker {
     async fn start(tls: Option<Arc<ServerConfig>>, sasl: Option<SaslPolicy>) -> Self {
+        Self::start_with(tls.into_iter().collect(), sasl).await
+    }
+
+    /// Starts a broker that serves its n-th connection with the n-th of `tls`, and every later
+    /// connection with the last one. Without any, it serves plaintext.
+    async fn start_with(tls: Vec<Arc<ServerConfig>>, sasl: Option<SaslPolicy>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = Url::parse(&format!("tcp://{}", listener.local_addr().unwrap())).unwrap();
         let seen = Arc::new(Seen::default());
@@ -225,9 +232,13 @@ impl Broker {
             let mut connections = JoinSet::new();
 
             while let Ok((stream, _)) = listener.accept().await {
-                _ = accepting.accepted.fetch_add(1, Ordering::SeqCst);
+                let nth = accepting.accepted.fetch_add(1, Ordering::SeqCst);
 
-                let (tls, sasl, seen) = (tls.clone(), sasl.clone(), accepting.clone());
+                let (tls, sasl, seen) = (
+                    tls.get(nth).or(tls.last()).cloned(),
+                    sasl.clone(),
+                    accepting.clone(),
+                );
 
                 _ = connections.spawn(async move {
                     _ = match tls {
@@ -563,7 +574,11 @@ async fn a_pool_presents_its_client_certificate_to_a_broker_that_asks() {
         .await
         .expect_err("the broker accepted a client without a certificate");
 
-    assert!(error.tls_failure().is_some(), "{error}");
+    assert_eq!(
+        Some(&TlsRejection::CertificateRequired),
+        error.tls_rejection(),
+        "{error}"
+    );
     assert!(!error.is_connect_failure(), "{error}");
 
     assert_eq!(
@@ -576,17 +591,27 @@ async fn a_pool_presents_its_client_certificate_to_a_broker_that_asks() {
     );
 }
 
-#[tokio::test]
-async fn a_login_without_the_client_certificate_that_the_broker_asks_for_is_a_tls_failure() {
-    let authority = Authority::new();
-    let broker = Broker::start(
-        Some(server_config(
-            authority.server(&["127.0.0.1"]),
-            Some(&authority),
-        )),
+/// Starts a broker that asks for a client certificate from every connection but its first. The
+/// pool's first connection is the bootstrap request, which logs in to nothing, so the broker
+/// lets it through, and the connection after it is the first one that logs in.
+async fn broker_that_asks_for_a_client_certificate_after_the_first_connection(
+    authority: &Authority,
+) -> Broker {
+    Broker::start_with(
+        vec![
+            server_config(authority.server(&["127.0.0.1"]), None),
+            server_config(authority.server(&["127.0.0.1"]), Some(authority)),
+        ],
         Some(SaslPolicy::plain()),
     )
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn a_login_without_the_client_certificate_that_the_broker_asks_for_is_a_tls_rejection() {
+    let authority = Authority::new();
+    let broker =
+        broker_that_asks_for_a_client_certificate_after_the_first_connection(&authority).await;
 
     let security = Security::default()
         .tls(tls(&authority, None))
@@ -594,8 +619,55 @@ async fn a_login_without_the_client_certificate_that_the_broker_asks_for_is_a_tl
 
     let error = metadata(broker.builder(security)).await.unwrap_err();
 
-    assert!(error.tls_failure().is_some(), "{error}");
+    assert_eq!(
+        Some(&TlsRejection::CertificateRequired),
+        error.tls_rejection(),
+        "{error}"
+    );
+    assert!(error.tls_failure().is_none(), "{error}");
     assert!(!error.is_connect_failure(), "{error}");
+
+    // The bootstrap connection and the login's connection, which the alert ended before any
+    // SaslAuthenticate token left the client.
+    assert_eq!(2, broker.seen.accepted.load(Ordering::SeqCst));
+    assert!(broker.seen.tokens.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_client_certificate_from_an_authority_that_the_broker_does_not_trust_is_a_tls_rejection()
+{
+    let authority = Authority::new();
+    let other = Authority::new();
+    let broker =
+        broker_that_asks_for_a_client_certificate_after_the_first_connection(&authority).await;
+
+    // The client trusts the broker's authority, and presents a certificate that another
+    // authority signed.
+    let security = Security::default()
+        .tls(tls(&authority, Some(other.client())))
+        .sasl(Sasl::new(SaslMechanism::Plain, USERNAME, PASSWORD));
+
+    let error = metadata(broker.builder(security)).await.unwrap_err();
+
+    assert_matches!(
+        error.tls_rejection(),
+        Some(TlsRejection::ClientCertificate(_)),
+        "{error}"
+    );
+    assert!(error.tls_failure().is_none(), "{error}");
+    assert!(!error.is_connect_failure(), "{error}");
+}
+
+#[test]
+fn a_rustls_error_that_is_not_an_alert_on_an_open_connection_stays_an_io_error() {
+    let error = Error::from(io::Error::new(
+        io::ErrorKind::InvalidData,
+        rustls::Error::DecryptError,
+    ));
+
+    assert_matches!(error, Error::Io(_));
+    assert!(error.tls_failure().is_none(), "{error}");
+    assert!(error.tls_rejection().is_none(), "{error}");
 }
 
 #[tokio::test]
@@ -708,16 +780,20 @@ async fn scram_login(mechanism: SaslMechanism, iterations: u32) -> (Error, usize
 }
 
 #[tokio::test]
-async fn a_scram_login_refuses_an_iteration_count_outside_the_range_that_kafka_allows() {
+async fn a_scram_login_refuses_an_iteration_count_outside_the_range_that_it_accepts() {
     for mechanism in [SaslMechanism::ScramSha256, SaslMechanism::ScramSha512] {
-        for iterations in [1, 4095, (1 << 20) + 1, u32::MAX] {
+        for iterations in [1, 4095, (1 << 16) + 1, u32::MAX] {
             let (error, sent) = scram_login(mechanism, iterations).await;
 
-            let reason = error.login_failure().unwrap_or_default();
-            assert!(
-                reason.contains(&format!("asked for {iterations} SCRAM iterations")),
+            assert_eq!(
+                Some((iterations, &(4096..=(1 << 16)))),
+                error.scram_iterations(),
                 "{mechanism:?} {iterations}: {error}"
             );
+
+            // The client refused the login, so the broker did not.
+            assert!(error.login_failure().is_none(), "{error}");
+            assert!(!error.is_connect_failure(), "{error}");
 
             // The client stopped after the broker's server-first message, so it never sent a
             // proof that costs few guesses to attack.

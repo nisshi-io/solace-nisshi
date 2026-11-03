@@ -43,7 +43,8 @@ use rsasl::{
     property::{AuthId, Password},
 };
 use rustls::{
-    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+    AlertDescription, ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore,
+    SignatureScheme,
     client::{
         WebPkiServerVerifier,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -296,12 +297,51 @@ pub(crate) fn rustls_cause(error: &io::Error) -> Option<&RustlsError> {
         .and_then(|inner| inner.downcast_ref::<RustlsError>())
 }
 
-/// The error of a failed TLS handshake. A certificate or protocol error that rustls reports, and
-/// a peer that closes the connection during the handshake, as a listener that does not speak TLS
-/// does, are TLS failures. Anything else is an I/O error.
+/// Why the broker rejected a TLS connection: the alert that it sent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TlsRejection {
+    /// The broker asks for a client certificate, and the client has none.
+    CertificateRequired,
+
+    /// The broker does not accept the client's certificate. The alert's name says why: for
+    /// example, `UnknownCA` means that the broker does not trust the authority that signed it.
+    ClientCertificate(String),
+
+    /// Any other alert, by name.
+    Other(String),
+}
+
+impl TlsRejection {
+    /// Returns the rejection that `cause` reports, when it is an alert from the broker.
+    pub(crate) fn from_rustls(cause: &RustlsError) -> Option<Self> {
+        let RustlsError::AlertReceived(alert) = cause else {
+            return None;
+        };
+
+        Some(match alert {
+            AlertDescription::CertificateRequired => Self::CertificateRequired,
+
+            AlertDescription::BadCertificate
+            | AlertDescription::UnsupportedCertificate
+            | AlertDescription::CertificateRevoked
+            | AlertDescription::CertificateExpired
+            | AlertDescription::CertificateUnknown
+            | AlertDescription::UnknownCA
+            | AlertDescription::AccessDenied => Self::ClientCertificate(format!("{alert:?}")),
+
+            _ => Self::Other(format!("{alert:?}")),
+        })
+    }
+}
+
+/// The error of a failed TLS handshake. An alert from the broker is a rejection, and a
+/// certificate or protocol error that rustls reports, or a peer that closes the connection
+/// during the handshake, as a listener that does not speak TLS does, is a TLS failure. Anything
+/// else is an I/O error.
 fn handshake_failure(error: io::Error) -> Error {
     if let Some(cause) = rustls_cause(&error) {
-        return Error::Tls(cause.to_string());
+        return TlsRejection::from_rustls(cause)
+            .map_or_else(|| Error::Tls(cause.to_string()), Error::TlsRejected);
     }
 
     match error.kind() {
@@ -464,17 +504,30 @@ const SCRAM_MIN_ITERATIONS: u32 = 4096;
 /// The most PBKDF2 iterations that a SCRAM login accepts from the broker. The client derives the
 /// key on the tokio worker that runs the login, and the pool's create timeout can't interrupt
 /// it, so a count that the broker's answer sets without limit would hold the worker. Kafka's
-/// brokers set at most 16384 and Kafka's client has no maximum.
-const SCRAM_MAX_ITERATIONS: u32 = 1 << 20;
+/// brokers set at most 16384, and Kafka's client has no maximum, so this is four times what a
+/// Kafka broker asks for.
+const SCRAM_MAX_ITERATIONS: u32 = 1 << 16;
 
 /// The iteration count that the broker asked for is outside the range that the client accepts.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "the broker asked for {0} SCRAM iterations, and the client accepts {min} to {max}",
-    min = SCRAM_MIN_ITERATIONS,
-    max = SCRAM_MAX_ITERATIONS
-)]
+#[error("the broker asked for {0} SCRAM iterations")]
 struct ScramIterationsOutOfRange(u32);
+
+/// Returns the error for a failed step of a SCRAM login. An iteration count outside the range
+/// that the client accepts is the client's refusal, and not the broker's, so it has an error of
+/// its own.
+fn scram_step_error(error: SessionError) -> Error {
+    if let SessionError::Boxed(cause) = &error
+        && let Some(&ScramIterationsOutOfRange(iterations)) = cause.downcast_ref()
+    {
+        return Error::ScramIterations {
+            iterations,
+            accepted: SCRAM_MIN_ITERATIONS..=SCRAM_MAX_ITERATIONS,
+        };
+    }
+
+    Error::Authentication(error.to_string())
+}
 
 /// Gives a SCRAM login its credentials, and refuses an iteration count outside the range that the
 /// client accepts before the client derives a key from the password.
@@ -690,7 +743,7 @@ impl Exchange<'_> {
 
             let state = session
                 .step(input.as_deref(), &mut output)
-                .map_err(|error| Error::Authentication(error.to_string()))?;
+                .map_err(scram_step_error)?;
 
             let output = output.into_inner().freeze();
 

@@ -37,6 +37,23 @@ const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
 /// Returns the error message for a command whose Kafka client failed. `broker_option` names
 /// the option and the environment variable that give the command its broker.
 fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
+    if let Some((iterations, accepted)) = error.scram_iterations() {
+        return format!(
+            "The client refused the SCRAM login: the broker asked for {iterations} iterations, \
+            and the client accepts {} to {}. Kafka's own client refuses fewer than {}. Recreate \
+            the user's credential with `nisshi user create --iterations` set within that range \
+            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
+            can also ask for such a count.",
+            accepted.start(),
+            accepted.end(),
+            accepted.start()
+        );
+    }
+
+    if let Some(rejection) = error.tls_rejection() {
+        return tls_rejection_message(rejection);
+    }
+
     match error {
         _ if error.sasl_not_used() => format!(
             "The broker's listener does not use SASL, so the command must not log in: it is a \
@@ -56,9 +73,8 @@ fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> St
         _ if error.tls_failure().is_some() => format!(
             "The TLS handshake with the broker failed: {}. Without --tls the command connects \
             in plaintext. With it, add --tls-ca-file for a broker certificate that the system \
-            doesn't trust, --tls-server-name (or --tls-no-hostname-check) when the certificate \
-            is for another name, and --tls-cert-file with --tls-key-file when the broker asks \
-            for a client certificate.",
+            doesn't trust, and --tls-server-name (or --tls-no-hostname-check) when the \
+            certificate is for another name.",
             error.tls_failure().unwrap_or_default()
         ),
         nisshi_client::Error::Pool(cause) if error.is_connect_failure() => format!(
@@ -82,6 +98,24 @@ fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> St
             )
         }
         _ => format!("The request to the broker failed: {error}"),
+    }
+}
+
+/// Returns the error message for a TLS alert that rejected the connection.
+fn tls_rejection_message(rejection: &nisshi_client::TlsRejection) -> String {
+    match rejection {
+        nisshi_client::TlsRejection::CertificateRequired => "The broker requires a client \
+            certificate for TLS, and the command sent none. Set --tls-cert-file and \
+            --tls-key-file."
+            .to_owned(),
+        nisshi_client::TlsRejection::ClientCertificate(alert) => format!(
+            "The broker does not accept the client certificate: it sent the TLS alert {alert}. \
+            Check --tls-cert-file and --tls-key-file, and that the broker trusts the authority \
+            that signed the certificate."
+        ),
+        nisshi_client::TlsRejection::Other(alert) => {
+            format!("The broker rejected the TLS connection: it sent the TLS alert {alert}.")
+        }
     }
 }
 
@@ -516,6 +550,70 @@ mod tests {
 
         assert_eq!(
             "The request to the broker failed: Timeout(30s)",
+            client_error_message(&error, BROKER_OPTION)
+        );
+    }
+
+    #[test]
+    fn scram_iteration_count_outside_the_accepted_range_is_the_clients_refusal() {
+        let error = nisshi_client::Error::ScramIterations {
+            iterations: 1000,
+            accepted: 4096..=65536,
+        };
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert_eq!(
+            "The client refused the SCRAM login: the broker asked for 1000 iterations, and the \
+            client accepts 4096 to 65536. Kafka's own client refuses fewer than 4096. Recreate \
+            the user's credential with `nisshi user create --iterations` set within that range \
+            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
+            can also ask for such a count.",
+            message
+        );
+        assert!(
+            !message.contains("refused the login: the broker"),
+            "{message}"
+        );
+        assert!(!message.contains("--sasl-password-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_requires_a_client_certificate_names_the_options_that_give_one() {
+        let error =
+            nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::CertificateRequired);
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("--tls-cert-file"), "{message}");
+        assert!(message.contains("--tls-key-file"), "{message}");
+        assert!(!message.contains("--tls-ca-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_does_not_accept_the_client_certificate_names_the_alert_and_the_trust() {
+        let error = nisshi_client::Error::TlsRejected(
+            nisshi_client::TlsRejection::ClientCertificate("UnknownCA".to_owned()),
+        );
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("UnknownCA"), "{message}");
+        assert!(
+            message.contains("the broker trusts the authority"),
+            "{message}"
+        );
+        assert!(!message.contains("--tls-ca-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_rejects_the_tls_connection_names_the_alert() {
+        let error = nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::Other(
+            "ProtocolVersion".to_owned(),
+        ));
+
+        assert_eq!(
+            "The broker rejected the TLS connection: it sent the TLS alert ProtocolVersion.",
             client_error_message(&error, BROKER_OPTION)
         );
     }

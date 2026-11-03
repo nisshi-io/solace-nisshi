@@ -114,6 +114,7 @@ use std::{
     cmp,
     collections::BTreeMap,
     error, fmt, io,
+    ops::RangeInclusive,
     sync::{Arc, LazyLock, PoisonError},
     time::{Instant, SystemTime},
 };
@@ -151,7 +152,7 @@ mod consumer;
 mod security;
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
-pub use security::{Sasl, SaslMechanism, Security, Tls, TlsOptions};
+pub use security::{Sasl, SaslMechanism, Security, Tls, TlsOptions, TlsRejection};
 use security::{Session, Stream};
 
 /// Client Errors
@@ -168,6 +169,12 @@ pub enum Error {
     Poison,
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
     Protocol(#[from] nisshi_sans_io::Error),
+    /// The SCRAM login stopped, because the broker asked for an iteration count outside the range
+    /// that the client accepts. The client refused the login, not the broker.
+    ScramIterations {
+        iterations: u32,
+        accepted: RangeInclusive<u32>,
+    },
     /// The client logs in with SASL, and the broker's listener does not use SASL: it is a
     /// `PLAINTEXT` or `SSL` listener, or a Nisshi broker that started without `--authentication`.
     SaslNotUsed,
@@ -177,8 +184,11 @@ pub enum Error {
     /// has connected yet.
     TlsConfiguration(String),
     /// The TLS handshake with the broker failed: its certificate is not trusted or is not valid
-    /// for its name, it wants a client certificate, or its listener does not use TLS.
+    /// for its name, or its listener does not use TLS.
     Tls(String),
+    /// The broker sent a TLS alert that rejects the connection: it wants a client certificate, or
+    /// does not accept the one that the client sent.
+    TlsRejected(TlsRejection),
     UnknownApiKey(i16),
     UnknownHost(Url),
 }
@@ -196,8 +206,10 @@ impl Error {
         match self {
             Self::Pool(cause) => {
                 self.login_failure().is_none()
+                    && self.scram_iterations().is_none()
                     && !self.sasl_not_used()
                     && self.tls_failure().is_none()
+                    && self.tls_rejection().is_none()
                     && !matches!(
                         cause.downcast_ref::<PoolError<Error>>(),
                         Some(
@@ -214,12 +226,44 @@ impl Error {
 
     /// Returns why the TLS handshake with the broker failed, when the client connected and the
     /// handshake then failed: the broker's certificate is not trusted or is not valid for the
-    /// broker's name, the broker wants a client certificate, or its listener does not use TLS.
+    /// broker's name, or its listener does not use TLS.
     pub fn tls_failure(&self) -> Option<&str> {
         match self {
             Self::Tls(message) => Some(message),
             Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
                 Some(PoolError::Backend(Self::Tls(message))) => Some(message),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns the alert that rejected the TLS connection, when the broker sent one: it wants a
+    /// client certificate, or does not accept the one that the client sent.
+    pub fn tls_rejection(&self) -> Option<&TlsRejection> {
+        match self {
+            Self::TlsRejected(rejection) => Some(rejection),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::TlsRejected(rejection))) => Some(rejection),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns the iteration count that the broker asked a SCRAM login for, and the range that the
+    /// client accepts, when the count is outside that range.
+    pub fn scram_iterations(&self) -> Option<(u32, &RangeInclusive<u32>)> {
+        match self {
+            Self::ScramIterations {
+                iterations,
+                accepted,
+            } => Some((*iterations, accepted)),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::ScramIterations {
+                    iterations,
+                    accepted,
+                })) => Some((*iterations, accepted)),
                 _ => None,
             },
             _ => None,
@@ -279,10 +323,13 @@ where
     }
 }
 
+/// A TLS alert from the broker, after the handshake, is a rejection of the connection: that is
+/// how a TLS 1.3 broker refuses a client certificate. Any other rustls error on a connection
+/// that is already open stays an I/O error, because the handshake did not cause it.
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        match security::rustls_cause(&value) {
-            Some(cause) => Self::Tls(cause.to_string()),
+        match security::rustls_cause(&value).and_then(TlsRejection::from_rustls) {
+            Some(rejection) => Self::TlsRejected(rejection),
             None => Self::Io(Arc::new(value)),
         }
     }
