@@ -319,7 +319,7 @@ jobs:
       # not wanted on a public repo. The Prisma verdict is enforced by the
       # Guardian gate.
       - name: Prisma Cloud scan
-        uses: SolaceDev/solace-public-workflows/prisma-cloud-scan@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/prisma-cloud-scan@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           image_registry: ${{ env.IMAGE_REGISTRY }}
           image_repo: ${{ env.IMAGE_REPO }}
