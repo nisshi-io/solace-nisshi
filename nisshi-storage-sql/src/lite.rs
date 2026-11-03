@@ -28,7 +28,8 @@ use chrono::NaiveDateTime;
 use deadpool::managed;
 use libsql::{
     Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
-    ffi::SQLITE_CONSTRAINT_UNIQUE, params::IntoParams,
+    ffi::SQLITE_CONSTRAINT_UNIQUE,
+    params::{IntoParams, Params},
 };
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
@@ -103,6 +104,10 @@ macro_rules! include_sql {
         remove_comments(include_str!($e))
     };
 }
+
+/// The query keys that [`PoolConnection::cached_statement`] prepares afresh on each call, because
+/// they are rare and carry credentials that a cached statement would keep bound.
+const UNCACHED_PREFIXES: &[&str] = &["scram_credential_"];
 
 static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
@@ -251,6 +256,33 @@ pub(crate) struct ConnectionManager {
 
 pub(crate) struct PoolConnection {
     connection: Connection,
+
+    /// The statements that this connection has prepared, by query key.
+    statements: Mutex<BTreeMap<String, Arc<Statement>>>,
+}
+
+/// A statement that a connection shares between calls, which can only be executed.
+///
+/// It offers no way to read rows: a `Row` or `Rows` reads its values from the statement, so a
+/// reset under a live reader would change what the caller sees. It is reset when dropped, so
+/// that a statement that stopped before its last row does not keep a read transaction open on
+/// the connection.
+struct CachedStatement(Arc<Statement>);
+
+impl CachedStatement {
+    fn parameter_count(&self) -> usize {
+        self.0.parameter_count()
+    }
+
+    async fn execute(&self, params: Params) -> result::Result<usize, libsql::Error> {
+        self.0.execute(params).await
+    }
+}
+
+impl Drop for CachedStatement {
+    fn drop(&mut self) {
+        self.0.reset();
+    }
 }
 
 impl Debug for PoolConnection {
@@ -327,7 +359,10 @@ impl PoolConnection {
     async fn new(connection: Connection) -> Result<Self> {
         Self::init(&connection).await?;
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            statements: Mutex::default(),
+        })
     }
 
     #[instrument(skip(self))]
@@ -338,6 +373,54 @@ impl PoolConnection {
             .ok_or(libsql::Error::Misuse(format!("Unknown cache key: {}", key)))?;
 
         self.connection.prepare(sql).await
+    }
+
+    /// Returns the connection's statement for the query key, preparing it on first use.
+    ///
+    /// libsql's `Connection::prepare` parses and plans the SQL on every call and keeps no
+    /// cache. The statement is reset when the returned guard drops, and the guard can only
+    /// execute, so only a caller that returns no row may use this method. A caller that returns
+    /// a row uses [`Self::prepared_statement`].
+    ///
+    /// A reset keeps the values last bound, and libsql binds blobs and text by copying them, so
+    /// a cached statement holds its last record, header or credential until its next use or
+    /// until the connection is dropped. The SCRAM credential keys are rare administrative
+    /// calls, so they are prepared afresh each time rather than cached.
+    async fn cached_statement(&self, key: &str) -> Result<CachedStatement, libsql::Error> {
+        if UNCACHED_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return Ok(CachedStatement(Arc::new(
+                self.prepared_statement(key).await?,
+            )));
+        }
+
+        let cached = self
+            .statements
+            .lock()
+            .map_err(|_| libsql::Error::Misuse("statement cache lock poisoned".into()))?
+            .get(key)
+            .cloned();
+
+        let statement = match cached {
+            Some(statement) => statement,
+            None => {
+                let statement = Arc::new(self.prepared_statement(key).await?);
+
+                _ = self
+                    .statements
+                    .lock()
+                    .map_err(|_| libsql::Error::Misuse("statement cache lock poisoned".into()))?
+                    .insert(key.to_owned(), statement.clone());
+
+                statement
+            }
+        };
+
+        statement.reset();
+
+        Ok(CachedStatement(statement))
     }
 
     fn attributes_for_error(&self, key: Option<&str>, error: &libsql::Error) -> Vec<KeyValue> {
@@ -427,7 +510,23 @@ impl PoolConnection {
         debug!(sql);
         let start = SystemTime::now();
 
-        let statement = self.prepared_statement(sql).await?;
+        let statement = self.cached_statement(sql).await?;
+
+        // A reset keeps the values last bound, so a placeholder that the caller did not bind
+        // would take the previous call's value instead of failing as NULL.
+        let params = params.into_params()?;
+        let supplied = match &params {
+            Params::None => 0,
+            Params::Positional(values) => values.len(),
+            Params::Named(values) => values.len(),
+        };
+
+        if supplied != statement.parameter_count() {
+            return Err(libsql::Error::Misuse(format!(
+                "sql={sql}: bound {supplied} parameters, statement has {}",
+                statement.parameter_count()
+            )));
+        }
 
         statement
             .execute(params)
@@ -6758,6 +6857,125 @@ mod tests {
 
         assert_eq!((ErrorCode::None, record_count), delete_up_to(-1).await?);
         assert_eq!((0, None), stored_rows().await?);
+
+        Ok(())
+    }
+
+    async fn scratch_connection() -> Result<(tempfile::TempDir, managed::Object<ConnectionManager>)>
+    {
+        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let db = libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+            .build()
+            .await?;
+
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        let pool = Pool::builder(ConnectionManager {
+            db: Arc::new(Mutex::new(db)),
+            busy_timeout: Duration::from_millis(100),
+        })
+        .build()?;
+
+        Ok((temp_dir, pool.get().await?))
+    }
+
+    async fn cluster_names(connection: &PoolConnection) -> Result<Vec<String>> {
+        let mut rows = connection
+            .connection
+            .query("select name from cluster order by name", ())
+            .await?;
+
+        let mut names = vec![];
+        while let Some(row) = rows.next().await? {
+            names.push(row.get::<String>(0)?);
+        }
+        Ok(names)
+    }
+
+    /// `PoolConnection::execute` runs a parameterised write key through the cache. A second call
+    /// reuses the first call's statement and binds its own values.
+    #[tokio::test]
+    async fn execute_reuses_the_cached_statement_and_binds_each_call() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let key = "register_broker.sql";
+        let (_directory, connection) = scratch_connection().await?;
+
+        assert_eq!(1, connection.execute(key, ["alpha"]).await?);
+        let first_statement = connection.statements.lock().unwrap().get(key).cloned();
+        assert!(first_statement.is_some());
+
+        assert_eq!(1, connection.execute(key, ["beta"]).await?);
+        let second_statement = connection.statements.lock().unwrap().get(key).cloned();
+        assert!(Arc::ptr_eq(
+            &first_statement.unwrap(),
+            &second_statement.unwrap()
+        ));
+
+        assert_eq!(1, connection.statements.lock().unwrap().len());
+        assert_eq!(vec!["alpha", "beta"], cluster_names(&connection).await?);
+
+        Ok(())
+    }
+
+    /// A reset statement keeps the values last bound, so a call that binds fewer parameters than
+    /// the statement has is refused, not run with the previous call's value.
+    #[tokio::test]
+    async fn execute_refuses_a_call_that_binds_the_wrong_number_of_parameters() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let key = "register_broker.sql";
+        let (_directory, connection) = scratch_connection().await?;
+
+        assert_eq!(1, connection.execute(key, ["alpha"]).await?);
+
+        let err = connection.execute(key, ()).await.unwrap_err();
+        assert_matches!(&err, libsql::Error::Misuse(message)
+            if message.contains(key) && message.contains("bound 0") && message.contains("has 1"));
+
+        let err = connection.execute(key, ["a", "b"]).await.unwrap_err();
+        assert_matches!(&err, libsql::Error::Misuse(message) if message.contains("bound 2"));
+
+        assert_eq!(vec!["alpha"], cluster_names(&connection).await?);
+
+        Ok(())
+    }
+
+    /// The SCRAM credential keys carry salts and keys, so a connection prepares them afresh and
+    /// keeps no statement bound to the last credential.
+    #[tokio::test]
+    async fn execute_does_not_cache_scram_credential_statements() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let (_directory, connection) = scratch_connection().await?;
+
+        assert_eq!(1, connection.execute("register_broker.sql", ["c"]).await?);
+        assert_eq!(
+            1,
+            connection
+                .execute(
+                    "scram_credential_insert.sql",
+                    (
+                        "c",
+                        "alice",
+                        1_i32,
+                        &b"salt"[..],
+                        4096_i32,
+                        &b"stored"[..],
+                        &b"server"[..],
+                    ),
+                )
+                .await?
+        );
+
+        let cached = connection
+            .statements
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["register_broker.sql"], cached);
 
         Ok(())
     }
