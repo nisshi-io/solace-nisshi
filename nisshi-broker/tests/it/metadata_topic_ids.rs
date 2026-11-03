@@ -75,22 +75,29 @@ async fn a_null_topic_name_is_refused_before_v12_and_the_connection_survives() -
         let broker = spawn_broker(None).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
 
-        for (correlation_id, api_version) in [(1, 10), (2, 11)] {
-            let response = metadata(
-                &mut stream,
-                api_version,
-                correlation_id,
-                MetadataRequestTopic::default()
-                    .topic_id(Some([7; 16]))
-                    .name(None),
-            )
-            .await?;
+        let mut correlation_id = 0;
 
-            assert_matches!(
-                only_topic(response)?,
-                (ErrorCode::InvalidRequest, Some(name)) if name.is_empty(),
-                "v{api_version}"
-            );
+        for api_version in [10, 11] {
+            // With the zero ID, only the null name is left to refuse.
+            for topic_id in [[7; 16], NULL_TOPIC_ID] {
+                correlation_id += 1;
+
+                let response = metadata(
+                    &mut stream,
+                    api_version,
+                    correlation_id,
+                    MetadataRequestTopic::default()
+                        .topic_id(Some(topic_id))
+                        .name(None),
+                )
+                .await?;
+
+                assert_matches!(
+                    only_topic(response)?,
+                    (ErrorCode::InvalidRequest, Some(name)) if name.is_empty(),
+                    "v{api_version} {topic_id:?}"
+                );
+            }
         }
 
         Ok::<_, anyhow::Error>(())

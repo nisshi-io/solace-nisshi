@@ -247,6 +247,40 @@ mod tests {
         Ok(())
     }
 
+    /// A null name is refused whatever the topic ID is. With the zero ID or none, the request
+    /// would reach the storage, which answers an unnamed topic that does not decode at these
+    /// versions.
+    #[tokio::test]
+    async fn a_null_name_is_invalid_at_v10_and_v11_with_the_zero_id_or_no_id() -> Result<(), Error>
+    {
+        for api_version in [10, 11] {
+            for topic_id in [Some(NULL_TOPIC_ID), None] {
+                let frame = serve(
+                    api_version,
+                    Some(vec![
+                        MetadataRequestTopic::default()
+                            .name(None)
+                            .topic_id(topic_id),
+                    ]),
+                )
+                .await?;
+
+                let [topic] = topics(&frame).try_into().expect("one topic");
+                assert_eq!(
+                    i16::from(ErrorCode::InvalidRequest),
+                    topic.error_code,
+                    "v{api_version} {topic_id:?}"
+                );
+                assert_eq!(Some(String::new()), topic.name);
+                assert_eq!(Some(NULL_TOPIC_ID), topic.topic_id);
+
+                encodes(api_version, frame)?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_named_topic_with_an_id_is_invalid_at_v10_and_v11() -> Result<(), Error> {
         for api_version in [10, 11] {

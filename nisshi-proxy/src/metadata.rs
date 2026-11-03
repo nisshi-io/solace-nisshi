@@ -145,23 +145,30 @@ mod tests {
         let origin = Origin::default();
 
         for api_version in [10, 11] {
-            let frame = serve(
-                &origin,
-                api_version,
-                MetadataRequestTopic::default()
-                    .name(None)
-                    .topic_id(Some([7; 16])),
-            )
-            .await?;
+            // With the zero ID or none, only the null name is left to refuse.
+            for topic_id in [Some([7; 16]), Some(NULL_TOPIC_ID), None] {
+                let frame = serve(
+                    &origin,
+                    api_version,
+                    MetadataRequestTopic::default()
+                        .name(None)
+                        .topic_id(topic_id),
+                )
+                .await?;
 
-            let Body::MetadataResponse(response) = frame.body else {
-                panic!("a metadata response");
-            };
+                let Body::MetadataResponse(response) = frame.body else {
+                    panic!("a metadata response");
+                };
 
-            let topics = response.topics.unwrap_or_default();
-            assert_eq!(1, topics.len());
-            assert_eq!(i16::from(ErrorCode::InvalidRequest), topics[0].error_code);
-            assert_eq!(Some(String::new()), topics[0].name);
+                let topics = response.topics.unwrap_or_default();
+                assert_eq!(1, topics.len(), "v{api_version} {topic_id:?}");
+                assert_eq!(
+                    i16::from(ErrorCode::InvalidRequest),
+                    topics[0].error_code,
+                    "v{api_version} {topic_id:?}"
+                );
+                assert_eq!(Some(String::new()), topics[0].name);
+            }
         }
 
         assert_eq!(0, origin.requests.load(Ordering::SeqCst));
