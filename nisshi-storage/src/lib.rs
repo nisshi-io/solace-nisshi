@@ -236,11 +236,11 @@ pub use service::{
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
+    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
+    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
+    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -487,10 +487,11 @@ impl Error {
     ///
     /// Two backend errors are permanent because a retry can't fix them. An object store error
     /// that names a missing object, a rejected credential or an unsupported operation, and a
-    /// PostgreSQL error whose SQLSTATE class names a request that the server never accepts: a
-    /// data exception, an integrity constraint violation, a syntax error or access rule
-    /// violation, or an internal error (classes 22, 23, 42 and XX). Every other SQLSTATE is
-    /// transient.
+    /// PostgreSQL error whose SQLSTATE names a request that the server never accepts: an
+    /// unsupported feature, a cardinality violation, a data exception, an integrity constraint
+    /// violation, a missing database or schema, a syntax error or access rule violation, a
+    /// program limit exceeded, an internal error (classes 0A, 21, 22, 23, 3D, 3F, 42, 54 and
+    /// XX), or a statement in a failed transaction (25P02). Every other SQLSTATE is transient.
     ///
     /// [`Error::Acquire`], [`Error::UnableToSend`], [`Error::OneshotRecv`] and an
     /// [`Error::Join`] of a cancelled task are transient. A semaphore, a channel to the storage
@@ -647,15 +648,27 @@ impl Error {
 
 /// Returns whether a PostgreSQL error with `sqlstate` may clear on a retry.
 ///
-/// The SQLSTATE classes for a data exception (22), an integrity constraint violation (23), a
-/// syntax error or access rule violation (42) and an internal error (XX) name a request that
-/// the server never accepts, so they are permanent. Every other class is transient. A state
-/// that nobody listed, such as `read_only_sql_transaction` (25006) on a pooled connection to a
-/// primary that a failover has demoted, or `lock_not_available` (55P03), then answers the
-/// retriable code and not a fatal one.
+/// The SQLSTATE classes for an unsupported feature (0A), a cardinality violation (21), a data
+/// exception (22), an integrity constraint violation (23), a missing database or schema (3D and
+/// 3F), a syntax error or access rule violation (42), a program limit exceeded (54) and an
+/// internal error (XX) name a request that the server never accepts. So does
+/// `in_failed_sql_transaction` (25P02), which a code bug causes. All of them are permanent.
+/// Class 0A is safe to call permanent because Nisshi runs only at the `READ COMMITTED` level
+/// and takes no runtime lock above `ROW EXCLUSIVE` on PostgreSQL, so a hot standby answers
+/// `read_only_sql_transaction` (25006) and not `feature_not_supported` (0A000). A request-time
+/// `pg_advisory_xact_lock` or a `SERIALIZABLE` transaction would change that. Every other state
+/// is transient. A state that nobody listed, such as
+/// `read_only_sql_transaction` (25006) on a pooled connection to a primary that a failover
+/// has demoted, or `lock_not_available` (55P03), then answers the retriable code and not a
+/// fatal one.
 #[cfg(feature = "postgres")]
 fn is_transient_sqlstate(sqlstate: &tokio_postgres::error::SqlState) -> bool {
-    !matches!(sqlstate.code().get(..2), Some("22" | "23" | "42" | "XX"))
+    let permanent_class = matches!(
+        sqlstate.code().get(..2),
+        Some("0A" | "21" | "22" | "23" | "3D" | "3F" | "42" | "54" | "XX")
+    );
+
+    !permanent_class && *sqlstate != tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
 }
 
 impl Display for Error {
@@ -3579,6 +3592,12 @@ mod tests {
             SqlState::UNIQUE_VIOLATION,
             SqlState::SYNTAX_ERROR,
             SqlState::INTERNAL_ERROR,
+            SqlState::PROGRAM_LIMIT_EXCEEDED,
+            SqlState::FEATURE_NOT_SUPPORTED,
+            SqlState::CARDINALITY_VIOLATION,
+            SqlState::INVALID_CATALOG_NAME,
+            SqlState::INVALID_SCHEMA_NAME,
+            SqlState::IN_FAILED_SQL_TRANSACTION,
         ] {
             assert!(!is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
         }

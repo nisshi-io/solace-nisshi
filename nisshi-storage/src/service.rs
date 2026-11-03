@@ -44,7 +44,7 @@ mod txn;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{self, Debug, Display, Formatter},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
@@ -333,11 +333,16 @@ pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
     error.error_code(ErrorCode::KafkaStorageError)
 }
 
-pub type RequestSender = mpsc::Sender<(Request, oneshot::Sender<Response>)>;
-pub type RequestReceiver = mpsc::Receiver<(Request, oneshot::Sender<Response>)>;
+/// The sender of a request's outcome: the response, or the error that its storage task failed
+/// with. The error keeps its type, so [`Error::is_transient`] and [`Error::error_code`] give
+/// the same answer on both sides of the channel.
+pub type OutcomeSender = oneshot::Sender<Result<Response>>;
+
+pub type RequestSender = mpsc::Sender<(Request, OutcomeSender)>;
+pub type RequestReceiver = mpsc::Receiver<(Request, OutcomeSender)>;
 
 pub fn bounded_channel(buffer: usize) -> (RequestSender, RequestReceiver) {
-    mpsc::channel::<(Request, oneshot::Sender<Response>)>(buffer)
+    mpsc::channel::<(Request, OutcomeSender)>(buffer)
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -476,7 +481,9 @@ impl Service<Request> for RequestChannelService {
 
         resp_rx
             .await
-            .map_err(|_| Error::OneshotRecv.into())
+            .map_err(|_| Error::OneshotRecv)
+            .and_then(|outcome| outcome)
+            .map_err(ServiceError::from)
             .inspect(|_| {
                 let elapsed_millis = self.elapsed_millis(start);
                 STORAGE_CHANNEL_REQUEST_DURATION.record(elapsed_millis, &attributes);
@@ -1118,7 +1125,7 @@ where
 
                     match tokio::spawn(async move { inner.serve(request).await }).await {
                         Ok(Ok(response)) => {
-                            if tx.send(response).is_err() {
+                            if tx.send(Ok(response)).is_err() {
                                 debug!(
                                     operation,
                                     "requester dropped its response receiver; discarding response"
@@ -1139,6 +1146,10 @@ where
                                     KeyValue::new("kind", "error"),
                                 ],
                             );
+
+                            // The requester may have dropped its receiver, and the error is
+                            // already logged and counted.
+                            _ = tx.send(Err(error));
                         }
 
                         Err(join_error) => {
@@ -1165,6 +1176,8 @@ where
                                     KeyValue::new("kind", kind),
                                 ],
                             );
+
+                            _ = tx.send(Err(Error::Join(Arc::new(join_error))));
                         }
                     }
                 }

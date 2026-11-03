@@ -3294,12 +3294,24 @@ impl Storage for DynoStore {
                 )
                 .await
                 .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                .inspect_err(|error| error!(?error, transaction_id, ?topition))
+                .inspect_err(|error| {
+                    error!(
+                        ?error,
+                        transaction_id,
+                        ?topition,
+                        offset,
+                        ?location,
+                        ?idempotent
+                    )
+                })
                 .map_err(|error| {
                     let error = Error::from(error);
 
-                    // An object store that times out can complete the write, so a retry of the
-                    // batch's sequence can store it twice.
+                    // Every transient error of this write answers UNKNOWN_SERVER_ERROR for an
+                    // idempotent batch, also one where the store refused the write, such as a
+                    // throttle. The error does not tell whether the write completed, and a
+                    // retry of a stored batch stores it twice. A HEAD request on `location`
+                    // would tell, and this code does not send one.
                     if idempotent.is_some() {
                         unretriable_after_write(error)
                     } else {

@@ -89,7 +89,7 @@ where
 
             _ = tokio::spawn(async move {
                 if let Ok(response) = service.serve(request).await {
-                    _ = reply.send(response);
+                    _ = reply.send(Ok(response));
                 }
             });
         }

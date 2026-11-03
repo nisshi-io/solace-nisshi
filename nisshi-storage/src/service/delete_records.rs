@@ -230,8 +230,8 @@ mod tests {
     enum Answer {
         /// Moves the log start to this offset.
         Cut(i64),
-        /// Fails the call with an error that has no Kafka code, as a
-        /// database or object store failure does.
+        /// Fails the call with an error that has no Kafka code and that a
+        /// retry may fix, as an unavailable database or object store does.
         Fail,
         /// Fails the call with this code.
         Api(ErrorCode),
@@ -303,7 +303,9 @@ mod tests {
                                     .partition_index(partition.partition_index)
                                     .low_watermark(offset)
                                     .error_code(ErrorCode::None.into())),
-                                Answer::Fail => Err(Error::Message(String::from("unavailable"))),
+                                Answer::Fail => {
+                                    Err(Error::from(std::io::Error::other("unavailable")))
+                                }
                                 Answer::Api(error_code) => Err(Error::Api(error_code)),
                             }
                         })
@@ -637,7 +639,7 @@ mod tests {
     }
 
     /// A storage error answers in its own partition: `KAFKA_STORAGE_ERROR`
-    /// for an error without a Kafka code, the code of an `Error::Api`, and
+    /// for a transient error without a Kafka code, the code of an `Error::Api`, and
     /// the partitions around it still answer their cut.
     #[tokio::test]
     async fn storage_error_answers_in_its_partition() -> Result<()> {

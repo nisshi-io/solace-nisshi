@@ -641,7 +641,9 @@ mod tests {
                 panic!("{request:?}");
             };
 
-            reply.send(Response::Fetch(Ok(vec![]))).expect("the reader");
+            reply
+                .send(Ok(Response::Fetch(Ok(vec![]))))
+                .expect("the reader");
 
             max_wait
         };
