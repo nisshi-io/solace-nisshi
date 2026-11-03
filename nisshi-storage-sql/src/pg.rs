@@ -555,13 +555,18 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// (`information_schema.columns` and `pg_indexes`).
 ///
 /// A step runs in the transaction that holds the schema lock, so it can't use `create index
-/// concurrently`. It must finish within the setup's 5 minute `statement_timeout`, which also
-/// ends every broker that waits for the lock, so a step can't raise its own limit with `SET
-/// LOCAL`. Each step gets a [`STEP_LOCK_TIMEOUT`]: an `ALTER TABLE` queues behind a long reader,
-/// and every later request on that table queues behind the `ALTER TABLE`, so a step that can't get
-/// its lock fails and is retried on the next start. A step that rewrites `record` or takes the
-/// lock for long must be split into an expand step and a contract step. A step that fails rolls
-/// the whole upgrade back and stops the broker.
+/// concurrently`. The transaction keeps the table locks of every step until the last step
+/// commits, and every request on those tables queues behind them. So each statement of a step
+/// gets the default statement timeout of a request, [`DEFAULT_STATEMENT_TIMEOUT_MS`], and not the
+/// 5 minutes of the setup, which a step can't raise with `SET LOCAL`. The sum of every step
+/// is not bounded. Each step also gets a [`STEP_LOCK_TIMEOUT`]: an `ALTER TABLE` queues behind a
+/// long reader, and every later request on that table queues behind the `ALTER TABLE`, so a step
+/// that can't get its lock fails and is retried on the next start. A step that rewrites `record`
+/// or takes the lock for long must be split into an expand step and a contract step. A step that
+/// fails rolls the whole upgrade back and stops the broker.
+///
+/// The change that adds the first step must also update the version table and the line about
+/// databases that 0.7.0-pre.3 set up in `docs/storage.md`, which stops being true then.
 const MIGRATIONS: &[Migration] = &[];
 
 /// How long a step of [`MIGRATIONS`] waits for a table lock before it fails.
@@ -2169,6 +2174,16 @@ impl Postgres {
         }
 
         if let (Action::Upgrade(steps), Some(recorded)) = (action, recorded) {
+            // The steps would run on the connection's own search path, which can hold other tables
+            // than the ones that the version describes. Nisshi never records a version without
+            // creating `cluster`, so this database was changed from outside.
+            if !has_tables {
+                return Err(Error::Message(format!(
+                    "the database records schema version {} but has no `cluster` table on the search path",
+                    recorded.version
+                )));
+            }
+
             announce_upgrade(recorded, steps);
             let started = Instant::now();
             self.upgrade_schema(&tx, recorded, steps).await?;
@@ -2212,10 +2227,16 @@ impl Postgres {
         recorded: RecordedSchema,
         steps: &[Migration],
     ) -> Result<()> {
-        // The transaction holds the schema lock already, so this timeout bounds only the table
-        // locks that the steps take.
-        tx.batch_execute(&format!("SET LOCAL lock_timeout = '{STEP_LOCK_TIMEOUT}'"))
-            .await?;
+        // The transaction holds the schema lock already, so the lock timeout bounds only the table
+        // locks that the steps take. The statement timeout drops from the setup's 5 minutes to
+        // the timeout of a request, because a step that holds a table lock stalls every request on
+        // that table. The brokers that wait for the schema lock keep the 5 minutes in their own
+        // sessions.
+        tx.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{STEP_LOCK_TIMEOUT}'; \
+             SET LOCAL statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"
+        ))
+        .await?;
 
         for step in steps {
             debug!(to_version = step.to_version);
@@ -13478,10 +13499,7 @@ mod tests {
 
                 assert_matches!(
                     storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
-                    Err(Error::OutdatedSchema {
-                        recorded_version: 0,
-                        schema_version: 2,
-                    })
+                    Err(Error::UnversionedSchema { schema_version: 2 })
                 );
 
                 assert_matches!(count(&storage, "nisshi_schema_version").await, Err(_));
@@ -13715,6 +13733,131 @@ mod tests {
                     .await?
                     .try_get::<_, i32>(0)?;
                 assert_eq!(recorded, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A `nisshi_schema_version` table that records a newer version sits first on the search path.
+    /// The broker must still read the version from the namespace that holds the tables, in the
+    /// read before the lock and in the read under it, so that it does not skip an upgrade that
+    /// the database needs.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_despite_a_stale_newer_version_table_earlier_on_the_search_path()
+    -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_despite_a_stale_newer_version_table_earlier_on_the_search_path",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.execute("create schema first_on_path").await?;
+                database
+                    .execute(
+                        "create table first_on_path.nisshi_schema_version as \
+                         select 2 as version, 1 as oldest_compatible_version",
+                    )
+                    .await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                assert_eq!(count(&storage, "public.upgrade_marker").await?, 1);
+                let recorded = storage
+                    .connection()
+                    .await?
+                    .query_one("select version from public.nisshi_schema_version", &[])
+                    .await?
+                    .try_get::<_, i32>(0)?;
+                assert_eq!(recorded, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database records a version but has lost its `cluster` table. The steps would then run
+    /// on whatever the connection's search path holds, so the upgrade must stop before it
+    /// changes anything.
+    #[tokio::test]
+    async fn ensure_schema_refuses_an_upgrade_of_a_database_without_its_cluster_table() -> Result<()>
+    {
+        with_empty_database(
+            "ensure_schema_refuses_an_upgrade_of_a_database_without_its_cluster_table",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                database.execute("drop table cluster cascade").await?;
+
+                assert_matches!(
+                    storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
+                    Err(Error::Message(message)) if message.contains("no `cluster` table")
+                );
+
+                assert_eq!(recorded_versions(&storage).await?, (1, 1));
+                assert_matches!(count(&storage, "upgrade_marker").await, Err(_));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that needs a table lock that another session holds must fail at its lock timeout,
+    /// leave the database at version 1, and not wait for the lock for the setup's 5 minutes.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_fails_when_a_step_cannot_get_its_table_lock() -> Result<()> {
+        const ADDS_COLUMN: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "alter table cluster add column upgrade_column int",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_fails_when_a_step_cannot_get_its_table_lock",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // A reader's lock on `cluster` conflicts with the lock of `alter table`.
+                let holder_storage = database.storage()?;
+                let mut holder = holder_storage.connection().await?;
+                let reading = holder.transaction().await?;
+                reading
+                    .batch_execute("LOCK TABLE cluster IN ACCESS SHARE MODE")
+                    .await?;
+
+                // Without a lock timeout, the step waits for the reader until this timeout fires.
+                let outcome = timeout(
+                    Duration::from_secs(30),
+                    storage.ensure_schema_of(&ADDS_COLUMN, SCHEMA),
+                )
+                .await
+                .map_err(|_| Error::Message("the step waited for its table lock".into()))?;
+                assert_matches!(
+                    outcome,
+                    Err(Error::TokioPostgres(err)) if err.code() == Some(&SqlState::LOCK_NOT_AVAILABLE)
+                );
+                reading.rollback().await?;
+
+                assert_eq!(recorded_versions(&storage).await?, (1, 1));
+                let columns = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select count(*) from information_schema.columns \
+                         where table_name = 'cluster' and column_name = 'upgrade_column'",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i64>(0)?;
+                assert_eq!(columns, 0);
                 Ok(())
             },
         )

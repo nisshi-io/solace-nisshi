@@ -204,7 +204,9 @@ A release can use a database when its schema version is at least the recorded `o
 
 | Releases | Schema version | Oldest compatible version |
 |---|---|---|
-| Every release so far | 1 | 1 |
+| 0.7.0 and later | 1 | 1 |
+
+A database that 0.7.0-pre.3 set up records no version, and the query above fails on it until a release from 0.7.0 on starts on it and records one.
 
 Nisshi is tested on PostgreSQL 16 and later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
 

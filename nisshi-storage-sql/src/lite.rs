@@ -1812,6 +1812,21 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// A step runs in the transaction that holds the write lock. Brokers that wait for that lock fail
 /// with `SQLITE_BUSY` when a step outlasts their `busy_timeout`. A step that fails rolls the whole
 /// upgrade back and stops the broker.
+///
+/// SQLite can't change most constraints or column types with `ALTER TABLE`, so a step usually
+/// rebuilds a table: it creates the new table, copies the rows, drops the old table and renames
+/// the new one. The upgrade runs with `PRAGMA foreign_keys = OFF`, because `DROP TABLE` with
+/// foreign keys on deletes the table's rows first, which fires every `on delete cascade` rule of
+/// the tables that refer to it. After the last step, the upgrade runs `PRAGMA foreign_key_check`
+/// and fails when a row breaks a foreign key.
+///
+/// A change to `ddl/` also changes what the Turso engine creates in a new database, because
+/// `limbo.rs` runs the same files with `create table if not exists` and ignores their errors. An
+/// existing Turso file keeps its old tables without any error, and its queries fail later. Turso
+/// has no schema upgrade yet, so the first step waits for it or lands with it.
+///
+/// The change that adds the first step must also update the version table and the line about
+/// databases that 0.7.0-pre.3 set up in `docs/storage.md`, which stops being true then.
 const MIGRATIONS: &[Migration] = &[];
 
 /// The schema that this release creates, and the way to upgrade each earlier one to it.
@@ -1910,6 +1925,11 @@ async fn ensure_schema_of(
     // Another broker on the same file can hold the write lock while it creates or upgrades the
     // schema. The busy timeout makes this broker wait for that lock, instead of failing at once.
     connection.busy_timeout(busy_timeout)?;
+
+    // Foreign keys stay off for the whole upgrade. A transaction can't change this setting, and
+    // the `drop table` of a rebuild step would otherwise delete rows of the tables that refer to
+    // the dropped table.
+    _ = connection.execute("PRAGMA foreign_keys = OFF", ()).await?;
 
     // An immediate transaction takes the write lock before it reads the version. Two brokers that
     // start together then read the version one at a time, and only the first one applies the
@@ -2020,6 +2040,24 @@ async fn upgrade_schema(
                     "a schema upgrade step failed, so the upgrade is rolled back and the file stays at its earlier version"
                 );
             })?;
+    }
+
+    // The steps ran with foreign keys off, so a row that breaks a key stays unnoticed until this
+    // check. It is the last check of SQLite's procedure for rebuilding a table.
+    if tx
+        .query("PRAGMA foreign_key_check", ())
+        .await?
+        .next()
+        .await?
+        .is_some()
+    {
+        error!(
+            from_version = recorded.version,
+            "a schema upgrade step left a row that breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
+        );
+        return Err(Error::Message(
+            "a schema upgrade step left a row that breaks a foreign key".into(),
+        ));
     }
 
     let Some(last) = steps.last() else {
@@ -7902,15 +7940,93 @@ mod tests {
 
         assert_matches!(
             upgrade_to_2(&db).await,
-            Err(Error::OutdatedSchema {
-                recorded_version: 0,
-                schema_version: 2,
-            })
+            Err(Error::UnversionedSchema { schema_version: 2 })
         );
 
         assert_matches!(recorded_version(&db).await, Err(_));
         ensure_schema(&db, Duration::from_secs(5)).await?;
         assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        Ok(())
+    }
+
+    /// A step that rebuilds a table that other tables refer to, as SQLite's procedure for
+    /// changing a constraint does, must keep the rows of the tables that refer to it. Its
+    /// `drop table` would otherwise fire the `on delete cascade` rule of the child table.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_that_rebuilds_a_table_keeps_the_rows_that_refer_to_it()
+    -> Result<()> {
+        const REBUILDS: Schema = Schema {
+            version: 3,
+            oldest_compatible_version: 1,
+            migrations: &[
+                Migration {
+                    to_version: 2,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    sql: "create table rebuilt_parent (id integer primary key); \
+                          create table rebuilt_child (id integer primary key, \
+                              parent_id integer not null references rebuilt_parent (id) \
+                              on delete cascade); \
+                          insert into rebuilt_parent (id) values (1); \
+                          insert into rebuilt_child (id, parent_id) values (1, 1);",
+                },
+                Migration {
+                    to_version: 3,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    sql: "create table rebuilt_parent_new (id integer primary key, note text); \
+                          insert into rebuilt_parent_new (id) select id from rebuilt_parent; \
+                          drop table rebuilt_parent; \
+                          alter table rebuilt_parent_new rename to rebuilt_parent;",
+                },
+            ],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        ensure_schema_of(&db, Duration::from_secs(5), &REBUILDS, &DDL).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(3));
+        assert_eq!(count(&db, "rebuilt_parent").await?, 1);
+        assert_eq!(count(&db, "rebuilt_child").await?, 1);
+        Ok(())
+    }
+
+    /// A step that leaves a row that breaks a foreign key must fail the upgrade, and the file must
+    /// stay at version 1 without the step's tables. The check exists because the steps run with
+    /// foreign keys off.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_an_upgrade_that_breaks_a_foreign_key() -> Result<()> {
+        const BREAKS_A_KEY: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "create table checked_parent (id integer primary key); \
+                      create table checked_child (parent_id integer references checked_parent (id)); \
+                      insert into checked_child (parent_id) values (7);",
+            }],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_matches!(
+            ensure_schema_of(&db, Duration::from_secs(5), &BREAKS_A_KEY, &DDL).await,
+            Err(Error::Message(message)) if message.contains("foreign key")
+        );
+
+        assert_eq!(recorded_version(&db).await?, Some(1));
+        assert_matches!(count(&db, "checked_child").await, Err(_));
         Ok(())
     }
 

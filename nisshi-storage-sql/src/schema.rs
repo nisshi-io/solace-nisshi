@@ -43,11 +43,11 @@ pub(crate) struct Migration {
     pub(crate) to_version: i32,
     /// The oldest schema version whose broker can use the schema that this step leaves.
     pub(crate) oldest_compatible_version: i32,
-    /// Whether this step leaves a schema that the release before it can't use, so that
-    /// `oldest_compatible_version` equals `to_version`. A step that sets this flag stops every
-    /// broker of the previous release that keeps serving while the upgrade runs, and the release
-    /// notes must say so. A step that can avoid it splits the change into an expand step, which
-    /// the previous release still works with, and a contract step in a later release.
+    /// Whether this step raises `oldest_compatible_version` above what the step before it leaves,
+    /// which is 1 for the first step. A step that sets this flag leaves a schema that some broker
+    /// that keeps serving can't use, and the release notes must say so. A step that can avoid it
+    /// splits the change into an expand step, which those brokers still work with, and a contract
+    /// step in a later release.
     pub(crate) breaks_previous_release: bool,
     /// The statements that change the schema.
     pub(crate) sql: &'static str,
@@ -66,10 +66,12 @@ pub(crate) struct Schema {
 
 impl Schema {
     /// Returns whether `migrations` has exactly one step for each version from 2 to `version`, in
-    /// order, each step that leaves a schema only its own version can use sets
-    /// `breaks_previous_release`, and the last step leaves `oldest_compatible_version`. A release
-    /// whose list fails this check can't upgrade every database that it accepts. Each engine
-    /// asserts it at build time.
+    /// order, each step that raises `oldest_compatible_version` sets `breaks_previous_release`,
+    /// and the last step leaves `oldest_compatible_version`. A release whose list fails this check
+    /// can't upgrade every database that it accepts. Each engine asserts it at build time.
+    ///
+    /// A step raises `oldest_compatible_version` when it leaves a larger value than the step
+    /// before it, so the check does not depend on how many schema versions a release adds.
     pub(crate) const fn is_consistent(&self) -> bool {
         let mut previous_compatible = 1;
         let mut index = 0;
@@ -80,9 +82,9 @@ impl Schema {
             // earlier release usable again: the broker records the last step's value.
             if step.to_version != index as i32 + 2
                 || step.oldest_compatible_version > step.to_version
-                || (step.oldest_compatible_version == step.to_version)
-                    != step.breaks_previous_release
                 || step.oldest_compatible_version < previous_compatible
+                || (step.oldest_compatible_version > previous_compatible)
+                    != step.breaks_previous_release
             {
                 return false;
             }
@@ -168,7 +170,7 @@ pub(crate) fn upgraded_compatibility(recorded: RecordedSchema, steps: &[Migratio
         })
 }
 
-/// Returns [`Error::OutdatedSchema`] when a database has Nisshi tables but records no schema
+/// Returns [`Error::UnversionedSchema`] when a database has Nisshi tables but records no schema
 /// version, and `schema` has steps.
 ///
 /// The tables that an earlier release created without recording a version may lack tables of
@@ -178,8 +180,7 @@ pub(crate) fn upgraded_compatibility(recorded: RecordedSchema, steps: &[Migratio
 /// and the operator starts a release that records version 1 first.
 pub(crate) fn check_unversioned_tables(has_tables: bool, schema: &Schema) -> Result<()> {
     if has_tables && !schema.migrations.is_empty() {
-        return Err(Error::OutdatedSchema {
-            recorded_version: 0,
+        return Err(Error::UnversionedSchema {
             schema_version: schema.version,
         });
     }
@@ -188,35 +189,35 @@ pub(crate) fn check_unversioned_tables(has_tables: bool, schema: &Schema) -> Res
 }
 
 /// Logs that a broker starts the `steps` that upgrade a database of `recorded`, so that a log
-/// shows which upgrade a failed or slow start was running.
+/// shows which upgrade a failed or slow start was running. The log warns before the first step
+/// when the upgrade raises the database's `oldest_compatible_version`, because brokers below it
+/// can no longer use the database once the upgrade commits.
 pub(crate) fn announce_upgrade(recorded: RecordedSchema, steps: &[Migration]) {
+    let oldest_compatible_version = upgraded_compatibility(recorded, steps);
     info!(
         from_version = recorded.version,
         to_version = steps.last().map(|last| last.to_version),
         steps = steps.len(),
         "upgrading the schema"
     );
-}
-
-/// Logs that `steps` upgraded a database of `recorded` in `elapsed`, and warns when the upgrade
-/// raised the database's `oldest_compatible_version`, because brokers below it can no longer use
-/// the database from that moment.
-pub(crate) fn report_upgrade(recorded: RecordedSchema, steps: &[Migration], elapsed: Duration) {
-    let oldest_compatible_version = upgraded_compatibility(recorded, steps);
-    info!(
-        from_version = recorded.version,
-        to_version = steps.last().map(|last| last.to_version),
-        oldest_compatible_version,
-        ?elapsed,
-        "upgraded the schema"
-    );
 
     if oldest_compatible_version > recorded.oldest_compatible_version {
         warn!(
             oldest_compatible_version,
-            "brokers with a schema version below this one can no longer use the database: stop them"
+            "this upgrade raises the oldest schema version that can use the database, so brokers with a schema version below it can no longer use the database once the upgrade commits: stop them"
         );
     }
+}
+
+/// Logs that `steps` upgraded a database of `recorded` in `elapsed`.
+pub(crate) fn report_upgrade(recorded: RecordedSchema, steps: &[Migration], elapsed: Duration) {
+    info!(
+        from_version = recorded.version,
+        to_version = steps.last().map(|last| last.to_version),
+        oldest_compatible_version = upgraded_compatibility(recorded, steps),
+        ?elapsed,
+        "upgraded the schema"
+    );
 }
 
 /// Returns the SHA-256 digest of `statements`, in hex.
@@ -251,7 +252,7 @@ mod tests {
     const STEP_3: Migration = Migration {
         to_version: 3,
         oldest_compatible_version: 2,
-        breaks_previous_release: false,
+        breaks_previous_release: true,
         sql: "select 3",
     };
     static STEPS: [Migration; 2] = [STEP_2, STEP_3];
@@ -455,14 +456,51 @@ mod tests {
         );
     }
 
+    /// A release that ships steps 2 and 3 together after a schema-1 release raises the oldest
+    /// compatible version in step 3 only, from 1 to 2, so step 3 must say so even though its
+    /// `oldest_compatible_version` is not its `to_version`.
+    #[test]
+    fn step_that_raises_compatibility_must_say_so_whatever_its_version() {
+        const QUIET: Migration = Migration {
+            to_version: 2,
+            oldest_compatible_version: 1,
+            breaks_previous_release: false,
+            sql: "select 2",
+        };
+        const RAISES: Migration = Migration {
+            to_version: 3,
+            oldest_compatible_version: 2,
+            breaks_previous_release: true,
+            sql: "select 3",
+        };
+        const UNDECLARED: Migration = Migration {
+            breaks_previous_release: false,
+            ..RAISES
+        };
+
+        assert!(
+            Schema {
+                version: 3,
+                oldest_compatible_version: 2,
+                migrations: &[QUIET, RAISES],
+            }
+            .is_consistent()
+        );
+        assert!(
+            !Schema {
+                version: 3,
+                oldest_compatible_version: 2,
+                migrations: &[QUIET, UNDECLARED],
+            }
+            .is_consistent()
+        );
+    }
+
     #[test]
     fn tables_without_a_recorded_version_are_refused_once_the_schema_has_steps() {
         assert_matches!(
             check_unversioned_tables(true, &SCHEMA),
-            Err(Error::OutdatedSchema {
-                recorded_version: 0,
-                schema_version: 3,
-            })
+            Err(Error::UnversionedSchema { schema_version: 3 })
         );
         assert_matches!(check_unversioned_tables(false, &SCHEMA), Ok(()));
         assert_matches!(

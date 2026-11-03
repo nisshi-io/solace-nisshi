@@ -180,6 +180,41 @@ fn cat_error_message(error: &nisshi_cat::Error) -> String {
     }
 }
 
+/// Returns the message for a schema setup of `storage` that failed because of the schema version
+/// that the database records, or `None` for any other error.
+fn schema_version_message(
+    storage: &impl std::fmt::Display,
+    error: &nisshi_storage::Error,
+) -> Option<String> {
+    match error {
+        nisshi_storage::Error::IncompatibleSchema {
+            recorded_version,
+            oldest_compatible_version,
+            schema_version,
+        } => Some(format!(
+            "storage {storage} records schema version {recorded_version}, which a release with \
+                schema version {oldest_compatible_version} or later can use. This release has \
+                schema version {schema_version}: upgrade Nisshi."
+        )),
+        nisshi_storage::Error::UnversionedSchema { schema_version } => Some(format!(
+            "storage {storage} has Nisshi tables but records no schema version, and this release \
+                has schema version {schema_version} with steps that upgrade only a recorded \
+                version. Start a release that records schema version 1 once, such as 0.8, then \
+                start this one."
+        )),
+        nisshi_storage::Error::OutdatedSchema {
+            recorded_version,
+            schema_version,
+        } => Some(format!(
+            "storage {storage} records schema version {recorded_version}, which is not a valid \
+                version: this release has schema version {schema_version} and upgrades only from \
+                version 1. Correct the row in nisshi_schema_version, or restore the database \
+                from a backup."
+        )),
+        _ => None,
+    }
+}
+
 /// Returns the error message for a storage URL whose engine this build doesn't have.
 /// `scheme` is the URL's scheme, and `storage` is the URL with its credentials redacted.
 fn feature_not_enabled_message(scheme: &str, storage: &str) -> String {
@@ -383,48 +418,31 @@ fn report_error(err: &nisshi_cli::Error) {
                     "storage {storage} failed its startup check: {source}{}",
                     startup_check_hint(storage.scheme())
                 ),
-                nisshi_storage::StartupFailure::SchemaSetup => match &**source {
-                    nisshi_storage::Error::IncompatibleSchema {
-                        recorded_version,
-                        oldest_compatible_version,
-                        schema_version,
-                    } => report_failure!(
-                        "storage {storage} records schema version {recorded_version}, which a \
-                            release with schema version {oldest_compatible_version} or later can \
-                            use. This release has schema version {schema_version}: upgrade Nisshi."
-                    ),
-                    nisshi_storage::Error::OutdatedSchema {
-                        recorded_version: 0,
-                        schema_version,
-                    } => report_failure!(
-                        "storage {storage} has Nisshi tables but records no schema version, and \
-                            this release has schema version {schema_version} with steps that \
-                            upgrade only a recorded version. Start a release that records schema \
-                            version 1 once, such as 0.8, then start this one."
-                    ),
-                    nisshi_storage::Error::OutdatedSchema {
-                        recorded_version,
-                        schema_version,
-                    } => report_failure!(
-                        "storage {storage} records schema version {recorded_version}, which is \
-                            older than this release's schema version {schema_version}, and \
-                            this release has no step that upgrades it."
-                    ),
-                    #[cfg(feature = "postgres")]
-                    nisshi_storage::Error::TokioPostgres(err)
-                        if err.code().map(|code| code.code()) == Some("42501") =>
-                    {
-                        report_failure!(
-                            "storage {storage} failed its schema setup: {source}. The \
-                                database records no schema version that this release can use, so \
-                                the broker must change the schema, and its role isn't allowed \
-                                to. Start one broker once with the credentials of the role that \
-                                owns Nisshi's tables, then start the others with this role. See \
-                                the PostgreSQL section of docs/storage.md."
-                        )
+                nisshi_storage::StartupFailure::SchemaSetup => {
+                    if let Some(message) = schema_version_message(storage, source) {
+                        report_failure!("{message}")
+                    } else {
+                        match &**source {
+                            #[cfg(feature = "postgres")]
+                            nisshi_storage::Error::TokioPostgres(err)
+                                if err.code().map(|code| code.code()) == Some("42501") =>
+                            {
+                                report_failure!(
+                                    "storage {storage} failed its schema setup: {source}. The \
+                                        database records no schema version that this release can \
+                                        use, so the broker must change the schema, and its role \
+                                        isn't allowed to. Start one broker once with the \
+                                        credentials of the role that owns Nisshi's tables, then \
+                                        start the others with this role. See the PostgreSQL \
+                                        section of docs/storage.md."
+                                )
+                            }
+                            _ => report_failure!(
+                                "storage {storage} failed its schema setup: {source}"
+                            ),
+                        }
                     }
-                    _ => report_failure!("storage {storage} failed its schema setup: {source}"),
-                },
+                }
             },
             nisshi_broker::Error::Storage(nisshi_storage::Error::AuthenticationUnsupported {
                 engine,
@@ -490,8 +508,75 @@ mod tests {
     use super::{
         BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message, failure_line,
         feature_not_enabled_message, invalid_storage_option_value_message,
-        listener_host_unresolved_message, listener_in_use_message,
+        listener_host_unresolved_message, listener_in_use_message, schema_version_message,
     };
+
+    /// Each way that a recorded schema version stops a start tells the operator what to do next:
+    /// upgrade Nisshi, start an earlier release once, or repair the row.
+    #[test]
+    fn schema_version_message_gives_each_case_its_own_next_step() {
+        let storage = "postgres://db/nisshi";
+
+        assert_eq!(
+            Some(
+                "storage postgres://db/nisshi records schema version 3, which a release with \
+                    schema version 3 or later can use. This release has schema version 2: \
+                    upgrade Nisshi."
+                    .to_owned()
+            ),
+            schema_version_message(
+                &storage,
+                &nisshi_storage::Error::IncompatibleSchema {
+                    recorded_version: 3,
+                    oldest_compatible_version: 3,
+                    schema_version: 2,
+                }
+            )
+        );
+
+        assert_eq!(
+            Some(
+                "storage postgres://db/nisshi has Nisshi tables but records no schema version, \
+                    and this release has schema version 2 with steps that upgrade only a \
+                    recorded version. Start a release that records schema version 1 once, such \
+                    as 0.8, then start this one."
+                    .to_owned()
+            ),
+            schema_version_message(
+                &storage,
+                &nisshi_storage::Error::UnversionedSchema { schema_version: 2 }
+            )
+        );
+    }
+
+    /// A row that records version 0 is a hand edit or a failed rollback, so the message must say
+    /// that the version is invalid and not that the database records none.
+    #[test]
+    fn schema_version_message_calls_a_recorded_version_below_1_invalid() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::OutdatedSchema {
+                recorded_version: 0,
+                schema_version: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("records schema version 0, which is not a valid version"));
+        assert!(message.contains("restore the database from a backup"));
+        assert!(!message.contains("records no schema version"));
+    }
+
+    #[test]
+    fn schema_version_message_leaves_other_errors_alone() {
+        assert_eq!(
+            None,
+            schema_version_message(
+                &"postgres://db/nisshi",
+                &nisshi_storage::Error::Message("anything else".into())
+            )
+        );
+    }
 
     /// The smoke tests find a failed start by the `error: ` prefix.
     #[test]
