@@ -1134,6 +1134,7 @@ fn offset_commit(generation_id: Option<i32>, member_id: Option<&str>) -> OffsetC
         group_instance_id: None,
         retention_time_ms: None,
         topics: None,
+        is_transactional: false,
     }
 }
 

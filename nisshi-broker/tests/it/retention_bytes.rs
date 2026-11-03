@@ -447,6 +447,63 @@ where
     Ok(())
 }
 
+/// A second sweep after more records arrive deletes exactly the records that the new ones push
+/// out, and a sweep that finds the partition within its limit deletes nothing.
+pub async fn retention_bytes_second_sweep_deletes_the_new_excess<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[
+            ("cleanup.policy", "delete"),
+            ("retention.bytes", &RETENTION_BYTES.to_string()),
+        ],
+    )
+    .await?;
+
+    for n in 0..PRODUCED {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+
+    // within the limit: nothing to delete
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(PRODUCED - KEPT),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+
+    // three more records push out the three oldest of the five that remain
+    for n in PRODUCED..PRODUCED + 3 {
+        let value = Bytes::from(format!("{n:0>VALUE_BYTES$}"));
+        _ = produce(&broker, &extensions, topic, value).await?;
+    }
+
+    sc.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        Some(PRODUCED + 3 - KEPT),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    assert_eq!(
+        Some(PRODUCED + 3),
+        list_offset(&broker, &extensions, topic, ListOffset::Latest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -508,6 +565,15 @@ macro_rules! backend {
             async fn stored_value_that_is_not_a_long_does_not_stop_retention() -> Result<()> {
                 let _guard = init_tracing()?;
                 super::retention_bytes_stored_value_that_is_not_a_long_does_not_stop_retention(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn second_sweep_deletes_the_new_excess() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::retention_bytes_second_sweep_deletes_the_new_excess(
                     storage_container().await?,
                 )
                 .await

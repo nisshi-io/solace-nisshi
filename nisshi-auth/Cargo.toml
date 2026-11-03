@@ -12,10 +12,10 @@ version.workspace = true
 
 [dependencies]
 bytes.workspace = true
-rama.workspace = true
-rsasl.workspace = true
 nisshi-sans-io.workspace = true
 nisshi-storage.workspace = true
+rama.workspace = true
+rsasl.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

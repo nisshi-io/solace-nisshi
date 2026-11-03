@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use nisshi_sans_io::fetch_response::PartitionData;
 use nisshi_sans_io::{
     ErrorCode, FetchRequest, RequestInput,
     create_topics_request::CreatableTopic,
@@ -28,10 +29,12 @@ use rama::{Layer as _, Service as _, extensions::Extensions};
 use crate::dynostore::{DynoStore, tests::init_tracing};
 
 /// Two brokers share one bucket. A consumer whose position came from
-/// broker A fetches through broker B, which still reads the high watermark
-/// from before A's writes. B answers `NONE` with no records, so the consumer
-/// keeps its position and catches up on a later fetch, instead of applying
-/// `auto.offset.reset`.
+/// broker A fetches through broker B, which still caches the high watermark
+/// from before A's writes. B reads the high watermark from the bucket before
+/// it answers, so a position that A's writes have reached is in range:
+/// `NONE` with no records, the current high watermark, and no
+/// `auto.offset.reset`. A position beyond the log is out of range, as in
+/// Kafka.
 #[tokio::test]
 async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -72,41 +75,52 @@ async fn fetch_ahead_of_a_stale_high_watermark() -> Result<(), Error> {
     assert_eq!(stale, b.offset_stage(&topition).await?.high_watermark());
     assert!(stale < high_watermark, "{stale} < {high_watermark}");
 
-    let response = FetchValidationLayer::new()
-        .layer(FetchService { storage: b })
-        .serve(RequestInput {
-            request: FetchRequest::default()
-                .max_wait_ms(100)
-                .min_bytes(1)
-                .max_bytes(Some(50 * 1024))
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default()
-                                .partition(0)
-                                .fetch_offset(high_watermark)
-                                .partition_max_bytes(50 * 1024)]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            extensions: Extensions::default(),
-        })
-        .await?;
+    let fetch = |fetch_offset: i64| {
+        let service = FetchValidationLayer::new().layer(FetchService { storage: b.clone() });
 
-    let topics = response.responses.unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
+        async move {
+            let response = service
+                .serve(RequestInput {
+                    request: FetchRequest::default()
+                        .max_wait_ms(100)
+                        .min_bytes(1)
+                        .max_bytes(Some(50 * 1024))
+                        .topics(Some(
+                            [FetchTopic::default()
+                                .topic(Some(name.into()))
+                                .partitions(Some(
+                                    [FetchPartition::default()
+                                        .partition(0)
+                                        .fetch_offset(fetch_offset)
+                                        .partition_max_bytes(50 * 1024)]
+                                    .into(),
+                                ))]
+                            .into(),
+                        )),
+                    extensions: Extensions::default(),
+                })
+                .await?;
+
+            let topics = response.responses.unwrap_or_default();
+            assert_eq!(1, topics.len());
+            let partitions = topics[0].partitions.clone().unwrap_or_default();
+            assert_eq!(1, partitions.len());
+
+            Ok::<PartitionData, Error>(partitions[0].clone())
+        }
+    };
+
+    let partition = fetch(high_watermark).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
+    assert_eq!(high_watermark, partition.high_watermark);
+    assert!(partition.records.is_none());
+
+    // the high watermark that B read is now current, so what is beyond it is out of range
+    let partition = fetch(high_watermark + 1).await?;
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
+        ErrorCode::OffsetOutOfRange,
+        ErrorCode::try_from(partition.error_code)?
     );
-    // B answered from its cached (stale) high watermark; had the cache
-    // entry expired, the fetch would have taken the fresh path instead
-    assert_eq!(stale, partitions[0].high_watermark);
-    assert!(partitions[0].records.is_none());
 
     Ok(())
 }

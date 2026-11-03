@@ -180,7 +180,7 @@ impl ObjectStore for BetweenWritesStore {
     }
 }
 
-fn plain_batch() -> Result<deflated::Batch, Error> {
+pub(super) fn plain_batch() -> Result<deflated::Batch, Error> {
     inflated::Batch::builder()
         .record(Record::builder().value(Some(Bytes::from_static(b"plain"))))
         .build()
@@ -189,7 +189,7 @@ fn plain_batch() -> Result<deflated::Batch, Error> {
 }
 
 /// A transactional batch of 3 records.
-fn transactional_batch(
+pub(super) fn transactional_batch(
     producer_id: i64,
     producer_epoch: i16,
     base_sequence: i32,

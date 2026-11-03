@@ -77,11 +77,11 @@ impl Host {
     }
 
     /// Stops a broker that didn't start, if it is still running, and returns its exit code, or
-    /// `None` if the harness killed it. Saves a container's output to `log` before it removes the
-    /// container.
-    pub(super) fn stop_after_failed_start(&mut self, log: &Path) -> Option<i32> {
+    /// `None` if the harness killed it, and why a container's log is missing or empty, if it is.
+    /// Saves a container's output to `log` before it removes the container.
+    pub(super) fn stop_after_failed_start(&mut self, log: &Path) -> (Option<i32>, Option<String>) {
         match self {
-            Self::Process(process) => process.stop_after_failed_start(),
+            Self::Process(process) => (process.stop_after_failed_start(), None),
             Self::Container(container) => container.stop_after_failed_start(log),
         }
     }

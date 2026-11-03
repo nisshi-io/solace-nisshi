@@ -34,6 +34,10 @@ pub struct OffsetCommit<'a> {
     pub group_instance_id: Option<&'a str>,
     pub retention_time_ms: Option<i64>,
     pub topics: Option<&'a [OffsetCommitRequestTopic]>,
+    /// Whether this is the group check of a `TxnOffsetCommit`, which Kafka does not hold to the
+    /// group's state: a group that waits for its leader's assignment does not refuse it, and
+    /// it is not a contact from the member.
+    pub is_transactional: bool,
 }
 
 #[async_trait]
@@ -86,6 +90,17 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     ) -> Result<Body>;
 
     async fn offset_commit(&self, detail: OffsetCommit<'_>) -> Result<Body>;
+
+    /// Fences a transactional offset commit as an `OffsetCommit` is fenced: the member, its
+    /// generation and its group instance ID must match the group. Returns the error code that
+    /// refuses the commit, or `None` when it may go ahead. Stores no offsets.
+    async fn txn_offset_commit_fence(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Option<nisshi_sans_io::ErrorCode>>;
 
     async fn offset_fetch(
         &self,

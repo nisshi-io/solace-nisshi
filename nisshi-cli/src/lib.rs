@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
+use std::{collections::HashMap, env::vars, path::PathBuf, result, str::FromStr};
 
 mod cli;
 mod insecure_tls;
@@ -23,62 +23,116 @@ use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error(transparent)]
     Box(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
     Cat(Box<nisshi_cat::Error>),
+    #[error(transparent)]
     Client(Box<nisshi_client::Error>),
+    #[error(transparent)]
     DotEnv(#[from] dotenv::Error),
+    #[error(transparent)]
     Generate(#[from] nisshi_generator::Error),
+    #[error(transparent)]
     InvalidLength(#[from] sha2::digest::InvalidLength),
     /// A data lake subcommand (`iceberg`, `delta`, `parquet`) was given
     /// without `--schema-registry`, which every lake writer requires.
-    LakeRequiresSchemaRegistry {
-        lake: &'static str,
-    },
+    #[error(
+        "{lake} requires --schema-registry: a data lake writer validates every record against a \
+            schema."
+    )]
+    LakeRequiresSchemaRegistry { lake: &'static str },
+    #[error(transparent)]
     Perf(#[from] nisshi_perf::Error),
+    #[error(transparent)]
     Proxy(#[from] nisshi_proxy::Error),
+    #[error(transparent)]
     Regex(#[from] regex::Error),
+    #[error(transparent)]
     SansIo(#[from] nisshi_sans_io::Error),
+    #[error("schema registry: {0}")]
     Schema(Box<nisshi_schema::Error>),
+    #[error("broker: {0}")]
     Server(Box<nisshi_broker::Error>),
+    #[error(transparent)]
     Tls(#[from] rustls::Error),
     /// The `--cert` file could not be read or parsed as PEM certificates.
+    ///
+    /// The message carries `cause`, so the field is not named `source`: thiserror would also
+    /// return it from `source()`, and a reporter that prints the chain would show it twice. The
+    /// other variants with a `cause` follow the same rule.
+    #[error(
+        "TLS certificate {} could not be loaded: {cause}. Expected one or more PEM certificates \
+            (--cert).",
+        path.display()
+    )]
     TlsCertificate {
         path: PathBuf,
-        source: rustls::pki_types::pem::Error,
+        cause: rustls::pki_types::pem::Error,
     },
     /// The `--key` file could not be read or parsed as a PEM private key.
+    #[error(
+        "TLS private key {} could not be loaded: {cause}. Expected a PKCS#8, SEC1 or RSA PEM \
+            key (--key).",
+        path.display()
+    )]
     TlsPrivateKey {
         path: PathBuf,
-        source: rustls::pki_types::pem::Error,
+        cause: rustls::pki_types::pem::Error,
     },
     /// The `--key` file is encrypted but no `--key-passphrase-file` was given.
-    TlsKeyPassphraseRequired {
-        path: PathBuf,
-    },
+    #[error(
+        "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
+        path.display()
+    )]
+    TlsKeyPassphraseRequired { path: PathBuf },
     /// The passphrase did not decrypt the key.
-    TlsKeyDecrypt {
-        path: PathBuf,
-        source: pkcs8::Error,
-    },
+    #[error(
+        "TLS private key {} could not be decrypted: {cause}. Check the passphrase in \
+            --key-passphrase-file.",
+        path.display()
+    )]
+    TlsKeyDecrypt { path: PathBuf, cause: pkcs8::Error },
     /// The key is encrypted with an algorithm this build does not support,
     /// named by `algorithm` (a friendly name, or the OID when unknown).
-    TlsKeyUnsupportedEncryption {
-        path: PathBuf,
-        algorithm: String,
-    },
+    #[error(
+        "TLS private key {} is encrypted with {algorithm}, which is not supported. Supported: \
+            PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. Re-encrypt \
+            it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc -v2prf \
+            hmacWithSHA256",
+        path.display()
+    )]
+    TlsKeyUnsupportedEncryption { path: PathBuf, algorithm: String },
     /// Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is not supported.
-    TlsKeyLegacyEncrypted {
-        path: PathBuf,
-    },
+    #[error(
+        "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. \
+            Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
+        path.display()
+    )]
+    TlsKeyLegacyEncrypted { path: PathBuf },
     /// The `--key-passphrase-file` could not be read.
+    #[error(
+        "TLS key passphrase file {} could not be read: {cause}.",
+        path.display()
+    )]
     TlsKeyPassphraseFile {
         path: PathBuf,
-        source: std::io::Error,
+        cause: std::io::Error,
     },
     /// `--cert` and `--key` must be supplied together.
+    #[error("TLS requires both --cert and --key.")]
     TlsRequiresCertAndKey,
+    #[error(transparent)]
     Topic(#[from] nisshi_topic::Error),
-    Url(#[from] url::ParseError),
+    /// The message carries the parse error, so the field is not `#[from]` or named `source`.
+    #[error("invalid URL: {0}")]
+    Url(url::ParseError),
+}
+
+impl From<url::ParseError> for Error {
+    fn from(value: url::ParseError) -> Self {
+        Self::Url(value)
+    }
 }
 
 impl From<nisshi_cat::Error> for Error {
@@ -102,12 +156,6 @@ impl From<nisshi_schema::Error> for Error {
 impl From<nisshi_broker::Error> for Error {
     fn from(value: nisshi_broker::Error) -> Self {
         Self::Server(Box::new(value))
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
     }
 }
 
@@ -161,5 +209,113 @@ where
             .replace(s)
             .and_then(|s| T::from_str(&s).map_err(Into::into))
             .map(|t| Self(t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::assert_matches;
+
+    #[test]
+    fn invalid_url_option_reads_as_a_sentence() {
+        let err = EnvVarExp::<url::Url>::from_str("foo").unwrap_err();
+
+        assert_matches!(err, Error::Url(_));
+        assert_eq!("invalid URL: relative URL without a base", err.to_string());
+    }
+
+    #[test]
+    fn clap_reports_an_invalid_schema_registry_url_as_a_sentence() {
+        use clap::Parser as _;
+
+        let err = Cli::try_parse_from(["nisshi", "broker", "--schema-registry", "foo"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("invalid URL: relative URL without a base"),
+            "{err}"
+        );
+        assert!(!err.contains("RelativeUrlWithoutBase"), "{err}");
+    }
+
+    /// The `nisshi` binary prints these messages as they are, so the text here is the text a
+    /// user reads.
+    #[test]
+    fn tls_and_lake_errors_name_the_fix() {
+        let path = PathBuf::from("/etc/nisshi/tls.key");
+
+        assert_eq!(
+            "iceberg requires --schema-registry: a data lake writer validates every record \
+                against a schema.",
+            Error::LakeRequiresSchemaRegistry { lake: "iceberg" }.to_string()
+        );
+        assert_eq!(
+            "TLS requires both --cert and --key.",
+            Error::TlsRequiresCertAndKey.to_string()
+        );
+        assert_eq!(
+            "TLS private key /etc/nisshi/tls.key is encrypted: pass --key-passphrase-file <file>.",
+            Error::TlsKeyPassphraseRequired { path: path.clone() }.to_string()
+        );
+        assert_eq!(
+            "TLS private key /etc/nisshi/tls.key uses legacy OpenSSL PEM encryption, which is not \
+                supported. Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
+            Error::TlsKeyLegacyEncrypted { path: path.clone() }.to_string()
+        );
+
+        let message = Error::TlsKeyUnsupportedEncryption {
+            path,
+            algorithm: "DES-CBC".into(),
+        }
+        .to_string();
+        assert!(
+            message.starts_with(
+                "TLS private key /etc/nisshi/tls.key is encrypted with DES-CBC, which is not \
+                    supported. Supported: "
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("Re-encrypt it: openssl pkcs8 -topk8"),
+            "{message}"
+        );
+    }
+
+    /// A message that carries its cause must not also return the cause from `source()`, or a
+    /// reporter that walks the chain prints it twice.
+    #[test]
+    fn a_message_with_its_cause_does_not_repeat_it_as_the_source() {
+        use std::error::Error as _;
+
+        let path = PathBuf::from("/etc/nisshi/tls.crt");
+        let cause = rustls::pki_types::pem::Error::NoItemsFound;
+        let message = format!("{cause}");
+
+        let err = Error::TlsCertificate {
+            path: path.clone(),
+            cause,
+        };
+        assert!(err.to_string().contains(&message), "{err}");
+        assert!(err.source().is_none());
+
+        let err = Error::TlsKeyPassphraseFile {
+            path,
+            cause: std::io::Error::other("permission denied"),
+        };
+        assert!(err.to_string().contains("permission denied"), "{err}");
+        assert!(err.source().is_none());
+
+        let err = Error::from(url::ParseError::RelativeUrlWithoutBase);
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn schema_and_broker_errors_name_their_subsystem() {
+        let err = Error::from(nisshi_schema::Error::Message("denied".into()));
+
+        assert_matches!(err, Error::Schema(_));
+        assert!(err.to_string().starts_with("schema registry: "), "{err}");
     }
 }

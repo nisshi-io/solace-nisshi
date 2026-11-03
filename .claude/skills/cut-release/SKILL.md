@@ -188,6 +188,12 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 - Stable: while the run builds, draft the body:
   - Use only the `[VERSION]` section of `CHANGELOG.md` at `MERGE_SHA`. Add no fact that the section doesn't state.
   - Follow the shape of the previous stable release's body (`gh release view VPREV --json body --jq .body`): an intro paragraph, `## Highlights` (the most important changes, one line each), `## Upgrade notes` (a link to `https://github.com/nisshi-io/solace-nisshi/blob/TAG/CHANGELOG.md` and a short list), and `## Install` (the `cargo install` command, the image `ghcr.io/nisshi-io/nisshi:VERSION`, and the attached binaries). Keep a caveat from the previous body only if it is still true.
+  - End `## Install` with this fixed line, after the binaries. The macOS binary is not notarized, so macOS blocks it when a browser downloads it, and `docs/quickstart.md` gives the same workaround:
+
+    ```markdown
+    - macOS blocks a binary that you download with a browser and displays "Not Opened". Download the tarball with `curl` instead, or extract it and run `xattr -d com.apple.quarantine bin/nisshi`.
+    ```
+
   - Write it to a file in the scratchpad and show the operator the full text.
 - When the `github-release` job has succeeded (`gh run view <id> --json jobs --jq '.jobs[] | select(.name == "github-release") | .conclusion'`) and the operator approves the body: `gh release edit TAG --notes-file <file>`.
 

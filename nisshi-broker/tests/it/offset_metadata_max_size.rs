@@ -110,6 +110,7 @@ where
             group_instance_id: None,
             retention_time_ms: None,
             topics: Some(&topics),
+            is_transactional: false,
         })
         .await?;
 

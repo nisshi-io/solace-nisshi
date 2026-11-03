@@ -224,7 +224,7 @@ jobs:
           # under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -350,6 +350,14 @@ jobs:
       # This leg only proves the feature compiles, so check skips codegen
       # and linking.
       - run: cargo check --bin nisshi --no-default-features --features ${{matrix.storage}}
+      # cargo tree resolves features without compiling anything.
+      - name: Check the build compiles no other engine's database client
+        env:
+          STORAGE: ${{matrix.storage}}
+        run: |
+          set -euo pipefail
+          cargo tree -p nisshi --no-default-features --features "$STORAGE" -e normal,build --prefix none -f '{p}' \
+            | bash .github/scripts/check-storage-deps.sh "$STORAGE"
   build-storage-lake:
     if: *tier_b_off_main
     needs: [changes]
@@ -619,7 +627,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -657,7 +665,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-about@0.8.4
       # The release binary is built with --all-features, so the list is too.
@@ -731,7 +739,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -815,7 +823,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -943,7 +951,7 @@ jobs:
       # dependencies. cargo-about writes the licence list that the tarball and
       # the image carry. This job generates it beside the build, instead of
       # waiting on the third-party-license job, which takes minutes.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1029,7 +1037,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none

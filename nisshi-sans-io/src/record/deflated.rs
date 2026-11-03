@@ -28,7 +28,8 @@ use serde::{
 use tracing::{debug, error, instrument};
 
 use crate::{
-    ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result, TimestampType,
+    BatchAttribute, ByteSize, Compression, Decode as _, Encode, Error, ErrorCode, Result,
+    TimestampType,
     record::{
         Record,
         codec::{
@@ -256,14 +257,13 @@ impl TryFrom<Bytes> for Batch {
 
 impl Batch {
     const TRANSACTIONAL_BITMASK: i16 = 0b1_0000i16;
-    const CONTROL_BITMASK: i16 = 0b10_0000i16;
 
     pub fn is_transactional(&self) -> bool {
         self.attributes & Self::TRANSACTIONAL_BITMASK == Self::TRANSACTIONAL_BITMASK
     }
 
     pub fn is_control(&self) -> bool {
-        self.attributes & Self::CONTROL_BITMASK == Self::CONTROL_BITMASK
+        self.attributes & BatchAttribute::CONTROL_BITMASK == BatchAttribute::CONTROL_BITMASK
     }
 
     pub fn is_idempotent(&self) -> bool {

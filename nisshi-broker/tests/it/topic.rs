@@ -709,7 +709,7 @@ mod turso {
         .await
     }
 
-    #[ignore]
+    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_id() -> Result<()> {
         let _guard = init_tracing()?;
@@ -725,7 +725,7 @@ mod turso {
         .await
     }
 
-    #[ignore]
+    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_name() -> Result<()> {
         let _guard = init_tracing()?;
@@ -741,7 +741,6 @@ mod turso {
         .await
     }
 
-    #[ignore]
     #[tokio::test]
     async fn describe_non_existing_topic_partitions_by_name() -> Result<()> {
         let _guard = init_tracing()?;
@@ -757,7 +756,7 @@ mod turso {
         .await
     }
 
-    #[ignore]
+    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_delete() -> Result<()> {
         let _guard = init_tracing()?;
@@ -773,7 +772,7 @@ mod turso {
         .await
     }
 
-    #[ignore]
+    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_with_config_delete() -> Result<()> {
         let _guard = init_tracing()?;

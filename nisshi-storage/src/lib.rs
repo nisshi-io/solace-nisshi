@@ -1948,6 +1948,26 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// connection.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
+    /// Query the offset stage for a topic partition, reading its high
+    /// watermark from the source of truth rather than from a cache.
+    ///
+    /// [`Storage::offset_stage`] may answer from a cache that lags a write
+    /// through another broker (dynostore keeps `watermark.json` for up to 5s).
+    /// Fetch calls this before it answers a fetch offset above the high
+    /// watermark with `OFFSET_OUT_OF_RANGE`, so that a client that is ahead
+    /// of a stale high watermark is not sent an error. An engine whose
+    /// `offset_stage` is always current keeps the default.
+    ///
+    /// A type that wraps a [`Storage`] must forward this method. The default calls the
+    /// wrapper's own `offset_stage`, which answers from the wrapped store's cache, so a wrapper
+    /// that does not forward it makes a dynostore Fetch reset a consumer that is only ahead of
+    /// a stale high watermark.
+    ///
+    /// The errors are those of [`Storage::offset_stage`].
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
+    }
+
     /// Query the offsets for one or more topic partitions. See
     /// [`ListOffsetResponse::offset`] for when an answer has no offset.
     async fn list_offsets(
@@ -2217,6 +2237,10 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.as_ref().current_offset_stage(topition).await
     }
 
     async fn list_offsets(
@@ -2498,6 +2522,10 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.as_ref().current_offset_stage(topition).await
     }
 
     async fn list_offsets(

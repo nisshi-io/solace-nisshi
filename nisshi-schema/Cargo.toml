@@ -25,20 +25,21 @@ anyhow.workspace = true
 apache-avro.workspace = true
 arrow = { workspace = true, optional = true }
 async-trait.workspace = true
+buoyant_kernel_derive = { workspace = true, optional = true }
 bytes.workspace = true
 chrono.workspace = true
 datafusion = { workspace = true, optional = true }
-buoyant_kernel_derive = { workspace = true, optional = true }
 deltalake = { workspace = true, optional = true }
 dotenv.workspace = true
 fake.workspace = true
 futures.workspace = true
 governor.workspace = true
+iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-datafusion = { workspace = true, optional = true }
-iceberg = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
 jsonschema.workspace = true
+nisshi-sans-io.workspace = true
 num-bigint.workspace = true
 object_store.workspace = true
 opentelemetry-semantic-conventions.workspace = true
@@ -54,7 +55,6 @@ rhai-rand.workspace = true
 rhai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-nisshi-sans-io.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

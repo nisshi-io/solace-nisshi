@@ -2088,7 +2088,6 @@ mod turso {
         .await
     }
 
-    #[ignore]
     #[tokio::test]
     async fn non_empty_group_then_empty() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2103,7 +2102,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn delete_evicts_coordinator_cache() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2118,7 +2116,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn delete_after_session_expiry() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2133,7 +2130,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn delete_offsets_only_group() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2148,7 +2144,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn cache_miss_with_live_member() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2163,7 +2158,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn stale_cache_on_another_broker() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2178,7 +2172,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn storage_read_error() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2193,7 +2186,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn mixed_request() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2212,7 +2204,6 @@ mod turso {
 
         Ok(())
     }
-    #[ignore]
     #[tokio::test]
     async fn delete_non_existent() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2227,7 +2218,6 @@ mod turso {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn empty_group_id_mixed_list() -> Result<()> {
         let _guard = init_tracing()?;

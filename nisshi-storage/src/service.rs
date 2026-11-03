@@ -144,6 +144,7 @@ pub enum Request {
         max_wait: Duration,
     },
     OffsetStage(Topition),
+    CurrentOffsetStage(Topition),
     ListOffsets {
         isolation_level: IsolationLevel,
         offsets: Vec<(Topition, ListOffset)>,
@@ -257,6 +258,7 @@ impl Display for Request {
             Self::OffsetCommit { .. } => f.write_str("OffsetCommit"),
             Self::OffsetFetch { .. } => f.write_str("OffsetFetch"),
             Self::OffsetStage(_) => f.write_str("OffsetStage"),
+            Self::CurrentOffsetStage(_) => f.write_str("CurrentOffsetStage"),
             Self::PendingTxnOffsets(_) => f.write_str("PendingTxnOffsets"),
             Self::Produce { .. } => f.write_str("Produce"),
             Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
@@ -301,6 +303,7 @@ pub enum Response {
     OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
     OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
     OffsetStage(Result<OffsetStage>),
+    CurrentOffsetStage(Result<OffsetStage>),
     PendingTxnOffsets(Result<BTreeSet<Topition>>),
     Ping(Result<()>),
     Produce(Result<i64>),
@@ -312,6 +315,26 @@ pub enum Response {
     UpdateGroup(Result<Version, UpdateError<GroupDetail>>),
     UpsertUserScramCredential(Result<()>),
     UserScramCredential(Result<Option<ScramCredential>>),
+}
+
+/// Returns the error code that a partition answers when storage fails for
+/// it: the code of an [`Error::Api`], and `KAFKA_STORAGE_ERROR` for every
+/// other error.
+///
+/// Kafka answers `UNKNOWN_SERVER_ERROR` for an exception that it does not
+/// map to a code ([KafkaApis.scala#L1228-L1251]). We answer
+/// `KAFKA_STORAGE_ERROR` instead, because these errors come from the storage
+/// engine (a database or object store that times out or is unavailable), and
+/// Kafka answers that code for a log that it cannot read. A client retries
+/// `KAFKA_STORAGE_ERROR` after a metadata refresh, and gives up on
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// [KafkaApis.scala#L1228-L1251]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1228-L1251
+pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
+    match error {
+        Error::Api(error_code) => *error_code,
+        _ => ErrorCode::KafkaStorageError,
+    }
 }
 
 pub type RequestSender = mpsc::Sender<(Request, oneshot::Sender<Response>)>;
@@ -618,6 +641,15 @@ impl Storage for RequestChannelService {
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         serve_and_extract!(self, Request::OffsetStage(topition.to_owned()), OffsetStage)
+    }
+
+    #[instrument(skip_all)]
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        serve_and_extract!(
+            self,
+            Request::CurrentOffsetStage(topition.to_owned()),
+            CurrentOffsetStage
+        )
     }
 
     #[instrument(skip_all)]
@@ -1223,6 +1255,9 @@ where
             )),
             Request::OffsetStage(topition) => Ok(Response::OffsetStage(
                 self.storage.offset_stage(&topition).await,
+            )),
+            Request::CurrentOffsetStage(topition) => Ok(Response::CurrentOffsetStage(
+                self.storage.current_offset_stage(&topition).await,
             )),
             Request::ListOffsets {
                 isolation_level,

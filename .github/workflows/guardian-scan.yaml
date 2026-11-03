@@ -239,7 +239,7 @@ jobs:
           "${RUNNER_TEMP}/fossa-bin/fossa" --version
       - name: FOSSA analyze and upload
         id: analyze
-        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@d07aa7fb57d0e352316223e016a5177ddc487086 # main 2026-10-28, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           scanners: "fossa"
           additional_scan_params: |
@@ -255,7 +255,7 @@ jobs:
       #   gh variable set FOSSA_LICENSING_BLOCK --body false
       # and `gh variable delete FOSSA_LICENSING_BLOCK` to block again.
       - name: FOSSA licensing guard
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -273,7 +273,7 @@ jobs:
       # but not when there is no fresh analysis to read.
       - name: FOSSA vulnerability guard
         if: ${{ !cancelled() && steps.analyze.outcome == 'success' }}
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -319,7 +319,7 @@ jobs:
       # not wanted on a public repo. The Prisma verdict is enforced by the
       # Guardian gate.
       - name: Prisma Cloud scan
-        uses: SolaceDev/solace-public-workflows/prisma-cloud-scan@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/prisma-cloud-scan@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           image_registry: ${{ env.IMAGE_REGISTRY }}
           image_repo: ${{ env.IMAGE_REPO }}
@@ -391,7 +391,7 @@ jobs:
       - name: Guardian DB sync and Jira report
         # Ahead of the other Guardian actions' pin: the merge commit of
         # SolaceDev/solace-public-workflows#144, which adds the dependency-graph input.
-        uses: SolaceDev/solace-public-workflows/guardian-db-sync@5b439271de3e28392f1c15e58c1043461700070a # main 2026-10-19, untagged
+        uses: SolaceDev/solace-public-workflows/guardian-db-sync@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-19, untagged
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
@@ -404,7 +404,7 @@ jobs:
           poll-timeout: "1200"
           upload-logs: "true"
       - name: Guardian vulnerability gate
-        uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/guardian-vulnerability-gate@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-13, untagged
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
@@ -494,7 +494,7 @@ jobs:
     permissions:
       contents: read
       id-token: write    # OIDC, to assume manifest_aws_role
-    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
     with:
       table_name: solace-cloud-manifest
       manifest_aws_role: arn:aws:iam::868978040651:role/github-solace-cloud-manifest-rw

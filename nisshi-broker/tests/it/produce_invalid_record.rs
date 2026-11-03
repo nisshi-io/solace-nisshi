@@ -540,21 +540,18 @@ mod slate {
 mod turso {
     use super::*;
 
-    #[ignore = "the turso backend fails its connection check in tests"]
     #[tokio::test]
     async fn undecodable_records() -> Result<()> {
         let _guard = init_tracing()?;
         super::undecodable_records(storage(StorageType::Turso, false).await?).await
     }
 
-    #[ignore = "the turso backend fails its connection check in tests"]
     #[tokio::test]
     async fn unknown_compression_codec() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_compression_codec(storage(StorageType::Turso, false).await?).await
     }
 
-    #[ignore = "the turso backend fails its connection check in tests"]
     #[tokio::test]
     async fn not_exactly_one_batch() -> Result<()> {
         let _guard = init_tracing()?;

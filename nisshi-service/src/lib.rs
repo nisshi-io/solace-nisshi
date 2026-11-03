@@ -254,6 +254,7 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod metadata_topic_ids;
 mod peer_address;
 mod stream;
 mod transaction_abortable;
@@ -266,6 +267,8 @@ pub use version_gate::{
 };
 
 pub use input::TcpListenerInput;
+
+pub use metadata_topic_ids::{MetadataTopicIdLayer, MetadataTopicIdService, refuse_topic_ids};
 
 pub use transaction_abortable::{
     TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,
@@ -325,6 +328,8 @@ pub enum Error {
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
+    /// [`FrameRouteBuilder::wrap_route`] found no registered route of `api_key` to wrap.
+    NoRouteToWrap(i16),
     OneshotRecv(oneshot::error::RecvError),
     Poison,
     /// A connection that has not authenticated declared a frame larger than
