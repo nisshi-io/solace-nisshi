@@ -50,7 +50,8 @@ fn log_filter<S: Subscriber>() -> Result<impl Filter<S> + use<S>> {
 /// replace that default. Malformed directives are ignored, as they always
 /// have been.
 ///
-/// `reqsign_core` events above `info` are dropped whatever `rust_log` says.
+/// `reqsign_core` and `turso_core` events above `info` are dropped whatever
+/// `rust_log` says.
 /// reqsign-core 3.3.2 logs each credential provider it tries at `debug`, and
 /// reqsign-aws-core 3.2.0's `StaticCredentialProvider` derives `Debug` over
 /// `secret_access_key` and `session_token` without redaction, so
@@ -60,7 +61,12 @@ fn log_filter<S: Subscriber>() -> Result<impl Filter<S> + use<S>> {
 /// instead of a directive in it, because a directive sets a level, and would
 /// raise `reqsign_core` to `info` under `warn,nisshi_broker=debug` or
 /// `error,foo=debug`.
-fn log_filter_from<S: Subscriber>(rust_log: Option<&str>) -> Result<impl Filter<S> + use<S>> {
+///
+/// `turso_core` is capped the same way. turso_core 0.8.3 logs the B-tree cell
+/// that it deletes or balances at `debug`, with the cell's payload, which is
+/// the stored record's key and value, so `RUST_LOG=debug` on a `turso://`
+/// broker would write every record that the broker deletes to the log.
+pub fn log_filter_from<S: Subscriber>(rust_log: Option<&str>) -> Result<impl Filter<S> + use<S>> {
     let env = EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
         .parse_lossy(rust_log.unwrap_or_default());
@@ -70,17 +76,23 @@ fn log_filter_from<S: Subscriber>(rust_log: Option<&str>) -> Result<impl Filter<
     // passes that hint to `LogTracer` as the `log` crate's max level, and
     // `log` records would then all reach the `EnvFilter`. TRACE tells `And`
     // that this filter limits nothing by level, so the `EnvFilter`'s hint wins.
-    let reqsign_core_cap = filter_fn(|metadata| {
-        !(is_reqsign_core(metadata.target()) && *metadata.level() > Level::INFO)
+    let dependency_cap = filter_fn(|metadata| {
+        !(is_capped_dependency(metadata.target()) && *metadata.level() > Level::INFO)
     })
     .with_max_level_hint(LevelFilter::TRACE);
 
-    Ok(env.and(reqsign_core_cap))
+    Ok(env.and(dependency_cap))
 }
 
-/// Whether `target` is the `reqsign_core` crate or one of its modules.
-fn is_reqsign_core(target: &str) -> bool {
-    target == "reqsign_core" || target.starts_with("reqsign_core::")
+/// Whether `target` is the `reqsign_core` or `turso_core` crate, or one of
+/// their modules.
+fn is_capped_dependency(target: &str) -> bool {
+    ["reqsign_core", "turso_core"].iter().any(|krate| {
+        target == *krate
+            || target
+                .strip_prefix(krate)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
@@ -209,6 +221,29 @@ mod tests {
             )
         })?;
         assert_matches!(levels, (true, false, false, false, true));
+        Ok(())
+    }
+
+    #[test]
+    fn turso_core_stays_capped_at_info_under_debug() -> Result<()> {
+        let levels = with_filter(Some("debug"), || {
+            (
+                enabled!(target: "turso_core", Level::INFO),
+                enabled!(target: "turso_core::storage::btree", Level::DEBUG),
+                enabled!(target: "turso_core_other", Level::DEBUG),
+            )
+        })?;
+        assert_matches!(levels, (true, false, true));
+        Ok(())
+    }
+
+    #[test]
+    fn turso_core_is_not_raised_to_info_by_a_quiet_filter() -> Result<()> {
+        let info = with_filter(
+            Some("error"),
+            || enabled!(target: "turso_core", Level::INFO),
+        )?;
+        assert_matches!(info, false);
         Ok(())
     }
 

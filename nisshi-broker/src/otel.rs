@@ -19,6 +19,8 @@ use crate::{Result, TracingFormat};
 
 mod tracing;
 
+pub use tracing::log_filter_from;
+
 #[derive(Debug)]
 pub struct Guard {
     #[allow(dead_code)]
