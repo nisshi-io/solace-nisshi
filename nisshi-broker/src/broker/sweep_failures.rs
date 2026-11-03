@@ -140,14 +140,16 @@ impl SweepFailures {
                 // At warn, the level of the failure, so that an operator at the default level
                 // sees it end. A sweep that flaps can reach here with failures that no line
                 // carried, and then the line says what the latest of them was and what the sweep
-                // stops, because the failure line before it may be hours old.
+                // stopped, because the failure line before it may be hours old. The fields are
+                // named differently from the failure line's `error` and `stopped`, so that a log
+                // query on those two matches only a failure that is happening now.
                 warn!(
                     sweep = self.sweep,
                     engine = %self.engine,
                     failed_sweeps = state.failed_sweeps,
                     failures_since_last_log = state.unlogged,
-                    stopped = (state.unlogged > 0).then_some(self.stopped),
-                    error = state.unlogged_error.as_deref(),
+                    was_stopped = (state.unlogged > 0).then_some(self.stopped),
+                    last_error = state.unlogged_error.as_deref(),
                     "storage maintenance sweep succeeded again"
                 );
 
@@ -358,8 +360,8 @@ mod tests {
         assert!(lines[1].contains("succeeded again"), "{logs}");
 
         // A recovery with no failure left out is a plain line.
-        assert!(!lines[1].contains("stopped"), "{}", lines[1]);
-        assert!(!lines[1].contains("error="), "{}", lines[1]);
+        assert!(!lines[1].contains("was_stopped"), "{}", lines[1]);
+        assert!(!lines[1].contains("last_error"), "{}", lines[1]);
 
         // The next due tick is a success: it carries the failure that was left out.
         let logs = captured(|| {
@@ -370,13 +372,40 @@ mod tests {
         let line = logs.lines().next().expect("the recovery line");
         assert!(line.contains("succeeded again"), "{logs}");
         assert!(line.contains("failures_since_last_log=2"), "{line}");
-        assert!(line.contains("third"), "{line}");
+        assert!(line.contains("last_error=\"third\""), "{line}");
         assert!(!line.contains("second"), "{line}");
+        assert!(line.contains("was_stopped="), "{line}");
         assert!(line.contains("read_committed"), "{line}");
+
+        // The failure line's own fields do not appear on the recovery line.
+        assert!(!line.contains(" error="), "{line}");
+        assert!(!line.contains(" stopped="), "{line}");
 
         // The recovery line used up its failures, so the next one is plain again.
         let logs = captured(|| failures.record(Err("fourth"), start + Duration::from_secs(900)));
         assert!(logs.contains("failures_since_last_log=1"), "{logs}");
+    }
+
+    #[test]
+    fn a_recovery_does_not_name_a_failure_that_an_earlier_line_carried() {
+        let failures = SweepFailures::maintain_transactions("postgres");
+        let start = Instant::now();
+
+        let logs = captured(|| {
+            // The failure at 0 is logged. The failure at 10 seconds is held, and the failure at
+            // 300 seconds is logged with a count that includes it, so the held error is used up.
+            failures.record(Err("first"), start);
+            failures.record(Err("held"), start + Duration::from_secs(10));
+            failures.record(Err("second"), start + REPEAT_INTERVAL);
+
+            failures.record(Ok::<(), &str>(()), start + 2 * REPEAT_INTERVAL);
+        });
+
+        let recovery = logs.lines().last().expect("the recovery line");
+        assert!(recovery.contains("succeeded again"), "{logs}");
+        assert!(recovery.contains("failures_since_last_log=0"), "{recovery}");
+        assert!(!recovery.contains("held"), "{recovery}");
+        assert!(!recovery.contains("last_error"), "{recovery}");
     }
 
     #[test]
