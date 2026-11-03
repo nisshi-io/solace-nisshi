@@ -3392,8 +3392,7 @@ impl Storage for Delegate {
                 .base_timestamp(
                     row.get_value(2)
                         .map_err(Error::from)
-                        .and_then(LiteTimestamp::try_from)
-                        .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                        .and_then(LiteTimestamp::millis)
                         .inspect_err(|err| error!(?err))?,
                 )
                 .producer_id(
@@ -3430,8 +3429,7 @@ impl Storage for Delegate {
                 let timestamp = row
                     .get_value(2)
                     .map_err(Error::from)
-                    .and_then(LiteTimestamp::try_from)
-                    .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                    .and_then(LiteTimestamp::millis)
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
@@ -3947,6 +3945,10 @@ impl Storage for Delegate {
                                 .map_err(Into::into)
                                 .and_then(|value| match value {
                                     Value::Null => Ok(None),
+                                    // A record that was produced without a timestamp stores
+                                    // NO_TIMESTAMP, -1, and `SystemTime` cannot hold a negative
+                                    // millisecond count, so this answers no timestamp for it.
+                                    Value::Integer(timestamp) if timestamp < 0 => Ok(None),
                                     value => LiteTimestamp::try_from(value)
                                         .map(SystemTime::from)
                                         .map(Some),
@@ -5754,6 +5756,20 @@ impl TryFrom<Value> for LiteTimestamp {
     }
 }
 
+impl LiteTimestamp {
+    /// Returns the Kafka timestamp, in milliseconds since the epoch, that the stored `value` holds.
+    ///
+    /// A record that a producer sent without a timestamp stores NO_TIMESTAMP, -1. A [`SystemTime`]
+    /// cannot hold a negative millisecond count, so an integer is returned as stored.
+    fn millis(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(timestamp) => Ok(timestamp),
+            value => LiteTimestamp::try_from(value)
+                .and_then(|timestamp| to_timestamp(&timestamp.0).map_err(Into::into)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod options_tests;
 
@@ -5777,6 +5793,14 @@ mod tests {
             LiteTimestamp::try_from(Value::Null),
             Err(Error::UnexpectedLibSqlValue(Value::Null))
         );
+    }
+
+    #[test]
+    fn stored_millis_keep_a_negative_no_timestamp() -> Result<()> {
+        assert_eq!(-1, LiteTimestamp::millis(Value::Integer(-1))?);
+        assert_eq!(1_234, LiteTimestamp::millis(Value::Integer(1_234))?);
+
+        Ok(())
     }
 
     fn init_tracing() -> Result<DefaultGuard> {

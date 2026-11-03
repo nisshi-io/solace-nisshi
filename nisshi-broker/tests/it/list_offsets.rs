@@ -18,9 +18,10 @@ use crate::common::{self, StorageType, alphanumeric_string, init_tracing, regist
 use bytes::Bytes;
 use nisshi_broker::{Error, Result, service::storage};
 use nisshi_sans_io::{
-    Ack, CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest,
-    ProduceRequest, RequestInput,
+    Ack, CreateTopicsRequest, ErrorCode, FetchRequest, IsolationLevel, ListOffset,
+    ListOffsetsRequest, ProduceRequest, RequestInput,
     create_topics_request::CreatableTopic,
+    fetch_request::{FetchPartition, FetchTopic},
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
@@ -30,7 +31,7 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig, Topition};
+use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig, TopicId, Topition};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tokio::time::sleep;
@@ -604,8 +605,24 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 /// Produces one batch of `values` to partition 0 of `topic_name` through
 /// `broker`, and returns its base offset.
 async fn produce_batch(broker: &Broker, topic_name: &str, values: &[&'static [u8]]) -> Result<i64> {
+    produce_batch_stamped(broker, topic_name, values, None).await
+}
+
+/// Produces one batch of `values` to partition 0 of `topic_name` through
+/// `broker`, and returns its base offset. The batch carries `timestamp` as its
+/// base and maximum timestamp, or the current time when `timestamp` is `None`.
+async fn produce_batch_stamped(
+    broker: &Broker,
+    topic_name: &str,
+    values: &[&'static [u8]],
+    timestamp: Option<i64>,
+) -> Result<i64> {
     let mut builder = inflated::Batch::builder()
         .last_offset_delta(i32::try_from(values.len() - 1).unwrap_or_default());
+
+    if let Some(timestamp) = timestamp {
+        builder = builder.base_timestamp(timestamp).max_timestamp(timestamp);
+    }
 
     for (offset_delta, value) in values.iter().enumerate() {
         builder = builder.record(
@@ -688,13 +705,8 @@ async fn list_offset(
     Ok((partitions[0].offset, partitions[0].timestamp))
 }
 
-/// After a batch of 3 records and a batch of 2, `Latest` answers the high
-/// watermark, 5, and `Earliest` answers the log start, 0. Kafka answers both
-/// without a timestamp (-1).
-pub async fn multi_record_batch(broker: Broker) -> Result<()> {
-    let topic_name = &alphanumeric_string(15)[..];
-    debug!(?topic_name);
-
+/// Creates `topic_name` with one partition through `broker`.
+async fn create_topic(broker: &Broker, topic_name: &str) -> Result<()> {
     let response = broker
         .serve(RequestInput {
             request: CreateTopicsRequest::default()
@@ -717,6 +729,82 @@ pub async fn multi_record_batch(broker: Broker) -> Result<()> {
     assert_eq!(1, topics.len());
     assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
 
+    Ok(())
+}
+
+/// Returns the timestamp of each record that `broker` answers for a READ_UNCOMMITTED `Fetch` of
+/// partition 0 of `topic_name`, from offset 0. A `Fetch` names the topic by its id, which
+/// `storage` knows.
+async fn fetch_timestamps<G>(storage: &G, broker: &Broker, topic_name: &str) -> Result<Vec<i64>>
+where
+    G: Storage,
+{
+    let topic_id = storage
+        .metadata(Some([TopicId::Name(topic_name.into())].as_slice()))
+        .await?
+        .topics()[0]
+        .topic_id;
+
+    let response = broker
+        .serve(RequestInput {
+            request: FetchRequest::default()
+                .max_wait_ms(100)
+                .min_bytes(1)
+                .max_bytes(Some(50 * 1024))
+                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                .session_id(Some(0))
+                .session_epoch(Some(-1))
+                .forgotten_topics_data(Some([].into()))
+                .rack_id(Some(String::new()))
+                .topics(Some(
+                    [FetchTopic::default()
+                        .topic(Some(topic_name.into()))
+                        .topic_id(topic_id)
+                        .partitions(Some(
+                            [FetchPartition::default()
+                                .partition(0)
+                                .current_leader_epoch(Some(-1))
+                                .fetch_offset(0)
+                                .last_fetched_epoch(Some(-1))
+                                .log_start_offset(Some(-1))
+                                .partition_max_bytes(50 * 1024)]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let partition = &response.responses.as_deref().unwrap_or_default()[0]
+        .partitions
+        .as_deref()
+        .unwrap_or_default()[0];
+    assert_eq!(i16::from(ErrorCode::None), partition.error_code);
+
+    let frame = inflated::Frame::try_from(partition.records.clone().unwrap_or_default())?;
+
+    Ok(frame
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .records
+                .iter()
+                .map(|record| batch.record_timestamp(record))
+        })
+        .collect())
+}
+
+/// After a batch of 3 records and a batch of 2, `Latest` answers the high
+/// watermark, 5, and `Earliest` answers the log start, 0. Kafka answers both
+/// without a timestamp (-1).
+pub async fn multi_record_batch(broker: Broker) -> Result<()> {
+    let topic_name = &alphanumeric_string(15)[..];
+    debug!(?topic_name);
+
+    create_topic(&broker, topic_name).await?;
+
     assert_eq!(
         0,
         produce_batch(&broker, topic_name, &[b"one", b"two", b"three"]).await?
@@ -733,6 +821,41 @@ pub async fn multi_record_batch(broker: Broker) -> Result<()> {
     assert_eq!(
         (Some(0), Some(-1)),
         list_offset(&broker, topic_name, ListOffset::Earliest).await?
+    );
+
+    Ok(())
+}
+
+/// A producer can send records without a timestamp: Kafka's `NO_TIMESTAMP`,
+/// -1. The records stay in the log with that timestamp, and `Latest` and
+/// `Earliest` answer the same offsets as they do for records that carry a time.
+pub async fn no_timestamp_batch<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let topic_name = &alphanumeric_string(15)[..];
+    debug!(?topic_name);
+
+    create_topic(&broker, topic_name).await?;
+
+    assert_eq!(
+        0,
+        produce_batch_stamped(&broker, topic_name, &[b"one", b"two"], Some(-1)).await?
+    );
+
+    assert_eq!(
+        (Some(2), Some(-1)),
+        list_offset(&broker, topic_name, ListOffset::Latest).await?
+    );
+    assert_eq!(
+        (Some(0), Some(-1)),
+        list_offset(&broker, topic_name, ListOffset::Earliest).await?
+    );
+
+    assert_eq!(
+        vec![-1, -1],
+        fetch_timestamps(&sc, &broker, topic_name).await?
     );
 
     Ok(())
@@ -1062,6 +1185,19 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn no_timestamp_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::no_timestamp_batch(sc).await
+    }
+
+    #[tokio::test]
     async fn new_topic() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -1137,6 +1273,19 @@ mod lite {
 
         let broker = broker(sc)?;
         super::multi_record_batch(broker).await
+    }
+
+    #[tokio::test]
+    async fn no_timestamp_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::no_timestamp_batch(sc).await
     }
 
     #[tokio::test]
@@ -1217,6 +1366,20 @@ mod turso {
 
         let broker = broker(sc)?;
         super::multi_record_batch(broker).await
+    }
+
+    #[ignore = "the Turso engine has no virtual_topic table, which a lookup of a topic by name reads"]
+    #[tokio::test]
+    async fn no_timestamp_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::no_timestamp_batch(sc).await
     }
 
     #[ignore]
