@@ -69,7 +69,8 @@ fn cat_error_message(error: &nisshi_cat::Error) -> String {
         | nisshi_cat::Error::MessageWithoutKeyOrValue { .. }
         | nisshi_cat::Error::NoMessages { .. }
         | nisshi_cat::Error::NotAnArray { .. }
-        | nisshi_cat::Error::Fetch { .. } => error.to_string(),
+        | nisshi_cat::Error::Fetch { .. }
+        | nisshi_cat::Error::Metadata { .. } => error.to_string(),
         _ => format!("Unknown error occurred during command: {error}"),
     }
 }
@@ -426,6 +427,15 @@ mod tests {
             },
             nisshi_cat::Error::NotAnArray {
                 location: nisshi_cat::Location::File("messages.json".into()),
+            },
+            nisshi_cat::Error::Fetch {
+                topic: "taxi".into(),
+                partition: 0,
+                error_code: 9999,
+            },
+            nisshi_cat::Error::Metadata {
+                topic: "taxi".into(),
+                error_code: 29,
             },
         ] {
             assert_eq!(error.to_string(), cat_error_message(&error));

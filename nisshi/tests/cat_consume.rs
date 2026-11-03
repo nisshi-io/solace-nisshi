@@ -92,6 +92,9 @@ fn missing_topic_fails_naming_the_topic() {
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     assert!(stderr.contains("no-such-topic"), "{stderr}");
     assert!(stderr.contains("UnknownTopicOrPartition"), "{stderr}");
+    assert!(!stderr.contains("Unknown error occurred"), "{stderr}");
+    // The metadata error code names the cause before any fetch, as it does on Kafka.
+    assert!(stderr.contains("looking up topic"), "{stderr}");
 }
 
 /// A partition that doesn't exist on a topic that does is reported the same way.
@@ -107,4 +110,5 @@ fn missing_partition_fails_naming_the_topic_and_partition() {
     assert!(stderr.contains("taxi"), "{stderr}");
     assert!(stderr.contains("partition 9"), "{stderr}");
     assert!(stderr.contains("UnknownTopicOrPartition"), "{stderr}");
+    assert!(!stderr.contains("Unknown error occurred"), "{stderr}");
 }

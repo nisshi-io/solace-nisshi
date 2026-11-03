@@ -230,7 +230,7 @@ impl Consume {
             )
             .await?;
 
-        let topic_id = metadata
+        let topic = metadata
             .topics
             .unwrap_or_default()
             .into_iter()
@@ -239,7 +239,23 @@ impl Consume {
                     .name
                     .as_ref()
                     .is_some_and(|name| self.configuration.topic.as_str() == name)
-            })
+            });
+
+        // Kafka answers a fetch by an unknown topic ID with `UNKNOWN_TOPIC_ID` before it checks
+        // authorization, so a topic the user may not read would be reported as unknown. The
+        // metadata error names the real cause on both brokers.
+        if let Some(error_code) = topic
+            .as_ref()
+            .map(|topic| topic.error_code)
+            .filter(|error_code| *error_code != i16::from(ErrorCode::None))
+        {
+            return Err(Error::Metadata {
+                topic: self.configuration.topic.clone(),
+                error_code,
+            });
+        }
+
+        let topic_id = topic
             .and_then(|topic| topic.topic_id)
             // The encoder leaves out a `None` topic ID, which moves the fields after it, so a
             // topic missing from the metadata is asked for by the null ID instead.

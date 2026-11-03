@@ -42,6 +42,15 @@ pub enum Error {
         error_code: i16,
     },
 
+    /// The broker answered the metadata lookup of `topic` with an error code. Kafka answers a
+    /// fetch by an unknown topic ID with `UNKNOWN_TOPIC_ID` before it checks authorization, so a
+    /// topic the user may not read would be reported as unknown. The metadata error code names
+    /// the real cause.
+    Metadata {
+        topic: String,
+        error_code: i16,
+    },
+
     Client(#[from] nisshi_client::Error),
     InvalidJson {
         location: Location,
@@ -113,14 +122,21 @@ impl fmt::Display for Error {
                     f,
                     "fetching partition {partition} of topic {topic:?} failed: "
                 )?;
-
-                match ErrorCode::try_from(*error_code) {
-                    Ok(error_code) => write!(f, "{error_code:?} ({})", i16::from(error_code)),
-                    Err(_) => write!(f, "unknown error code {error_code}"),
-                }
+                write_error_code(f, *error_code)
+            }
+            Self::Metadata { topic, error_code } => {
+                write!(f, "looking up topic {topic:?} failed: ")?;
+                write_error_code(f, *error_code)
             }
             _ => write!(f, "{self:?}"),
         }
+    }
+}
+
+fn write_error_code(f: &mut fmt::Formatter<'_>, error_code: i16) -> fmt::Result {
+    match ErrorCode::try_from(error_code) {
+        Ok(error_code) => write!(f, "{error_code:?} ({})", i16::from(error_code)),
+        Err(_) => write!(f, "unknown error code {error_code}"),
     }
 }
 
