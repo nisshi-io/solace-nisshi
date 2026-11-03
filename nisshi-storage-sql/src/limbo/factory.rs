@@ -51,7 +51,10 @@ impl StorageFactory for LimboFactory {
     }
 
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
-        reject_unrecognized_options(&configuration.storage, &["vacuum_into"])?;
+        reject_unrecognized_options(
+            &configuration.storage,
+            &["vacuum_into", "busy_timeout", "compaction"],
+        )?;
 
         Engine::builder()
             .storage(configuration.storage)

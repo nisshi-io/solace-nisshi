@@ -20,7 +20,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     result,
-    str::FromStr as _,
+    str::FromStr,
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
@@ -79,7 +79,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
 };
-use rand::{rng, seq::SliceRandom as _};
+use rand::{RngExt as _, rng, seq::SliceRandom as _};
 use regex::Regex;
 use tokio::{fs::rename, sync::Semaphore};
 use tracing::{debug, error, info, warn};
@@ -96,6 +96,51 @@ macro_rules! include_sql {
     ($e: expr) => {
         remove_comments(include_str!($e))
     };
+}
+
+/// Runs `$body` in a concurrent write transaction named `$tx` and commits it, and runs it again from
+/// the start while it conflicts with another writer. The macro evaluates to a `Result` of the
+/// value of `$body`.
+///
+/// `$body` runs more than once, so it must have no effect outside the transaction. It is not a
+/// closure, because the compiler cannot show that a closure over a borrowed transaction is `Send`.
+macro_rules! write_transaction {
+    ($engine:expr, $tx:ident => $body:expr) => {{
+        let mut attempt = 0;
+
+        loop {
+            let mut connection = $engine.connection().await?;
+
+            let result: Result<_> = async {
+                let $tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Concurrent)
+                    .await?;
+
+                let value = $body;
+                $tx.commit().await?;
+
+                Ok(value)
+            }
+            .await;
+
+            match result {
+                Err(error) if is_conflict(&error) => {
+                    connection.discard();
+
+                    if attempt >= MAXIMUM_CONFLICT_ATTEMPTS {
+                        break Err(error);
+                    }
+
+                    attempt += 1;
+                    debug!(attempt, ?error, "running the transaction again");
+
+                    tokio::time::sleep(conflict_backoff(attempt)).await;
+                }
+
+                otherwise => break otherwise,
+            }
+        }
+    }};
 }
 
 static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -182,6 +227,102 @@ impl TryFrom<Row> for Txn {
     }
 }
 
+/// The most connections that the engine keeps for the next operation.
+const MAXIMUM_IDLE_CONNECTIONS: usize = 16;
+
+/// How many locks serialize the producers of one engine. A partition maps to one of them, so
+/// that producers to the same partition queue in the engine, instead of conflicting on the row
+/// that holds the partition's watermark and running again. Two partitions that map to one lock
+/// only wait for each other, and the number of locks does not grow with the number of partitions.
+const PRODUCE_LOCKS: usize = 64;
+
+/// The locks that serialize producers to one partition.
+#[derive(Debug)]
+struct ProduceLocks(Vec<tokio::sync::Mutex<()>>);
+
+impl Default for ProduceLocks {
+    fn default() -> Self {
+        Self(
+            (0..PRODUCE_LOCKS)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        )
+    }
+}
+
+impl ProduceLocks {
+    fn lock_for(&self, topition: &Topition) -> &tokio::sync::Mutex<()> {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        topition.hash(&mut hasher);
+
+        // the remainder is below `PRODUCE_LOCKS`, so it fits in a `usize`
+        &self.0[(hasher.finish() % PRODUCE_LOCKS as u64) as usize]
+    }
+}
+
+/// Connections that an operation has finished with, so that the next operation does not open and
+/// set up another one. A connection costs about half a millisecond on its first transaction,
+/// which is several times what a produce spends in the database.
+#[derive(Debug, Default)]
+struct IdleConnections(Mutex<Vec<Connection>>);
+
+/// A connection that returns to the idle list when it is dropped.
+///
+/// A connection that is in the middle of a transaction when it is dropped is closed instead,
+/// because the next operation must start with none.
+struct PooledConnection {
+    connection: Connection,
+    idle: Arc<IdleConnections>,
+    reusable: bool,
+}
+
+impl PooledConnection {
+    /// Closes the connection when it is dropped, instead of keeping it for the next operation.
+    ///
+    /// A dropped `Transaction` does not roll back. It flags its connection, and the connection's
+    /// next use rolls back. When the database has already ended the transaction, as it does for a
+    /// write-write conflict, that rollback fails, and so does whatever uses the connection next.
+    fn discard(&mut self) {
+        self.reusable = false;
+    }
+}
+
+impl Debug for PooledConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.connection.fmt(f)
+    }
+}
+
+impl Deref for PooledConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        // A clone of a `Connection` is another handle on the same database connection, so the
+        // idle list keeps the connection when this handle goes.
+        if self.reusable
+            && self.connection.is_autocommit().unwrap_or_default()
+            && let Ok(mut idle) = self.idle.0.lock()
+            && idle.len() < MAXIMUM_IDLE_CONNECTIONS
+        {
+            idle.push(self.connection.clone());
+        }
+    }
+}
+
 /// Turso storage engine
 ///
 #[derive(Clone, Debug)]
@@ -190,8 +331,12 @@ pub struct Engine {
     node: i32,
     advertised_listener: Url,
     db: Arc<Mutex<Database>>,
+    idle: Arc<IdleConnections>,
+    produce_locks: Arc<ProduceLocks>,
     maintenance: Arc<Semaphore>,
     vacuum_into: Option<PathBuf>,
+    busy_timeout: Duration,
+    compaction: CompactionMode,
 
     schemas: Option<Registry>,
     lake: Option<House>,
@@ -201,11 +346,7 @@ impl Engine {
     /// Applies every change in `resource` to its topic in one transaction, so
     /// that a failed change leaves the topic's configuration unchanged.
     async fn alter_topic(&self, resource: &AlterConfigsResource) -> Result<()> {
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-
+        write_transaction!(self, tx => {
         let topic = resource.resource_name.as_str();
 
         if tx
@@ -269,7 +410,7 @@ impl Engine {
             }
         }
 
-        tx.commit().await.map_err(Into::into)
+        })
     }
 
     pub fn builder()
@@ -277,9 +418,34 @@ impl Engine {
         Builder::default()
     }
 
-    async fn connection(&self) -> Result<Connection> {
-        let db = self.db.lock()?;
-        db.connect().map_err(Into::into)
+    /// Returns an idle connection, or opens one with foreign keys enforced.
+    ///
+    /// Turso, like SQLite, enforces foreign keys only on a connection that turns them on, and the
+    /// setting is not stored in the database. Without it, `on delete cascade` deletes nothing, and
+    /// a row can name a parent that does not exist.
+    async fn connection(&self) -> Result<PooledConnection> {
+        let idle = self.idle.0.lock()?.pop();
+
+        let connection = match idle {
+            Some(connection) => connection,
+            None => {
+                let connection = {
+                    let db = self.db.lock()?;
+                    db.connect()?
+                };
+
+                _ = connection.execute("PRAGMA foreign_keys = ON", ()).await?;
+                connection.busy_timeout(self.busy_timeout)?;
+
+                connection
+            }
+        };
+
+        Ok(PooledConnection {
+            connection,
+            idle: Arc::clone(&self.idle),
+            reusable: true,
+        })
     }
 
     /// Writes a snapshot of the database to the `vacuum_into` path, when the storage URL names
@@ -325,16 +491,15 @@ impl Engine {
     }
 
     async fn policy_compact_delete(&self, topition: i64, offset_id: i64) -> Result<u64> {
-        let c = self.connection().await?;
-
-        self.prepare_execute(
-            &c,
-            &sql_lookup("lite/policy_compact_delete.sql")?,
-            (topition, offset_id),
-        )
-        .await
-        .inspect(|rows| debug!(rows))
-        .map_err(Into::into)
+        write_transaction!(self, tx => {
+            self.prepare_execute(
+                &tx,
+                &sql_lookup("lite/policy_compact_delete.sql")?,
+                (topition, offset_id),
+            )
+            .await
+            .inspect(|rows| debug!(rows))?
+        })
     }
 
     async fn policy_compact_compaction(
@@ -427,6 +592,17 @@ impl Engine {
     /// Removes every record of a topic whose `cleanup.policy` includes `compact` that a later
     /// record with the same key replaces.
     async fn policy_compact(&self) -> Result<u64> {
+        if self.compaction == CompactionMode::Single {
+            return write_transaction!(self, tx => {
+                self.prepare_execute(
+                    &tx,
+                    &sql_lookup("policy_compact.sql")?,
+                    [self.cluster.as_str()],
+                )
+                .await?
+            });
+        }
+
         let mut compacted = 0;
 
         for topition in self.policy_compact_topitions().await? {
@@ -461,24 +637,25 @@ impl Engine {
         let now = to_timestamp(&now)?;
         let retention_ms = i64::try_from(Duration::from_hours(7 * 24).as_millis())?;
 
-        let c = self.connection().await?;
+        write_transaction!(self, tx => {
+            let by_age = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("lite/policy_delete.sql")?,
+                    (self.cluster.as_str(), now, retention_ms),
+                )
+                .await?;
 
-        let by_age = self
-            .prepare_execute(
-                &c,
-                &sql_lookup("lite/policy_delete.sql")?,
-                (self.cluster.as_str(), now, retention_ms),
-            )
-            .await?;
+            let by_bytes = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("lite/policy_delete_bytes.sql")?,
+                    [self.cluster.as_str()],
+                )
+                .await?;
 
-        self.prepare_execute(
-            &c,
-            &sql_lookup("lite/policy_delete_bytes.sql")?,
-            [self.cluster.as_str()],
-        )
-        .await
-        .map(|by_bytes| by_age + by_bytes)
-        .map_err(Into::into)
+            by_age + by_bytes
+        })
     }
 
     /// Splits `topic` into its base topic and key when the base topic is virtual
@@ -523,25 +700,25 @@ impl Engine {
             format!("tag:nisshi.io,2026-04:virtual:{topic}:{key}",).as_bytes(),
         );
 
-        let c = self.connection().await.inspect_err(|err| error!(?err))?;
+        write_transaction!(self, tx => {
+            let row = self
+                .prepare_query_one(
+                    &tx,
+                    &sql_lookup("virtual_topic_upsert.sql")?,
+                    (self.cluster.as_str(), topic, key, uuid.to_string()),
+                )
+                .await?;
 
-        let row = self
-            .prepare_query_one(
-                &c,
-                &sql_lookup("virtual_topic_upsert.sql")?,
-                (self.cluster.as_str(), topic, key, uuid.to_string()),
-            )
-            .await?;
-
-        row.get_value(0)
-            .map_err(Error::from)
-            .and_then(|value| {
-                value
-                    .as_text()
-                    .map(|text| Uuid::parse_str(text).map_err(Error::from))
-                    .unwrap_or_else(|| Err(Error::UnexpectedValue(value)))
-            })
-            .inspect(|vt| debug!(%vt))
+            row.get_value(0)
+                .map_err(Error::from)
+                .and_then(|value| {
+                    value
+                        .as_text()
+                        .map(|text| Uuid::parse_str(text).map_err(Error::from))
+                        .unwrap_or_else(|| Err(Error::UnexpectedValue(value)))
+                })
+                .inspect(|vt| debug!(%vt))?
+        })
     }
 
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
@@ -1447,8 +1624,33 @@ const _: () = assert!(SCHEMA_VERSION == 1);
 /// The oldest schema version whose broker can use the schema that [`DDL`] creates.
 const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 
-/// How long a broker waits for another broker on the same file to finish creating the schema.
-const SCHEMA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection waits for a lock that another connection holds, when the storage URL does
+/// not set `busy_timeout`. Brokers on the same file wait this long for one another to create the
+/// schema.
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How `maintain` compacts a topic whose `cleanup.policy` includes `compact`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CompactionMode {
+    /// One statement for every partition of the cluster.
+    Single,
+
+    /// A few statements for every key of every partition.
+    #[default]
+    Multi,
+}
+
+impl FromStr for CompactionMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s {
+            "single" => Ok(Self::Single),
+            "multi" => Ok(Self::Multi),
+            otherwise => Err(Error::Message(otherwise.to_owned())),
+        }
+    }
+}
 
 static DDL: LazyLock<Cache> = LazyLock::new(|| {
     let mapping = [
@@ -1521,6 +1723,32 @@ fn fix_parameters(sql: &str) -> Result<String> {
     Regex::new(r"\$(?<i>\d+)")
         .map(|re| re.replace_all(sql, "?$i").into_owned())
         .map_err(Into::into)
+}
+
+/// How many times an operation runs again when it conflicts with another writer.
+const MAXIMUM_CONFLICT_ATTEMPTS: u32 = 100;
+
+/// Whether `error` says that a write transaction lost to another one, and that running it again can
+/// succeed. In MVCC mode a transaction that writes a row that another one wrote after it began
+/// fails with a write-write conflict, and a lock that a writer holds fails with `Busy`.
+fn is_conflict(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Turso(error) if matches!(
+            error.as_ref(),
+            turso::Error::Busy(_) | turso::Error::BusySnapshot(_)
+        ) || matches!(
+            error.as_ref(),
+            turso::Error::Error(reason) if reason.to_lowercase().contains("conflict")
+        )
+    )
+}
+
+/// How long to wait before running a transaction again after its `attempt`th conflict: a random
+/// time that grows with the attempt, so that writers that collide do not collide again at once.
+fn conflict_backoff(attempt: u32) -> Duration {
+    let ceiling = 50 * u64::from(attempt.min(40));
+    Duration::from_micros(rng().random_range(0..=ceiling))
 }
 
 /// Reads column `index` of `row` as an integer.
@@ -1647,6 +1875,39 @@ impl Builder<String, i32, Url, Url> {
             }
         });
 
+        let busy_timeout = self
+            .storage
+            .query_pairs()
+            .find_map(|(k, v)| {
+                if k == "busy_timeout" {
+                    human_units::Duration::from_str(v.as_ref())
+                        .map(|duration| duration.0)
+                        .inspect_err(
+                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
+                        )
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(DEFAULT_BUSY_TIMEOUT);
+
+        let compaction = self
+            .storage
+            .query_pairs()
+            .find_map(|(k, v)| {
+                if k == "compaction" {
+                    CompactionMode::from_str(v.as_ref())
+                        .inspect_err(
+                            |err| warn!(storage = %redact_url(&self.storage), v = v.as_ref(), ?err),
+                        )
+                        .ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
         let path = path
             .to_str()
             .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?;
@@ -1655,7 +1916,14 @@ impl Builder<String, i32, Url, Url> {
         // fails here, and not in `ensure_schema`.
         let db = async {
             let db = turso::Builder::new_local(path).build().await?;
-            ensure_schema(&db, SCHEMA_BUSY_TIMEOUT).await?;
+
+            // The mode is stored in the file, so this changes a file that is not yet in it.
+            _ = db
+                .connect()?
+                .pragma_update("journal_mode", "'mvcc'")
+                .await?;
+
+            ensure_schema(&db, busy_timeout).await?;
             Ok::<_, Error>(db)
         }
         .await
@@ -1670,8 +1938,12 @@ impl Builder<String, i32, Url, Url> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             db: Arc::new(Mutex::new(db)),
+            idle: Arc::default(),
+            produce_locks: Arc::default(),
             maintenance: Arc::new(Semaphore::new(1)),
             vacuum_into,
+            busy_timeout,
+            compaction,
             schemas: self.schemas,
             lake: self.lake,
         })
@@ -1803,16 +2075,15 @@ impl Storage for Engine {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(?broker_registration);
 
-        let connection = self.connection().await?;
-
-        self.prepare_execute(
-            &connection,
-            &sql_lookup("register_broker.sql")?,
-            &[broker_registration.cluster_id],
-        )
-        .await
-        .map_err(Into::into)
-        .and(Ok(()))
+        write_transaction!(self, tx => {
+            _ = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("register_broker.sql")?,
+                    &[broker_registration.cluster_id.as_str()],
+                )
+                .await?;
+        })
     }
 
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
@@ -1839,10 +2110,7 @@ impl Storage for Engine {
     async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
         debug!(cluster = self.cluster, ?topic, validate_only);
 
-        let mut connection = self.connection().await.inspect_err(|err| error!(?err))?;
-
-        let tx = connection.transaction().await?;
-
+        write_transaction!(self, tx => {
         let uuid = {
             let uuid = Uuid::new_v4();
 
@@ -1890,7 +2158,7 @@ impl Storage for Engine {
                 .inspect(|watermark| debug!(?watermark))?;
         }
 
-        if let Some(configs) = topic.configs {
+        if let Some(configs) = topic.configs.as_ref() {
             for config in configs {
                 debug!(?config);
 
@@ -1910,7 +2178,8 @@ impl Storage for Engine {
             }
         }
 
-        tx.commit().await.map_err(Into::into).and(Ok(uuid))
+        uuid
+        })
     }
 
     async fn delete_records(
@@ -1919,11 +2188,7 @@ impl Storage for Engine {
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         debug!(?topics);
 
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-
+        write_transaction!(self, tx => {
         let mut responses = vec![];
 
         for topic in topics {
@@ -2008,19 +2273,14 @@ impl Storage for Engine {
             );
         }
 
-        tx.commit().await.inspect_err(|err| error!(?err))?;
-
-        Ok(responses)
+        responses
+        })
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         debug!(cluster = self.cluster, ?topic);
 
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-
+        write_transaction!(self, tx => {
         let mut rows = match topic {
             TopicId::Id(id) => {
                 tx.query(
@@ -2076,10 +2336,8 @@ impl Storage for Engine {
             )
             .await?;
 
-        tx.commit()
-            .await
-            .map_err(Into::into)
-            .and(Ok(ErrorCode::None))
+        ErrorCode::None
+        })
     }
 
     async fn incremental_alter_resource(
@@ -2140,16 +2398,21 @@ impl Storage for Engine {
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
+        // Producers to one partition take turns here, because they would otherwise all write the
+        // partition's watermark and all but one would run again. The lock does not replace the
+        // transaction's conflict check, which still covers other brokers on the same file.
+        let _turn = self.produce_locks.lock_for(topition).lock().await;
 
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
-            .await?;
-
-        tx.commit().await.map_err(Into::into).and(Ok(high))
+        write_transaction!(self, tx => {
+            self.produce_in_tx(
+                transaction_id,
+                topition,
+                deflated.clone(),
+                inflated.clone(),
+                &tx,
+            )
+            .await?
+        })
     }
 
     async fn fetch(
@@ -2159,9 +2422,27 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>> {
-        debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
+        let started_at = SystemTime::now();
+
+        // The answer stops growing once `max_wait` has elapsed, but always holds the first record.
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        debug!(
+            ?topition,
+            offset,
+            min_bytes,
+            max_bytes,
+            ?isolation_level,
+            ?max_wait
+        );
 
         let (base_topic, key_filter) = self.topic_with_key(topition.topic()).await?;
 
@@ -2323,7 +2604,9 @@ impl Storage for Engine {
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
-            while let Some(row) = records.next().await? {
+            while let Some(row) = records.next().await?
+                && !has_deadline_expired()
+            {
                 let attributes = row
                     .get_value(1)
                     .map(|value| {
@@ -2539,9 +2822,7 @@ impl Storage for Engine {
         offsets: &[(Topition, OffsetCommitRequest)],
     ) -> Result<Vec<(Topition, ErrorCode)>> {
         debug!(cluster = self.cluster, ?group, ?retention, ?offsets);
-        let mut c = self.connection().await?;
-        let tx = c.transaction().await?;
-
+        write_transaction!(self, tx => {
         let mut cg_inserted = false;
 
         let mut responses = vec![];
@@ -2608,9 +2889,8 @@ impl Storage for Engine {
             }
         }
 
-        tx.commit().await.inspect_err(|err| error!(?err))?;
-
-        Ok(responses)
+        responses
+        })
     }
 
     async fn committed_offset_topitions(
@@ -3650,22 +3930,27 @@ impl Storage for Engine {
         group_ids: Option<&[String]>,
     ) -> Result<Vec<DeletableGroupResult>> {
         debug!(?group_ids);
-        let mut results = vec![];
 
-        if let Some(group_ids) = group_ids {
-            let c = self.connection().await?;
+        let Some(group_ids) = group_ids else {
+            return Ok(vec![]);
+        };
 
-            let mut consumer_offset = c
+        // The deletes of every group are one transaction, so that a request that fails leaves every
+        // group as it was.
+        write_transaction!(self, tx => {
+            let mut results = vec![];
+
+            let mut consumer_offset = tx
                 .prepare(&sql_lookup("consumer_offset_delete_by_cg.sql")?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            let mut group_detail = c
+            let mut group_detail = tx
                 .prepare(&sql_lookup("consumer_group_detail_delete_by_cg.sql")?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            let mut group = c
+            let mut group = tx
                 .prepare(&sql_lookup("consumer_group_delete.sql")?)
                 .await
                 .inspect_err(|err| error!(?err))?;
@@ -3699,9 +3984,9 @@ impl Storage for Engine {
                         ),
                 );
             }
-        }
 
-        Ok(results)
+            results
+        })
     }
 
     async fn describe_groups(
@@ -3787,18 +4072,6 @@ impl Storage for Engine {
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
         debug!(cluster = self.cluster, group_id, ?detail, ?version);
-        debug!(cluster = self.cluster, group_id, ?detail, ?version);
-
-        let mut c = self.connection().await?;
-        let tx = c.transaction().await?;
-
-        _ = self
-            .prepare_execute(
-                &tx,
-                &sql_lookup("consumer_group_insert.sql")?,
-                (self.cluster.as_str(), group_id),
-            )
-            .await?;
 
         let existing_e_tag = version
             .as_ref()
@@ -3818,59 +4091,67 @@ impl Storage for Engine {
 
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
-        let outcome = if let Some(row) = self
-            .prepare_query_opt(
-                &tx,
-                &sql_lookup("consumer_group_detail_insert.sql")?,
-                (
-                    self.cluster.as_str(),
-                    group_id,
-                    existing_e_tag.to_string().as_str(),
-                    new_e_tag.to_string().as_str(),
-                    detail.to_string().as_str(),
-                ),
-            )
-            .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| error!(?err))?
-        {
-            row.get_value(2)
-                .map_err(Error::from)
-                .and_then(|value| {
-                    value
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(value.clone()))
-                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                })
-                .inspect_err(|err| error!(?err))
-                .map_err(Into::into)
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))
-        } else {
-            let row = self
-                .prepare_query_one(
+        let outcome = write_transaction!(self, tx => {
+            _ = self
+                .prepare_execute(
                     &tx,
-                    &sql_lookup("consumer_group_detail.sql")?,
-                    (group_id, self.cluster.as_str()),
+                    &sql_lookup("consumer_group_insert.sql")?,
+                    (self.cluster.as_str(), group_id),
+                )
+                .await?;
+
+            if let Some(row) = self
+                .prepare_query_opt(
+                    &tx,
+                    &sql_lookup("consumer_group_detail_insert.sql")?,
+                    (
+                        self.cluster.as_str(),
+                        group_id,
+                        existing_e_tag.to_string().as_str(),
+                        new_e_tag.to_string().as_str(),
+                        detail.to_string().as_str(),
+                    ),
                 )
                 .await
                 .inspect(|row| debug!(?row))
-                .inspect_err(|err| error!(?err))?;
+                .inspect_err(|err| error!(?err))?
+            {
+                row.get_value(2)
+                    .map_err(Error::from)
+                    .and_then(|value| {
+                        value
+                            .as_text()
+                            .ok_or(Error::UnexpectedValue(value.clone()))
+                            .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
+                    })
+                    .inspect_err(|err| error!(?err))
+                    .map_err(UpdateError::from)
+                    .map(|uuid| uuid.to_string())
+                    .map(Some)
+                    .map(|e_tag| Version {
+                        e_tag,
+                        version: None,
+                    })
+                    .inspect(|version| debug!(?version))
+            } else {
+                let row = self
+                    .prepare_query_one(
+                        &tx,
+                        &sql_lookup("consumer_group_detail.sql")?,
+                        (group_id, self.cluster.as_str()),
+                    )
+                    .await
+                    .inspect(|row| debug!(?row))
+                    .inspect_err(|err| error!(?err))?;
 
-            let (current, version) = group_detail_with_version(&row)?;
+                let (current, version) = group_detail_with_version(&row)?;
 
-            Err(UpdateError::Outdated {
-                current: Box::new(current),
-                version,
-            })
-        };
-
-        tx.commit().await.inspect_err(|err| error!(?err))?;
+                Err(UpdateError::Outdated {
+                    current: Box::new(current),
+                    version,
+                })
+            }
+        })?;
 
         debug!(?outcome);
 
@@ -3895,9 +4176,7 @@ impl Storage for Engine {
 
         match transaction_id {
             Some(transaction_id) => {
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
+                write_transaction!(self, tx => {
                 let mut rolled_back = false;
 
                 if let Some(row) = self
@@ -4051,14 +4330,15 @@ impl Storage for Engine {
                                     .inspect_err(|err| error!(self.cluster, producer, ?err))?;
                             }
 
-                            let error = match tx.commit().await.inspect_err(|err| {
+                            // A commit that conflicts with another writer runs this transaction
+                            // again, and any other failure is an error.
+                            tx.commit().await.inspect_err(|err| {
                                 error!(?err, cluster = self.cluster, transaction_id, producer)
-                            }) {
-                                Ok(()) => ErrorCode::ConcurrentTransactions,
-                                Err(_) => ErrorCode::UnknownServerError,
-                            };
+                            })?;
 
-                            return Ok(ProducerIdResponse::failed(error));
+                            return Ok(ProducerIdResponse::failed(
+                                ErrorCode::ConcurrentTransactions,
+                            ));
                         }
 
                         let previous = producer;
@@ -4219,32 +4499,15 @@ impl Storage for Engine {
                     ))?
                 );
 
-                let error = match tx.commit().await.inspect_err(|err| {
-                    error!(
-                        ?err,
-                        cluster = self.cluster,
-                        transaction_id,
-                        producer,
-                        epoch
-                    )
-                }) {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
-                };
-
-                Ok(ProducerIdResponse {
-                    error,
+                ProducerIdResponse {
+                    error: ErrorCode::None,
                     id: producer,
                     epoch,
+                }
                 })
             }
 
-            None => {
-                let mut connection = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .await?;
-
+            None => write_transaction!(self, tx => {
                 let mut rows = tx
                     .query(
                         &sql_lookup("producer_insert.sql")?,
@@ -4299,41 +4562,29 @@ impl Storage for Engine {
                             debug!(?row)
                         }
 
-                        let error = match tx
-                            .commit()
-                            .await
-                            .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
-                        {
-                            Ok(()) => ErrorCode::None,
-                            Err(_) => ErrorCode::UnknownServerError,
-                        };
-
-                        Ok(ProducerIdResponse {
-                            error,
+                        ProducerIdResponse {
+                            error: ErrorCode::None,
                             id: producer,
                             epoch,
-                        })
-                        .inspect(|response| debug!(?response))
+                        }
                     } else {
-                        Ok(ProducerIdResponse {
+                        ProducerIdResponse {
                             error: ErrorCode::UnknownServerError,
                             id: producer,
                             epoch: -1,
-                        })
-                        .inspect(|response| debug!(?response))
+                        }
                     }
                 } else {
-                    Ok(ProducerIdResponse {
+                    ProducerIdResponse {
                         error: ErrorCode::UnknownServerError,
                         id: -1,
                         epoch: -1,
-                    })
-                    .inspect(|response| debug!(?response))
+                    }
                 }
-            }
+            })
+            .inspect(|response| debug!(?response)),
         }
     }
-
     async fn txn_add_offsets(
         &self,
         transaction_id: &str,
@@ -4364,12 +4615,10 @@ impl Storage for Engine {
             } => {
                 debug!(?transaction_id, ?producer_id, ?producer_epoch, ?topics);
 
-                let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-                let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
+                write_transaction!(self, tx => {
                 let mut results = vec![];
 
-                for topic in topics {
+                for topic in topics.clone() {
                     let mut results_by_partition = vec![];
 
                     for partition_index in topic.partitions.unwrap_or(vec![]) {
@@ -4433,9 +4682,9 @@ impl Storage for Engine {
                         )
                     })?;
 
-                tx.commit().await?;
-
-                Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
+                results
+                })
+                .map(TxnAddPartitionsResponse::VersionZeroToThree)
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
@@ -4450,9 +4699,7 @@ impl Storage for Engine {
     ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
         debug!(cluster = self.cluster, ?offsets);
 
-        let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
+        write_transaction!(self, tx => {
         let (producer_id, producer_epoch) = if let Some(row) = self
             .prepare_query_opt(
                 &tx,
@@ -4505,7 +4752,7 @@ impl Storage for Engine {
                     offsets.producer_id,
                     offsets.producer_epoch,
                     offsets.generation_id,
-                    offsets.member_id,
+                    offsets.member_id.as_deref(),
                 ),
             )
             .await
@@ -4513,7 +4760,7 @@ impl Storage for Engine {
 
         let mut topics = vec![];
 
-        for topic in offsets.topics {
+        for topic in offsets.topics.clone() {
             let mut partitions = vec![];
 
             for partition in topic.partitions.unwrap_or(vec![]) {
@@ -4569,9 +4816,8 @@ impl Storage for Engine {
             );
         }
 
-        tx.commit().await?;
-
-        Ok(topics)
+        topics
+        })
     }
 
     async fn txn_end(
@@ -4583,16 +4829,10 @@ impl Storage for Engine {
     ) -> Result<ErrorCode> {
         debug!(cluster = ?self.cluster, transaction_id, producer_id, producer_epoch, committed);
 
-        let mut c = self.connection().await.inspect_err(|err| error!(?err))?;
-        let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
-
-        let error_code = self
-            .end_in_tx(transaction_id, producer_id, producer_epoch, committed, &tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(error_code)
+        write_transaction!(self, tx => {
+            self.end_in_tx(transaction_id, producer_id, producer_epoch, committed, &tx)
+                .await?
+        })
     }
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
@@ -4642,17 +4882,16 @@ impl Storage for Engine {
         user: &str,
         mechanism: ScramMechanism,
     ) -> Result<()> {
-        let c = self.connection().await?;
-
-        self.prepare_execute(
-            &c,
-            &sql_lookup("scram_credential_delete.sql")?,
-            (self.cluster.as_str(), user, i32::from(mechanism)),
-        )
-        .await
-        .inspect_err(|err| error!(?err))
-        .map_err(Into::into)
-        .and(Ok(()))
+        write_transaction!(self, tx => {
+            _ = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("scram_credential_delete.sql")?,
+                    (self.cluster.as_str(), user, i32::from(mechanism)),
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
+        })
     }
 
     async fn upsert_user_scram_credential(
@@ -4661,25 +4900,24 @@ impl Storage for Engine {
         mechanism: ScramMechanism,
         credential: ScramCredential,
     ) -> Result<()> {
-        let c = self.connection().await?;
-
-        self.prepare_execute(
-            &c,
-            &sql_lookup("scram_credential_insert.sql")?,
-            (
-                self.cluster.as_str(),
-                user,
-                i32::from(mechanism),
-                credential.salt.to_vec(),
-                credential.iterations,
-                credential.stored_key.to_vec(),
-                credential.server_key.to_vec(),
-            ),
-        )
-        .await
-        .inspect_err(|err| error!(?err))
-        .map_err(Into::into)
-        .and(Ok(()))
+        write_transaction!(self, tx => {
+            _ = self
+                .prepare_execute(
+                    &tx,
+                    &sql_lookup("scram_credential_insert.sql")?,
+                    (
+                        self.cluster.as_str(),
+                        user,
+                        i32::from(mechanism),
+                        credential.salt.to_vec(),
+                        credential.iterations,
+                        credential.stored_key.to_vec(),
+                        credential.server_key.to_vec(),
+                    ),
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
+        })
     }
 
     async fn user_scram_credential(
@@ -6160,6 +6398,310 @@ mod tests {
         assert!(storage.maintain(SystemTime::now()).await.is_err());
         assert!(!snapshot.exists());
         assert!(!snapshot.with_extension("db.temporary").exists());
+
+        Ok(())
+    }
+
+    /// Counts the rows of `table` in the database at `path`.
+    async fn rows(path: &std::path::Path, table: &str) -> Result<i64> {
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        let row = db
+            .connect()?
+            .query(&format!("select count(*) from {table}"), ())
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| Error::Message(format!("no count for {table}")))?;
+
+        integer(&row, 0)
+    }
+
+    /// A virtual topic's row depends on its topic with `on delete cascade`, and
+    /// `delete_topic` does not delete it itself. SQLite enforces foreign keys only on a connection
+    /// that turns them on, so deleting the topic must leave no row behind.
+    #[tokio::test]
+    async fn delete_topic_cascades_to_its_virtual_topics() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: "nisshi".into(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("events".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        [CreatableTopicConfig::default()
+                            .name("tansu.virtual".into())
+                            .value(Some("true".into()))]
+                        .into(),
+                    )),
+                false,
+            )
+            .await?;
+
+        // a metadata request for a key of a virtual topic records the virtual topic
+        _ = storage
+            .metadata(Some(&[TopicId::Name("events/key".into())]))
+            .await?;
+        assert_eq!(1, rows(&path, "virtual_topic").await?);
+
+        assert_eq!(
+            ErrorCode::None,
+            storage
+                .delete_topic(&TopicId::Name("events".into()))
+                .await?
+        );
+
+        assert_eq!(0, rows(&path, "virtual_topic").await?);
+
+        Ok(())
+    }
+
+    /// Returns the journal mode of the database at `path`.
+    async fn journal_mode(path: &std::path::Path) -> Result<String> {
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+
+        let row = db
+            .connect()?
+            .query("pragma journal_mode", ())
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| Error::Message("no journal mode".into()))?;
+
+        let value = row.get_value(0)?;
+        value
+            .as_text()
+            .cloned()
+            .ok_or(Error::UnexpectedValue(value))
+    }
+
+    /// A `turso://` database that an earlier release created is in WAL mode. The engine must turn
+    /// MVCC on without losing what the database holds.
+    #[tokio::test]
+    async fn a_database_in_wal_mode_moves_to_mvcc_with_its_data() -> Result<()> {
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        {
+            let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+                .build()
+                .await?;
+            ensure_schema(&db, Duration::from_secs(5)).await?;
+
+            let c = db.connect()?;
+            _ = c
+                .execute("insert into cluster (name) values ('kept')", ())
+                .await?;
+        }
+
+        assert_eq!("wal", journal_mode(&path).await?);
+
+        let _storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        assert_eq!("mvcc", journal_mode(&path).await?);
+
+        // the row survived the change of mode, and so did the schema version
+        let db = turso::Builder::new_local(path.to_str().expect("a UTF-8 path"))
+            .build()
+            .await?;
+        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
+        assert_eq!(
+            1,
+            integer(
+                &db.connect()?
+                    .query("select count(*) from cluster where name = 'kept'", ())
+                    .await?
+                    .next()
+                    .await?
+                    .ok_or_else(|| Error::Message("no count".into()))?,
+                0
+            )?
+        );
+
+        Ok(())
+    }
+
+    /// A column that is not a time must make the conversion fail, not panic the request.
+    #[test]
+    fn a_value_that_is_not_a_time_is_an_error() {
+        for value in [Value::Null, Value::Real(1.5), Value::Blob(vec![1, 2, 3])] {
+            assert_matches!(
+                LiteTimestamp::try_from(value),
+                Err(Error::UnexpectedValue(_))
+            );
+        }
+    }
+
+    /// A statement that returns no row, here the insert of a topic into a cluster that no broker
+    /// has registered, must answer an error, not panic the request.
+    #[tokio::test]
+    async fn a_statement_without_a_row_is_an_error() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopic;
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        // no `register_broker`, so the cluster has no row
+        let created = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("events".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await;
+
+        assert!(created.is_err(), "{created:?}");
+
+        Ok(())
+    }
+
+    /// Produces two records with one key to a topic that compacts, runs `maintain`, and returns the
+    /// values that a fetch answers, for a storage built with `query` on its URL.
+    async fn compacted_values(query: &str) -> Result<Vec<Bytes>> {
+        use nisshi_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+        use nisshi_storage::StorageFactory as _;
+
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+
+        let storage = factory::LimboFactory
+            .build(configuration(Url::parse(&format!(
+                "turso:///{}?{query}",
+                path.display()
+            ))?)?)
+            .await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: "nisshi".into(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("compacted".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        [CreatableTopicConfig::default()
+                            .name("cleanup.policy".into())
+                            .value(Some("compact".into()))]
+                        .into(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new("compacted", 0);
+
+        for value in ["older", "newer"] {
+            let batch = inflated::Batch::builder()
+                .record(
+                    Record::builder()
+                        .key(Some(Bytes::from_static(b"key")))
+                        .value(Some(Bytes::from(value))),
+                )
+                .producer_id(-1)
+                .producer_epoch(-1)
+                .build()
+                .and_then(deflated::Batch::try_from)?;
+
+            _ = storage.produce(None, &topition, batch).await?;
+        }
+
+        storage.maintain(SystemTime::now()).await?;
+
+        storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(60),
+            )
+            .await?
+            .into_iter()
+            .map(|batch| {
+                inflated::Batch::try_from(batch).map(|batch| {
+                    batch
+                        .records
+                        .into_iter()
+                        .filter_map(|record| record.value)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .try_fold(Vec::new(), |mut values, batch| {
+                values.extend(batch?);
+                Ok(values)
+            })
+    }
+
+    /// Both compaction modes leave only the latest record of a key.
+    #[tokio::test]
+    async fn compaction_modes_keep_the_latest_record_of_a_key() -> Result<()> {
+        for query in [
+            "compaction=multi",
+            "compaction=single",
+            "busy_timeout=250ms",
+        ] {
+            assert_eq!(
+                vec![Bytes::from_static(b"newer")],
+                compacted_values(query).await?,
+                "{query}"
+            );
+        }
 
         Ok(())
     }

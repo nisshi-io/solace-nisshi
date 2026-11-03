@@ -48,7 +48,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::common::{init_tracing, lite_storage};
+use crate::common::{init_tracing, lite_storage, turso_storage};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -93,10 +93,7 @@ impl Drop for RunningBroker {
 
 /// Serves each accepted connection with the service stack that [`services`]
 /// builds, as the broker does.
-async fn spawn_broker(sasl: bool) -> Result<RunningBroker> {
-    let storage: ArcDynStorage =
-        lite_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
-
+async fn spawn_broker(sasl: bool, storage: ArcDynStorage) -> Result<RunningBroker> {
     let sasl_config = if sasl {
         storage
             .upsert_user_scram_credential(PRINCIPAL, ScramMechanism::Scram256, credential())
@@ -318,12 +315,11 @@ async fn authenticate(stream: &mut TcpStream, correlation_id: &mut i32) -> Resul
     sasl_authenticate(stream, correlation_id).await
 }
 
-#[tokio::test]
-async fn sasl_listener_rejects_oversized_frame_before_authentication() -> Result<()> {
-    let _guard = init_tracing()?;
-
+async fn sasl_listener_rejects_oversized_frame_before_authentication(
+    storage: ArcDynStorage,
+) -> Result<()> {
     timeout(TEST_TIMEOUT, async {
-        let broker = spawn_broker(true).await?;
+        let broker = spawn_broker(true, storage).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
 
         ensure!(!oversized_request_is_answered(&mut stream, 1).await?);
@@ -332,12 +328,11 @@ async fn sasl_listener_rejects_oversized_frame_before_authentication() -> Result
     .await?
 }
 
-#[tokio::test]
-async fn sasl_listener_accepts_oversized_frame_after_authentication() -> Result<()> {
-    let _guard = init_tracing()?;
-
+async fn sasl_listener_accepts_oversized_frame_after_authentication(
+    storage: ArcDynStorage,
+) -> Result<()> {
     timeout(TEST_TIMEOUT, async {
-        let broker = spawn_broker(true).await?;
+        let broker = spawn_broker(true, storage).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
         let mut correlation_id = 0;
 
@@ -349,12 +344,11 @@ async fn sasl_listener_accepts_oversized_frame_after_authentication() -> Result<
     .await?
 }
 
-#[tokio::test]
-async fn sasl_listener_rejects_oversized_frame_during_reauthentication() -> Result<()> {
-    let _guard = init_tracing()?;
-
+async fn sasl_listener_rejects_oversized_frame_during_reauthentication(
+    storage: ArcDynStorage,
+) -> Result<()> {
     timeout(TEST_TIMEOUT, async {
-        let broker = spawn_broker(true).await?;
+        let broker = spawn_broker(true, storage).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
         let mut correlation_id = 0;
 
@@ -367,12 +361,11 @@ async fn sasl_listener_rejects_oversized_frame_during_reauthentication() -> Resu
     .await?
 }
 
-#[tokio::test]
-async fn sasl_listener_accepts_oversized_frame_after_reauthentication() -> Result<()> {
-    let _guard = init_tracing()?;
-
+async fn sasl_listener_accepts_oversized_frame_after_reauthentication(
+    storage: ArcDynStorage,
+) -> Result<()> {
     timeout(TEST_TIMEOUT, async {
-        let broker = spawn_broker(true).await?;
+        let broker = spawn_broker(true, storage).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
         let mut correlation_id = 0;
 
@@ -385,12 +378,9 @@ async fn sasl_listener_accepts_oversized_frame_after_reauthentication() -> Resul
     .await?
 }
 
-#[tokio::test]
-async fn listener_without_sasl_accepts_oversized_frame() -> Result<()> {
-    let _guard = init_tracing()?;
-
+async fn listener_without_sasl_accepts_oversized_frame(storage: ArcDynStorage) -> Result<()> {
     timeout(TEST_TIMEOUT, async {
-        let broker = spawn_broker(false).await?;
+        let broker = spawn_broker(false, storage).await?;
         let mut stream = TcpStream::connect(broker.addr).await?;
 
         ensure!(oversized_request_is_answered(&mut stream, 1).await?);
@@ -398,3 +388,65 @@ async fn listener_without_sasl_accepts_oversized_frame() -> Result<()> {
     })
     .await?
 }
+
+macro_rules! backend {
+    ($name:ident, $feature:literal, $storage:path) => {
+        #[cfg(feature = $feature)]
+        mod $name {
+            use super::*;
+
+            #[tokio::test]
+            async fn sasl_listener_rejects_oversized_frame_before_authentication() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                super::sasl_listener_rejects_oversized_frame_before_authentication(
+                    $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn sasl_listener_accepts_oversized_frame_after_authentication() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                super::sasl_listener_accepts_oversized_frame_after_authentication(
+                    $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn sasl_listener_rejects_oversized_frame_during_reauthentication() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                super::sasl_listener_rejects_oversized_frame_during_reauthentication(
+                    $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn sasl_listener_accepts_oversized_frame_after_reauthentication() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                super::sasl_listener_accepts_oversized_frame_after_reauthentication(
+                    $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn listener_without_sasl_accepts_oversized_frame() -> Result<()> {
+                let _guard = init_tracing()?;
+
+                super::listener_without_sasl_accepts_oversized_frame(
+                    $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?,
+                )
+                .await
+            }
+        }
+    };
+}
+
+backend!(lite, "libsql", lite_storage);
+backend!(turso, "turso", turso_storage);

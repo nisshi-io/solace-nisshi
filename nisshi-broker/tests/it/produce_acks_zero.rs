@@ -739,11 +739,18 @@ mod turso {
         let mut path = env::current_dir()?;
         path.push(&relative);
 
-        match remove_file(path).await {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }?;
+        // A database in MVCC mode has a logical log beside it, and Turso refuses a new database
+        // that finds the log of an old one.
+        for suffix in ["", "-log", "-wal", "-shm"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+
+            match remove_file(file).await {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }?;
+        }
 
         Url::parse(&format!("turso://{relative}")).map_err(Into::into)
     }
