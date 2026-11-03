@@ -42,5 +42,5 @@ having coalesce(max(pe.epoch), -1) < 32767
 )
 
 insert into producer_epoch (producer, epoch)
-select * from curr
+select id, epoch from curr
 returning epoch;

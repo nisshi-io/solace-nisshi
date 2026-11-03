@@ -21,7 +21,7 @@
 
 select
 
-coalesce(w.high, 0), r.timestamp
+coalesce(w.high, 0) as offset_id, r.timestamp
 
 from
 

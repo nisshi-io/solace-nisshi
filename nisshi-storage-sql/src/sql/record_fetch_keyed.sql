@@ -53,7 +53,7 @@ and r.k = $7)
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
-select offset_id, attributes, timestamp, k, v, bytes, producer_id, producer_epoch
+select offset_id, attributes, timestamp, k as key, v as value, bytes, producer_id, producer_epoch
 from sized
 where bytes < $5
 or ordinal = 1;

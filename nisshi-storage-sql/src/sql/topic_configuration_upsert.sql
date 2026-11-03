@@ -30,4 +30,4 @@ do update set
 value = excluded.value,
 last_updated = excluded.last_updated
 
-returning topic_configuration.id;
+returning topic_configuration.id as id;

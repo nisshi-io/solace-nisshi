@@ -20,7 +20,7 @@
 -- As in record_fetch.sql, the topition id comes from a scalar subquery and not from a join: a join
 -- hides from the planner that the rows come out in offset order, and it sorts them, which for the
 -- headers of 10000 records spills to a temp file.
-select h.offset_id, h.k, h.v
+select h.offset_id, h.k as key, h.v as value
 from header h
 where h.topition = (
     select tp.id

@@ -22,15 +22,22 @@
 //! the batch's producer ID, `$4` its producer epoch, `$5` the topic's name, and `$6` the
 //! partition's index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "txn_produce_partition_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("txn_produce_partition_select.sql");
 
-/// The column that holds the producer ID that owns the transactional ID.
-pub(crate) const PRODUCER: &str = "producer";
-
-/// The column that holds 0 when the partition is not in the transaction, 1 when it is, and 2
-/// when it is and the transaction is preparing to commit or abort.
-pub(crate) const ADDED: &str = "added";
+sql_row! {
+    /// The transactional ID's producer, and whether the batch's partition is in its transaction.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The producer ID that owns the transactional ID.
+        producer: Option<i64>,
+        /// 0 when the partition is not in the transaction, 1 when it is, and 2 when it is and the
+        /// transaction is preparing to commit or abort.
+        added: i32,
+    }
+}
 
 /// The `added` value for a partition in a transaction that is ongoing.
 pub(crate) const ADDED_IN_TRANSACTION: i32 = 1;

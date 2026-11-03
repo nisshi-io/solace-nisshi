@@ -255,6 +255,19 @@ pub enum StartupFailure {
     SchemaSetup,
 }
 
+/// The kind of a value that libSQL or Turso returned, by SQLite's storage classes.
+///
+/// A text or blob value keeps only its length, because it can hold record data or SCRAM
+/// credentials, and the broker logs each error that holds this summary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SqliteValueSummary {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text { length: usize },
+    Blob { length: usize },
+}
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -462,11 +475,9 @@ pub enum Error {
         source: Box<Error>,
     },
 
-    #[cfg(feature = "turso")]
-    UnexpectedValue(turso::Value),
-
-    #[cfg(feature = "libsql")]
-    UnexpectedLibSqlValue(libsql::Value),
+    /// libSQL or Turso returned a value of this kind for a column whose declared type can't hold
+    /// it.
+    UnexpectedSqliteValue(SqliteValueSummary),
 
     UnknownCacheKey(String),
 
