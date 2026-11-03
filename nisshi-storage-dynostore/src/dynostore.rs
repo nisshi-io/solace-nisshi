@@ -93,6 +93,8 @@ use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod held;
 mod metadata;
 mod opticon;
 mod produced_batches;
