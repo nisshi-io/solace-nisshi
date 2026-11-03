@@ -230,7 +230,7 @@ impl Consume {
             )
             .await?;
 
-        let topic_id = metadata
+        let topic = metadata
             .topics
             .unwrap_or_default()
             .into_iter()
@@ -239,7 +239,23 @@ impl Consume {
                     .name
                     .as_ref()
                     .is_some_and(|name| self.configuration.topic.as_str() == name)
-            })
+            });
+
+        // Kafka answers a fetch by an unknown topic ID with `UNKNOWN_TOPIC_ID` before it checks
+        // authorization, so a topic the user may not read would be reported as unknown. The
+        // metadata error names the real cause on both brokers.
+        if let Some(error_code) = topic
+            .as_ref()
+            .map(|topic| topic.error_code)
+            .filter(|error_code| *error_code != i16::from(ErrorCode::None))
+        {
+            return Err(Error::Metadata {
+                topic: self.configuration.topic.clone(),
+                error_code,
+            });
+        }
+
+        let topic_id = topic
             .and_then(|topic| topic.topic_id)
             // The encoder leaves out a `None` topic ID, which moves the fields after it, so a
             // topic missing from the metadata is asked for by the null ID instead.
@@ -253,17 +269,17 @@ impl Consume {
             for partition in response.partitions.unwrap_or_default() {
                 debug!(?partition);
 
-                // A fetch offset outside the partition is answered with an error code and no
-                // records, which would otherwise look like a partition with nothing to read.
-                match ErrorCode::try_from(partition.error_code) {
-                    Ok(ErrorCode::None) => {}
-                    Ok(error_code) => return Err(Error::Api(error_code)),
-                    Err(_) => {
-                        return Err(Error::Message(format!(
-                            "unknown error code {}",
-                            partition.error_code
-                        )));
-                    }
+                // A fetch offset outside the partition, or a topic or partition that doesn't
+                // exist, is answered with an error code and no records, which would otherwise
+                // look like a partition with nothing to read. Kafka's consumer retries after a
+                // metadata refresh on `UNKNOWN_TOPIC_OR_PARTITION`, but `cat consume` reads
+                // once, so it reports the error and exits non-zero.
+                if partition.error_code != i16::from(ErrorCode::None) {
+                    return Err(Error::Fetch {
+                        topic: self.configuration.topic.clone(),
+                        partition: partition.partition_index,
+                        error_code: partition.error_code,
+                    });
                 }
 
                 if let Some(frame) = partition.records {
@@ -273,7 +289,7 @@ impl Consume {
                     for batch in frame
                         .batches
                         .into_iter()
-                        .filter_map(|batch| from_offset(batch, self.configuration.fetch_offset))
+                        .filter_map(|batch| readable(batch, self.configuration.fetch_offset))
                     {
                         debug!(?batch);
 
@@ -307,6 +323,8 @@ impl Consume {
             .max_wait_ms(self.configuration.max_wait_time_ms)
             .min_bytes(self.configuration.min_bytes)
             .max_bytes(self.configuration.max_bytes)
+            // `cat consume` asks for `read_committed` but does not use the response's
+            // `aborted_transactions`, so it still prints the records of an aborted transaction.
             .isolation_level(Some(1))
             .session_id(Some(-1))
             .session_epoch(Some(-1))
@@ -342,6 +360,24 @@ impl Consume {
     }
 }
 
+/// The records of `batch` that `cat consume` prints, or `None` when it has none.
+///
+/// A control batch holds a transaction marker, not a record. Kafka's consumer skips it, as
+/// [`CompletedFetch`] does, and so does `cat consume`. The records before `fetch_offset` are
+/// skipped as [`from_offset`] does.
+///
+/// [`CompletedFetch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L232-L238
+fn readable(batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch> {
+    if batch.is_control() {
+        // A fetch that returns only a marker prints nothing and exits 0, like a partition with
+        // nothing to read, so this line is the only trace of it.
+        debug!(base_offset = batch.base_offset, "skipped a control batch");
+        None
+    } else {
+        from_offset(batch, fetch_offset)
+    }
+}
+
 /// The records of `batch` at or after `fetch_offset`, or `None` when it has none.
 ///
 /// Fetch answers with whole batches, so the first batch can start before `fetch_offset`. A Kafka
@@ -360,10 +396,11 @@ fn from_offset(mut batch: inflated::Batch, fetch_offset: i64) -> Option<inflated
 
 #[cfg(test)]
 mod tests {
-    use super::{Configuration, Consume, from_offset};
+    use super::{Configuration, Consume, from_offset, readable};
     use bytes::Bytes;
     use nisshi_sans_io::{
-        ApiKey, Body, FetchRequest, Frame, Header,
+        ApiKey, BatchAttribute, Body, ControlBatch, EndTransactionMarker, FetchRequest, Frame,
+        Header,
         record::{Record, inflated},
     };
     use url::Url;
@@ -470,5 +507,46 @@ mod tests {
     #[test]
     fn batch_before_the_fetch_offset_is_dropped() {
         assert_eq!(None, values(from_offset(batch(10, &["a", "b"]), 12)));
+    }
+
+    /// The batch that the broker's storage writes when it ends a transaction.
+    fn commit_marker(base_offset: i64) -> inflated::Batch {
+        let key: Bytes = ControlBatch::default().commit().try_into().unwrap();
+        let value: Bytes = EndTransactionMarker::default().try_into().unwrap();
+
+        inflated::Batch::builder()
+            .base_offset(base_offset)
+            .record(Record::builder().key(Some(key)).value(Some(value)))
+            .attributes(
+                BatchAttribute::default()
+                    .control(true)
+                    .transaction(true)
+                    .into(),
+            )
+            .producer_id(1)
+            .producer_epoch(0)
+            .base_sequence(-1)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn commit_marker_is_not_readable() {
+        let marker = commit_marker(10);
+
+        assert!(marker.is_control());
+        assert_eq!(None, values(readable(marker, 0)));
+    }
+
+    #[test]
+    fn data_batch_in_a_transaction_is_readable() {
+        let data = batch(10, &["a"])
+            .into_builder()
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .build()
+            .unwrap();
+
+        assert!(!data.is_control());
+        assert_eq!(Some(vec![Bytes::from("a")]), values(readable(data, 0)));
     }
 }
