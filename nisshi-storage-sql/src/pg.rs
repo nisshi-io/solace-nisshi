@@ -7377,6 +7377,147 @@ mod tests {
         Ok(())
     }
 
+    /// The `retention.bytes` sweep reads a partition from its newest record only until the bytes
+    /// pass the limit, so its cost follows what a partition may keep and not how many records it
+    /// holds, and it deletes the older records of every partition that has the limit.
+    #[tokio::test]
+    async fn retention_bytes_sweep_stops_reading_at_the_limit() -> Result<()> {
+        use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
+
+        const PARTITIONS: i32 = 2;
+        const ROWS: i64 = 20_000;
+        const VALUE_BYTES: i64 = 1_000;
+        const KEPT: i64 = 100;
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "retention_bytes_sweep_stops_reading_at_the_limit",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        let configs = [
+            ("cleanup.policy", "delete".to_owned()),
+            ("retention.bytes", (KEPT * VALUE_BYTES).to_string()),
+        ];
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(PARTITIONS)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        configs
+                            .iter()
+                            .map(|(name, value)| {
+                                CreatableTopicConfig::default()
+                                    .name((*name).into())
+                                    .value(Some(value.as_str().into()))
+                            })
+                            .collect(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let mut c = storage.connection().await?;
+        let tx = c.transaction().await?;
+
+        // fill the partitions directly, which is far faster than producing
+        _ = tx
+            .execute(
+                "insert into record (topition, offset_id, v) \
+             select tp.id, g, decode(repeat('00', $2), 'hex') \
+             from topition tp \
+             join topic t on t.id = tp.topic \
+             cross join generate_series(0::bigint, $3) g \
+             where t.name = $1",
+                &[&topic_name, &i32::try_from(VALUE_BYTES)?, &(ROWS - 1)],
+            )
+            .await?;
+        _ = tx
+            .execute(
+                "update watermark set low = 0, high = $2 \
+             where topition in ( \
+                 select tp.id from topition tp join topic t on t.id = tp.topic where t.name = $1)",
+                &[&topic_name, &ROWS],
+            )
+            .await?;
+        tx.batch_execute("analyze record").await?;
+
+        // On a table this small, with no visibility map yet, the planner prefers to scan and sort.
+        // On the large partitions that a limit is for it walks the primary key, which is the case
+        // that this test is about.
+        tx.batch_execute("set local enable_seqscan = off; set local enable_bitmapscan = off")
+            .await?;
+
+        let sql = crate::sql::SQL.get("policy_delete_bytes.sql")?;
+        let plan = tx
+            .query(
+                &format!("explain (analyze, costs off, timing off, buffers off) {sql}"),
+                &[&cluster],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+
+        // the scan that reads each partition from its newest record, as the planner counts it:
+        // rows per loop times loops
+        let read = plan
+            .iter()
+            .find(|line| line.contains("Index Scan Backward"))
+            .and_then(|line| {
+                let rows = line.split("rows=").nth(1)?.split_whitespace().next()?;
+                let loops = line.split("loops=").nth(1)?.split(')').next()?;
+                Some(rows.parse::<f64>().ok()? * loops.parse::<f64>().ok()?)
+            })
+            .unwrap_or_else(|| panic!("no backward scan of the primary key in {plan:#?}"));
+
+        let remaining = tx
+            .query(
+                "select count(*) from record r \
+                 join topition tp on tp.id = r.topition \
+                 join topic t on t.id = tp.topic where t.name = $1 group by tp.id",
+                &[&topic_name],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect::<Vec<_>>();
+
+        _ = tx.rollback().await;
+
+        // each partition keeps its newest KEPT records
+        assert_eq!(vec![KEPT; PARTITIONS as usize], remaining, "{plan:#?}");
+
+        // and the sweep read about KEPT records of each, where it held ROWS
+        assert!(
+            read <= (PARTITIONS as f64) * (KEPT as f64 + 2.0),
+            "read {read} records of {} in {plan:#?}",
+            PARTITIONS as i64 * ROWS
+        );
+
+        Ok(())
+    }
+
     /// DeleteRecords commits the new log start before it removes the records
     /// below it. When that removal fails, `maintain` removes them.
     #[tokio::test]
