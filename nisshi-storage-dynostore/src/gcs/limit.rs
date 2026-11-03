@@ -179,6 +179,15 @@ where
     }
 
     #[instrument(skip_all, fields(prefix))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
+    #[instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
@@ -203,6 +212,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use bytes::Bytes;
+    use futures::TryStreamExt as _;
     use nisshi_storage::Error;
     use object_store::memory::InMemory;
     use tracing::subscriber::DefaultGuard;
@@ -342,6 +352,118 @@ mod tests {
         };
 
         assert!(delay >= EXPECTED_DELAY, "{delay}");
+
+        Ok(())
+    }
+
+    /// An object store whose `list` fails, so that a caller must reach its
+    /// `list_with_offset` to list.
+    #[derive(Debug)]
+    struct OffsetListingOnly(InMemory);
+
+    impl Display for OffsetListingOnly {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OffsetListingOnly").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for OffsetListingOnly {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult, object_store::Error> {
+            self.0.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> Result<GetResult, object_store::Error> {
+            self.0.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path, object_store::Error>>,
+        ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+            self.0.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            Box::pin(futures::stream::once(async {
+                Err(object_store::Error::NotImplemented {
+                    operation: "list".into(),
+                    implementer: "OffsetListingOnly".into(),
+                })
+            }))
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            self.0.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Result<ListResult, object_store::Error> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> Result<(), object_store::Error> {
+            self.0.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// A start-after listing reaches the wrapped store's own start-after
+    /// listing, so that Google Cloud Storage lists from the start-after key
+    /// instead of from the first key under the prefix.
+    #[tokio::test]
+    async fn list_with_offset_reaches_the_wrapped_store() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let prl = PutRateLimiter::new(OffsetListingOnly(InMemory::new()), Duration::from_mins(5))?;
+
+        for id in ["a", "b", "c"] {
+            _ = prl
+                .put_opts(
+                    &Path::from(id),
+                    PutPayload::from(Bytes::from_static(b"12321")),
+                    PutOptions::default(),
+                )
+                .await?;
+        }
+
+        let listed = prl
+            .list_with_offset(None, &Path::from("a"))
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(vec!["b", "c"], listed);
 
         Ok(())
     }

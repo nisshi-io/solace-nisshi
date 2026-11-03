@@ -12,7 +12,7 @@ The tables compare the PostgreSQL, SQLite, in-memory and S3 storage engines. The
 engines share one implementation, so their columns are the same. The tables do not cover Turso,
 which is experimental, or SlateDB, which is deprecated.
 
-The [storage engine table](../README.md#storage-options) in the README gives each engine's status, and
+The [storage engine table](storage.md) gives each engine's status, and
 [What CI tests on each storage engine](../CONTRIBUTING.md#what-ci-tests-on-each-storage-engine)
 gives the checks that CI runs on each engine.
 
@@ -47,10 +47,10 @@ client that reads the ApiVersions response first does not send such a request.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with 4 partitions, if the client allows automatic topic creation. The broker has no setting to turn this off. To set a different number of partitions, create the topic with CreateTopics first. Metadata does not list `__consumer_offsets`, because the broker keeps committed offsets in its storage engine, not in a topic. |
-| CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | |
+| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with `--num-partitions` partitions (default 1), if the client allows automatic topic creation and `--auto-create-topics-enable` is `true` (the default). If the missing topics of one request would need more than 10,000 partitions in total, the broker creates none of them, as Kafka does. Metadata does not list `__consumer_offsets`, because the broker keeps committed offsets in its storage engine, not in a topic. |
+| CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | A topic with `num_partitions` of -1 gets `--num-partitions` partitions (default 1). |
 | DeleteTopics | 20 | 0-6 | Yes | Yes | Yes | Yes | |
-| DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists only the configs set on a topic, not the defaults. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
+| DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists every Kafka 3.9.1 topic config: each config set on the topic, and Kafka's default for each other config, as [Topic configuration](#topic-configuration) describes. The list does not include synonyms. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
 | AlterConfigs | 33 | – | No | No | No | No | Use IncrementalAlterConfigs. |
 | CreatePartitions | 37 | – | No | No | No | No | You cannot add partitions to an existing topic. |
 | IncrementalAlterConfigs | 44 | 0-1 | Partial | Partial | Partial | Partial | Changes topic configs, including APPEND and SUBTRACT on list configs. The broker accepts a change to a broker config, for example with `kafka-configs --alter --entity-type brokers`, and ignores it. |
@@ -64,10 +64,13 @@ Nisshi does not implement them, because the storage engine holds all the state.
 
 ### Consumer groups
 
+[Consumer groups and offsets](consumer-groups.md) explains how groups and committed offsets work,
+with an example and the limits of this build.
+
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | |
-| OffsetFetch | 9 | 0-9 | Partial | Partial | Partial | Partial | Returns empty metadata for a committed offset. |
+| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
+| OffsetFetch | 9 | 0-9 | Yes | Yes | Yes | Yes | |
 | FindCoordinator | 10 | 0-6 | Yes | Yes | Yes | Yes | Answers with the broker that receives the request. |
 | JoinGroup | 11 | 0-9 | Partial | Partial | Partial | Partial | A consumer group cannot change to the `cooperative-sticky` assignor with a rolling restart ([#1051]). |
 | Heartbeat | 12 | 0-4 | Yes | Yes | Yes | Yes | |
@@ -85,13 +88,16 @@ Nisshi does not implement them, because the storage engine holds all the state.
 Nisshi supports the idempotent producer, and does not support transactions. The broker answers
 TRANSACTIONAL_ID_AUTHORIZATION_FAILED to an InitProducerId request with a `transactional.id`, so
 a transactional producer fails at `initTransactions()` with
-TransactionalIdAuthorizationException. The broker still advertises the other transaction APIs,
-but a client cannot start a transaction to use them.
+TransactionalIdAuthorizationException. A Kafka Streams application with `processing.guarantee`
+set to `exactly_once_v2` uses a transactional producer, so it fails the same way. The broker still
+advertises the other transaction APIs, but a client cannot start a transaction to use them.
 
 An idempotent producer can bump its own epoch after an error and restart its sequence at 0
 (KIP-360), and the broker keeps the epoch for each partition, as Kafka does. A batch at an epoch
-older than its partition's gets PRODUCER_FENCED, where Kafka answers INVALID_PRODUCER_EPOCH. The
-broker refuses a bump to epoch 32766 or above with PRODUCER_FENCED, and Kafka accepts it.
+older than its partition's gets INVALID_PRODUCER_EPOCH, as in Kafka. Every engine refuses such a
+batch also when the broker received it before the bump and the newer epoch's batch reached the
+partition first. The broker refuses a bump to epoch 32766 or above with INVALID_PRODUCER_EPOCH,
+and Kafka accepts it. The Java producer then moves to a new producer ID and continues.
 
 The in-memory and S3 engines answer a retry of one of an idempotent producer's last 5 batches to
 a partition as Kafka does: with no error and the offset of the stored batch. They answer any
@@ -140,7 +146,11 @@ LeaderAndIsr, Vote and BrokerRegistration.
 ## Topic configuration
 
 The broker stores every topic config that a client sets, and returns it with DescribeConfigs.
-The broker applies only the configs that this table marks Yes. The broker applies
+For each Kafka topic config that a topic does not set, DescribeConfigs returns Kafka 3.9.1's
+default, such as `retention.ms=604800000`, as `kafka-configs --describe --all` shows.
+The broker applies only the configs that this table marks Yes. A default that DescribeConfigs
+lists for a config marked No is Kafka's value, not what the broker does: an in-memory topic lists
+`retention.ms=604800000`, and keeps every record. The broker applies
 `cleanup.policy`, `retention.ms` and `retention.bytes` in a maintenance run, every 10 minutes by
 default. The `maintenance_interval` option on the storage engine URL changes the interval.
 

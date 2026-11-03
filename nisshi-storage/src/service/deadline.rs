@@ -57,9 +57,12 @@ static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///
 /// An operator reads it from the `stage` attribute of the
 /// `nisshi_storage_read_deadline_exceeded` counter: `reading` points at a
-/// slow storage engine, `queued` at an engine's limit on reads in flight
-/// being used up by slow reads, and `not_started` at a request with more
-/// partitions than could be read before the deadline.
+/// slow storage engine, `queued` at a limit on reads in flight being used
+/// up by slow reads, and `not_started` at a request with more partitions
+/// than could be read before the deadline. A `queued` read also carries a
+/// `limit` attribute: `engine` for its storage engine's limit, which slow
+/// reads on any connection use up, and `connection` for its connection's
+/// read share, which only that connection's own slow reads use up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Missed {
     /// The deadline had passed before the read was polled, so no storage
@@ -69,6 +72,9 @@ pub(crate) enum Missed {
     /// reads in flight, for a pooled connection, or for room on its request
     /// channel.
     Queued,
+    /// The read was waiting in [`queued_for_connection_share`] for its
+    /// connection's read share, see [`read_share`](super::read_share).
+    QueuedForConnectionShare,
     /// The read was in storage.
     Reading,
 }
@@ -77,15 +83,37 @@ impl Missed {
     pub(crate) fn stage(self) -> &'static str {
         match self {
             Self::NotStarted => "not_started",
-            Self::Queued => "queued",
+            Self::Queued | Self::QueuedForConnectionShare => "queued",
             Self::Reading => "reading",
         }
+    }
+
+    /// Returns the limit that a `queued` read waited for, or `None` for a
+    /// read in another stage.
+    pub(crate) fn limit(self) -> Option<&'static str> {
+        match self {
+            Self::Queued => Some("engine"),
+            Self::QueuedForConnectionShare => Some("connection"),
+            Self::NotStarted | Self::Reading => None,
+        }
+    }
+
+    /// Returns the attributes of the `nisshi_storage_read_deadline_exceeded`
+    /// counter for this read of `operation`.
+    pub(crate) fn attributes(self, operation: &'static str) -> Vec<KeyValue> {
+        let mut attributes = vec![
+            KeyValue::new("operation", operation),
+            KeyValue::new("stage", self.stage()),
+        ];
+        attributes.extend(self.limit().map(|limit| KeyValue::new("limit", limit)));
+        attributes
     }
 }
 
 tokio::task_local! {
-    /// Whether the read that the enclosing [`bounded`] bounds is in [`queued`].
-    static QUEUED: Cell<bool>;
+    /// What the read that the enclosing [`bounded`] bounds is waiting for,
+    /// while it is in [`queued`] or [`queued_for_connection_share`].
+    static QUEUED: Cell<Option<Missed>>;
 }
 
 /// Runs `wait`, a storage engine's wait for its own limit on reads in
@@ -105,9 +133,27 @@ pub async fn queued<F>(wait: F) -> F::Output
 where
     F: Future,
 {
-    _ = QUEUED.try_with(|queued| queued.set(true));
+    queued_as(Missed::Queued, wait).await
+}
+
+/// Runs `wait`, a read's wait for its connection's read share, so that a
+/// read abandoned during it is counted under the `queued` stage with the
+/// `connection` limit, see [`Missed`].
+pub(crate) async fn queued_for_connection_share<F>(wait: F) -> F::Output
+where
+    F: Future,
+{
+    queued_as(Missed::QueuedForConnectionShare, wait).await
+}
+
+/// Runs `wait`, so that a read abandoned during it is counted as `missed`.
+async fn queued_as<F>(missed: Missed, wait: F) -> F::Output
+where
+    F: Future,
+{
+    _ = QUEUED.try_with(|queued| queued.set(Some(missed)));
     let output = wait.await;
-    _ = QUEUED.try_with(|queued| queued.set(false));
+    _ = QUEUED.try_with(|queued| queued.set(None));
     output
 }
 
@@ -129,15 +175,14 @@ where
         return Err(Missed::NotStarted);
     }
 
-    let mut read = pin!(QUEUED.scope(Cell::new(false), timeout_at(deadline, read)));
+    let mut read = pin!(QUEUED.scope(Cell::new(None), timeout_at(deadline, read)));
 
     match read.as_mut().await {
         Ok(output) => Ok(output),
-        Err(_elapsed) => Err(if read.take_value().is_some_and(|queued| queued.get()) {
-            Missed::Queued
-        } else {
-            Missed::Reading
-        }),
+        Err(_elapsed) => Err(read
+            .take_value()
+            .and_then(Cell::into_inner)
+            .unwrap_or(Missed::Reading)),
     }
 }
 
@@ -167,13 +212,7 @@ where
     let outcome = bounded(deadline, read).await;
 
     if let Err(missed) = outcome {
-        exceeded.add(
-            1,
-            &[
-                KeyValue::new("operation", operation),
-                KeyValue::new("stage", missed.stage()),
-            ],
-        );
+        exceeded.add(1, &missed.attributes(operation));
     }
 
     outcome
@@ -345,5 +384,74 @@ mod tests {
         assert_eq!(2, exceeded(&exporter, "stalled", "reading"));
         assert_eq!(1, exceeded(&exporter, "stalled", "queued"));
         assert_eq!(1, exceeded(&exporter, "stalled", "not_started"));
+    }
+
+    /// A read abandoned while it waits for its connection's read share and
+    /// one abandoned while it waits for its engine's limit both count under
+    /// the `queued` stage, and the `limit` attribute tells them apart.
+    #[tokio::test(start_paused = true)]
+    async fn counts_queued_reads_by_the_limit_they_waited_for() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let counter = provider
+            .meter("test")
+            .u64_counter("nisshi_storage_read_deadline_exceeded")
+            .build();
+
+        let deadline = || Instant::now() + Duration::from_secs(1);
+
+        assert_eq!(
+            Err(Missed::QueuedForConnectionShare),
+            within_counting(
+                &counter,
+                "stalled",
+                deadline(),
+                queued_for_connection_share(pending::<()>())
+            )
+            .await
+        );
+        assert_eq!(
+            Err(Missed::Queued),
+            within_counting(&counter, "stalled", deadline(), queued(pending::<()>())).await
+        );
+        assert_eq!(
+            Err(Missed::Queued),
+            within_counting(&counter, "stalled", deadline(), queued(pending::<()>())).await
+        );
+
+        provider.force_flush().expect("flush");
+
+        assert_eq!(3, exceeded(&exporter, "stalled", "queued"));
+        assert_eq!(1, exceeded_waiting_for(&exporter, "connection"));
+        assert_eq!(2, exceeded_waiting_for(&exporter, "engine"));
+    }
+
+    /// Sums the `nisshi_storage_read_deadline_exceeded` counter for reads
+    /// abandoned while they waited for `limit`.
+    fn exceeded_waiting_for(exporter: &InMemoryMetricExporter, limit: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("finished metrics")
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "nisshi_storage_read_deadline_exceeded")
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
+                    sum.data_points()
+                        .filter(|point| {
+                            point.attributes().any(|attribute| {
+                                attribute.key.as_str() == "limit"
+                                    && attribute.value.as_str() == limit
+                            })
+                        })
+                        .map(SumDataPoint::value)
+                        .sum::<u64>(),
+                ),
+                _ => None,
+            })
+            .sum()
     }
 }

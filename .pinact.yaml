@@ -1,0 +1,9 @@
+version: 3
+rules:
+  # pinact skips solace-public-workflows, because that repository publishes no
+  # release tags. Its pins carry a dated `# main <date>, untagged` comment
+  # instead, and pinact can verify a pin only against a tag.
+  - ignore: true
+    conditions:
+      - expr: |
+          ActionRepoFullName == "SolaceDev/solace-public-workflows"

@@ -22,8 +22,8 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DeleteTopicsService,
-    MetadataService, Storage,
+    ArcDynStorage, AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer,
+    DeleteTopicsService, MetadataService, Storage, TopicCreationConfig,
 };
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -42,6 +42,8 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
 
     let metadata = MetadataService {
         storage: storage.clone(),
+        topic_creation: TopicCreationConfig::default(),
+        auto_create_refusals: AutoCreateRefusals::default(),
     };
 
     let name = &alphanumeric_string(15)[..];

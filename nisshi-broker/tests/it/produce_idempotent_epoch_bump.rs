@@ -192,7 +192,7 @@ async fn previous_epoch_continues_on_other_partition(storage: impl Storage) -> R
         storage
             .produce(None, &other, batch(producer.id, 0, 4, 2, false)?)
             .await,
-        Err(Error::Api(ErrorCode::ProducerFenced))
+        Err(Error::Api(ErrorCode::InvalidProducerEpoch))
     );
 
     assert_eq!(Some(6), high_watermark(&storage, &other).await?);
@@ -200,8 +200,8 @@ async fn previous_epoch_continues_on_other_partition(storage: impl Storage) -> R
     Ok(())
 }
 
-/// After a bump, the previous epoch is fenced.
-async fn previous_epoch_is_fenced_after_bump(storage: impl Storage) -> Result<()> {
+/// After a bump, a batch at the previous epoch is answered INVALID_PRODUCER_EPOCH.
+async fn previous_epoch_is_invalid_after_bump(storage: impl Storage) -> Result<()> {
     let topition = create_topition(&storage).await?;
     let producer = init_idempotent_producer(&storage).await?;
 
@@ -217,7 +217,7 @@ async fn previous_epoch_is_fenced_after_bump(storage: impl Storage) -> Result<()
         storage
             .produce(None, &topition, batch(producer.id, 0, 2, 2, false)?)
             .await,
-        Err(Error::Api(ErrorCode::ProducerFenced))
+        Err(Error::Api(ErrorCode::InvalidProducerEpoch))
     );
 
     assert_eq!(Some(4), high_watermark(&storage, &topition).await?);
@@ -254,9 +254,9 @@ async fn bump_at_other_sequence_is_out_of_order(storage: impl Storage) -> Result
     Ok(())
 }
 
-/// A bump into an exhausted epoch is fenced, because the broker keeps `i16::MAX` to retire
-/// a producer ID.
-async fn bump_into_exhausted_epoch_is_fenced(storage: impl Storage) -> Result<()> {
+/// A bump into an exhausted epoch is answered INVALID_PRODUCER_EPOCH and is not stored,
+/// because the broker keeps `i16::MAX` to retire a producer ID.
+async fn bump_into_exhausted_epoch_is_invalid(storage: impl Storage) -> Result<()> {
     let topition = create_topition(&storage).await?;
     let producer = init_idempotent_producer(&storage).await?;
 
@@ -279,7 +279,7 @@ async fn bump_into_exhausted_epoch_is_fenced(storage: impl Storage) -> Result<()
                 batch(producer.id, i16::MAX - 1, 0, 2, false)?
             )
             .await,
-        Err(Error::Api(ErrorCode::ProducerFenced))
+        Err(Error::Api(ErrorCode::InvalidProducerEpoch))
     );
 
     assert_eq!(Some(2), high_watermark(&storage, &topition).await?);
@@ -288,8 +288,8 @@ async fn bump_into_exhausted_epoch_is_fenced(storage: impl Storage) -> Result<()
 }
 
 /// A transactional producer's epoch moves only through InitProducerId, so its batch at a
-/// higher epoch is fenced.
-async fn transactional_bump_is_fenced(storage: impl Storage) -> Result<()> {
+/// higher epoch is answered INVALID_PRODUCER_EPOCH.
+async fn transactional_bump_is_invalid(storage: impl Storage) -> Result<()> {
     let topition = create_topition(&storage).await?;
     let transactional_id = Uuid::now_v7().to_string();
 
@@ -306,7 +306,7 @@ async fn transactional_bump_is_fenced(storage: impl Storage) -> Result<()> {
                 batch(producer.id, producer.epoch + 1, 0, 2, true)?
             )
             .await,
-        Err(Error::Api(ErrorCode::ProducerFenced))
+        Err(Error::Api(ErrorCode::InvalidProducerEpoch))
     );
 
     assert_eq!(Some(0), high_watermark(&storage, &topition).await?);
@@ -335,7 +335,7 @@ async fn non_transactional_batch_cannot_bump_transactional_producer(
                 batch(producer.id, producer.epoch + 1, 0, 2, false)?
             )
             .await,
-        Err(Error::Api(ErrorCode::ProducerFenced))
+        Err(Error::Api(ErrorCode::InvalidProducerEpoch))
     );
 
     assert_eq!(Some(0), high_watermark(&storage, &topition).await?);
@@ -392,9 +392,9 @@ macro_rules! engine_tests {
             }
 
             #[tokio::test]
-            async fn previous_epoch_is_fenced_after_bump() -> Result<()> {
+            async fn previous_epoch_is_invalid_after_bump() -> Result<()> {
                 let _guard = init_tracing()?;
-                super::previous_epoch_is_fenced_after_bump(registered_storage().await?).await
+                super::previous_epoch_is_invalid_after_bump(registered_storage().await?).await
             }
 
             #[tokio::test]
@@ -404,15 +404,15 @@ macro_rules! engine_tests {
             }
 
             #[tokio::test]
-            async fn bump_into_exhausted_epoch_is_fenced() -> Result<()> {
+            async fn bump_into_exhausted_epoch_is_invalid() -> Result<()> {
                 let _guard = init_tracing()?;
-                super::bump_into_exhausted_epoch_is_fenced(registered_storage().await?).await
+                super::bump_into_exhausted_epoch_is_invalid(registered_storage().await?).await
             }
 
             #[tokio::test]
-            async fn transactional_bump_is_fenced() -> Result<()> {
+            async fn transactional_bump_is_invalid() -> Result<()> {
                 let _guard = init_tracing()?;
-                super::transactional_bump_is_fenced(registered_storage().await?).await
+                super::transactional_bump_is_invalid(registered_storage().await?).await
             }
 
             #[tokio::test]

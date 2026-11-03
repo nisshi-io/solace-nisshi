@@ -61,9 +61,9 @@ use nisshi_sans_io::{
     sync_group_response::SyncGroupResponse,
 };
 use nisshi_storage::{
-    GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState, InitialDelay,
-    JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition, UpdateError,
-    Version, describe_groups_response, list_groups_response,
+    CommittedOffset, GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState,
+    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition,
+    UpdateError, Version, describe_groups_response, list_groups_response, offset_metadata,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::{
@@ -76,6 +76,10 @@ use uuid::Uuid;
 use crate::{Error, METER, Result};
 
 use super::{Coordinator, OffsetCommit};
+
+mod subscription;
+
+use subscription::{ChangeMap, Subscription};
 
 // Kafka's own `group.max.session.timeout.ms` default. There is no corresponding
 // nisshi config, so we hardcode it. We deliberately do NOT enforce Kafka's
@@ -783,7 +787,7 @@ pub struct Controller<O> {
     wrappers: WrapperMap<O>,
     /// Wakes the requests that this coordinator holds for a group, after each change that it
     /// stores for the group.
-    changes: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
+    changes: ChangeMap,
 }
 
 impl<O> Controller<O>
@@ -803,14 +807,30 @@ where
         Ok(Self::new(storage, GroupCoordinatorConfig::default()))
     }
 
-    fn changes(&self, group_id: &str) -> Result<Arc<Notify>> {
+    /// Returns a hold on the group's notifier, for a request that waits for a change of the group.
+    fn subscribe(&self, group_id: &str) -> Result<Subscription> {
         self.changes
             .lock()
             .map(|mut changes| {
-                changes
+                let notify = changes
                     .entry(group_id.to_owned())
                     .or_insert_with(|| Arc::new(Notify::new()))
-                    .clone()
+                    .clone();
+
+                Subscription::new(&self.changes, group_id, notify)
+            })
+            .map_err(Into::into)
+    }
+
+    /// Wakes the requests that wait on the group. A group without an entry has no waiting request,
+    /// because each request adds the entry before it waits.
+    fn wake_waiters(&self, group_id: &str) -> Result<()> {
+        self.changes
+            .lock()
+            .map(|changes| {
+                if let Some(notify) = changes.get(group_id) {
+                    notify.notify_waiters();
+                }
             })
             .map_err(Into::into)
     }
@@ -848,7 +868,8 @@ where
             .map_err(Into::into)
     }
 
-    /// Returns the group as storage holds it, or an empty group if storage holds none.
+    /// Returns the group as storage holds it, or an empty group if storage holds none. The
+    /// coordinator caches only a group that storage holds, because a client chooses the group id.
     async fn stored_group(&self, group_id: &str) -> Result<(Wrapper<O>, Option<Version>)> {
         let stored = match self.storage.group_with_version(group_id).await? {
             Some((detail, version)) => (
@@ -856,7 +877,7 @@ where
                 Some(version),
             ),
 
-            None => (Wrapper::Forming(Inner::new(self.storage.clone())), None),
+            None => return Ok((Wrapper::Forming(Inner::new(self.storage.clone())), None)),
         };
 
         self.cache(group_id, stored.0.clone(), stored.1.clone())?;
@@ -896,7 +917,7 @@ where
             Ok(version) => {
                 debug!(group_id, ?version, method);
                 self.cache(group_id, wrapper.clone(), Some(version))?;
-                self.changes(group_id)?.notify_waiters();
+                self.wake_waiters(group_id)?;
                 Ok(true)
             }
 
@@ -1023,7 +1044,7 @@ where
 
         let mut member_id = member_id.to_owned();
         let mut held_since = None;
-        let changes = self.changes(group_id)?;
+        let subscription = self.subscribe(group_id)?;
         let mut max_age = Duration::ZERO;
 
         loop {
@@ -1031,7 +1052,7 @@ where
 
             // The request registers for a wake-up before it reads the group, so that it can't
             // miss a change stored between the read and the wait.
-            let changed = changes.notified();
+            let changed = subscription.notified();
             tokio::pin!(changed);
             _ = changed.as_mut().enable();
 
@@ -1183,14 +1204,14 @@ where
             assignments,
         };
 
-        let changes = self.changes(group_id)?;
+        let subscription = self.subscribe(group_id)?;
         let mut max_age = Duration::ZERO;
         let held_since = Instant::now();
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
 
-            let changed = changes.notified();
+            let changed = subscription.notified();
             tokio::pin!(changed);
             _ = changed.as_mut().enable();
 
@@ -1328,6 +1349,49 @@ where
                         offset_commit_response(&offset_commit, ErrorCode::UnknownMemberId)
                     }),
             });
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn txn_offset_commit_fence(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Option<ErrorCode>> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "txn_offset_commit_fence")]);
+
+        let detail = OffsetCommit {
+            group_id,
+            generation_id_or_member_epoch: Some(generation_id),
+            member_id: Some(member_id),
+            group_instance_id,
+            retention_time_ms: None,
+            topics: None,
+            is_transactional: true,
+        };
+
+        loop {
+            // As `offset_commit` does: against the group in storage. The offsets are not stored
+            // here, so a lost write only means the fence is checked again.
+            let (original, version) = self.stored_group(group_id).await?;
+            let now = SystemTime::now();
+
+            let (wrapper, error_code) = original
+                .clone()
+                .settle(group_id, now)
+                .check_offset_commit(now, &detail);
+
+            let is_unchanged = wrapper == original && version.is_some();
+
+            if is_unchanged
+                || self
+                    .store_group(group_id, &wrapper, version, "txn_offset_commit_fence")
+                    .await?
+            {
+                return Ok(error_code);
+            }
         }
     }
 
@@ -1488,14 +1552,6 @@ where
                 for result in &deleted {
                     if result.error_code == i16::from(ErrorCode::None) {
                         _ = wrappers.remove(&result.group_id);
-                    }
-                }
-            })?;
-
-            _ = self.changes.lock().map(|mut changes| {
-                for result in &deleted {
-                    if result.error_code == i16::from(ErrorCode::None) {
-                        _ = changes.remove(&result.group_id);
                     }
                 }
             })?;
@@ -1859,6 +1915,27 @@ where
     O: Storage,
     S: Debug,
 {
+    /// Returns the partitions that an `OffsetFetch` with `require_stable` answers with
+    /// `UNSTABLE_OFFSET_COMMIT`: those for which an open transaction holds an offset of the
+    /// group. Without `require_stable`, storage is not read and no partition is unstable.
+    ///
+    /// The caller reads the unstable partitions before the committed offsets. A transaction
+    /// that ends between the two reads is then answered as unstable, which the client
+    /// retries, and not as the offset from before its end. PostgreSQL, SQLite and Turso
+    /// commit a transaction's offsets and drop its pending ones in one database
+    /// transaction. DynoStore does not yet: its `txn_end` clears the pending offsets before
+    /// it writes the committed ones, so a read in between gets the earlier offset as stable.
+    async fn unstable_offsets(
+        &self,
+        group_id: Option<&str>,
+        require_stable: Option<bool>,
+    ) -> nisshi_storage::Result<BTreeSet<Topition>> {
+        match (group_id, require_stable) {
+            (Some(group_id), Some(true)) => self.storage.pending_txn_offsets(group_id).await,
+            _ => Ok(BTreeSet::new()),
+        }
+    }
+
     async fn fetch_offset(
         &mut self,
         group_id: Option<&str>,
@@ -1887,9 +1964,12 @@ where
                 })
                 .collect();
 
+            let unstable = self.unstable_offsets(group_id, require_stable).await?;
+
             self.storage
                 .offset_fetch(group_id, topics.deref(), require_stable)
                 .await
+                .map(|offsets| fetched_offsets(offsets, &unstable))
                 .map(|offsets| {
                     offsets
                         .iter()
@@ -1904,15 +1984,17 @@ where
                                 .partitions(Some(
                                     offsets
                                         .iter()
-                                        .filter_map(|(topition, offset)| {
+                                        .filter_map(|(topition, (committed, error_code))| {
                                             if topition.topic() == *topic_name {
                                                 Some(
                                                     OffsetFetchResponsePartition::default()
                                                         .partition_index(topition.partition())
-                                                        .committed_offset(*offset)
-                                                        .committed_leader_epoch(Some(-1))
-                                                        .metadata(Some("".into()))
-                                                        .error_code(ErrorCode::None.into()),
+                                                        .committed_offset(committed.offset)
+                                                        .committed_leader_epoch(Some(
+                                                            fetched_leader_epoch(committed),
+                                                        ))
+                                                        .metadata(Some(fetched_metadata(committed)))
+                                                        .error_code((*error_code).into()),
                                                 )
                                             } else {
                                                 None
@@ -1934,7 +2016,7 @@ where
             for group in groups {
                 debug!(?group);
 
-                let response = if let Some(topics) = group.topics.as_ref().map(|topics| {
+                let topics = group.topics.as_ref().map(|topics| {
                     topics
                         .iter()
                         .flat_map(|topic| {
@@ -1952,23 +2034,31 @@ where
                                 .unwrap_or_default()
                         })
                         .collect::<Vec<_>>()
-                }) {
-                    self.storage
-                        .offset_fetch(
-                            Some(group.group_id.as_str()),
-                            topics.deref(),
-                            require_stable,
-                        )
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
-                } else {
-                    self.storage
-                        .committed_offset_topitions(&group.group_id)
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
+                });
+
+                let response = async {
+                    let unstable = self
+                        .unstable_offsets(Some(group.group_id.as_str()), require_stable)
+                        .await?;
+
+                    if let Some(topics) = topics {
+                        self.storage
+                            .offset_fetch(
+                                Some(group.group_id.as_str()),
+                                topics.deref(),
+                                require_stable,
+                            )
+                            .await
+                    } else {
+                        self.storage
+                            .committed_offset_topitions(&group.group_id)
+                            .await
+                    }
+                    .map(|offsets| fetched_offsets(offsets, &unstable))
                 }
+                .await
+                .inspect(|offsets| debug!(?offsets))
+                .inspect_err(|err| error!(?err, ?group))
                 .map(|offsets| {
                     OffsetFetchResponseGroup::default()
                         .group_id(group.group_id.clone())
@@ -1986,21 +2076,27 @@ where
                                         .partitions(Some(
                                             offsets
                                                 .iter()
-                                                .filter_map(|(topition, offset)| {
-                                                    if topition.topic() == *topic_name {
-                                                        Some(
+                                                .filter_map(
+                                                    |(topition, (committed, error_code))| {
+                                                        if topition.topic() == *topic_name {
+                                                            Some(
                                                             OffsetFetchResponsePartitions::default(
                                                             )
                                                             .partition_index(topition.partition())
-                                                            .committed_offset(*offset)
-                                                            .committed_leader_epoch(-1)
-                                                            .metadata(None)
-                                                            .error_code(ErrorCode::None.into()),
+                                                            .committed_offset(committed.offset)
+                                                            .committed_leader_epoch(
+                                                                fetched_leader_epoch(committed),
+                                                            )
+                                                            .metadata(Some(fetched_metadata(
+                                                                committed,
+                                                            )))
+                                                            .error_code((*error_code).into()),
                                                         )
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
+                                                        } else {
+                                                            None
+                                                        }
+                                                    },
+                                                )
                                                 .collect(),
                                         ))
                                 })
@@ -2044,11 +2140,18 @@ where
 
         if let Some(topics) = detail.topics {
             let mut offsets = vec![];
+            let mut too_large = vec![];
 
             for topic in topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let topition = Topition::new(topic.name.clone(), partition.partition_index);
+
+                        if offset_metadata::is_too_large(partition.committed_metadata.as_deref()) {
+                            too_large.push((topition, ErrorCode::OffsetMetadataTooLarge));
+                            continue;
+                        }
+
                         let offset = OffsetCommitRequest::try_from(partition)?;
 
                         offsets.push((topition, offset));
@@ -2059,7 +2162,9 @@ where
             self.storage
                 .offset_commit(detail.group_id, retention_time_ms, offsets.deref())
                 .await
-                .map(|value| {
+                .map(|mut value| {
+                    value.append(&mut too_large);
+
                     let topics = value
                         .iter()
                         .fold(BTreeSet::new(), |mut topics, (topition, _)| {
@@ -2379,7 +2484,8 @@ where
     /// generation or a member, from a simple consumer or an admin client, needs an empty
     /// group. Any other commit must come from a member in the group's current generation. A
     /// member that commits while the group waits for the leader's assignment gets
-    /// `REBALANCE_IN_PROGRESS`.
+    /// `REBALANCE_IN_PROGRESS`, unless the commit is transactional, which Kafka does not hold
+    /// to the group's state.
     ///
     /// [`validateOffsetCommit`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/classic/ClassicGroup.java#L825
     #[instrument(skip(self, now, detail), fields(generation_id = detail.generation_id_or_member_epoch, member_id = detail.member_id))]
@@ -2408,11 +2514,13 @@ where
             return Some(ErrorCode::UnknownMemberId);
         }
 
-        if is_completing_rebalance {
+        if is_completing_rebalance && !detail.is_transactional {
             return Some(ErrorCode::RebalanceInProgress);
         }
 
-        if let Some(member) = self.members.get_mut(member_id) {
+        if !detail.is_transactional
+            && let Some(member) = self.members.get_mut(member_id)
+        {
             member.last_contact = Some(now);
         }
 
@@ -3745,6 +3853,61 @@ fn offset_commit_response(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> B
         .into()
 }
 
+/// Returns the leader epoch that `OffsetFetch` answers for a committed offset: the
+/// committed epoch, or -1 when the commit did not give one, as Kafka does
+/// ([`OffsetMetadataManager.fetchOffsets`]).
+///
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L775-L780
+fn fetched_leader_epoch(committed: &CommittedOffset) -> i32 {
+    committed.leader_epoch.unwrap_or(-1)
+}
+
+/// Returns the metadata that `OffsetFetch` answers for a committed offset: the
+/// committed metadata, or `""` when the commit did not give any.
+///
+/// Kafka never answers a null metadata. It stores a null commit metadata as `""`
+/// ([`OffsetAndMetadata.fromRequest`]), and it answers `""` for a partition without a
+/// committed offset ([`OffsetMetadataManager.fetchOffsets`]).
+///
+/// [`OffsetAndMetadata.fromRequest`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetAndMetadata.java#L159-L171
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L769-L774
+fn fetched_metadata(committed: &CommittedOffset) -> String {
+    committed.metadata.clone().unwrap_or_default()
+}
+
+/// Pairs each committed offset with the error code that `OffsetFetch` answers for its
+/// partition.
+///
+/// Kafka answers a partition in `unstable` with `UNSTABLE_OFFSET_COMMIT`, offset -1, leader
+/// epoch -1 and metadata `""`, in place of its committed offset ([`GroupMetadataManager.getOffsets`],
+/// [`OffsetMetadataManager.fetchOffsets`], [`OffsetMetadataManager.fetchAllOffsets`]). A
+/// request for every committed offset of the group lists only the partitions with a committed
+/// offset, so a partition that only an open transaction has an offset for is not listed.
+///
+/// [`GroupMetadataManager.getOffsets`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupMetadataManager.scala#L526-L531
+/// [`OffsetMetadataManager.fetchOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L762-L768
+/// [`OffsetMetadataManager.fetchAllOffsets`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetMetadataManager.java#L829-L835
+fn fetched_offsets(
+    offsets: BTreeMap<Topition, CommittedOffset>,
+    unstable: &BTreeSet<Topition>,
+) -> BTreeMap<Topition, (CommittedOffset, ErrorCode)> {
+    offsets
+        .into_iter()
+        .map(|(topition, committed)| {
+            let fetched = if unstable.contains(&topition) {
+                (
+                    CommittedOffset::uncommitted(),
+                    ErrorCode::UnstableOffsetCommit,
+                )
+            } else {
+                (committed, ErrorCode::None)
+            };
+
+            (topition, fetched)
+        })
+        .collect()
+}
+
 /// Returns the error code that an `OffsetFetch` reports when storage fails
 /// with `error`.
 ///
@@ -3979,6 +4142,9 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod cache_tests;
 
 #[cfg(test)]
 mod rebalance_tests;

@@ -60,8 +60,9 @@ impl FailedStart {
     /// Returns the error lines the broker printed: each line that starts with `Error: ` or
     /// `error: `, or that tracing logged at level `ERROR`.
     ///
-    /// A test checks these lines rather than the whole log, because the broker prints its storage
-    /// URL at startup. A bad value in the URL is therefore in the log whatever the error says.
+    /// A test checks these lines rather than the whole log, because other lines can name the
+    /// storage URL: the banner, once the broker listens, and its logs. A bad value in the URL can
+    /// therefore be in the log whatever the error says.
     fn error_lines(&self) -> impl Iterator<Item = &str> {
         self.log.lines().filter(|line| {
             line.starts_with("Error: ")

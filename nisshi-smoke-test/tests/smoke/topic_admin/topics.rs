@@ -18,7 +18,7 @@
 use nisshi_smoke_test::{KafkaCli, PartitionReplicas, unique};
 
 /// The partition count of a topic the broker creates for a producer.
-const AUTO_CREATE_PARTITIONS: u32 = 4;
+const AUTO_CREATE_PARTITIONS: u32 = 1;
 
 /// Every record on each partition, as offset and value.
 #[track_caller]
@@ -128,8 +128,8 @@ fn producing_to_deleted_topic_recreates_it_empty() {
 }
 
 /// Like Apache Kafka with its default settings, the broker creates a topic when a producer writes
-/// to one that doesn't exist. It gives the topic [`AUTO_CREATE_PARTITIONS`] partitions, where
-/// Kafka gives it 1.
+/// to one that doesn't exist, and gives it [`AUTO_CREATE_PARTITIONS`] partition, as Kafka's
+/// default `num.partitions` does.
 #[test]
 fn produce_to_missing_topic_creates_it() {
     let cli = KafkaCli::shared();

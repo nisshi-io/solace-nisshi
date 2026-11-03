@@ -14,6 +14,8 @@
 
 mod alter_user_scram_credentials;
 mod consumer_group_describe;
+#[cfg(test)]
+mod counting_storage;
 mod create_acls;
 mod create_topics;
 pub mod deadline;
@@ -36,10 +38,11 @@ mod list_offsets;
 mod list_partition_reassignments;
 mod metadata;
 mod produce;
+pub mod read_share;
 mod txn;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Debug, Display, Formatter},
     sync::LazyLock,
     time::{Duration, SystemTime},
@@ -76,9 +79,9 @@ pub use find_coordinator::FindCoordinatorService;
 pub use incremental_alter_configs::IncrementalAlterConfigsService;
 pub use init_producer_id::InitProducerIdService;
 pub use list_groups::{ListGroupsService, list_groups_response};
-pub use list_offsets::ListOffsetsService;
+pub use list_offsets::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
-pub use metadata::MetadataService;
+pub use metadata::{AutoCreateRefusals, MetadataService};
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
     create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
@@ -110,10 +113,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -156,6 +159,7 @@ pub enum Request {
         topics: Vec<Topition>,
         require_stable: Option<bool>,
     },
+    PendingTxnOffsets(String),
     Metadata(Option<Vec<TopicId>>),
     DescribeConfig {
         name: String,
@@ -253,6 +257,7 @@ impl Display for Request {
             Self::OffsetCommit { .. } => f.write_str("OffsetCommit"),
             Self::OffsetFetch { .. } => f.write_str("OffsetFetch"),
             Self::OffsetStage(_) => f.write_str("OffsetStage"),
+            Self::PendingTxnOffsets(_) => f.write_str("PendingTxnOffsets"),
             Self::Produce { .. } => f.write_str("Produce"),
             Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
             Self::TxnAddOffsets { .. } => f.write_str("TxnAddOffsets"),
@@ -273,7 +278,7 @@ pub enum Response {
     AdvertisedListener(Result<Url>),
     Brokers(Result<Vec<DescribeClusterBroker>>),
     ClusterId(Result<String>),
-    CommittedOffsetTopitions(Result<BTreeMap<Topition, i64>>),
+    CommittedOffsetTopitions(Result<BTreeMap<Topition, CommittedOffset>>),
     CreateTopic(Result<Uuid>),
     DeleteGroups(Result<Vec<DeletableGroupResult>>),
     DeleteRecords(Result<Vec<DeleteRecordsTopicResult>>),
@@ -294,8 +299,9 @@ pub enum Response {
     Metadata(Result<MetadataResponse>),
     Node(Result<i32>),
     OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
-    OffsetFetch(Result<BTreeMap<Topition, i64>>),
+    OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
     OffsetStage(Result<OffsetStage>),
+    PendingTxnOffsets(Result<BTreeSet<Topition>>),
     Ping(Result<()>),
     Produce(Result<i64>),
     RegisterBroker(Result<()>),
@@ -654,7 +660,10 @@ impl Storage for RequestChannelService {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let group_id = group_id.to_string();
 
         serve_and_extract!(
@@ -670,7 +679,7 @@ impl Storage for RequestChannelService {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let group_id = group_id.map(|s| s.to_string());
         let topics = Vec::from(topics);
 
@@ -682,6 +691,17 @@ impl Storage for RequestChannelService {
                 require_stable,
             },
             OffsetFetch
+        )
+    }
+
+    #[instrument(skip_all)]
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let group_id = group_id.to_string();
+
+        serve_and_extract!(
+            self,
+            Request::PendingTxnOffsets(group_id),
+            PendingTxnOffsets
         )
     }
 
@@ -1232,6 +1252,9 @@ where
                 self.storage
                     .offset_fetch(group_id.as_deref(), &topics[..], require_stable)
                     .await,
+            )),
+            Request::PendingTxnOffsets(group_id) => Ok(Response::PendingTxnOffsets(
+                self.storage.pending_txn_offsets(&group_id).await,
             )),
             Request::Metadata(topic_ids) => Ok(Response::Metadata(
                 self.storage.metadata(topic_ids.as_deref()).await,

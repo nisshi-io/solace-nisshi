@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use nisshi_service::{
     BytesFrameLayer, BytesFrameService, DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
-    FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer,
-    TcpContextService,
+    FrameRouteBuilder, FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext,
+    TcpContextLayer, TcpContextService,
 };
-use nisshi_storage::Storage;
+use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::Layer;
 use rsasl::config::SASLConfig;
 use tracing::debug;
@@ -29,26 +29,49 @@ use crate::{Error, Result, coordinator::group::Coordinator};
 pub mod auth;
 pub mod coordinator;
 pub mod storage;
+pub mod txn_offset_commit;
 
 type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<Error>>>>;
+
+/// Returns the broker's routes, before `build` adds `ApiVersions`.
+pub fn routes<C, S>(
+    coordinator: C,
+    storage: S,
+    topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage + Clone,
+    C: Coordinator,
+{
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        topic_creation,
+        auto_create_refusals,
+    )
+    .inspect(|builder| debug!(?builder))
+    .and_then(|builder| {
+        coordinator::services(builder, coordinator.clone()).inspect(|builder| debug!(?builder))
+    })
+    .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator))
+    .and_then(auth::services)
+}
 
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
     storage: S,
+    topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
     sasl_config: Option<Arc<SASLConfig>>,
 ) -> Result<TcpRouteFrame, Error>
 where
     S: Storage + Clone,
     C: Coordinator,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .inspect(|builder| debug!(?builder))
-        .and_then(|builder| {
-            coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
-        })
-        .and_then(auth::services)
+    routes(coordinator, storage, topic_creation, auto_create_refusals)
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
             let pre_authentication_maximum_frame_size = sasl_config

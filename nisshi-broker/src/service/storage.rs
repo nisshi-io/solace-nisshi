@@ -21,16 +21,16 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
+use nisshi_service::{FrameRequestLayer, FrameRouteBuilder, TransactionAbortableDowngradeLayer};
 use nisshi_storage::{
-    AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ConsumerGroupDescribeService,
+    CreateAclsService, CreateTopicsService, CreateTopicsValidationLayer, DeleteAclsService,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService,
+    ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service as _, layer::MapErrLayer};
 
@@ -39,6 +39,8 @@ use crate::Error;
 pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -49,7 +51,6 @@ where
         alter_user_scram_credentials,
         consumer_group_describe,
         create_acls,
-        create_topics,
         delete_acls,
         delete_records,
         delete_topics,
@@ -64,7 +65,6 @@ where
         init_producer_id,
         list_offsets,
         list_partition_reassignments,
-        metadata,
         produce,
         end_txn,
         txn_offset_commit,
@@ -73,6 +73,15 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+    .and_then(|builder| {
+        metadata(
+            builder,
+            storage.clone(),
+            topic_creation,
+            auto_create_refusals,
+        )
+    })
+    .and_then(|builder| create_topics(builder, storage, topic_creation))
 }
 
 pub fn alter_user_scram_credentials<S>(
@@ -198,6 +207,7 @@ where
 pub fn create_topics<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage,
@@ -208,7 +218,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
-                CreateTopicsValidationLayer::new(),
+                CreateTopicsValidationLayer::new().num_partitions(topic_creation.num_partitions),
             )
                 .into_layer(CreateTopicsService { storage })
                 .boxed(),
@@ -432,9 +442,11 @@ where
 pub fn metadata<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage,
+    S: Storage + Clone,
 {
     builder
         .with_route(
@@ -443,7 +455,11 @@ where
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
-                .into_layer(MetadataService { storage })
+                .into_layer(MetadataService {
+                    storage,
+                    topic_creation,
+                    auto_create_refusals,
+                })
                 .boxed(),
         )
         .map_err(Into::into)
@@ -457,7 +473,10 @@ where
     S: Storage,
 {
     builder
-        .with_capped_route::<ProduceRequest, _>(ProduceService { storage })
+        .with_capped_route_layer::<ProduceRequest, _, _>(
+            TransactionAbortableDowngradeLayer,
+            ProduceService { storage },
+        )
         .map_err(Into::into)
 }
 
@@ -493,26 +512,6 @@ where
         .map_err(Into::into)
 }
 
-pub fn txn_offset_commit<S>(
-    builder: FrameRouteBuilder<Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<Error>, Error>
-where
-    S: Storage,
-{
-    builder
-        .with_route(
-            TxnOffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
-            )
-                .into_layer(TxnOffsetCommitService { storage })
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
 pub fn end_txn<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
@@ -528,6 +527,26 @@ where
                 FrameRequestLayer::<EndTxnRequest>::new(),
             )
                 .into_layer(TxnEndService { storage })
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn txn_offset_commit<S>(
+    builder: FrameRouteBuilder<Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<Error>, Error>
+where
+    S: Storage,
+{
+    builder
+        .with_route(
+            TxnOffsetCommitRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
+            )
+                .into_layer(TxnOffsetCommitService { storage })
                 .boxed(),
         )
         .map_err(Into::into)

@@ -14,12 +14,15 @@
 
 //! Tests that `kafka-configs` shows the settings a user set on a topic, stops showing one after it
 //! is removed, and shows the configs set for every broker, so the user can tell which settings are
-//! in force.
+//! in force. With `--all`, it also shows Kafka's default for each config that a topic doesn't set.
 
 use nisshi_smoke_test::KafkaCli;
 
 /// A topic config that isn't the default, so `kafka-configs` shows it as the topic's own.
 const NON_DEFAULT_RETENTION: &str = "retention.ms=123456";
+
+/// Kafka's default `retention.ms`, 7 days, which the broker lists for a topic that doesn't set one.
+const DEFAULT_RETENTION: &str = "retention.ms=604800000";
 
 /// A setting given when the topic was created must show.
 #[test]
@@ -57,7 +60,8 @@ fn add_config_shows_in_describe() {
     );
 }
 
-/// A setting removed from a topic must stop showing, because the topic now uses the default.
+/// A setting removed from a topic must stop showing, because the topic now uses the default, which
+/// `--all` shows.
 #[test]
 fn delete_config_removes_it_from_describe() {
     let cli = KafkaCli::shared();
@@ -78,6 +82,27 @@ fn delete_config_removes_it_from_describe() {
     assert!(
         !after.succeeded().describes_config(NON_DEFAULT_RETENTION),
         "{after}"
+    );
+
+    let all = cli.configs().describe_topic(&topic, true);
+    assert!(all.succeeded().describes_config(DEFAULT_RETENTION), "{all}");
+}
+
+/// A user describes every config of a topic with `--all`. A topic that sets no configs must show
+/// Kafka's defaults, such as a 7-day retention. Without `--all`, the tool shows only the configs
+/// that the topic sets, so the broker must mark each default as one.
+#[test]
+fn all_shows_topic_defaults() {
+    let cli = KafkaCli::shared();
+    let topic = cli.topics().create_unique(1, &[]);
+
+    let all = cli.configs().describe_topic(&topic, true);
+    assert!(all.succeeded().describes_config(DEFAULT_RETENTION), "{all}");
+
+    let own = cli.configs().describe_topic(&topic, false);
+    assert!(
+        !own.succeeded().describes_config(DEFAULT_RETENTION),
+        "{own}"
     );
 }
 

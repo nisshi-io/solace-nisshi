@@ -177,35 +177,17 @@ async fn config_value(
     name: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    let response = DescribeConfigsService { storage }
-        .serve(RequestInput {
-            request: DescribeConfigsRequest::default()
-                .include_documentation(Some(false))
-                .include_synonyms(Some(false))
-                .resources(Some(
-                    [DescribeConfigsResource::default()
-                        .resource_name(name.into())
-                        .resource_type(ConfigResource::Topic.into())
-                        .configuration_keys(Some([key.into()].into()))]
-                    .into(),
-                )),
-            extensions: Extensions::default(),
-        })
+    // `Storage::describe_config` returns only the configs that the topic sets.
+    // `DescribeConfigsService` also lists Kafka's defaults.
+    let result = storage
+        .describe_config(name, ConfigResource::Topic, Some(&[key.into()]))
         .await?;
 
-    Ok(response
-        .results
+    Ok(result
+        .configs
         .unwrap_or_default()
-        .first()
-        .and_then(|result| {
-            result
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .find(|config| config.name == key)
-                .cloned()
-        })
+        .into_iter()
+        .find(|config| config.name == key)
         .and_then(|config| config.value))
 }
 

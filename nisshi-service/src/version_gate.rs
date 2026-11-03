@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service, layer::MapErrLayer};
 use tracing::{instrument, warn};
 
-use crate::{Error, FrameRequestLayer, FrameRouteBuilder};
+use crate::{Error, FrameRequestLayer, FrameRequestService, FrameRouteBuilder};
 
 /// The version range nisshi routes for each API whose handler implements only part of the
 /// Kafka protocol's own range for that API.
@@ -200,12 +200,33 @@ where
         S::Error: From<nisshi_sans_io::Error>,
         E: From<S::Error>,
     {
+        self.with_capped_route_layer::<Q, _, _>((), handler)
+    }
+
+    /// As [`Self::with_capped_route`], with `layer` between the [`VersionGateLayer`] and the
+    /// decoding of the request frame, so that `layer` sees the request's version and the
+    /// encoded response.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::with_capped_route`].
+    pub fn with_capped_route_layer<Q, L, S>(self, layer: L, handler: S) -> Result<Self, Error>
+    where
+        Q: Request + TryFrom<Body>,
+        <Q as TryFrom<Body>>::Error: Into<S::Error>,
+        S: Service<RequestInput<Q>, Output = Q::Response>,
+        S::Error: From<nisshi_sans_io::Error>,
+        E: From<S::Error>,
+        L: Layer<FrameRequestService<S, Q>>,
+        L::Service: Service<FrameInput, Output = Frame, Error = S::Error>,
+    {
         let supported = capped_range(Q::KEY).ok_or(Error::UncappedApi(Q::KEY))?;
         validate_capped_range(Q::KEY, supported.clone())?;
 
         let service = (
             VersionGateLayer::new(Q::KEY, supported.clone()),
             MapErrLayer::new(E::from),
+            layer,
             FrameRequestLayer::<Q>::new(),
         )
             .into_layer(handler)

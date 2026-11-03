@@ -16,7 +16,7 @@
 
 use crate::{Error, Result};
 use std::{str::FromStr, time::Duration};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 pub(crate) const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
 pub(crate) const TRANSACTION_MAINTENANCE_INTERVAL: &str = "transaction_maintenance_interval";
@@ -48,15 +48,17 @@ pub(crate) fn take_intervals(mut storage: Url) -> Result<(Url, Intervals)> {
     let mut intervals = Intervals::default();
     let mut retained = Vec::new();
 
-    for (key, value) in storage.query_pairs() {
-        match key.as_ref() {
-            MAINTENANCE_INTERVAL => {
+    // The other options are kept as written. Serializing them again would form-encode them, and a
+    // space (`%20`) would become `+`, which a Postgres `options` value reads literally.
+    for segment in storage.query().unwrap_or_default().split('&') {
+        match form_urlencoded::parse(segment.as_bytes()).next() {
+            Some((key, value)) if key == MAINTENANCE_INTERVAL => {
                 intervals.maintenance = Some(parse_interval(&key, &value)?);
             }
-            TRANSACTION_MAINTENANCE_INTERVAL => {
+            Some((key, value)) if key == TRANSACTION_MAINTENANCE_INTERVAL => {
                 intervals.transaction_maintenance = Some(parse_interval(&key, &value)?);
             }
-            _ => retained.push((key.into_owned(), value.into_owned())),
+            _ => retained.push(segment),
         }
     }
 
@@ -67,7 +69,7 @@ pub(crate) fn take_intervals(mut storage: Url) -> Result<(Url, Intervals)> {
     if retained.is_empty() {
         storage.set_query(None);
     } else {
-        _ = storage.query_pairs_mut().clear().extend_pairs(retained);
+        storage.set_query(Some(&retained.join("&")));
     }
 
     Ok((storage, intervals))
@@ -169,10 +171,7 @@ mod tests {
             "sqlite://nisshi.db?maintenance_interval=1m&vacuum_into=/tmp/x&transaction_maintenance_interval=5s",
         )?)?;
 
-        assert_eq!(
-            "sqlite://nisshi.db?vacuum_into=%2Ftmp%2Fx",
-            retained.as_str()
-        );
+        assert_eq!("sqlite://nisshi.db?vacuum_into=/tmp/x", retained.as_str());
         assert_eq!(
             Intervals {
                 maintenance: Some(Duration::from_mins(1)),
@@ -193,6 +192,26 @@ mod tests {
             .unwrap_err();
 
         assert!(invalid(error, TRANSACTION_MAINTENANCE_INTERVAL, "0s"));
+
+        Ok(())
+    }
+
+    /// A Postgres `options` value keeps its `%20`, whatever else is removed beside it.
+    #[test]
+    fn take_intervals_keeps_the_other_options_byte_for_byte() -> Result<()> {
+        let (retained, intervals) = take_intervals(Url::parse(
+            "postgres://user:pw@host/db?maintenance_interval=60s&options=-c%20statement_timeout%3D5000&a=b+c&empty=&transaction_maintenance_interval=5s&x=%2F",
+        )?)?;
+
+        assert_eq!(
+            "postgres://user:pw@host/db?options=-c%20statement_timeout%3D5000&a=b+c&empty=&x=%2F",
+            retained.as_str()
+        );
+        assert_eq!(Some(Duration::from_mins(1)), intervals.maintenance);
+        assert_eq!(
+            Some(Duration::from_secs(5)),
+            intervals.transaction_maintenance
+        );
 
         Ok(())
     }

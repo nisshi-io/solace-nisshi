@@ -25,20 +25,29 @@ use tracing_subscriber::EnvFilter;
 
 use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_part};
 
+mod batched_produce;
 mod concurrent_retry;
 mod delete_records;
 mod describe_groups;
+mod epoch_fence;
 mod failing_object_store;
+mod fetch_listing;
+mod held_put_store;
 mod init_producer;
+mod lake_sink_idempotence;
 mod latency;
 mod list_groups;
 mod list_offsets;
+mod list_offsets_storage_error;
 mod metadata_read_error;
+mod offset_commit_unknown_partition;
 mod ping;
 mod post_write_failure_reason;
 mod produce_topic_guard;
+mod produce_write_failure;
 mod producer_detail;
 mod stale_watermark;
+mod transaction_last_stable;
 mod unknown_partition_guard;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
@@ -267,6 +276,7 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         low: Some(6),
         high: Some(66),
         time_index: TimeIndex::complete(),
+        producer_epochs: BTreeMap::new(),
     })?;
     assert!(!written.contains("timestamps"), "{written}");
     let round_trip: Watermark = serde_json::from_str(&written)?;
@@ -276,6 +286,128 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         (Some(6), Some(66), None),
         (legacy.low, legacy.high, legacy.timestamps)
     );
+
+    Ok(())
+}
+
+#[test]
+fn watermark_without_producer_epochs_decodes_to_an_empty_map() -> Result<()> {
+    use super::Watermark;
+
+    let watermark: Watermark = serde_json::from_str(r#"{"low":6,"high":66}"#)?;
+    assert!(watermark.producer_epochs.is_empty());
+
+    let written = serde_json::to_string(&watermark)?;
+    assert!(!written.contains("producer_epochs"), "{written}");
+
+    Ok(())
+}
+
+#[test]
+fn watermark_producer_epochs_round_trip() -> Result<()> {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    watermark.record_producer_epoch(7, 3);
+
+    let round_trip: Watermark = serde_json::from_str(&serde_json::to_string(&watermark)?)?;
+    assert_eq!(BTreeMap::from([(7, 3)]), round_trip.producer_epochs);
+
+    Ok(())
+}
+
+#[test]
+fn watermark_records_only_a_newer_epoch_above_zero() {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+
+    watermark.record_producer_epoch(7, 0);
+    assert!(watermark.producer_epochs.is_empty());
+
+    watermark.record_producer_epoch(7, 3);
+    watermark.record_producer_epoch(7, 2);
+    assert_eq!(BTreeMap::from([(7, 3)]), watermark.producer_epochs);
+}
+
+#[test]
+fn watermark_fences_only_an_older_epoch() {
+    use super::Watermark;
+    use nisshi_storage::OLDER_EPOCH_ERROR;
+    use std::assert_matches;
+
+    let mut watermark = Watermark::default();
+    watermark.record_producer_epoch(7, 3);
+
+    assert_matches!(
+        watermark.fence_producer_epoch(7, 2),
+        Err(Error::Api(error)) if error == OLDER_EPOCH_ERROR
+    );
+    assert_matches!(watermark.fence_producer_epoch(7, 3), Ok(()));
+    assert_matches!(watermark.fence_producer_epoch(7, 4), Ok(()));
+
+    // The partition holds no epoch for producer 8, so it fences none of its batches.
+    assert_matches!(watermark.fence_producer_epoch(8, 0), Ok(()));
+}
+
+#[test]
+fn batch_is_ahead_only_of_the_next_epoch_that_started_after_it() {
+    use super::{ProduceEpoch, ProducerDetail};
+
+    let topition = Topition::new("t", 0);
+    let mut producer = ProducerDetail::default();
+
+    producer.advance(0, ProduceEpoch::Start, &topition, 0, 0, 0);
+    producer.advance(1, ProduceEpoch::Start, &topition, 0, 0, 5);
+
+    assert!(producer.is_ahead_of_next_epoch(0, &topition, 4));
+    assert!(!producer.is_ahead_of_next_epoch(0, &topition, 6));
+
+    // Epoch 2 starting forgets where epoch 1 started, so a batch at epoch 0 can no longer be
+    // shown to be ahead of the epoch 1 batches.
+    producer.advance(2, ProduceEpoch::Start, &topition, 0, 0, 9);
+
+    assert!(!producer.is_ahead_of_next_epoch(0, &topition, 4));
+    assert!(producer.is_ahead_of_next_epoch(1, &topition, 8));
+}
+
+#[test]
+fn producer_that_never_bumps_records_no_epoch_start() -> Result<()> {
+    use super::{ProduceEpoch, ProducerDetail};
+
+    let mut producer = ProducerDetail::default();
+    producer.advance(0, ProduceEpoch::Start, &Topition::new("t", 0), 0, 0, 0);
+
+    let written = serde_json::to_string(&producer)?;
+    assert!(!written.contains("epoch_starts"), "{written}");
+
+    Ok(())
+}
+
+#[test]
+fn watermark_forgets_the_smallest_producer_id_over_the_limit() -> Result<()> {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+
+    let limit = i64::try_from(Watermark::MAX_FENCED_PRODUCERS)?;
+    for producer_id in 1..=limit {
+        watermark.record_producer_epoch(producer_id, 1);
+    }
+    assert_eq!(
+        Watermark::MAX_FENCED_PRODUCERS,
+        watermark.producer_epochs.len()
+    );
+
+    watermark.record_producer_epoch(limit + 1, 1);
+
+    assert_eq!(
+        Watermark::MAX_FENCED_PRODUCERS,
+        watermark.producer_epochs.len()
+    );
+    assert!(!watermark.producer_epochs.contains_key(&1));
+    assert!(watermark.producer_epochs.contains_key(&2));
+    assert!(watermark.producer_epochs.contains_key(&(limit + 1)));
 
     Ok(())
 }

@@ -43,10 +43,10 @@ clap.workspace = true
 crc-fast.workspace = true
 flate2.workspace = true
 lz4.workspace = true
+nisshi-model.workspace = true
 rama.workspace = true
 serde.workspace = true
 snap.workspace = true
-nisshi-model.workspace = true
 thiserror.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
@@ -55,12 +55,12 @@ zstd.workspace = true
 [build-dependencies]
 convert_case.workspace = true
 glob.workspace = true
+nisshi-model.workspace = true
 prettyplease.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
 serde_json.workspace = true
 syn.workspace = true
-nisshi-model.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true

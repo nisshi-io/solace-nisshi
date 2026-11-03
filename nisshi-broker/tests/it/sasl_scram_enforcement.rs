@@ -42,7 +42,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use rsasl::{
@@ -57,12 +57,17 @@ fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )
+    .and_then(auth::services)
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
 }
 
 fn create_topics_frame(correlation_id: i32) -> Result<Bytes> {

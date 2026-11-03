@@ -15,7 +15,7 @@
 
 -- prepare consumer_offset_select_by_group (text, text) as
 
-select t.name, tp.partition, co.committed_offset
+select t.name as topic, tp.partition, co.committed_offset, co.leader_epoch, co.metadata
 
 from cluster c
 join consumer_group cg on cg.cluster = c.id

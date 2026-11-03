@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use nisshi_sans_io::{
-    ErrorCode, IsolationLevel, ListOffset,
+    BatchAttribute, Compression, ErrorCode, IsolationLevel, ListOffset, TimestampType,
     create_topics_request::CreatableTopic,
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     to_system_time, to_timestamp,
@@ -120,6 +120,40 @@ mod deflated_batch {
         }
 
         builder
+            .build()
+            .and_then(Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// Builds a batch whose header claims `max_timestamp`, whatever its
+    /// records hold, as a client wrote it before the broker rewrote the
+    /// header from the records.
+    pub(super) fn with_header(
+        base_offset: i64,
+        timestamp_type: TimestampType,
+        base_timestamp: i64,
+        max_timestamp: i64,
+        timestamp_deltas: &[i64],
+    ) -> Result<Batch> {
+        timestamp_deltas
+            .iter()
+            .zip(0..)
+            .fold(
+                inflated::Batch::builder()
+                    .base_offset(base_offset)
+                    .attributes(BatchAttribute::default().timestamp(timestamp_type).into())
+                    .base_timestamp(base_timestamp)
+                    .max_timestamp(max_timestamp)
+                    .last_offset_delta(i32::try_from(timestamp_deltas.len())? - 1),
+                |builder, (&timestamp_delta, offset_delta)| {
+                    builder.record(
+                        Record::builder()
+                            .value(Some(Bytes::from_static(b"v")))
+                            .timestamp_delta(timestamp_delta)
+                            .offset_delta(offset_delta),
+                    )
+                },
+            )
             .build()
             .and_then(Batch::try_from)
             .map_err(Into::into)
@@ -1044,6 +1078,376 @@ async fn backfill_get_failure_leaves_the_index_incomplete() -> Result<()> {
     assert_eq!(Some(1), offset);
     assert_eq!(Some(T0 + 100), timestamp);
     assert!(time_index_complete(&storage, &topition).await?);
+
+    Ok(())
+}
+
+/// Writes a `CreateTime` batch whose header claims `max_timestamp`, whatever
+/// its records hold.
+async fn write_batch_with_header(
+    storage: &DynoStore,
+    topition: &Topition,
+    base_offset: i64,
+    max_timestamp: i64,
+    timestamps: &[i64],
+) -> Result<()> {
+    let base_timestamp = timestamps[0];
+    let deltas = timestamps
+        .iter()
+        .map(|timestamp| timestamp - base_timestamp)
+        .collect::<Vec<_>>();
+
+    write_batch_object(
+        storage,
+        topition,
+        deflated_batch::with_header(
+            base_offset,
+            TimestampType::CreateTime,
+            base_timestamp,
+            max_timestamp,
+            &deltas,
+        )?,
+    )
+    .await
+}
+
+/// Writes two batches whose headers are below their records, as an older
+/// client wrote them before the broker rewrote the header: offset 0 claims
+/// no timestamp and holds `T0`, and offsets 1 and 2 claim `T0 + 10` and hold
+/// `T0 + 10` and `T0 + 100`.
+async fn write_understated_batches(storage: &DynoStore, topition: &Topition) -> Result<()> {
+    write_batch_with_header(storage, topition, 0, -1, &[T0]).await?;
+    write_batch_with_header(storage, topition, 1, T0 + 10, &[T0 + 10, T0 + 100]).await
+}
+
+async fn time_index_max_timestamp(storage: &DynoStore, topition: &Topition) -> Result<i64> {
+    storage
+        .watermark_for(topition)?
+        .with(&storage.object_store, |w| Ok(w.time_index.max_timestamp()))
+        .await
+}
+
+/// A time index as a broker wrote it before the index took a batch's
+/// maximum from its records.
+fn index_from_headers(
+    entries: &[(i64, i64)],
+    max_timestamp: i64,
+    complete: bool,
+) -> Result<TimeIndex> {
+    serde_json::from_value(serde_json::json!({
+        "entries": entries.iter().copied().collect::<BTreeMap<i64, i64>>(),
+        "max_timestamp": max_timestamp,
+        "complete": complete,
+    }))
+    .map_err(Into::into)
+}
+
+/// Seeds a partition whose offset 0 has a header far above its record, and
+/// whose offset 1 fills an index interval, under an index that a broker
+/// built from those headers, complete or not. A lookup then checks that the
+/// rebuild drops the header's entry and maximum. Kept, the old entry at
+/// offset 0 would stay above every record, and offset 1 would get no entry.
+async fn assert_overstated_index_is_rebuilt(topic: &str, complete: bool) -> Result<()> {
+    let storage = storage()?;
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_batch_with_header(&storage, &topition, 0, T0 + 1_000, &[T0]).await?;
+    write_batch_object(&storage, &topition, interval_batch(1, T0 + 100)?).await?;
+    let from_headers = index_from_headers(&[(T0 + 1_000, 0)], T0 + 1_000, complete)?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(2);
+        w.time_index = from_headers.clone();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    assert!(time_index_complete(&storage, &topition).await?);
+    assert_eq!(
+        BTreeMap::from([(T0, 0), (T0 + 100, 1)]),
+        time_index_entries(&storage, &topition).await?
+    );
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// The backfill takes each stored batch's maximum timestamp from its
+/// records, not from its header, as Kafka's time index does after
+/// `LogValidator` has rewritten the header. An index maximum from these
+/// headers is `T0 + 10`, so a lookup for `T0 + 50` would answer no match,
+/// although offset 2 is at `T0 + 100`.
+#[tokio::test]
+async fn backfill_takes_a_stored_batch_maximum_from_its_records() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "understated-headers";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_understated_batches(&storage, &topition).await?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 - 5).await?;
+    assert_eq!(Some(0), offset);
+    assert_eq!(Some(T0), timestamp);
+
+    assert!(time_index_complete(&storage, &topition).await?);
+    assert_eq!(
+        BTreeMap::from([(T0, 0)]),
+        time_index_entries(&storage, &topition).await?
+    );
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A header far above its records does not raise the index maximum, so a
+/// later batch that raises the maximum of the records still gets an entry,
+/// and a lookup scans from it instead of from offset 0.
+#[tokio::test]
+async fn batch_after_an_overstated_header_gets_an_index_entry() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "overstated-header";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_batch_with_header(&storage, &topition, 0, T0 + 1_000, &[T0]).await?;
+    write_batch_object(&storage, &topition, interval_batch(1, T0 + 100)?).await?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(2);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(1), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    assert_eq!(
+        BTreeMap::from([(T0, 0), (T0 + 100, 1)]),
+        time_index_entries(&storage, &topition).await?
+    );
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A broker that backfilled the index from the batch headers marked it
+/// complete. The next lookup rebuilds it once from the records, so that a
+/// target between a header and its record answers the record.
+#[tokio::test]
+async fn complete_index_built_from_understated_headers_is_rebuilt_from_records() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "understated-complete";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_understated_batches(&storage, &topition).await?;
+    let from_headers = index_from_headers(&[(T0 + 10, 1)], T0 + 10, true)?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = from_headers.clone();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+
+    assert!(time_index_complete(&storage, &topition).await?);
+    assert_eq!(
+        BTreeMap::from([(T0, 0)]),
+        time_index_entries(&storage, &topition).await?
+    );
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_index_built_from_an_overstated_header_is_rebuilt_from_records() -> Result<()> {
+    let _guard = init_tracing()?;
+    assert_overstated_index_is_rebuilt("overstated-complete", true).await
+}
+
+/// A broker's backfill from the headers can also leave the index
+/// incomplete, for a batch in flight during its listing. The rebuild drops
+/// that index's entries and maximum too, because the merge would keep an
+/// entry above every record.
+#[tokio::test]
+async fn incomplete_index_built_from_an_overstated_header_is_rebuilt_from_records() -> Result<()> {
+    let _guard = init_tracing()?;
+    assert_overstated_index_is_rebuilt("overstated-incomplete", false).await
+}
+
+/// The backfill takes the header of a batch whose records do not decode, so
+/// that the index completes and a lookup below that batch still answers. A
+/// lookup whose scan reaches the batch answers an error, because the batch
+/// can hold the match.
+#[tokio::test]
+async fn backfill_takes_the_header_of_a_batch_that_does_not_decode() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "undecodable";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_batch_with_header(&storage, &topition, 0, T0, &[T0]).await?;
+
+    // The attributes claim gzip, but the records are not compressed, so the
+    // batch passes its CRC check and fails to inflate.
+    let mut undecodable =
+        deflated_batch::with_header(1, TimestampType::CreateTime, T0 + 100, T0 + 100, &[0])?;
+    undecodable.attributes = BatchAttribute::default()
+        .compression(Compression::Gzip)
+        .into();
+    undecodable.crc = undecodable.computed_crc();
+    write_batch_object(&storage, &topition, undecodable).await?;
+
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(2);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0).await?;
+    assert_eq!(Some(0), offset);
+    assert_eq!(Some(T0), timestamp);
+
+    assert!(time_index_complete(&storage, &topition).await?);
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    assert_eq!(
+        ErrorCode::KafkaStorageError,
+        list_offsets_timestamp_error(&storage, &topition, T0 + 50).await?
+    );
+
+    Ok(())
+}
+
+/// A stored record whose `base_timestamp + timestamp_delta` overflows has
+/// the wrapped timestamp, as Java's `long` addition gives a consumer. Here
+/// it wraps below the target, so the scan passes it, and the backfill does
+/// not take it as the batch's maximum. The broker rejects such a record at
+/// produce, so only a batch stored before that check holds one.
+#[tokio::test]
+async fn record_timestamp_that_wraps_is_read_as_a_consumer_reads_it() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "overflow";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_batch_object(
+        &storage,
+        &topition,
+        deflated_batch::with_header(
+            0,
+            TimestampType::CreateTime,
+            T0,
+            T0 + 100,
+            &[i64::MAX, 0, 100],
+        )?,
+    )
+    .await?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(3);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, T0 + 50).await?;
+    assert_eq!(Some(2), offset);
+    assert_eq!(Some(T0 + 100), timestamp);
+    assert_eq!(
+        T0 + 100,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A consumer reads a `LogAppendTime` batch's `max_timestamp` for each of
+/// its records, whatever their deltas, so every lookup at or below it
+/// answers the batch's first record at that timestamp, and the backfill
+/// takes it as the batch's maximum.
+#[tokio::test]
+async fn log_append_time_batch_answers_every_record_at_its_max_timestamp() -> Result<()> {
+    let _guard = init_tracing()?;
+    let storage = storage()?;
+    let topic = "log-append-time";
+    let topition = Topition::new(topic, 0);
+
+    create_topic(&storage, topic, 1).await?;
+    write_batch_object(
+        &storage,
+        &topition,
+        deflated_batch::with_header(0, TimestampType::LogAppendTime, T0, T0 + 500, &[0, 50])?,
+    )
+    .await?;
+    seed_watermark(&storage, &topition, |w| {
+        w.low = Some(0);
+        w.high = Some(2);
+        w.time_index = TimeIndex::default();
+        Ok(())
+    })
+    .await?;
+
+    for target in [T0, T0 + 50, T0 + 500] {
+        let (offset, timestamp) = list_offsets_timestamp(&storage, &topition, target).await?;
+        assert_eq!(Some(0), offset, "target {target}");
+        assert_eq!(Some(T0 + 500), timestamp, "target {target}");
+    }
+
+    assert_eq!(
+        (None, None),
+        list_offsets_timestamp(&storage, &topition, T0 + 501).await?
+    );
+    assert_eq!(
+        T0 + 500,
+        time_index_max_timestamp(&storage, &topition).await?
+    );
 
     Ok(())
 }

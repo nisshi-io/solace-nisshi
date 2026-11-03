@@ -24,13 +24,15 @@
 use std::process;
 
 use crate::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use nisshi_sans_io::ErrorCode;
 use tracing::debug;
 
 mod broker;
 mod cat;
 mod generator;
+mod missing_feature;
+mod output;
 mod perf;
 mod proxy;
 mod topic;
@@ -103,33 +105,45 @@ pub struct Cli {
     broker: broker::Arg,
 }
 
+/// The `--help` note of each tool that connects to a broker as a Kafka client.
+const CLIENT_TOOL_NOTE: &str = "For development and demos. Connects in plaintext only, so it can't reach a broker listener that requires TLS or SASL.";
+
+/// The `--help` note of `nisshi proxy`.
+const PROXY_NOTE: &str = "For development and demos, not production.";
+
 #[derive(Clone, Debug, Subcommand)]
 enum Command {
     /// Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
     Broker(Box<broker::Arg>),
 
-    /// Easily consume or produce Avro, JSON or Protobuf messages to a topic
+    /// Consume or produce Avro, JSON or Protobuf messages to a topic (development and demos)
+    #[command(after_help = CLIENT_TOOL_NOTE)]
     Cat {
         #[command(subcommand)]
         command: cat::Command,
     },
 
-    /// Traffic Generator for schema backed topics
+    /// Generate fake messages for schema-backed topics (development and demos)
+    #[command(after_help = CLIENT_TOOL_NOTE)]
     Generator(Box<generator::Arg>),
 
-    /// Performance
+    /// Measure produce and consume throughput against a broker (development and demos)
+    #[command(after_help = CLIENT_TOOL_NOTE)]
     Perf(Box<perf::Arg>),
 
-    /// Apache Kafka®-compatible proxy
+    /// Apache Kafka®-compatible proxy (development and demos)
+    #[command(after_help = PROXY_NOTE)]
     Proxy(Box<proxy::Arg>),
 
-    /// Create, list or delete topics managed by the broker
+    /// Create, list or delete topics managed by the broker (development and demos)
+    #[command(after_help = CLIENT_TOOL_NOTE)]
     Topic {
         #[command(subcommand)]
         command: topic::Command,
     },
 
-    /// Create, list or delete users managed by the broker
+    /// Create, list or delete users managed by the broker (development and demos)
+    #[command(after_help = CLIENT_TOOL_NOTE)]
     User {
         #[command(subcommand)]
         command: user::Command,
@@ -167,7 +181,14 @@ impl Cli {
             lakes = ?lakes()
         );
 
-        let cli = Cli::parse();
+        let cli = Cli::try_parse().unwrap_or_else(|error| {
+            missing_feature::explain(
+                error,
+                &missing_feature::built_features(),
+                &mut Cli::command(),
+            )
+            .exit()
+        });
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
             Command::Broker(arg) => arg.main().await.map(Outcome::from),
@@ -187,5 +208,34 @@ impl Cli {
             Command::Topic { command } => command.main().await.map(Outcome::from),
             Command::User { command } => command.main().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn long_help(tool: &str) -> String {
+        Cli::command()
+            .find_subcommand_mut(tool)
+            .expect(tool)
+            .render_long_help()
+            .to_string()
+    }
+
+    #[test]
+    fn each_tool_help_states_its_role() {
+        for tool in ["cat", "generator", "perf", "topic", "user"] {
+            let help = long_help(tool);
+            assert!(help.contains(CLIENT_TOOL_NOTE), "{tool}: {help}");
+        }
+
+        let proxy = long_help("proxy");
+        assert!(proxy.contains(PROXY_NOTE), "{proxy}");
+
+        let broker = long_help("broker");
+        assert!(!broker.contains(CLIENT_TOOL_NOTE), "{broker}");
+        assert!(!broker.contains(PROXY_NOTE), "{broker}");
     }
 }

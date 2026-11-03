@@ -20,6 +20,9 @@ cargo-flamegraph.trace
 /dist
 debug
 dhat.*
+# `just kafka-ref`: a clone of Apache Kafka, or a symlink to one, and its partial clone
+/kafka-ref
+/kafka-ref.tmp
 flamegraph*.svg
 license.html
 perf.data*

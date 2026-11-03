@@ -188,7 +188,7 @@ updates:
       prefix: "build"
       include: "scope"
     ignore:
-      # The compose default stays on the major that README.md documents and the
+      # The compose default stays on the major that docs/storage.md documents and the
       # nightly matrix tests. Dependabot refreshes its digest; a person moves
       # the major.
       - dependency-name: "postgres"

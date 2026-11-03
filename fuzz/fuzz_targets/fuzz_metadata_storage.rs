@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock};
 use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
 use nisshi_sans_io::MetadataRequest;
-use nisshi_storage::{MetadataService, StorageContainer};
+use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use tokio::runtime::Runtime;
@@ -59,7 +59,11 @@ fuzz_target!(|request: MetadataRequest| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = MetadataService { storage };
+        let service = MetadataService {
+            storage,
+            topic_creation: TopicCreationConfig::default(),
+            auto_create_refusals: AutoCreateRefusals::default(),
+        };
 
         service
             .serve(request)

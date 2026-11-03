@@ -207,33 +207,40 @@ mod inflate;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
+pub mod offset_metadata;
 mod producer;
 mod proxy;
 mod service;
+mod topic_creation;
+mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
-pub use producer::{ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim};
+pub use producer::{
+    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+};
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
+pub use service::read_share;
+pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
     DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
-    MetadataService, ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver,
-    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, bounded_channel, describe_groups_response, inflate_produced,
-    list_groups_response,
+    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -434,6 +441,20 @@ pub enum Error {
     UnexpectedLibSqlValue(libsql::Value),
 
     UnknownCacheKey(String),
+
+    /// A storage URL gave an option that the engine reads, with a value that the
+    /// engine cannot parse.
+    InvalidStorageOptionValue {
+        scheme: String,
+        option: String,
+        value: String,
+
+        /// The values that the option takes, for example `"single or multi"`.
+        /// The engine that defines the option writes this hint, so a message
+        /// can tell the user what to give without knowing every engine's
+        /// options.
+        expected: &'static str,
+    },
 
     /// A storage URL named a query option that scheme's engine does not
     /// recognise (for example a typo, or an option that belongs to a
@@ -837,6 +858,43 @@ impl TryFrom<&OffsetCommitRequestPartition> for OffsetCommitRequest {
                 timestamp,
                 metadata: value.committed_metadata.clone(),
             })
+    }
+}
+
+/// Committed Offset
+///
+/// The offset that a consumer group committed for a partition, with the leader
+/// epoch and the metadata of that commit.
+///
+/// The type does not implement `Default`, because an offset of 0 tells a consumer to
+/// read the partition from its start. [`CommittedOffset::uncommitted`] is the value for
+/// a partition without a committed offset.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CommittedOffset {
+    pub offset: i64,
+    pub leader_epoch: Option<i32>,
+    pub metadata: Option<String>,
+}
+
+impl CommittedOffset {
+    /// Returns the committed offset of a partition that the group has not
+    /// committed: offset -1, with no leader epoch and no metadata.
+    pub fn uncommitted() -> Self {
+        Self {
+            offset: -1,
+            leader_epoch: None,
+            metadata: None,
+        }
+    }
+}
+
+impl From<OffsetCommitRequest> for CommittedOffset {
+    fn from(value: OffsetCommitRequest) -> Self {
+        Self {
+            offset: value.offset,
+            leader_epoch: value.leader_epoch,
+            metadata: value.metadata,
+        }
     }
 }
 
@@ -1444,6 +1502,26 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .authorized_operations(Some(authorized_operations::OMITTED))
             }
 
+            // `DescribeGroups` v0 to v5 describes a group that does not exist with the error
+            // NONE and the state `Dead`. Kafka adds `GROUP_ID_NOT_FOUND` to `DescribeGroups` from
+            // v6 ([KIP-1043]), and Nisshi supports v5 at most. An admin client reads the group
+            // as missing from `Dead`, but fails on `GROUP_ID_NOT_FOUND` as an unexpected error
+            // ([`GroupCoordinator.handleDescribeGroup`]).
+            //
+            // [KIP-1043]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-1043%3A+Administration+of+groups
+            // [`GroupCoordinator.handleDescribeGroup`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+            NamedGroupDetail {
+                name,
+                response: GroupDetailResponse::ErrorCode(ErrorCode::GroupIdNotFound),
+            } => Self::default()
+                .error_code(ErrorCode::None.into())
+                .group_id(name.clone())
+                .group_state(ConsumerGroupState::Dead.to_string())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some(vec![]))
+                .authorized_operations(Some(authorized_operations::OMITTED)),
+
             NamedGroupDetail {
                 name,
                 response: GroupDetailResponse::ErrorCode(error_code),
@@ -1859,15 +1937,35 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<Vec<(Topition, ErrorCode)>>;
 
     /// Fetch committed offsets for one or more topic partitions in a consumer group.
+    ///
+    /// The group coordinator answers `require_stable` with
+    /// [`Storage::pending_txn_offsets`], so an engine may ignore it here.
     async fn offset_fetch(
         &self,
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>>;
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Fetch all committed offsets in a consumer group.
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>>;
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
+
+    /// Returns the partitions for which an open transaction has committed an offset of the
+    /// consumer group with `TxnOffsetCommit`, and has not yet ended.
+    ///
+    /// The current epoch of each transactional producer counts, and an earlier epoch only
+    /// while its end is prepared and waits behind an older open transaction: an
+    /// `InitProducerId` that moves the producer to a new epoch ends its earlier open
+    /// transaction in Kafka. An `OffsetFetch` with `require_stable` answers
+    /// `UNSTABLE_OFFSET_COMMIT` for each of these partitions.
+    ///
+    /// A transaction that only commits offsets, with no `AddPartitionsToTxn`, is not timed
+    /// out: its partitions stay unstable until its `EndTxn`, or until an `InitProducerId`
+    /// moves its producer to a new epoch.
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -1895,6 +1993,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
     /// implementation needs to answer only the other resource types.
+    ///
+    /// For a topic, an implementation returns only the configs that the topic sets, and answers
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store.
+    /// [`DescribeConfigsService`] adds Kafka's default for each other topic config when the error
+    /// code is [`ErrorCode::None`]. The broker also calls this method, and reads a config that the
+    /// topic doesn't set as Nisshi's own default.
     async fn describe_config(
         &self,
         name: &str,
@@ -2111,14 +2215,21 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2385,14 +2496,21 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        self.as_ref().pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -2669,6 +2787,42 @@ pub fn reject_unrecognized_options(storage: &Url, recognized: &[&str]) -> Result
                 option: k.into_owned(),
             })
         })
+}
+
+/// Returns the value of the query option `option` in `storage`, parsed with `parse`, or
+/// `None` when the URL doesn't give the option.
+///
+/// Every occurrence of the option must parse, and the last one is used, as the broker
+/// does for its own options. A [`StorageFactory::build`] calls this for each option that
+/// its engine reads, so a value that doesn't parse stops startup instead of being
+/// replaced by the default.
+///
+/// # Errors
+///
+/// [`Error::InvalidStorageOptionValue`], with `expected` as its hint, for the first
+/// occurrence whose value `parse` rejects.
+pub fn parse_storage_option<T>(
+    storage: &Url,
+    option: &str,
+    expected: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>> {
+    let mut parsed = None;
+
+    for (key, value) in storage.query_pairs() {
+        if key == option {
+            parsed = Some(
+                parse(&value).ok_or_else(|| Error::InvalidStorageOptionValue {
+                    scheme: storage.scheme().to_owned(),
+                    option: option.to_owned(),
+                    value: value.into_owned(),
+                    expected,
+                })?,
+            );
+        }
+    }
+
+    Ok(parsed)
 }
 
 impl<N, C, A, S> Builder<N, C, A, S> {
@@ -3439,5 +3593,64 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn parse_mode(storage: &str) -> Result<Option<String>> {
+        parse_storage_option(&Url::parse(storage)?, "mode", "fast or slow", |value| {
+            ["fast", "slow"].contains(&value).then(|| value.to_owned())
+        })
+    }
+
+    #[test]
+    fn parse_storage_option_without_the_option_returns_none() -> Result<()> {
+        assert_eq!(None, parse_mode("sqlite://nisshi.db")?);
+        assert_eq!(None, parse_mode("sqlite://nisshi.db?other=fast")?);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_returns_the_parsed_value() -> Result<()> {
+        assert_eq!(
+            Some("fast".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_uses_the_last_occurrence() -> Result<()> {
+        assert_eq!(
+            Some("slow".to_owned()),
+            parse_mode("sqlite://nisshi.db?mode=fast&mode=slow")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_storage_option_names_the_scheme_option_value_and_hint() {
+        assert_matches!(
+            parse_mode("sqlite://nisshi.db?mode=Fast"),
+            Err(Error::InvalidStorageOptionValue { scheme, option, value, expected })
+                if scheme == "sqlite"
+                    && option == "mode"
+                    && value == "Fast"
+                    && expected == "fast or slow"
+        );
+    }
+
+    /// A value that doesn't parse is an error wherever it is, even when another
+    /// occurrence of the option parses.
+    #[test]
+    fn parse_storage_option_rejects_any_occurrence_that_does_not_parse() {
+        for storage in [
+            "sqlite://nisshi.db?mode=Fast&mode=slow",
+            "sqlite://nisshi.db?mode=slow&mode=Fast",
+        ] {
+            assert_matches!(
+                parse_mode(storage),
+                Err(Error::InvalidStorageOptionValue { value, .. }) if value == "Fast",
+                "{storage}"
+            );
+        }
     }
 }

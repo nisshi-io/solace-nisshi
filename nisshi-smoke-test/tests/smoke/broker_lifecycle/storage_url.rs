@@ -109,6 +109,17 @@ mod sqlite {
         );
     }
 
+    /// A `mode` that the engine doesn't take must stop the broker with a message that names it,
+    /// instead of the broker running in the default mode. The match is case-sensitive.
+    #[test]
+    fn unparsable_mode_stops_the_broker() {
+        let option = "mode=Direct";
+
+        let storage = StorageUrl::as_given(format!("sqlite://nisshi.db?{option}"));
+
+        Broker::launch_expecting_refusal(LaunchOptions::new(storage)).assert_error_names(option);
+    }
+
     /// A database path the broker can't write must stop it at startup with a message that names the
     /// path, so the user sees what to fix.
     #[test]

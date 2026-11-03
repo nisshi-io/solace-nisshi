@@ -52,6 +52,39 @@ fn topic_create_and_cat_produce_confirm_success() {
 }
 
 #[test]
+fn topic_list_prints_a_table_or_json() {
+    let broker = Broker::start();
+
+    assert_eq!("No topics.\n", stdout(&broker.run(&["topic", "list"], "")));
+    assert_eq!(
+        "[]\n",
+        stdout(&broker.run(&["topic", "list", "--output", "json"], ""))
+    );
+
+    _ = stdout(&broker.run(&["topic", "create", "taxi"], ""));
+    _ = stdout(&broker.run(&["topic", "create", "hello", "--partitions", "1"], ""));
+
+    assert_eq!(
+        "TOPIC  PARTITIONS\nhello  1\ntaxi   3\n",
+        stdout(&broker.run(&["topic", "list"], ""))
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(
+        &broker.run(&["topic", "list", "--output", "json"], ""),
+    ))
+    .expect("topic list --output json prints JSON");
+
+    let taxi = json
+        .as_array()
+        .expect("an array of topics")
+        .iter()
+        .find(|topic| topic["name"] == "taxi")
+        .expect("taxi is listed");
+
+    assert_eq!(3, taxi["partitions"].as_array().expect("partitions").len());
+}
+
+#[test]
 fn silent_prints_nothing_on_success() {
     let broker = Broker::start();
 

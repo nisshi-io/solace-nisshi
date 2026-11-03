@@ -30,7 +30,7 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::Storage;
+use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
@@ -65,18 +65,23 @@ fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .inspect(|builder| debug!(?builder))
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (
-                RequestFrameLayer,
-                FrameBytesLayer,
-                BytesLayer,
-                BytesFrameLayer::default(),
-            )
-                .into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )
+    .inspect(|builder| debug!(?builder))
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (
+            RequestFrameLayer,
+            FrameBytesLayer,
+            BytesLayer,
+            BytesFrameLayer::default(),
+        )
+            .into_layer(frame_route)
+    })
 }
 
 pub async fn compact_only<G>(sc: G) -> Result<()>

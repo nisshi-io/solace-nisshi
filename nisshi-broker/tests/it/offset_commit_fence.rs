@@ -149,6 +149,7 @@ where
             group_instance_id: None,
             retention_time_ms: None,
             topics: Some(&topics),
+            is_transactional: false,
         })
         .await?;
 
@@ -178,7 +179,9 @@ where
         .await?;
 
     assert!(
-        stored.get(&topition).is_none_or(|offset| *offset == -1),
+        stored
+            .get(&topition)
+            .is_none_or(|committed| committed.offset == -1),
         "a fenced commit stored offset {:?}",
         stored.get(&topition)
     );

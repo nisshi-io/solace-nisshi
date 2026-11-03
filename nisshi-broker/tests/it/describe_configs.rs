@@ -15,8 +15,8 @@
 use crate::common::{self, alphanumeric_string, register_broker};
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ConfigResource, ConfigSource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
-    IncrementalAlterConfigsRequest, OpType, RequestInput,
+    ConfigResource, ConfigSource, ConfigType, DescribeConfigsRequest, DescribeConfigsResponse,
+    ErrorCode, IncrementalAlterConfigsRequest, OpType, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     describe_configs_request::DescribeConfigsResource,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
@@ -27,6 +27,19 @@ use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
 use uuid::Uuid;
+
+/// Returns `response` with only the configs that each topic sets. The defaults that the response
+/// also lists are checked in `describe_configs_topic_defaults`.
+fn dynamic_topic_configs(mut response: DescribeConfigsResponse) -> DescribeConfigsResponse {
+    for result in response.results.iter_mut().flatten() {
+        if let Some(configs) = result.configs.as_mut() {
+            configs.retain(|config| {
+                config.config_source == Some(ConfigSource::DynamicTopicConfig.into())
+            });
+        }
+    }
+    response
+}
 
 pub async fn single_topic<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
 where
@@ -84,7 +97,7 @@ where
     .await?;
 
     assert_eq!(
-        results,
+        dynamic_topic_configs(results),
         DescribeConfigsResponse::default().results(Some(vec![
             DescribeConfigsResult::default()
                 .error_code(ErrorCode::None.into())
@@ -100,7 +113,7 @@ where
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
+                        .config_type(Some(ConfigType::List.into()))
                         .documentation(Some("".into()))]
                     .into()
                 ))
@@ -168,7 +181,7 @@ where
     let none = ErrorCode::None;
 
     assert_eq!(
-        results,
+        dynamic_topic_configs(results),
         DescribeConfigsResponse::default().results(Some(vec![
             DescribeConfigsResult::default()
                 .error_code(none.into())
@@ -218,7 +231,7 @@ where
     .await?;
 
     assert_eq!(
-        results,
+        dynamic_topic_configs(results),
         DescribeConfigsResponse::default().results(Some(vec![
             DescribeConfigsResult::default()
                 .error_code(none.into())
@@ -234,7 +247,7 @@ where
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
+                        .config_type(Some(ConfigType::List.into()))
                         .documentation(Some("".into()))]
                     .into(),
                 )),
@@ -280,7 +293,7 @@ where
     .await?;
 
     assert_eq!(
-        results,
+        dynamic_topic_configs(results),
         DescribeConfigsResponse::default().results(Some(vec![
             DescribeConfigsResult::default()
                 .error_code(none.into())
@@ -296,7 +309,7 @@ where
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
+                        .config_type(Some(ConfigType::List.into()))
                         .documentation(Some("".into()))]
                     .into(),
                 )),
@@ -342,7 +355,7 @@ where
     .await?;
 
     assert_eq!(
-        results,
+        dynamic_topic_configs(results),
         DescribeConfigsResponse::default().results(Some(vec![
             DescribeConfigsResult::default()
                 .error_code(none.into())

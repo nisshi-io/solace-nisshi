@@ -19,14 +19,15 @@ use bytes::Bytes;
 use common::init_tracing;
 use datafusion::prelude::SessionContext;
 use dotenv::dotenv;
-use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg::{Catalog, NamespaceIdent, TableIdent};
+use iceberg_datafusion::IcebergStaticTableProvider;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     record::{Record, inflated::Batch},
 };
 use nisshi_schema::{
-    Registry, Result,
+    Error, Registry, Result,
     lake::{House, LakeHouse, berg::iceberg_catalog},
 };
 use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
@@ -37,6 +38,11 @@ use url::Url;
 
 pub mod common;
 
+fn catalog_url() -> Result<Url> {
+    Url::parse(&var("ICEBERG_CATALOG").unwrap_or("http://localhost:8181".into()))
+        .map_err(Into::into)
+}
+
 pub async fn lake_store(
     namespace: &str,
     topic: &str,
@@ -45,7 +51,30 @@ pub async fn lake_store(
     config: DescribeConfigsResult,
     inflated: &Batch,
 ) -> Result<Vec<RecordBatch>> {
-    let catalog_uri = &var("ICEBERG_CATALOG").unwrap_or("http://localhost:8181".into())[..];
+    lake_store_with_catalog(
+        &catalog_url()?,
+        namespace,
+        topic,
+        partition,
+        schema_registry,
+        config,
+        inflated,
+    )
+    .await
+}
+
+/// Stores the batch in the lake through the catalog at `catalog_url`, and
+/// returns the rows of the topic's table.
+async fn lake_store_with_catalog(
+    catalog_url: &Url,
+    namespace: &str,
+    topic: &str,
+    partition: i32,
+    schema_registry: Registry,
+    config: DescribeConfigsResult,
+    inflated: &Batch,
+) -> Result<Vec<RecordBatch>> {
+    let catalog_uri = catalog_url.as_str();
     let location_uri = &var("DATA_LAKE").unwrap_or("s3://lake".into())[..];
     let warehouse = var("ICEBERG_WAREHOUSE").ok();
 
@@ -62,27 +91,66 @@ pub async fn lake_store(
 
     let offset = 543212345;
 
-    lake_house
-        .store(topic, partition, offset, inflated, config)
-        .await
-        .inspect(|result| debug!(?result))
-        .inspect_err(|err| debug!(?err))?;
-
     // Build the same catalog (storage factory, path-style pin and all)
     // that nisshi itself uses, rather than re-deriving a `RestCatalogBuilder`
     // call here that could drift from `iceberg_catalog`'s.
     let catalog = iceberg_catalog(&Url::parse(catalog_uri)?, warehouse.clone()).await?;
 
-    let catalog_provider = IcebergCatalogProvider::try_new(catalog).await?;
+    let namespace_ident = NamespaceIdent::new(namespace.to_owned());
+    let results = async {
+        lake_house
+            .store(topic, partition, offset, inflated, config)
+            .await
+            .inspect(|result| debug!(?result))
+            .inspect_err(|err| debug!(?err))?;
 
-    let ctx = SessionContext::new();
-    _ = ctx.register_catalog("iceberg", Arc::new(catalog_provider));
+        // The test loads only the topic's table. A catalog provider for the
+        // whole catalog would load every table of every namespace at once,
+        // and with many tests running, that opens hundreds of connections to
+        // the catalog.
+        let table = catalog
+            .load_table(&TableIdent::new(namespace_ident.clone(), topic.to_owned()))
+            .await?;
+        let ctx = SessionContext::new();
+        _ = ctx.register_table(
+            topic,
+            Arc::new(IcebergStaticTableProvider::try_new_from_table(table).await?),
+        )?;
+        ctx.sql(&format!("select * from {topic}"))
+            .await?
+            .collect()
+            .await
+            .map_err(Error::from)
+    }
+    .await;
 
-    ctx.sql(&format!("select * from iceberg.{namespace}.{topic}"))
-        .await?
-        .collect()
-        .await
-        .map_err(Into::into)
+    // The namespace is removed before the caller checks the results, so a
+    // test that fails leaves no namespace behind either. A store that failed
+    // can fail before it creates the namespace.
+    let cleanup = async {
+        if catalog.namespace_exists(&namespace_ident).await? {
+            drop_namespace_with_tables(catalog.as_ref(), &namespace_ident).await?;
+        }
+        Ok::<_, Error>(())
+    }
+    .await
+    .inspect_err(|err| debug!(?err, "cleanup"));
+
+    // The store's or the query's error is the one that explains a failed test,
+    // so it wins over an error of the cleanup.
+    results.and_then(|results| cleanup.map(|()| results))
+}
+
+/// Removes the namespace and purges each of its tables, so that the catalog
+/// keeps no table or namespace that a test created.
+async fn drop_namespace_with_tables(
+    catalog: &dyn Catalog,
+    namespace: &NamespaceIdent,
+) -> Result<()> {
+    for table in catalog.list_tables(namespace).await? {
+        catalog.purge_table(&table).await?;
+    }
+    catalog.drop_namespace(namespace).await.map_err(Into::into)
 }
 
 fn empty_config(topic: &str) -> DescribeConfigsResult {
@@ -3342,6 +3410,192 @@ mod avro {
         ];
 
         assert_eq!(pretty_results.trim().lines().collect::<Vec<_>>(), expected);
+
+        Ok(())
+    }
+}
+
+mod catalog_connections {
+    use super::*;
+    use iceberg::{
+        TableCreation,
+        spec::{NestedField, PrimitiveType, Schema, Type},
+    };
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::copy_bidirectional,
+        net::{TcpListener, TcpStream},
+    };
+
+    /// A TCP forwarder to the catalog that counts the connections that it
+    /// accepts.
+    struct CountingForwarder {
+        url: Url,
+        connections: Arc<AtomicUsize>,
+    }
+
+    impl CountingForwarder {
+        async fn start(catalog: &Url) -> Result<Self> {
+            let upstream = format!(
+                "{}:{}",
+                catalog.host_str().unwrap(),
+                catalog.port_or_known_default().unwrap()
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let mut url = catalog.clone();
+            url.set_host(Some("127.0.0.1"))?;
+            url.set_port(Some(listener.local_addr()?.port())).unwrap();
+
+            let connections = Arc::new(AtomicUsize::new(0));
+            let accepted = connections.clone();
+            _ = tokio::spawn(async move {
+                while let Ok((mut client, _)) = listener.accept().await {
+                    _ = accepted.fetch_add(1, Ordering::SeqCst);
+                    let upstream = upstream.clone();
+                    _ = tokio::spawn(async move {
+                        if let Ok(mut server) = TcpStream::connect(upstream).await {
+                            _ = copy_bidirectional(&mut client, &mut server).await;
+                        }
+                    });
+                }
+            });
+
+            Ok(Self { url, connections })
+        }
+
+        /// Returns the connections accepted since the last call.
+        fn take_count(&self) -> usize {
+            self.connections.swap(0, Ordering::SeqCst)
+        }
+    }
+
+    async fn json_schema_registry(topic: &str) -> Result<Registry> {
+        let object_store = InMemory::new();
+        let schema = json!({
+            "type": "object",
+            "properties": {"key": {"type": "number"}}
+        });
+        _ = object_store
+            .put(
+                &Path::from(format!("{topic}.json")),
+                serde_json::to_vec(&schema)
+                    .map(Bytes::from)
+                    .map(PutPayload::from)?,
+            )
+            .await?;
+        Ok(Registry::new(object_store))
+    }
+
+    /// Creates `count` namespaces, each with one table.
+    async fn create_namespaces_with_a_table(
+        catalog: &dyn Catalog,
+        count: usize,
+    ) -> Result<Vec<NamespaceIdent>> {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()?;
+        let mut namespaces = Vec::with_capacity(count);
+        for _ in 0..count {
+            let namespace = NamespaceIdent::new(alphanumeric_string(8));
+            _ = catalog.create_namespace(&namespace, HashMap::new()).await?;
+            namespaces.push(namespace.clone());
+            _ = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name(alphanumeric_string(8))
+                        .schema(schema.clone())
+                        .build(),
+                )
+                .await?;
+        }
+        Ok(namespaces)
+    }
+
+    /// Stores one record through the forwarder, and returns how many
+    /// connections the store and the read opened to the catalog.
+    async fn connections_to_store_and_read(forwarder: &CountingForwarder) -> Result<usize> {
+        let topic = &alphanumeric_string(5)[..];
+        let namespace = &alphanumeric_string(5)[..];
+        let schema_registry = json_schema_registry(topic).await?;
+        let record_batch = Batch::builder()
+            .base_timestamp(1_234_567_890 * 1_000)
+            .record(Record::builder().key(Some(Bytes::from_static(b"12321"))))
+            .build()?;
+
+        _ = forwarder.take_count();
+        let results = lake_store_with_catalog(
+            &forwarder.url,
+            namespace,
+            topic,
+            32123,
+            schema_registry,
+            empty_config(topic),
+            &record_batch,
+        )
+        .await?;
+        let connections = forwarder.take_count();
+
+        assert_eq!(1, results.iter().map(RecordBatch::num_rows).sum::<usize>());
+
+        // The namespace is gone, so a test run leaves no namespace behind in
+        // the catalog.
+        let catalog = iceberg_catalog(&catalog_url()?, var("ICEBERG_WAREHOUSE").ok()).await?;
+        assert!(
+            !catalog
+                .namespace_exists(&NamespaceIdent::new(namespace.to_owned()))
+                .await?,
+            "{namespace} is still in the catalog"
+        );
+
+        Ok(connections)
+    }
+
+    /// Reading a topic's table opens as many connections to the catalog
+    /// whatever else the catalog holds, so tests that run at once can't use
+    /// up the catalog's connections.
+    #[tokio::test]
+    async fn catalog_connections_are_bounded() -> Result<()> {
+        _ = dotenv().ok();
+        let _guard = init_tracing()?;
+
+        let catalog_url = catalog_url()?;
+        let catalog = iceberg_catalog(&catalog_url, var("ICEBERG_WAREHOUSE").ok()).await?;
+        let forwarder = CountingForwarder::start(&catalog_url).await?;
+
+        let alone = connections_to_store_and_read(&forwarder).await?;
+
+        // Twenty more tables in the catalog, which the read must not load.
+        let others = create_namespaces_with_a_table(catalog.as_ref(), 20).await;
+        let beside_others = match &others {
+            Ok(_) => connections_to_store_and_read(&forwarder).await,
+            Err(_) => Ok(0),
+        };
+        for namespace in others.as_ref().into_iter().flatten() {
+            drop_namespace_with_tables(catalog.as_ref(), namespace).await?;
+        }
+        let beside_others = others.and(beside_others)?;
+
+        debug!(alone, beside_others);
+        // The store and the read each connect at least once, so a lower count
+        // means that they reached the catalog without the forwarder, and the
+        // test counted nothing.
+        assert!(
+            (2..=10).contains(&alone),
+            "{alone} connections to the catalog"
+        );
+        // A client can reconnect when the catalog closes an idle connection,
+        // so the counts may differ by a connection or two. Loading every
+        // table of the 20 namespaces would add 20.
+        assert!(
+            beside_others <= alone + 2,
+            "{alone} connections alone, {beside_others} beside 20 other tables"
+        );
 
         Ok(())
     }

@@ -16,7 +16,10 @@
 //! and the list-typed configuration that the `APPEND` and `SUBTRACT` operations of
 //! [`IncrementalAlterConfigsRequest`](nisshi_sans_io::IncrementalAlterConfigsRequest) alter.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use nisshi_sans_io::{ConfigResource, ErrorCode, OpType};
 
@@ -67,7 +70,11 @@ pub fn validate_topic_config(key: &str, value: Option<&str>) -> Result<Option<St
 }
 
 /// Kafka's default `cleanup.policy`, which applies to a topic that doesn't set one.
-const DEFAULT_CLEANUP_POLICY: &str = "delete";
+pub(crate) const DEFAULT_CLEANUP_POLICY: &str = "delete";
+
+/// Kafka's default `retention.ms`, 7 days, which the storage engines that enforce retention apply
+/// to a topic that doesn't set one.
+pub const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
 /// The topic configuration keys whose type is `LIST`.
 ///

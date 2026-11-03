@@ -58,6 +58,7 @@ async fn seed(
                         .map(|(epoch, _)| (*epoch, BTreeMap::new()))
                         .collect(),
                     batches: BTreeMap::new(),
+                    epoch_starts: BTreeMap::new(),
                 },
             );
 

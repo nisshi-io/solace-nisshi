@@ -21,7 +21,7 @@ use nisshi_storage::{
 };
 use regex::Regex;
 
-use super::Engine;
+use super::{BUSY_TIMEOUT, COMPACTION, Engine, MODE};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LiteFactory;
@@ -47,7 +47,7 @@ impl StorageFactory for LiteFactory {
     async fn build(&self, configuration: StorageFactoryConfiguration) -> Result<ArcDynStorage> {
         reject_unrecognized_options(
             &configuration.storage,
-            &["vacuum_into", "busy_timeout", "compaction", "mode"],
+            &["vacuum_into", BUSY_TIMEOUT, COMPACTION, MODE],
         )?;
 
         Engine::builder()

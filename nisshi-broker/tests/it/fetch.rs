@@ -14,7 +14,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
@@ -26,7 +26,7 @@ use nisshi_sans_io::{
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     fetch_request::{FetchPartition, FetchTopic},
-    record::{Header, Record, inflated},
+    record::{Header, Record, deflated, inflated},
 };
 use nisshi_storage::{FetchService, FetchValidationLayer, ListOffsetResponse, Storage, Topition};
 use rama::{Layer as _, Service, extensions::Extensions};
@@ -1210,16 +1210,17 @@ async fn fetch_offsets<G>(
 where
     G: Storage + Clone,
 {
-    fetch_offsets_within(sc, topic, partitions, max_wait_ms, 50 * 1024, 50 * 1024).await
+    fetch_offsets_within(sc, topic, partitions, max_wait_ms, 1, 50 * 1024, 50 * 1024).await
 }
 
 /// Fetch through [`FetchService`], one entry per `(partition, fetch_offset)`,
-/// with the given `max_bytes` and `partition_max_bytes`.
+/// with the given `min_bytes`, `max_bytes` and `partition_max_bytes`.
 async fn fetch_offsets_within<G>(
     sc: &G,
     topic: &str,
     partitions: &[(i32, i64)],
     max_wait_ms: i32,
+    min_bytes: i32,
     max_bytes: i32,
     partition_max_bytes: i32,
 ) -> Result<FetchResponse>
@@ -1233,7 +1234,7 @@ where
         .serve(RequestInput {
             request: FetchRequest::default()
                 .max_wait_ms(max_wait_ms)
-                .min_bytes(1)
+                .min_bytes(min_bytes)
                 .max_bytes(Some(max_bytes))
                 .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
                 .topics(Some(
@@ -1746,6 +1747,7 @@ where
             &topic_name,
             &[(0, 0), (1, 0), (2, 0), (3, 0)],
             500,
+            1,
             100 * 1024,
             1024,
         )
@@ -1768,6 +1770,116 @@ where
         offsets.push(record_offsets(partition)?);
     }
     assert_eq!(vec![vec![0], vec![0], vec![], vec![]], offsets);
+
+    Ok(())
+}
+
+/// A Fetch whose `min_bytes` is never met waits for its `max_wait`, and then
+/// returns the records that it read. Each wait round reads the partition again
+/// with the whole `max_bytes`, so the last round still returns records after
+/// earlier rounds read the same bytes. The Postgres engine reads at most
+/// 10,000 rows at a time, so there the service reads again from the next
+/// offset, and the response spans several reads.
+pub async fn long_wait_for_min_bytes_spans_several_reads<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    // more records than two reads of the Postgres engine return
+    const RECORDS: i32 = 25_000;
+    const MAX_WAIT: Duration = Duration::from_secs(5);
+
+    // The service gives a storage read a deadline of its own, after
+    // `max_wait`, and the margin also covers a slow CI runner.
+    const OVERRUN: Duration = Duration::from_secs(10);
+
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let batch: deflated::Batch = (0..RECORDS)
+        .fold(inflated::Batch::builder(), |builder, delta| {
+            builder.record(
+                Record::builder()
+                    .value(Some(Bytes::from_static(b"a")))
+                    .offset_delta(delta),
+            )
+        })
+        .last_offset_delta(RECORDS - 1)
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    // One round reads the whole batch at most, which leaves `min_bytes`
+    // unmet. A round that started with the bytes that the round before it
+    // spent would have a tenth of a batch to read.
+    let max_bytes = i32::try_from(batch.record_data.len() + batch.record_data.len() / 10)?;
+
+    _ = sc
+        .produce(None, &Topition::new(topic_name.clone(), 0), batch)
+        .await?;
+
+    let started_at = Instant::now();
+
+    let partitions = partition_data(
+        fetch_offsets_within(
+            &sc,
+            &topic_name,
+            &[(0, 0)],
+            i32::try_from(MAX_WAIT.as_millis())?,
+            i32::MAX,
+            max_bytes,
+            max_bytes,
+        )
+        .await?,
+    );
+
+    // The service returns before `max_wait` when the time left is shorter
+    // than its last round took, so that it does not overrun `max_wait`. A
+    // round that does not meet `min_bytes` waits half the time left, so the
+    // fetch returns after half of `max_wait` at the earliest.
+    let elapsed = started_at.elapsed();
+    assert!(
+        elapsed >= MAX_WAIT / 2,
+        "the fetch returned after {elapsed:?}, before half its max_wait of {MAX_WAIT:?}"
+    );
+    assert!(
+        elapsed < MAX_WAIT + OVERRUN,
+        "the fetch returned after {elapsed:?}, more than {OVERRUN:?} after its max_wait"
+    );
+
+    assert_eq!(1, partitions.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(partitions[0].error_code)?
+    );
+
+    let offsets = record_offsets(&partitions[0])?;
+    assert!(
+        offsets.len() > 10_000,
+        "expected more than one Postgres read of 10,000 records after the wait, got {}",
+        offsets.len()
+    );
+    assert_eq!(
+        (0..i64::try_from(offsets.len())?).collect::<Vec<_>>(),
+        offsets
+    );
 
     Ok(())
 }
@@ -1970,6 +2082,21 @@ mod pg {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn long_wait_for_min_bytes_spans_several_reads() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::long_wait_for_min_bytes_spans_several_reads(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "dynostore")]
@@ -2164,6 +2291,21 @@ mod in_memory {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::oversized_records_spend_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn long_wait_for_min_bytes_spans_several_reads() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::long_wait_for_min_bytes_spans_several_reads(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2379,6 +2521,21 @@ mod lite {
         let broker_id = rng().random_range(0..i32::MAX);
 
         super::oversized_records_spend_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn long_wait_for_min_bytes_spans_several_reads() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::long_wait_for_min_bytes_spans_several_reads(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

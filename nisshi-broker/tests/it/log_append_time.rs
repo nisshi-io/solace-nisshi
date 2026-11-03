@@ -15,7 +15,7 @@
 //! The topic's `message.timestamp.type` selects the timestamp of each stored record. On a
 //! `LogAppendTime` topic, the broker stamps each batch with its own clock. On a `CreateTime` topic,
 //! the broker keeps the producer's timestamps, even for a batch that the producer marks
-//! `LogAppendTime`.
+//! `LogAppendTime`. The broker refuses a producer's `LogAppendTime` bit where Kafka refuses it.
 
 use crate::{
     common::{StorageType, alphanumeric_string, init_tracing},
@@ -31,6 +31,7 @@ use nisshi_sans_io::{
     IsolationLevel, ListOffset, OpType, RequestInput, TimestampType,
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
+    produce_response::PartitionProduceResponse,
     record::{Record, deflated, inflated},
 };
 use nisshi_storage::{
@@ -63,6 +64,20 @@ async fn storage(storage_type: StorageType) -> Result<ArcDynStorage> {
 /// the producer has set the `LogAppendTime` bit. A normal producer leaves the bit clear, because
 /// the topic's config decides the type.
 fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<deflated::Batch> {
+    marked_log_append_time_with_max(
+        base_timestamp,
+        timestamp_delta,
+        base_timestamp + timestamp_delta,
+    )
+}
+
+/// Returns [`marked_log_append_time`] with `max_timestamp` in its header instead of the record's
+/// timestamp.
+fn marked_log_append_time_with_max(
+    base_timestamp: i64,
+    timestamp_delta: i64,
+    max_timestamp: i64,
+) -> Result<deflated::Batch> {
     inflated::Batch::builder()
         .attributes(
             BatchAttribute::default()
@@ -70,7 +85,7 @@ fn marked_log_append_time(base_timestamp: i64, timestamp_delta: i64) -> Result<d
                 .into(),
         )
         .base_timestamp(base_timestamp)
-        .max_timestamp(base_timestamp + timestamp_delta)
+        .max_timestamp(max_timestamp)
         .record(
             Record::builder()
                 .value(Bytes::from_static(b"marked log append time").into())
@@ -219,8 +234,9 @@ async fn accepts_a_record_outside_the_timestamp_window(
 /// On a `CreateTime` topic, the broker ignores a `LogAppendTime` bit that the producer set, as
 /// Kafka does. The topic's config decides the type, not the batch. A marked batch with a record ten
 /// years ahead is therefore rejected like any `CreateTime` batch, instead of skipping the one-hour
-/// limit. A marked batch within the limit is stored as `CreateTime`, and its record keeps the
-/// producer's timestamp.
+/// limit. A marked batch whose `max_timestamp` is -1 is rejected, as Kafka rejects it. A marked
+/// batch within the limit is stored as `CreateTime`, and its record keeps the producer's
+/// timestamp.
 async fn create_time_topic_validates_a_batch_marked_log_append_time(
     storage: impl Storage + Clone,
 ) -> Result<()> {
@@ -238,6 +254,17 @@ async fn create_time_topic_validates_a_batch_marked_log_append_time(
         ErrorCode::InvalidTimestamp,
         ErrorCode::try_from(rejected.error_code)?
     );
+
+    // Kafka reads a marked batch's `max_timestamp` as each record's timestamp, and -1 skips the
+    // window, so Kafka refuses the bit here.
+    let without_timestamp = produce_batches(
+        storage.clone(),
+        &topic,
+        PARTITION,
+        vec![marked_log_append_time_with_max(now, 0, -1)?],
+    )
+    .await?;
+    assert_refused_log_append_time(&without_timestamp)?;
 
     let accepted = produce_batches(
         storage.clone(),
@@ -260,6 +287,54 @@ async fn create_time_topic_validates_a_batch_marked_log_append_time(
     );
     assert_eq!(1, batch.records.len());
     assert_eq!(now + 7, batch.record_timestamp(&batch.records[0]));
+
+    Ok(())
+}
+
+/// Asserts that `response` refuses a producer's `LogAppendTime` bit with `INVALID_TIMESTAMP`, and
+/// Kafka's top-level message and record error.
+fn assert_refused_log_append_time(response: &PartitionProduceResponse) -> Result<()> {
+    assert_eq!(
+        ErrorCode::InvalidTimestamp,
+        ErrorCode::try_from(response.error_code)?
+    );
+    assert_eq!(
+        Some("One or more records have been rejected due to invalid timestamp"),
+        response.error_message.as_deref()
+    );
+
+    let record_errors = response.record_errors.as_deref().unwrap_or_default();
+    assert_eq!(1, record_errors.len());
+    assert_eq!(0, record_errors[0].batch_index);
+    assert_eq!(
+        Some(
+            "Invalid timestamp type in the record at batch index 0. Producer should not set \
+             timestamp type to LogAppendTime."
+        ),
+        record_errors[0].batch_index_error_message.as_deref()
+    );
+
+    Ok(())
+}
+
+/// On a `LogAppendTime` topic, the broker refuses a batch on which the producer set the
+/// `LogAppendTime` bit, as Kafka does. Only the broker sets the bit on such a topic.
+async fn log_append_time_topic_rejects_a_batch_marked_log_append_time(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let topic = create_topic_with_configs(storage.clone(), &[LOG_APPEND_TIME]).await?;
+
+    let response = produce_batches(
+        storage.clone(),
+        &topic,
+        PARTITION,
+        vec![marked_log_append_time(now_ms()?, 0)?],
+    )
+    .await?;
+    assert_refused_log_append_time(&response)?;
+    assert_eq!(-1, response.base_offset);
+
+    assert!(fetch_batches(storage, &topic, PARTITION).await?.is_empty());
 
     Ok(())
 }
@@ -394,7 +469,7 @@ async fn incremental_alter_configs_rejects_an_invalid_timestamp_type(
         storage,
         &topic,
         PARTITION,
-        vec![marked_log_append_time(now_ms()?, 0)?],
+        vec![create_time_batch(Compression::None, now_ms()?, -1, &[0])?],
     )
     .await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
@@ -459,6 +534,15 @@ mod in_memory {
         let _guard = init_tracing()?;
         super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::InMemory).await?).await
     }
+
+    #[tokio::test]
+    async fn log_append_time_topic_rejects_a_batch_marked_log_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::log_append_time_topic_rejects_a_batch_marked_log_append_time(
+            storage(StorageType::InMemory).await?,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -513,6 +597,15 @@ mod lite {
     async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
         let _guard = init_tracing()?;
         super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Lite).await?).await
+    }
+
+    #[tokio::test]
+    async fn log_append_time_topic_rejects_a_batch_marked_log_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::log_append_time_topic_rejects_a_batch_marked_log_append_time(
+            storage(StorageType::Lite).await?,
+        )
+        .await
     }
 }
 
@@ -571,6 +664,15 @@ mod pg {
     async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
         let _guard = init_tracing()?;
         super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Postgres).await?).await
+    }
+
+    #[tokio::test]
+    async fn log_append_time_topic_rejects_a_batch_marked_log_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::log_append_time_topic_rejects_a_batch_marked_log_append_time(
+            storage(StorageType::Postgres).await?,
+        )
+        .await
     }
 }
 
@@ -664,5 +766,15 @@ mod turso {
     async fn timestamp_lookup_uses_the_broker_clock() -> Result<()> {
         let _guard = init_tracing()?;
         super::timestamp_lookup_uses_the_broker_clock(storage(StorageType::Turso).await?).await
+    }
+
+    #[ignore = "the turso backend fails its connection check in tests"]
+    #[tokio::test]
+    async fn log_append_time_topic_rejects_a_batch_marked_log_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::log_append_time_topic_rejects_a_batch_marked_log_append_time(
+            storage(StorageType::Turso).await?,
+        )
+        .await
     }
 }

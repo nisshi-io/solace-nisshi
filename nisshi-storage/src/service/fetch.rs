@@ -28,7 +28,10 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     Error, METER, OffsetStage, Result, Storage, Topition,
-    service::deadline::{self, Missed},
+    service::{
+        deadline::{self, Missed},
+        read_share::FetchReadShare,
+    },
 };
 use validation::ValidatedFetchRequest;
 
@@ -83,17 +86,13 @@ static FETCH_UNKNOWN_PARTITION: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///
 /// `max_wait` plus this sits under all three with room for the response,
 /// for any `max_wait` under Java's 30s less this.
-const READ_DEADLINE_OVERHEAD: Duration = Duration::from_secs(5);
+const FETCH_DEADLINE_OVERHEAD: Duration = Duration::from_secs(5);
 
-/// The smallest part of a partition's share of the read deadline that its
-/// storage budget leaves unused.
-///
-/// An engine checks its budget only between records or object reads, and
-/// it starts its clock after it gets a connection or a permit. A read that
-/// spends its whole budget therefore returns a little after the budget
-/// ends. The margin lets that read return what it assembled before the
-/// broker abandons it.
-const MIN_BUDGET_MARGIN: Duration = Duration::from_millis(50);
+/// The smallest stop margin: how long an engine stops assembling batches before its partition
+/// deadline, when the broker abandons the read and loses every batch it assembled. An engine checks
+/// the time only between records or object reads, and starts its clock only after it gets a
+/// connection, so it returns a little after it stops.
+const MIN_STOP_MARGIN: Duration = Duration::from_millis(50);
 
 static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -113,8 +112,8 @@ static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// - libSQL: a local statement runs synchronously inside the read's
 ///   `async fn`, so the deadline interrupts only a wait for a permit or a
 ///   connection, never a slow statement.
-/// - SlateDB: the engine ignores its budget, so a slow read is abandoned
-///   with nothing kept.
+/// - SlateDB: the engine ignores when to stop, so a slow read is
+///   abandoned with nothing kept.
 /// - Object store: work the engine runs on its own tasks carries on until
 ///   it finishes.
 async fn before<F>(deadline: Instant, read: F) -> Result<F::Output, Missed>
@@ -143,27 +142,22 @@ fn missed(
     started_at: Instant,
 ) {
     let stage = missed.stage();
+    let limit = missed.limit();
 
-    READ_DEADLINE_EXCEEDED.add(
-        1,
-        &[
-            KeyValue::new("operation", operation),
-            KeyValue::new("stage", stage),
-        ],
-    );
+    READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(operation));
 
     match missed {
         Missed::NotStarted => {
             debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
-        Missed::Queued | Missed::Reading => {
-            warn!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
+        Missed::Queued | Missed::QueuedForConnectionShare | Missed::Reading => {
+            warn!(?tp, operation, offset, stage, limit, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
 }
 
-/// When the next partition's reads must finish, with `left` partitions,
-/// this one included, still to read before `read_deadline`.
+/// Returns the partition deadline of the next partition: when its reads must finish, with `left`
+/// partitions, this one included, still to read before `fetch_deadline`.
 ///
 /// Each partition may spend half of the time left, and the last all of it,
 /// so one partition that never answers delays the rest of the request by
@@ -172,60 +166,34 @@ fn missed(
 /// its unused share to those after it. A partition whose offset stage is
 /// read again after its records takes a fresh half for that read, so it
 /// can spend up to three quarters of the time left in all.
-fn partition_deadline(read_deadline: Instant, left: usize) -> Instant {
+fn next_partition_deadline(fetch_deadline: Instant, left: usize) -> Instant {
     if left <= 1 {
-        read_deadline
+        fetch_deadline
     } else {
         let now = Instant::now();
-        now + read_deadline.saturating_duration_since(now) / 2
+        now + fetch_deadline.saturating_duration_since(now) / 2
     }
 }
 
-/// The deadlines of one Fetch request.
-#[derive(Clone, Copy, Debug)]
-struct Deadlines {
-    /// The client's `max_wait`.
-    max_wait: Duration,
-
-    /// When the client's `max_wait` ends.
-    client: Instant,
-
-    /// When every storage read must have finished.
-    read: Instant,
+/// Returns the fetch deadline of a Fetch that started at `started_at`: the time by which every
+/// storage read of the Fetch must finish.
+fn fetch_deadline(started_at: Instant, max_wait: Duration) -> Instant {
+    started_at + max_wait + FETCH_DEADLINE_OVERHEAD
 }
 
-impl Deadlines {
-    fn new(started_at: Instant, max_wait: Duration) -> Self {
-        Self {
-            max_wait,
-            client: started_at + max_wait,
-            read: started_at + max_wait + READ_DEADLINE_OVERHEAD,
-        }
-    }
-
-    /// The storage budget of a partition whose reads start now and must
-    /// finish by `cap`.
-    ///
-    /// The client's `max_wait` bounds the response: engines stop assembling
-    /// batches at their budget and return what they have. A partition that
-    /// starts with less than half of `max_wait` left, because one before it
-    /// was slow, gets that half rather than a budget engines would read
-    /// nothing with, as far as its share allows.
-    ///
-    /// The budget ends a quarter of the partition's share, and at least
-    /// [`MIN_BUDGET_MARGIN`], before `cap`. A budget that ends at `cap`
-    /// makes a read that uses all of it return after `cap`, so the broker
-    /// abandons it and loses every batch it read. So a partition whose
-    /// share is under two thirds of `max_wait`, deep in a request or after
-    /// a stall, gets three quarters of its share, and one whose share is
-    /// under the least margin gets no budget at all.
-    fn storage(&self, cap: Instant) -> Instant {
-        let now = Instant::now();
-        let share = cap.saturating_duration_since(now);
-        let margin = (share / 4).max(MIN_BUDGET_MARGIN).min(share);
-
-        self.client.max(now + self.max_wait / 2).min(cap - margin)
-    }
+/// Returns the stop margin of a partition read with `time_left` until its partition deadline: a
+/// quarter of `time_left`, and at least [`MIN_STOP_MARGIN`]. A read with less time left than
+/// that stops at once. [`next_partition_deadline`] sets the partition deadline.
+///
+/// A read stops this much time before its partition deadline, not when `max_wait` ends,
+/// because `max_wait` limits only how long a Fetch waits for new records. Kafka reads the log up
+/// to the request's byte limits without a time limit ([ReplicaManager.scala#L1523-L1563]).
+///
+/// [ReplicaManager.scala#L1523-L1563]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1523-L1563
+fn stop_margin(time_left: Duration) -> Duration {
+    // TODO(SOL-157095): let each engine choose its stop margin from what one of its read steps
+    // costs, instead of a fraction of the time left that nothing measured.
+    (time_left / 4).max(MIN_STOP_MARGIN).min(time_left)
 }
 
 /// A [`Service`] using its [`Storage`] taking [`ValidatedFetchRequest`] returning [`FetchResponse`].
@@ -330,17 +298,13 @@ impl<G> FetchService<G>
 where
     G: Storage,
 {
-    /// Reads one partition, with `left` partitions, this one included, still
-    /// to read before the read deadline.
+    /// Reads one partition, with `left` partitions, this one included, still to read
+    /// before `fetch_deadline`.
     ///
-    /// A read that has not finished by this partition's share of the read
-    /// deadline (see [`partition_deadline`]) is abandoned; an offset stage
-    /// read again after the records gets a share of its own. Each records
-    /// read is given the time left of its storage budget (see
-    /// [`Deadlines::storage`]) and the reads stop once that is spent. What
-    /// is left of the client's `max_wait` alone may have been spent by a
-    /// slow partition earlier in the request, and with no budget some
-    /// engines read nothing and the rest at most one record.
+    /// A read that has not finished by this partition's deadline (see [`next_partition_deadline`])
+    /// is abandoned; an offset stage read again after the records gets a partition deadline of its
+    /// own. Each records read stops a stop margin (see [`stop_margin`]) before the partition
+    /// deadline, and the reads stop once that time has passed.
     ///
     /// A partition whose read does not finish in time is answered with
     /// [`ErrorCode::None`], whatever batches it had already read, and the
@@ -352,7 +316,7 @@ where
     #[instrument(skip(self,min_bytes,isolation,fetch_partition), fields(partition = fetch_partition.partition))]
     async fn fetch_partition(
         &self,
-        deadlines: Deadlines,
+        fetch_deadline: Instant,
         left: usize,
         min_bytes: u32,
         max_bytes: &mut u32,
@@ -364,7 +328,7 @@ where
         G: Storage,
     {
         let started_at = Instant::now();
-        let cap = partition_deadline(deadlines.read, left);
+        let partition_deadline = next_partition_deadline(fetch_deadline, left);
 
         let partition_index = fetch_partition.partition;
         let tp = Topition::new(topic, partition_index);
@@ -375,7 +339,7 @@ where
         // range from it, so the offset is checked against the partition
         // before it reaches storage. The bounds are the same for every
         // isolation level, as in Kafka.
-        let offset_stage = match before(cap, self.storage.offset_stage(&tp)).await {
+        let offset_stage = match before(partition_deadline, self.storage.offset_stage(&tp)).await {
             Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
                 return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
             }
@@ -447,9 +411,8 @@ where
             return Ok(Self::partition_data(partition_index, offset_stage, vec![]));
         }
 
-        // The budget starts after the offset stage is read, so a partition
-        // whose stage was slow still gets its half of `max_wait` for records.
-        let budget = deadlines.storage(cap);
+        let stop_at = partition_deadline
+            - stop_margin(partition_deadline.saturating_duration_since(Instant::now()));
 
         let mut batches = Vec::new();
 
@@ -465,14 +428,14 @@ where
             debug!(offset);
 
             let fetched = match before(
-                cap,
+                partition_deadline,
                 self.storage.fetch(
                     &tp,
                     offset,
                     min_bytes,
                     *max_bytes,
                     isolation,
-                    budget.saturating_duration_since(Instant::now()),
+                    stop_at.saturating_duration_since(Instant::now()),
                 ),
             )
             .await
@@ -514,12 +477,10 @@ where
 
             batches.append(&mut fetched);
 
-            // The budget bounds the response: engines that assemble
-            // batches from rows stop at the budget but return what they
-            // have, so another round now would return one record per round
-            // trip until max_bytes is spent
-            if Instant::now() >= budget {
-                debug!(?offset, elapsed = ?started_at.elapsed(), ?budget);
+            // Engines that assemble batches from rows stop at `stop_at` but return what they have,
+            // so another read now would return one record per round trip until max_bytes is spent
+            if Instant::now() >= stop_at {
+                debug!(?offset, elapsed = ?started_at.elapsed(), ?stop_at);
                 break;
             }
         }
@@ -544,11 +505,10 @@ where
             // partition.
             Self::covering(offset_stage, offset, isolation)
         } else {
-            // A read that used its whole budget assembling batches did not
-            // stall, so the stage gets a fresh share of the time left rather
-            // than what may be none at all.
+            // A read that assembled batches until `stop_at` did not stall, so the stage gets a
+            // fresh partition deadline rather than what may be none at all.
             match before(
-                partition_deadline(deadlines.read, left),
+                next_partition_deadline(fetch_deadline, left),
                 self.storage.offset_stage(&tp),
             )
             .await
@@ -703,7 +663,7 @@ where
     #[instrument(skip(self, min_bytes, isolation, fetch))]
     async fn fetch_topic(
         &self,
-        deadlines: Deadlines,
+        fetch_deadline: Instant,
         left: &mut usize,
         min_bytes: u32,
         max_bytes: &mut u32,
@@ -763,7 +723,7 @@ where
 
                 let partition = self
                     .fetch_partition(
-                        deadlines,
+                        fetch_deadline,
                         *left,
                         min_bytes,
                         &mut partition_bytes,
@@ -845,7 +805,7 @@ where
         &self,
         max_wait: Duration,
         min_bytes: u32,
-        max_bytes: &mut u32,
+        max_bytes: u32,
         isolation: IsolationLevel,
         topics: &[FetchTopic],
     ) -> Result<Vec<FetchableTopicResponse>> {
@@ -857,18 +817,26 @@ where
             // Instant rather than SystemTime: the deadlines below must not
             // move with the wall clock
             let started_at = Instant::now();
-            let deadlines = Deadlines::new(started_at, max_wait);
+            let fetch_deadline = fetch_deadline(started_at, max_wait);
             let mut responses = vec![];
             let mut iteration = 0;
-            let mut bytes = 0;
-            let mut is_first_non_empty = true;
 
-            while !max_wait.saturating_sub(started_at.elapsed()).is_zero() && bytes <= min_bytes {
-                debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()));
-
+            // The first round reads before any check of `max_wait`, as in Kafka, so a Fetch with
+            // `max_wait` of zero answers with every record that the round found.
+            loop {
                 responses.clear();
 
-                // Every round reads every partition again
+                // Every round reads every partition again from its fetch
+                // offset, and answers with only its own records. So each
+                // round starts with the whole `max_bytes`, and only its own
+                // bytes count toward `min_bytes`. Kafka also counts the bytes
+                // available at each check, not a sum over the checks
+                // ([DelayedFetch.scala]).
+                //
+                // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
+                let mut round_max_bytes = max_bytes;
+                let mut is_first_non_empty = true;
+
                 let mut left = topics
                     .iter()
                     .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
@@ -878,10 +846,10 @@ where
                 for fetch in topics.iter() {
                     let fetch_response = self
                         .fetch_topic(
-                            deadlines,
+                            fetch_deadline,
                             &mut left,
                             min_bytes,
-                            max_bytes,
+                            &mut round_max_bytes,
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
@@ -891,13 +859,21 @@ where
                     responses.push(fetch_response);
                 }
 
-                bytes += u32::try_from(responses.byte_size())?;
+                let bytes = u32::try_from(responses.byte_size())?;
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
                 debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
 
-                if bytes > min_bytes {
+                if remaining.is_zero() {
+                    break;
+                }
+
+                // Kafka answers once the bytes reach `min_bytes`
+                // ([DelayedFetch.scala#L147]).
+                //
+                // [DelayedFetch.scala#L147]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L147
+                if bytes >= min_bytes {
                     break;
                 }
 
@@ -971,26 +947,27 @@ where
     type Error = Error;
 
     #[instrument(skip(self, request))]
-    async fn serve(&self, mut request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, request: ValidatedFetchRequest) -> Result<Self::Output, Self::Error> {
         let started_at = Instant::now();
 
-        self.fetch(
-            request.max_wait,
-            request.min_bytes,
-            &mut request.max_bytes,
-            request.isolation_level,
-            &request.topics,
-        )
-        .await
-        .map(|responses| {
-            FetchResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(Some(ErrorCode::None.into()))
-                .session_id(Some(0))
-                .node_endpoints(Some([].into()))
-                .responses(Some(responses))
-        })
-        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        FetchReadShare::of(&request.extensions)
+            .scope(self.fetch(
+                request.max_wait,
+                request.min_bytes,
+                request.max_bytes,
+                request.isolation_level,
+                &request.topics,
+            ))
+            .await
+            .map(|responses| {
+                FetchResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(Some(ErrorCode::None.into()))
+                    .session_id(Some(0))
+                    .node_endpoints(Some([].into()))
+                    .responses(Some(responses))
+            })
+            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 }
 
@@ -1093,7 +1070,8 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use nisshi_sans_io::{
-        ConfigResource, ErrorCode, FetchRequest, IsolationLevel, ListOffset, ScramMechanism,
+        ConfigResource, ErrorCode, FetchRequest, IsolationLevel, ListOffset, RequestInput,
+        ScramMechanism,
         create_topics_request::CreatableTopic,
         delete_groups_response::DeletableGroupResult,
         delete_records_request::DeleteRecordsTopic,
@@ -1109,19 +1087,23 @@ mod tests {
         record::{Record, deflated, inflated},
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
-    use rama::{Layer as _, Service as _};
-    use tokio::time::{Duration, Instant, advance};
+    use rama::{Layer as _, Service as _, extensions::Extensions};
+    use tokio::{
+        sync::OwnedSemaphorePermit,
+        time::{Duration, Instant, advance},
+    };
     use url::Url;
     use uuid::Uuid;
 
     use super::{
-        Deadlines, FetchService, MIN_BUDGET_MARGIN, Missed, READ_DEADLINE_OVERHEAD, before,
+        FETCH_DEADLINE_OVERHEAD, FetchService, MIN_STOP_MARGIN, Missed, before, fetch_deadline,
     };
     use crate::{
-        BrokerRegistrationRequest, Error, FetchValidationLayer, GroupDetail, ListOffsetResponse,
-        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-        TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+        BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
+        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+        Version, read_share::FetchReadShare,
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -1207,7 +1189,11 @@ mod tests {
                 async fn committed_offset_topitions(
                     &self,
                     _group_id: &str,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+                    unimplemented!()
+                }
+
+                async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
                     unimplemented!()
                 }
 
@@ -1216,7 +1202,7 @@ mod tests {
                     _group_id: Option<&str>,
                     _topics: &[Topition],
                     _require_stable: Option<bool>,
-                ) -> Result<BTreeMap<Topition, i64>> {
+                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
                     unimplemented!()
                 }
 
@@ -1386,18 +1372,16 @@ mod tests {
         };
     }
 
-    /// Storage whose `fetch` replays scripted responses, records the offset
-    /// and remaining `max_wait` of each call, and optionally advances the
-    /// (paused) clock past the deadline on the first call, as an engine
-    /// that spends the whole budget assembling one truncated batch does.
-    /// Each read of the offset stage moves its last stable offset and high
-    /// watermark up by `stage_growth`, as writes during a fetch do, so a
-    /// test can tell which read answered.
+    /// Storage whose `fetch` replays scripted responses, records the offset and remaining
+    /// `max_wait` of each call, and optionally advances the (paused) clock past the deadline on the
+    /// first call, as an engine that assembles one truncated batch until it has to stop does. Each
+    /// read of the offset stage moves its last stable offset and high watermark up by
+    /// `stage_growth`, as writes during a fetch do, so a test can tell which read answered.
     #[derive(Clone, Debug)]
     struct Scripted {
         responses: Arc<Mutex<Vec<Vec<deflated::Batch>>>>,
         calls: Arc<Mutex<Vec<(i64, Duration)>>>,
-        consume_budget_on_first_call: Option<Duration>,
+        first_call_takes: Option<Duration>,
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
@@ -1414,7 +1398,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses)),
                 calls: Arc::new(Mutex::new(vec![])),
-                consume_budget_on_first_call: None,
+                first_call_takes: None,
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
@@ -1472,9 +1456,9 @@ mod tests {
             };
 
             if calls == 1
-                && let Some(budget) = self.consume_budget_on_first_call
+                && let Some(duration) = self.first_call_takes
             {
-                advance(budget).await;
+                advance(duration).await;
             }
 
             Ok(response)
@@ -1522,7 +1506,7 @@ mod tests {
 
         FetchService { storage }
             .fetch_partition(
-                Deadlines::new(Instant::now(), max_wait),
+                fetch_deadline(Instant::now(), max_wait),
                 1,
                 1,
                 &mut remaining,
@@ -1566,14 +1550,19 @@ mod tests {
     async fn stops_at_the_deadline() -> Result<()> {
         let max_wait = Duration::from_millis(100);
 
-        // one truncated batch spends the whole budget, then a single record
-        // per call forever
+        // The test reads one partition, so its partition deadline is the fetch deadline, and the
+        // engine stops a quarter of that time before it.
+        let fetch_deadline = max_wait + FETCH_DEADLINE_OVERHEAD;
+        let stop_after = fetch_deadline - fetch_deadline / 4;
+
+        // one truncated batch takes until the engine has to stop, then a single
+        // record per call forever
         let responses = (0..10_000)
             .map(|offset| batch(offset, &[0]).map(|batch| vec![batch]))
             .collect::<Result<Vec<_>>>()?;
 
         let storage = Scripted {
-            consume_budget_on_first_call: Some(max_wait),
+            first_call_takes: Some(stop_after),
             ..Scripted::new(responses, OFFSET_STAGE)
         };
 
@@ -1582,7 +1571,7 @@ mod tests {
         assert_eq!(1, batches.len());
         assert_eq!(0, batches[0].base_offset);
         assert_eq!(
-            vec![(0, max_wait)],
+            vec![(0, stop_after)],
             storage.calls(),
             "storage was called again after the deadline"
         );
@@ -1928,8 +1917,8 @@ mod tests {
     /// What one storage read of a partition does, in [`Partitions`].
     #[derive(Clone, Debug)]
     enum Read {
-        /// Returns this batch, or nothing given no budget, as engines that
-        /// stop assembling at the deadline do.
+        /// Returns this batch, or nothing when it has to stop at once, as engines that stop
+        /// assembling at their stop time do.
         Batch(deflated::Batch),
 
         /// Returns nothing.
@@ -1938,14 +1927,13 @@ mod tests {
         /// Does not answer for an hour.
         Stall,
 
-        /// Returns this batch once its budget is spent, plus the given
-        /// overshoot, as an engine does that checks its budget only between
-        /// records.
+        /// Returns this batch once its time to stop has passed, plus the given overshoot, as an
+        /// engine does that checks when to stop only between records.
         Assemble(deflated::Batch, Duration),
     }
 
-    /// How long past its budget a [`Read::Assemble`] returns, when the test
-    /// is not about the overshoot.
+    /// How long past its time to stop a [`Read::Assemble`] returns, when the test is not
+    /// about the overshoot.
     const OVERSHOOT: Duration = Duration::from_millis(8);
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -1978,6 +1966,11 @@ mod tests {
         /// offset stage read answers [`ErrorCode::UnknownTopicOrPartition`].
         deleted: Arc<Mutex<BTreeSet<i32>>>,
         calls: Arc<Mutex<Vec<Call>>>,
+        /// Whether each offset stage read takes a permit from its read
+        /// share and keeps it in `kept_read_shares`, as an abandoned read
+        /// keeps its permit until its statement ends.
+        keeps_read_share: bool,
+        kept_read_shares: Arc<Mutex<Vec<OwnedSemaphorePermit>>>,
     }
 
     impl Partitions {
@@ -2034,6 +2027,23 @@ mod tests {
                 .filter(|call| call.topic == TOPIC && call.partition == partition)
                 .cloned()
                 .collect()
+        }
+
+        /// Makes each offset stage read take a permit from a read share of
+        /// one permit, and keep it.
+        fn keep_read_share(self) -> Self {
+            Self {
+                keeps_read_share: true,
+                ..self
+            }
+        }
+
+        /// How many permits offset stage reads took from their read share.
+        fn kept_read_shares(&self) -> usize {
+            self.kept_read_shares
+                .lock()
+                .expect("kept read shares")
+                .len()
         }
 
         /// How many times the offset stage of `partition` of [`TOPIC`] was
@@ -2094,6 +2104,13 @@ mod tests {
         }
 
         async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+            if self.keeps_read_share {
+                let permit = FetchReadShare::acquire(1)
+                    .await?
+                    .ok_or_else(|| Error::Message("the read ran outside a read share".into()))?;
+                self.kept_read_shares.lock()?.push(permit);
+            }
+
             let key = (topition.topic().to_owned(), topition.partition());
 
             let read = {
@@ -2208,37 +2225,64 @@ mod tests {
         isolation: IsolationLevel,
         topics: &[(&str, &[i32])],
     ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
+        fetch_on_connection(storage, max_wait, isolation, topics, Extensions::default()).await
+    }
+
+    /// As [`fetch_isolated`], on the connection that `extensions` belongs
+    /// to.
+    async fn fetch_on_connection(
+        storage: Partitions,
+        max_wait: Duration,
+        isolation: IsolationLevel,
+        topics: &[(&str, &[i32])],
+        extensions: Extensions,
+    ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
+        fetch_with_min_bytes(storage, max_wait, 1, isolation, topics, extensions).await
+    }
+
+    /// As [`fetch_on_connection`], with the given `min_bytes`.
+    async fn fetch_with_min_bytes(
+        storage: Partitions,
+        max_wait: Duration,
+        min_bytes: i32,
+        isolation: IsolationLevel,
+        topics: &[(&str, &[i32])],
+        extensions: Extensions,
+    ) -> Result<(Vec<Vec<PartitionData>>, Duration)> {
         let started_at = Instant::now();
+
+        let request = FetchRequest::default()
+            .max_wait_ms(i32::try_from(max_wait.as_millis())?)
+            .isolation_level(Some(isolation.into()))
+            .min_bytes(min_bytes)
+            .max_bytes(Some(MAX_BYTES))
+            .topics(Some(
+                topics
+                    .iter()
+                    .map(|(topic, partitions)| {
+                        FetchTopic::default()
+                            .topic(Some((*topic).into()))
+                            .partitions(Some(
+                                partitions
+                                    .iter()
+                                    .map(|partition| {
+                                        FetchPartition::default()
+                                            .partition(*partition)
+                                            .fetch_offset(0)
+                                            .partition_max_bytes(MAX_BYTES)
+                                    })
+                                    .collect(),
+                            ))
+                    })
+                    .collect(),
+            ));
 
         let response = FetchValidationLayer::new()
             .layer(FetchService { storage })
-            .serve(
-                FetchRequest::default()
-                    .max_wait_ms(i32::try_from(max_wait.as_millis())?)
-                    .isolation_level(Some(isolation.into()))
-                    .min_bytes(1)
-                    .max_bytes(Some(MAX_BYTES))
-                    .topics(Some(
-                        topics
-                            .iter()
-                            .map(|(topic, partitions)| {
-                                FetchTopic::default()
-                                    .topic(Some((*topic).into()))
-                                    .partitions(Some(
-                                        partitions
-                                            .iter()
-                                            .map(|partition| {
-                                                FetchPartition::default()
-                                                    .partition(*partition)
-                                                    .fetch_offset(0)
-                                                    .partition_max_bytes(MAX_BYTES)
-                                            })
-                                            .collect(),
-                                    ))
-                            })
-                            .collect(),
-                    )),
-            )
+            .serve(RequestInput {
+                request,
+                extensions,
+            })
             .await?;
 
         let elapsed = started_at.elapsed();
@@ -2254,6 +2298,42 @@ mod tests {
         ))
     }
 
+    /// A Fetch's reads take their permits from the read share of the request's connection. A
+    /// permit that one request's read keeps then holds back the reads of the connection's
+    /// next request, which answers no records and no error by its fetch deadline, and not
+    /// those of another connection.
+    #[tokio::test(start_paused = true)]
+    async fn requests_on_a_connection_share_its_read_share() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]).keep_read_share();
+        let listener = Extensions::default();
+        let connection = listener.fork();
+
+        let fetch = |extensions: Extensions| {
+            fetch_on_connection(
+                storage.clone(),
+                MAX_WAIT,
+                IsolationLevel::ReadUncommitted,
+                &[(TOPIC, &[0])],
+                extensions,
+            )
+        };
+
+        let (topics, _) = fetch(connection.clone()).await?;
+        assert_eq!(1, batches(&topics[0][0]));
+        assert_eq!(1, storage.kept_read_shares());
+
+        let (topics, elapsed) = fetch(connection).await?;
+        assert_eq!(0, batches(&topics[0][0]));
+        assert_eq!(i16::from(ErrorCode::None), topics[0][0].error_code);
+        assert!(elapsed <= FETCH_DEADLINE, "{elapsed:?}");
+        assert_eq!(1, storage.kept_read_shares());
+
+        _ = fetch(listener.fork()).await?;
+        assert_eq!(2, storage.kept_read_shares());
+
+        Ok(())
+    }
+
     fn batches(partition: &PartitionData) -> usize {
         partition
             .records
@@ -2261,14 +2341,12 @@ mod tests {
             .map_or(0, |records| records.batches.len())
     }
 
-    /// The read deadline of a request with [`MAX_WAIT`].
-    const READ_DEADLINE: Duration = MAX_WAIT.saturating_add(READ_DEADLINE_OVERHEAD);
+    /// The fetch deadline of a request with [`MAX_WAIT`].
+    const FETCH_DEADLINE: Duration = MAX_WAIT.saturating_add(FETCH_DEADLINE_OVERHEAD);
 
-    /// A partition that never answers holds the request for half of the
-    /// read deadline, and the partitions after it are then read with a
-    /// budget of their own: given none, engines read nothing or one record,
-    /// so a budget taken from the spent `max_wait` would leave them as
-    /// starved as before.
+    /// A partition that never answers holds the request for half of the fetch deadline, and the
+    /// partitions after it then each get a partition deadline of their own in the time left: with
+    /// none, engines read nothing or one record.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_partition_does_not_starve_the_rest() -> Result<()> {
         let storage = Partitions::new([
@@ -2280,7 +2358,7 @@ mod tests {
 
         let (partitions, elapsed) = fetch(storage.clone(), &[0, 1, 2, 3]).await?;
 
-        assert_eq!(READ_DEADLINE / 2, elapsed);
+        assert_eq!(FETCH_DEADLINE / 2, elapsed);
 
         assert_eq!(0, partitions[0].partition_index);
         assert_eq!(
@@ -2305,33 +2383,41 @@ mod tests {
             assert_eq!(1_000, partition.high_watermark);
         }
 
-        // max_wait was spent by the stall, and each read after it had half
-        // of max_wait of its own
-        for partition in 1..=3 {
-            assert_eq!(MAX_WAIT / 2, storage.calls(partition)[0].max_wait);
+        // The stall left half of the fetch deadline. Each read after it stopped a quarter of its
+        // time short of its partition deadline: half of what was left for the first two partitions,
+        // and all of it for the last.
+        let left = FETCH_DEADLINE / 2;
+        for (partition, time_left) in [(1, left / 2), (2, left / 2), (3, left)] {
+            assert_eq!(
+                time_left - time_left / 4,
+                storage.calls(partition)[0].max_wait,
+                "partition {partition}"
+            );
         }
 
         Ok(())
     }
 
-    /// However many partitions never answer, the request is answered by
-    /// its read deadline.
+    /// However many partitions never answer, the request is answered by its fetch deadline.
     #[tokio::test(start_paused = true)]
-    async fn stalled_partitions_end_at_the_read_deadline() -> Result<()> {
+    async fn stalled_partitions_end_at_the_fetch_deadline() -> Result<()> {
         let storage = Partitions::new([
             (0, vec![Read::Stall]),
             (1, vec![Read::Stall]),
             (2, vec![Read::Stall]),
         ]);
 
-        let (partitions, elapsed) = fetch(storage, &[0, 1, 2]).await?;
+        let (partitions, elapsed) = fetch(storage.clone(), &[0, 1, 2]).await?;
 
-        assert_eq!(READ_DEADLINE, elapsed);
+        assert_eq!(FETCH_DEADLINE, elapsed);
         assert_eq!(3, partitions.len());
 
         for partition in &partitions {
             assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
             assert_eq!(0, batches(partition));
+
+            // max_wait has passed, so no round follows the first
+            assert_eq!(1, storage.calls(partition.partition_index).len());
         }
 
         Ok(())
@@ -2363,7 +2449,7 @@ mod tests {
                 fetch_isolated(storage.clone(), MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
             let partitions = topics.remove(0);
 
-            assert_eq!(READ_DEADLINE / 2, elapsed, "{isolation:?}");
+            assert_eq!(FETCH_DEADLINE / 2, elapsed, "{isolation:?}");
 
             assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
             assert_eq!(1_002, partitions[0].high_watermark, "{isolation:?}");
@@ -2385,11 +2471,11 @@ mod tests {
         Ok(())
     }
 
-    /// Every round of the long poll shares the read deadline among all of
-    /// the partitions again: a count of partitions left over from the
-    /// round before would give the first partition the whole deadline.
+    /// Every round of the long poll shares the fetch deadline among all of the partitions
+    /// again: a count of partitions left over from the round before would give the first
+    /// partition the whole deadline.
     #[tokio::test(start_paused = true)]
-    async fn every_round_shares_the_read_deadline() -> Result<()> {
+    async fn every_round_shares_the_fetch_deadline() -> Result<()> {
         let storage = Partitions::new([
             (0, vec![Read::Empty, Read::Stall]),
             (1, vec![Read::Empty, Read::Batch(batch(0, &[0])?)]),
@@ -2400,7 +2486,7 @@ mod tests {
         // The first round finds nothing, and the long poll waits half of
         // max_wait before the second
         let second_round = MAX_WAIT / 2;
-        assert_eq!(second_round + (READ_DEADLINE - second_round) / 2, elapsed);
+        assert_eq!(second_round + (FETCH_DEADLINE - second_round) / 2, elapsed);
 
         assert_eq!(0, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
@@ -2408,17 +2494,153 @@ mod tests {
         Ok(())
     }
 
-    /// A partition whose `max_wait` reaches past its share of the read
-    /// deadline gets a budget that ends a quarter of the share before it,
-    /// so a read that spends its whole budget and returns within that
-    /// quarter keeps what it assembled. With `max_wait` of 5s, the first of
-    /// two partitions has a share of 5s and a budget of 3.75s.
+    /// Every round of the long poll reads the partitions again as the first
+    /// round does: the first partition with the whole `max_bytes`, and the
+    /// others with their `partition_max_bytes`. Only the round's own bytes
+    /// count toward `min_bytes`. Each round reads the same records again, so
+    /// `max_bytes` spent by the rounds before would leave the last round with
+    /// nothing to return, and a sum over the rounds would meet `min_bytes`
+    /// with the same records counted more than once.
     #[tokio::test(start_paused = true)]
-    async fn a_read_that_spends_its_budget_keeps_what_it_read() -> Result<()> {
-        let max_wait = Duration::from_secs(5);
-        let share = (max_wait + READ_DEADLINE_OVERHEAD) / 2;
+    async fn every_round_reads_as_the_first() -> Result<()> {
+        const PARTITION_MAX_BYTES: i32 = 1024;
 
-        // past the least margin, within a quarter of the share
+        let record_batch = batch(0, &[0])?;
+        let round_bytes = 2 * u32::try_from(record_batch.record_data.len())?;
+
+        // Each round reads a batch from each partition, then reads nothing
+        // from the next offset. The script holds more rounds than the long
+        // poll can take within `MAX_WAIT`.
+        let script = (0..64)
+            .flat_map(|_| [Read::Batch(record_batch.clone()), Read::Empty])
+            .collect::<Vec<_>>();
+        let storage = Partitions::new([(0, script.clone()), (1, script)]);
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            round_bytes + 1,
+            u32::try_from(MAX_BYTES)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..2)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(PARTITION_MAX_BYTES)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        for (partition, round_max_bytes) in [(0, MAX_BYTES), (1, PARTITION_MAX_BYTES)] {
+            let calls = storage.calls(partition);
+            assert!(
+                calls.len() > 4,
+                "the long poll stopped after two rounds: {calls:?}"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .step_by(2)
+                    .all(|call| i64::from(call.max_bytes) == i64::from(round_max_bytes)),
+                "a round read partition {partition} with other than {round_max_bytes} bytes: \
+                 {calls:?}"
+            );
+        }
+
+        let partitions = responses
+            .into_iter()
+            .flat_map(|topic| topic.partitions.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(2, partitions.len());
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(1, batches(&partitions[1]));
+
+        Ok(())
+    }
+
+    /// A Fetch with `max_wait` of zero reads its partitions before it answers, as Kafka
+    /// does, and each read stops only its stop margin short of its partition deadline,
+    /// whatever `max_wait` is.
+    #[tokio::test(start_paused = true)]
+    async fn zero_max_wait_reads_until_its_stop_margin() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]);
+
+        let (mut topics, elapsed) =
+            fetch_topics(storage.clone(), Duration::ZERO, &[(TOPIC, &[0])]).await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(1_000, partitions[0].high_watermark);
+
+        let time_left = FETCH_DEADLINE_OVERHEAD;
+        assert_eq!(time_left - time_left / 4, storage.calls(0)[0].max_wait);
+
+        Ok(())
+    }
+
+    /// A Fetch with `max_wait` of zero answers a partition without records with
+    /// its offsets at once.
+    #[tokio::test(start_paused = true)]
+    async fn zero_max_wait_answers_an_empty_partition() -> Result<()> {
+        let storage = Partitions::new([(0, vec![])]);
+
+        let (mut topics, elapsed) = fetch_topics(storage, Duration::ZERO, &[(TOPIC, &[0])]).await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(0, batches(&partitions[0]));
+        assert_eq!(1_000, partitions[0].high_watermark);
+
+        Ok(())
+    }
+
+    /// A Fetch whose partitions hold exactly `min_bytes` answers at once, as Kafka does, and so
+    /// does one with `min_bytes` of zero and no records.
+    #[tokio::test(start_paused = true)]
+    async fn exactly_min_bytes_answers_at_once() -> Result<()> {
+        let record_batch = batch(0, &[0])?;
+        let size = i32::try_from(record_batch.record_data.len())?;
+
+        for (min_bytes, script) in [(size, vec![Read::Batch(record_batch)]), (0, vec![])] {
+            let (_, elapsed) = fetch_with_min_bytes(
+                Partitions::new([(0, script)]),
+                MAX_WAIT,
+                min_bytes,
+                IsolationLevel::ReadUncommitted,
+                &[(TOPIC, &[0])],
+                Extensions::default(),
+            )
+            .await?;
+
+            assert_eq!(Duration::ZERO, elapsed, "min_bytes {min_bytes}");
+        }
+
+        Ok(())
+    }
+
+    /// A read stops a quarter of its time short of its partition deadline, so a read that returns
+    /// within that quarter after it stops keeps what it assembled. With `max_wait` of 5s, the first
+    /// of two partitions has 5s until its partition deadline, and stops after 3.75s.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_stops_at_its_stop_margin_keeps_what_it_read() -> Result<()> {
+        let max_wait = Duration::from_secs(5);
+        let time_left = (max_wait + FETCH_DEADLINE_OVERHEAD) / 2;
+
+        // past the least stop margin, within a quarter of the time left
         let overshoot = Duration::from_secs(1);
 
         let storage = Partitions::new([
@@ -2429,7 +2651,7 @@ mod tests {
         let (mut topics, _) = fetch_topics(storage.clone(), max_wait, &[(TOPIC, &[0, 1])]).await?;
         let partitions = topics.remove(0);
 
-        assert_eq!(share - share / 4, storage.calls(0)[0].max_wait);
+        assert_eq!(time_left - time_left / 4, storage.calls(0)[0].max_wait);
 
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1_000, partitions[0].high_watermark);
@@ -2438,13 +2660,12 @@ mod tests {
         Ok(())
     }
 
-    /// An offset stage read again after records reached past it, and that
-    /// never answers, is abandoned at a fresh share of the time left after
-    /// the read. The partition keeps its batches, and the stage read before
-    /// them answers, raised to cover the records: the last stable offset
-    /// too, under `ReadCommitted`.
+    /// An offset stage read again after records reached past it, and that never answers, is
+    /// abandoned at a fresh partition deadline taken after the read. The partition keeps its
+    /// batches, and the stage read before them answers, raised to cover the records: the last
+    /// stable offset too, under `ReadCommitted`.
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_offset_stage_is_abandoned_at_its_own_share() -> Result<()> {
+    async fn a_stalled_offset_stage_is_abandoned_at_its_own_partition_deadline() -> Result<()> {
         for (isolation, last_stable) in [
             (IsolationLevel::ReadUncommitted, 1_000),
             (IsolationLevel::ReadCommitted, 1_001),
@@ -2461,10 +2682,17 @@ mod tests {
                 fetch_isolated(storage, MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
             let partitions = topics.remove(0);
 
-            // The read spends the client's max_wait and its overshoot, then
-            // the offset stage gets half of the time left
-            let read = MAX_WAIT + OVERSHOOT;
-            assert_eq!(read + (READ_DEADLINE - read) / 2, elapsed, "{isolation:?}");
+            // The read runs three quarters of the time until its partition deadline, half of the
+            // fetch deadline, and its overshoot, then the offset stage gets half of the time
+            // left. Tokio's timers have millisecond resolution, so the stage's deadline can end
+            // up to a millisecond later.
+            let time_left = FETCH_DEADLINE / 2;
+            let read = time_left - time_left / 4 + OVERSHOOT;
+            let expected = read + (FETCH_DEADLINE - read) / 2;
+            assert!(
+                elapsed.abs_diff(expected) <= Duration::from_millis(1),
+                "{isolation:?}: {elapsed:?}, expected {expected:?}"
+            );
 
             assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
             assert_eq!(1_001, partitions[0].high_watermark, "{isolation:?}");
@@ -2482,25 +2710,24 @@ mod tests {
         Ok(())
     }
 
-    /// A `max_wait` whose read deadline halves into whole milliseconds seven
-    /// times, since tokio's timers have millisecond resolution: 5504ms, so
-    /// the 32nd of it is 172ms and the 128th is 43ms.
+    /// A `max_wait` whose fetch deadline halves into whole milliseconds seven times,
+    /// since tokio's timers have millisecond resolution: 5504ms, so the 32nd of it is
+    /// 172ms and the 128th is 43ms.
     const HALVING_MAX_WAIT: Duration = Duration::from_millis(504);
 
-    /// A partition whose share is too short for a quarter of it to cover
-    /// an engine's overshoot keeps the least margin instead. After five
-    /// stalls the last partition has a share of a 32nd of the read
-    /// deadline, under 200ms, so its budget ends 50ms before its share
-    /// does, and a read that overshoots its budget by less than that keeps
-    /// what it assembled.
+    /// A partition whose time until its partition deadline is too short for a quarter of it
+    /// to cover an engine's overshoot keeps the least stop margin instead. After five stalls
+    /// the last partition has a 32nd of the fetch deadline, under 200ms, so it stops 50ms
+    /// before its partition deadline, and a read that overshoots its stop by less than that
+    /// keeps what it assembled.
     #[tokio::test(start_paused = true)]
-    async fn a_short_share_keeps_the_least_margin() -> Result<()> {
-        let share = (HALVING_MAX_WAIT + READ_DEADLINE_OVERHEAD) / 32;
-        assert!(share / 4 < MIN_BUDGET_MARGIN && share > MIN_BUDGET_MARGIN);
+    async fn a_short_partition_deadline_keeps_the_least_stop_margin() -> Result<()> {
+        let time_left = (HALVING_MAX_WAIT + FETCH_DEADLINE_OVERHEAD) / 32;
+        assert!(time_left / 4 < MIN_STOP_MARGIN && time_left > MIN_STOP_MARGIN);
 
-        // past a quarter of the share, within the least margin
+        // past a quarter of the time left, within the least stop margin
         let overshoot = Duration::from_millis(45);
-        assert!(share / 4 < overshoot && overshoot < MIN_BUDGET_MARGIN);
+        assert!(time_left / 4 < overshoot && overshoot < MIN_STOP_MARGIN);
 
         let storage = Partitions::new([
             (0, vec![Read::Stall]),
@@ -2519,22 +2746,21 @@ mod tests {
         .await?;
         let partitions = topics.remove(0);
 
-        assert_eq!(share - MIN_BUDGET_MARGIN, storage.calls(5)[0].max_wait);
+        assert_eq!(time_left - MIN_STOP_MARGIN, storage.calls(5)[0].max_wait);
         assert_eq!(1, batches(&partitions[5]));
         assert_eq!(1_000, partitions[5].high_watermark);
 
         Ok(())
     }
 
-    /// A partition whose share is under the least margin is read with no
-    /// budget at all, and answers with the stage read before the records.
-    /// After seven stalls the last partition has a share of a 128th of the
-    /// read deadline, under 50ms.
+    /// A partition with less time until its partition deadline than the least stop margin is read
+    /// with no time to assemble anything, and answers with the stage read before the records. After
+    /// seven stalls the last partition has a 128th of the fetch deadline, under 50ms.
     #[tokio::test(start_paused = true)]
-    async fn a_share_under_the_least_margin_gives_no_budget() -> Result<()> {
-        let read_deadline = HALVING_MAX_WAIT + READ_DEADLINE_OVERHEAD;
-        let share = read_deadline / 128;
-        assert!(share < MIN_BUDGET_MARGIN);
+    async fn less_time_than_the_least_stop_margin_stops_the_read_at_once() -> Result<()> {
+        let fetch_deadline = HALVING_MAX_WAIT + FETCH_DEADLINE_OVERHEAD;
+        let time_left = fetch_deadline / 128;
+        assert!(time_left < MIN_STOP_MARGIN);
 
         let storage = Partitions::new([
             (0, vec![Read::Stall]),
@@ -2555,7 +2781,7 @@ mod tests {
         .await?;
         let partitions = topics.remove(0);
 
-        assert_eq!(read_deadline - share, elapsed);
+        assert_eq!(fetch_deadline - time_left, elapsed);
 
         assert_eq!(Duration::ZERO, storage.calls(7)[0].max_wait);
         assert_eq!(
@@ -2568,30 +2794,31 @@ mod tests {
         Ok(())
     }
 
-    /// The storage budget starts once the offset stage is read, so a
-    /// partition whose stage was slow still gets its half of `max_wait`
-    /// for its records, rather than what the stage left of it.
+    /// The stop margin of the records read is a quarter of the time left after a slow offset stage
+    /// read, not of the time before that read.
     #[tokio::test(start_paused = true)]
-    async fn the_budget_starts_after_the_offset_stage() -> Result<()> {
+    async fn the_stop_margin_is_taken_after_the_offset_stage() -> Result<()> {
+        let stage_read = MAX_WAIT - MAX_WAIT / 4;
+
         let storage = Partitions::new([
             (0, vec![Read::Batch(batch(0, &[0])?)]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
         ])
-        .delay_offset_stage(0, 1, MAX_WAIT - MAX_WAIT / 4);
+        .delay_offset_stage(0, 1, stage_read);
 
         let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
 
-        assert_eq!(MAX_WAIT / 2, storage.calls(0)[0].max_wait);
+        let time_left = FETCH_DEADLINE / 2 - stage_read;
+        assert_eq!(time_left - time_left / 4, storage.calls(0)[0].max_wait);
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
 
         Ok(())
     }
 
-    /// A partition whose offset stage never answers before its records are
-    /// read is answered with no records and unknown offsets at its share,
-    /// its records are never read, and the partitions after it are read
-    /// with a budget of their own.
+    /// A partition whose offset stage never answers before its records are read is answered with no
+    /// records and unknown offsets at its partition deadline, its records are never read, and the
+    /// partitions after it get a partition deadline of their own.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_offset_stage_before_the_read_answers_unknown_offsets() -> Result<()> {
         let storage = Partitions::new([
@@ -2602,7 +2829,7 @@ mod tests {
 
         let (partitions, elapsed) = fetch(storage.clone(), &[0, 1]).await?;
 
-        assert_eq!(READ_DEADLINE / 2, elapsed);
+        assert_eq!(FETCH_DEADLINE / 2, elapsed);
 
         assert_eq!(
             ErrorCode::None,
@@ -2616,16 +2843,18 @@ mod tests {
 
         assert_eq!(1, batches(&partitions[1]));
         assert_eq!(1_000, partitions[1].high_watermark);
-        assert_eq!(MAX_WAIT / 2, storage.calls(1)[0].max_wait);
+
+        // the last partition's time is all of the half that the stall left
+        let time_left = FETCH_DEADLINE / 2;
+        assert_eq!(time_left - time_left / 4, storage.calls(1)[0].max_wait);
 
         Ok(())
     }
 
-    /// The partitions of every topic share one read deadline: a stall in
-    /// the only partition of the first topic takes half of it, not all of
-    /// it, so the next topic is still read.
+    /// The partitions of every topic share one fetch deadline: a stall in the only partition of the
+    /// first topic takes half of it, not all of it, so the next topic is still read.
     #[tokio::test(start_paused = true)]
-    async fn topics_share_the_read_deadline() -> Result<()> {
+    async fn topics_share_the_fetch_deadline() -> Result<()> {
         let storage = Partitions::topics([
             (TOPIC, 0, vec![Read::Stall]),
             ("def", 0, vec![Read::Batch(batch(0, &[0])?)]),
@@ -2634,15 +2863,15 @@ mod tests {
         let (topics, elapsed) =
             fetch_topics(storage, MAX_WAIT, &[(TOPIC, &[0]), ("def", &[0])]).await?;
 
-        assert_eq!(READ_DEADLINE / 2, elapsed);
+        assert_eq!(FETCH_DEADLINE / 2, elapsed);
         assert_eq!(0, batches(&topics[0][0]));
         assert_eq!(1, batches(&topics[1][0]));
 
         Ok(())
     }
 
-    /// The partitions of an unknown topic count as read, so the last
-    /// partition of the request gets all of the read deadline left.
+    /// The partitions of an unknown topic count as read, so the last partition of the request gets
+    /// all of the fetch deadline left.
     #[tokio::test(start_paused = true)]
     async fn an_unknown_topic_counts_as_read() -> Result<()> {
         let storage = Partitions::new([(0, vec![Read::Stall])]);
@@ -2650,7 +2879,7 @@ mod tests {
         let (topics, elapsed) =
             fetch_topics(storage, MAX_WAIT, &[("unknown", &[0]), (TOPIC, &[0])]).await?;
 
-        assert_eq!(READ_DEADLINE, elapsed);
+        assert_eq!(FETCH_DEADLINE, elapsed);
         assert_eq!(
             ErrorCode::UnknownTopicOrPartition,
             ErrorCode::try_from(topics[0][0].error_code)?

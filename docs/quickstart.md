@@ -40,13 +40,15 @@ By default, other computers on your network can reach the broker on port 9092, a
 The broker prints its address and stays in the foreground. The following example shows the output. Press Ctrl-C to stop the broker.
 
 ```text
-nisshi broker 0.7.0
-listening on: tcp://127.0.0.1:9092 (advertised: tcp://127.0.0.1:9092)
+nisshi broker 0.8.0
+listener: tcp://127.0.0.1:9092 (advertised: tcp://127.0.0.1:9092)
 storage: memory://nisshi/ ["dynostore", "libsql", "postgres", "slatedb", "turso"]
 ready in 12ms
 ```
 
 Your version number, list of storage engines, and startup time can differ.
+
+After `ready`, the broker logs only warnings and errors. To see each request, start the broker with `RUST_LOG=nisshi_service::frame=debug` before the command. That setting is verbose: it logs each request's API key as a number, and the whole request and response.
 
 By default, the broker keeps topics and messages in memory, and loses them when it stops. To keep them, you can start the broker with a SQLite file by running the following command:
 
@@ -56,7 +58,7 @@ By default, the broker keeps topics and messages in memory, and loses them when 
 
 To start again with no data, stop the broker and delete `nisshi.db`, and the `nisshi.db-shm` and `nisshi.db-wal` files if they exist.
 
-If another program already uses port 9092, the broker stops with the error "Address already in use". To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. For example, to use port 9093, run the following command:
+If another program already uses port 9092, the broker stops with an error that says the address is already in use. To use a different port, set both the `--listener-url` and `--advertised-listener-url` options. For example, to use port 9093, run the following command:
 
 ```shell
 ./bin/nisshi --listener-url tcp://127.0.0.1:9093 --advertised-listener-url tcp://127.0.0.1:9093
@@ -86,6 +88,19 @@ The `nisshi cat` command sends and reads JSON messages from the terminal. The `c
 [{"key":null,"value":"hello world"}]
 ```
 
+To list the broker's topics and their partition counts, run the following command:
+
+```shell
+./bin/nisshi topic list
+```
+
+```text
+TOPIC  PARTITIONS
+hello  3
+```
+
+To print the topic metadata as JSON for a script, add `--output json`.
+
 If a command prints nothing and does not return, check that the broker from Step 2 is running and that the command uses the same address.
 
 ## Step 4: Connect Your Own Client
@@ -99,6 +114,7 @@ A client connects to the address that the broker advertises. To connect from ano
 You now have a running broker that serves Kafka clients. To continue:
 
 - Connect your applications — Point your Kafka clients at the broker to start sending and receiving messages. For a client example, see [Sarama (Go)](https://docs.nisshi.io/docs/golang-sarama). For an example that uses Kafka Mirror Maker, see [Mirror Maker](https://docs.nisshi.io/docs/example-mirror-maker).
+- Read messages with a consumer group — Kafka consumers share a topic's partitions in a group, and the broker keeps the offset that each group has read up to. For more information, see [Consumer Groups and Offsets](https://github.com/nisshi-io/solace-nisshi/blob/main/docs/consumer-groups.md).
 - Explore the command-line options — Run `./bin/nisshi --help`, `./bin/nisshi topic --help`, and `./bin/nisshi cat --help`.
 - Learn how Nisshi works — Every broker is stateless and keeps its state in the storage engine (for example, PostgreSQL or S3). For more information, see [Stateless Brokers](https://docs.nisshi.io/docs/stateless-brokers).
 
@@ -120,9 +136,9 @@ If there is no release for your operating system or architecture, for example Wi
 4. Run the following command:
 
    ```shell
-   cargo install nisshi --locked --features dynostore,libsql,postgres
+   cargo install nisshi --locked
    ```
 
-   The `--features` option adds the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines. The build takes several minutes.
+   The build includes the `memory://`, `s3://`, `gs://`, `sqlite://`, and `postgres://` storage engines, and takes several minutes.
 
 The build installs the `nisshi` command on your `PATH`. In the other steps, run `nisshi` instead of `./bin/nisshi`.

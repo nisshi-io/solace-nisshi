@@ -42,7 +42,19 @@ group by t.id, tp.id
 
 )
 
-select w.low, w.high, s.offset as stable
+-- The last stable offset is the first offset of the oldest open transaction,
+-- and null when no transaction is open. DeleteRecords can move the log start
+-- (watermark.low) past that offset. Kafka then raises the last stable offset
+-- to the log start, so it never answers an offset below the log:
+-- https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L964-L978
+-- CASE, not greatest(), because libSQL and Turso run this statement too.
+select
+w.low,
+w.high,
+case
+    when s.offset < coalesce(w.low, 0) then coalesce(w.low, 0)
+    else s.offset
+end as stable
 
 from
 

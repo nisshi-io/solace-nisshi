@@ -330,6 +330,24 @@ where
             .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
     }
 
+    /// Replaces the registered route of `api_key` with the service that `wrap` builds from it.
+    /// Returns [`Error::NoRouteToWrap`] when no route of `api_key` is registered, so that a
+    /// route table that registers it after this call, or not at all, does not build without
+    /// what the wrapper adds.
+    pub fn wrap_route<F>(mut self, api_key: i16, wrap: F) -> Result<Self, Error>
+    where
+        F: FnOnce(BoxService<FrameInput, Frame, E>) -> BoxService<FrameInput, Frame, E>,
+    {
+        let route = self
+            .routes
+            .remove(&api_key)
+            .ok_or(Error::NoRouteToWrap(api_key))?;
+
+        _ = self.routes.insert(api_key, wrap(route));
+
+        Ok(self)
+    }
+
     /// The number of routes registered so far (`build` has not yet added `ApiVersions`).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -370,6 +388,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use nisshi_sans_io::{ApiVersionsRequest, ProduceRequest};
 
     use super::*;
@@ -483,5 +503,14 @@ mod tests {
             .expect("v4 is within the ApiVersions protocol range");
 
         assert!(ApiVersionsResponse::try_from(response.body).is_ok());
+    }
+
+    #[test]
+    fn wrapping_an_unregistered_route_is_an_error() {
+        let result = FrameRouteService::<Error>::builder()
+            .wrap_route(ProduceRequest::KEY, |route| route)
+            .map(|builder| builder.len());
+
+        assert_matches!(result, Err(Error::NoRouteToWrap(api_key)) if api_key == ProduceRequest::KEY);
     }
 }

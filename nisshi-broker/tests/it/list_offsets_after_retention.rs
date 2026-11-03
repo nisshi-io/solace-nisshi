@@ -32,32 +32,39 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{Storage, Topition, TxnAddPartitionsRequest};
+use nisshi_storage::{
+    AutoCreateRefusals, Storage, TopicCreationConfig, Topition, TxnAddPartitionsRequest,
+};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-type Broker = RequestFrameService<
+pub(crate) type Broker = RequestFrameService<
     FrameBytesService<BytesService<BytesFrameService<FrameRouteService<Error>>>>,
 >;
 
-fn broker<S>(storage: S) -> Result<Broker>
+pub(crate) fn broker<S>(storage: S) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (
-                RequestFrameLayer,
-                FrameBytesLayer,
-                BytesLayer,
-                BytesFrameLayer::default(),
-            )
-                .into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (
+            RequestFrameLayer,
+            FrameBytesLayer,
+            BytesLayer,
+            BytesFrameLayer::default(),
+        )
+            .into_layer(frame_route)
+    })
 }
 
 /// How many records a test produces before retention deletes them all, at offsets 0 to 4.
@@ -328,7 +335,7 @@ where
 /// Creates a topic with a ten minute `retention.ms`, and produces three records to it: `first`
 /// at `first_create_time`, one in a transaction that stays open, and one more at the current
 /// time. Returns the offset of the transaction's record.
-async fn create_topic_with_open_transaction<G>(
+pub(crate) async fn create_topic_with_open_transaction<G>(
     sc: &G,
     broker: &Broker,
     extensions: &Extensions,

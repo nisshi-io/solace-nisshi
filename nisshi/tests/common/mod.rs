@@ -47,6 +47,15 @@ impl Broker {
 
     /// Starts a broker on the `storage` engine, with `broker_args` added to its command line.
     pub(crate) fn start_on(storage: &str, broker_args: &[&str]) -> Self {
+        Self::launch(storage, broker_args, true)
+    }
+
+    /// Starts a broker on `memory://` without `--silent`, so that it prints its banner.
+    pub(crate) fn start_with_banner() -> Self {
+        Self::launch("memory://nisshi/", &[], false)
+    }
+
+    fn launch(storage: &str, broker_args: &[&str], silent: bool) -> Self {
         let port = TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
             .map(|address| address.port())
@@ -66,8 +75,8 @@ impl Broker {
                     &url,
                     "--storage-engine",
                     storage,
-                    "--silent",
                 ])
+                .args(silent.then_some("--silent"))
                 .args(broker_args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -101,16 +110,28 @@ impl Broker {
 
     /// Stops the broker and returns how it exited and what it wrote, for a failure message.
     fn stop(&mut self) -> String {
+        let output = self.kill();
+
+        format!(
+            "{:?}, stdout: {}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// Kills the broker and returns what it wrote.
+    pub(crate) fn kill(&mut self) -> Output {
         _ = self.process.kill();
-        let status = self.process.wait();
+        let status = self.process.wait().expect("broker status");
         let stdout = self.process.stdout.take().map(read_to_end);
         let stderr = self.process.stderr.take().map(read_to_end);
 
-        format!(
-            "{status:?}, stdout: {}, stderr: {}",
-            String::from_utf8_lossy(&joined(stdout)),
-            String::from_utf8_lossy(&joined(stderr))
-        )
+        Output {
+            status,
+            stdout: joined(stdout),
+            stderr: joined(stderr),
+        }
     }
 
     /// Starts `nisshi` with `args` and `--broker` set to this broker.
@@ -147,6 +168,19 @@ impl Drop for Broker {
         _ = self.process.kill();
         _ = self.process.wait();
     }
+}
+
+/// Runs `nisshi` with `args` and no input, and returns its output.
+pub(crate) fn run(args: &[&str]) -> Output {
+    finish(
+        nisshi()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("command starts"),
+    )
 }
 
 /// The `nisshi` binary, with an empty environment, run from a directory without a `.env`, so

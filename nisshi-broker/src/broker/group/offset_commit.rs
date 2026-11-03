@@ -55,6 +55,7 @@ where
                 group_instance_id: offset_commit.group_instance_id.as_deref(),
                 retention_time_ms: offset_commit.retention_time_ms,
                 topics: offset_commit.topics.as_deref(),
+                is_transactional: false,
             })
             .await
             .map(|body| Frame {

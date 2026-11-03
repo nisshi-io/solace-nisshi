@@ -14,7 +14,7 @@
 -- limitations under the License.
 
 -- prepare consumer_offset_select(text, text, text, integer) as
-select co.committed_offset
+select co.committed_offset, co.leader_epoch, co.metadata
 
 from cluster c
 join consumer_group cg on cg.cluster = c.id

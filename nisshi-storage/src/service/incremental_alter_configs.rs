@@ -104,7 +104,8 @@ use crate::{
 ///     )
 ///     .await?;
 ///
-/// assert!(response.results.unwrap_or_default()[0].configs.is_none());
+/// let results = response.results.unwrap_or_default();
+/// assert!(results[0].configs.as_deref().unwrap_or_default().is_empty());
 ///
 /// let alter_configs = IncrementalAlterConfigsService {
 ///     storage: storage.clone(),

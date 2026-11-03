@@ -82,7 +82,7 @@ pub(super) enum Command {
         #[arg(long, default_value = "0")]
         fetch_offset: i64,
 
-        /// The partition to consume from
+        /// The maximum bytes to fetch from the partition
         #[arg(long, default_value = "1048576")]
         partition_max_bytes: i32,
     },

@@ -30,6 +30,7 @@ use nisshi_sans_io::{
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
 use nisshi_service::{BytesFrameLayer, CAPPED_API_VERSIONS, FrameRouteService};
+use nisshi_storage::{AutoCreateRefusals, TopicCreationConfig};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use uuid::Uuid;
 
@@ -48,7 +49,12 @@ async fn route_table() -> Result<FrameRouteService<Error>> {
 
     let coordinator = Controller::with_storage(storage.clone())?;
 
-    let builder = storage::services(FrameRouteService::<Error>::builder(), storage)?;
+    let builder = storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )?;
     let builder = coordinator::services(builder, coordinator)?;
     let builder = auth::services(builder)?;
 
@@ -138,7 +144,12 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
 
     let coordinator = Controller::with_storage(storage.clone())?;
 
-    let with_storage_routes = storage::services(FrameRouteService::<Error>::builder(), storage)?;
+    let with_storage_routes = storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )?;
     // The broker does not register a route for GetTelemetrySubscriptions, so it does not
     // advertise the client telemetry APIs.
     assert_eq!(24, with_storage_routes.len());

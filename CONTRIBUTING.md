@@ -49,8 +49,33 @@ just ci                # start postgres, minio, and lakehouse via docker compose
 just                   # fmt, build, test, clippy
 ```
 
-See `CLAUDE.md` at the repo root for the full command reference and
-architecture overview.
+Without Docker, `just test-fast` runs every test that needs no Postgres,
+MinIO or Iceberg catalog, and `just test-doc` runs the doc tests. Run the full
+suite with `just ci` and `just test` before you ask for review; CI runs it on
+every pull request.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains how the crates fit together.
+See `AGENTS.md` at the repo root for the full command reference.
+
+In a linked git worktree, the tests start the worktree's own services
+(`etc/worktree-services.sh`) on ports that Docker picks, and write those ports
+to the worktree's `.env`, so several worktrees can run their tests at once.
+This needs Docker, `jq` and `curl`. `just services-down` removes a
+worktree's services, and `just services-prune` removes those of each
+worktree that is gone. Set `NISSHI_WORKTREE_SERVICES=0` to use the default
+project's services from a worktree instead.
+
+### Local services on macOS (colima)
+
+- Homebrew installs the `docker compose` plugin outside the Docker CLI's
+  plugin directory. Add it to `~/.docker/config.json`:
+  `"cliPluginsExtraDirs": ["/opt/homebrew/lib/docker/cli-plugins"]`.
+- The smoke suite (`just smoke <engine>`) needs
+  `NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2`, the address at which colima's
+  containers reach this machine.
+- Each worktree's services use about 0.3 GB of the VM's memory when idle, and
+  more while tests run. Size the VM for the worktrees that test at once, for
+  example `colima start --memory 16` for about ten.
 
 ## Making a change
 

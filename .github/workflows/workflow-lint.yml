@@ -67,6 +67,9 @@ jobs:
       # ci.yml runs check-ca-bundle.sh only on the image's real certificates,
       # so its failure paths are tested here.
       - run: bash .github/scripts/check-ca-bundle.test.sh
+      # ci.yml runs check-storage-deps.sh only in the merge queue, on real
+      # dependency trees that should pass, so its failure paths are tested here.
+      - run: bash .github/scripts/check-storage-deps.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
@@ -74,7 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: zizmor@1.30.1
       # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,
@@ -85,6 +88,9 @@ jobs:
       # The medium/medium thresholds below also hide the open
       # `cache-poisoning` findings. zizmor applies the thresholds globally,
       # so this step cannot show one audit without the other.
+      #
+      # `just lint-workflows` runs both zizmor steps locally. Keep its zizmor
+      # arguments in step with these.
       - env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --min-confidence medium --min-severity medium .github/workflows/

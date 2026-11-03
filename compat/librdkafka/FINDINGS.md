@@ -8,9 +8,11 @@ Sweeps of the librdkafka integration test suite against
 
 1. **No automatic topic creation on MetadataRequest** *(fixed 2026-06-11)* —
    implemented in `MetadataService`: unknown topics named in a
-   MetadataRequest with `allow_auto_topic_creation` are created with four
-   partitions (the `num.partitions` the Kafka client test suites assume)
-   and replication factor 1. Invalid topic names are reported as
+   MetadataRequest with `allow_auto_topic_creation` are created with
+   `--num-partitions` partitions and replication factor 1. The broker
+   default is 1, as in Kafka, but `just compat-librdkafka` passes
+   `--num-partitions=4`, because tests such as 0012 produce to partition 1
+   of a topic they leave to auto-creation. Invalid topic names are reported as
    `INVALID_TOPIC_EXCEPTION` and not created. This unlocked ~100 tests
    that previously could not run.
 
@@ -62,9 +64,10 @@ Sweeps of the librdkafka integration test suite against
 4. **OffsetCommit `metadata` is not round-tripped** — committed metadata
    comes back empty from OffsetFetch (0099, 0140).
 
-5. **DescribeConfigs returns no config entries** — topics report zero
-   ConfigEntry rows where Kafka reports every config with its default
-   (0092 via AlterConfigs read-modify-write).
+5. **AlterConfigs is not implemented** — 0092 reads a topic's configs
+   with DescribeConfigs and writes them back with AlterConfigs. DescribeConfigs
+   now lists every topic config with its default, as Kafka does, but the
+   broker does not implement AlterConfigs.
 
 6. **Transactions are refused** — nisshi answers InitProducerId with a
    `transactional.id` with `TRANSACTIONAL_ID_AUTHORIZATION_FAILED`, so

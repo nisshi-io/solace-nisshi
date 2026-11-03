@@ -96,7 +96,7 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     assert_eq!(1, topics.len());
     assert_eq!(name, topics[0].name.as_str());
     assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(3), topics[0].num_partitions);
+    assert_eq!(Some(1), topics[0].num_partitions);
     assert_eq!(Some(1), topics[0].replication_factor);
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 
@@ -118,7 +118,7 @@ async fn create_with_default(node_id: i32, storage: impl Storage + Clone) -> Res
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
     let partitions = topics[0].partitions.as_deref().unwrap_or_default();
 
-    assert_eq!(3, partitions.len());
+    assert_eq!(1, partitions.len());
 
     for (index, partition) in partitions.iter().enumerate() {
         assert_eq!(index as i32, partition.partition_index);
@@ -374,7 +374,7 @@ async fn invalid_partitions_rejected(storage: impl Storage + Clone) -> Result<()
     assert_eq!(1, topics.len());
     assert_eq!(name, topics[0].name.as_str());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    assert_eq!(Some(3), topics[0].num_partitions);
+    assert_eq!(Some(1), topics[0].num_partitions);
 
     Ok(())
 }
@@ -710,16 +710,16 @@ async fn total_partitions_cap_rejected(storage: impl Storage + Clone) -> Result<
     };
 
     let cases = [
-        // A `-1` topic counts as the broker default of 3 partitions.
+        // A `-1` topic counts as the broker default of 1 partition.
         (
-            "9,997 + default",
-            vec![topic(9_997, 0), topic(-1, 0)],
+            "9,999 + default",
+            vec![topic(9_999, 0), topic(-1, 0)],
             false,
             ErrorCode::InvalidTopicException,
         ),
         (
-            "9,998 + default",
-            vec![topic(9_998, 0), topic(-1, 0)],
+            "10,000 + default",
+            vec![topic(10_000, 0), topic(-1, 0)],
             false,
             ErrorCode::PolicyViolation,
         ),

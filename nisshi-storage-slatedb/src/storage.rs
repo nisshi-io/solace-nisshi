@@ -48,9 +48,9 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
     max_message_bytes, producer_claim,
@@ -1306,7 +1306,10 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let prefix = postcard::to_stdvec(&OffsetCommitKeyPrefix::new(group_id))?;
 
         let mut topitions = BTreeMap::new();
@@ -1321,10 +1324,23 @@ impl Storage for Engine {
             let key: OffsetCommitKey = decode_offset(&kv.key)?;
             let value: OffsetCommitValue = decode_offset(&kv.value)?;
 
-            _ = topitions.insert(Topition::new(key.topic, key.partition), value.offset);
+            _ = topitions.insert(
+                Topition::new(key.topic, key.partition),
+                CommittedOffset {
+                    offset: value.offset,
+                    leader_epoch: None,
+                    metadata: None,
+                },
+            );
         }
 
         Ok(topitions)
+    }
+
+    /// SlateDB is deprecated and takes only security fixes, so it keeps its earlier answer
+    /// to `require_stable`: it reports no pending transactional offset.
+    async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
+        Ok(BTreeSet::new())
     }
 
     async fn offset_fetch(
@@ -1332,7 +1348,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         // TODO: Implement require_stable
         // When true, we must return the Last Stable Offset instead of High Watermark.
         // Current implementation violates READ_COMMITTED isolation by returning potentially unstable offsets.
@@ -1350,7 +1366,7 @@ impl Storage for Engine {
             for topition in topics {
                 // If the topic doesn't exist, return -1 (mimics PG behavior with JOINs)
                 if !existing_topics.contains_key(&topition.topic[..]) {
-                    _ = responses.insert(topition.clone(), -1);
+                    _ = responses.insert(topition.clone(), CommittedOffset::uncommitted());
                     continue;
                 }
 
@@ -1363,9 +1379,13 @@ impl Storage for Engine {
                 let offset = match self.db.get(&key).await {
                     Ok(Some(encoded)) => {
                         let value: OffsetCommitValue = decode_offset(&encoded)?;
-                        value.offset
+                        CommittedOffset {
+                            offset: value.offset,
+                            leader_epoch: None,
+                            metadata: None,
+                        }
                     }
-                    Ok(None) => -1, // No committed offset
+                    Ok(None) => CommittedOffset::uncommitted(), // No committed offset
                     Err(err) => {
                         debug!(?err, ?group_id, ?topition);
                         return Err(Error::Slate(Arc::new(err)));

@@ -192,6 +192,71 @@ pub struct Compaction {
     pub records: usize,
 }
 
+/// How [`Batch::append_rebased`] moves the records of a batch onto the end of another.
+#[derive(Clone, Copy, Debug)]
+struct Rebase {
+    /// The offset delta of the first appended record, added to each appended offset delta.
+    first_offset_delta: i32,
+
+    /// The `last_offset_delta` of the merged batch.
+    last_offset_delta: i32,
+
+    /// The difference between the two base timestamps, added to each appended timestamp delta.
+    timestamp_shift: i64,
+}
+
+impl Rebase {
+    /// The rebase of `other` onto the end of `sink`, or [`Error::OffsetDeltaOverflow`] when the
+    /// merged `last_offset_delta` does not fit in an `i32`.
+    fn onto(sink: &Batch, other: &Batch) -> Result<Self> {
+        let first_offset_delta = sink
+            .last_offset_delta
+            .checked_add(1)
+            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
+
+        let last_offset_delta = other
+            .last_offset_delta
+            .checked_add(1)
+            .and_then(|appended| sink.last_offset_delta.checked_add(appended))
+            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
+
+        Ok(Self {
+            first_offset_delta,
+            last_offset_delta,
+            timestamp_shift: other.base_timestamp.wrapping_sub(sink.base_timestamp),
+        })
+    }
+
+    /// The timestamp delta and offset delta of `record` once rebased, or
+    /// [`Error::OffsetDeltaOverflow`] when its offset delta does not fit in an `i32`.
+    fn deltas(&self, record: &Record) -> Result<(i64, i32)> {
+        let offset_delta = record
+            .offset_delta
+            .checked_add(self.first_offset_delta)
+            .ok_or(Error::OffsetDeltaOverflow("record offset_delta"))?;
+
+        Ok((
+            record.timestamp_delta.wrapping_add(self.timestamp_shift),
+            offset_delta,
+        ))
+    }
+}
+
+/// What decoding `record` charges to its batch's decode budget, when the batch is encoded with
+/// `compression`. `encoded_size` gives the record's encoded size, which only a compressed batch
+/// charges.
+fn decoded_record_size(
+    record: &Record,
+    compression: &Compression,
+    encoded_size: impl FnOnce() -> Result<usize>,
+) -> Result<usize> {
+    if *compression == Compression::None {
+        Ok(record.allocated_size())
+    } else {
+        encoded_size().map(|encoded_size| record.allocated_size().saturating_add(encoded_size))
+    }
+}
+
 impl Batch {
     pub fn compression(&self) -> Result<Compression> {
         Compression::try_from(self.attributes)
@@ -242,40 +307,88 @@ impl Batch {
     ///
     /// [`DefaultRecord`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecord.java#L314
     pub fn append_rebased(&mut self, other: Batch) -> Result<()> {
-        let first_offset_delta = self
-            .last_offset_delta
-            .checked_add(1)
-            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
-
-        let last_offset_delta = other
-            .last_offset_delta
-            .checked_add(1)
-            .and_then(|appended| self.last_offset_delta.checked_add(appended))
-            .ok_or(Error::OffsetDeltaOverflow("last_offset_delta"))?;
-
-        let timestamp_shift = other.base_timestamp.wrapping_sub(self.base_timestamp);
+        let rebase = Rebase::onto(self, &other)?;
 
         let records = other
             .records
             .into_iter()
             .map(|record| {
-                record
-                    .offset_delta
-                    .checked_add(first_offset_delta)
-                    .map(|offset_delta| Record {
+                rebase
+                    .deltas(&record)
+                    .map(|(timestamp_delta, offset_delta)| Record {
                         offset_delta,
-                        timestamp_delta: record.timestamp_delta.wrapping_add(timestamp_shift),
+                        timestamp_delta,
                         ..record
                     })
-                    .ok_or(Error::OffsetDeltaOverflow("record offset_delta"))
             })
             .collect::<Result<Vec<_>>>()?;
 
         self.records.extend(records);
-        self.last_offset_delta = last_offset_delta;
+        self.last_offset_delta = rebase.last_offset_delta;
         self.max_timestamp = self.max_timestamp.max(other.max_timestamp);
 
         Ok(())
+    }
+
+    /// Returns what the decoder charges to the decode budget for this batch once it is encoded
+    /// with `compression`.
+    ///
+    /// The size is what the decoder charges to a batch's decode budget, which
+    /// [`MAX_DECODED_BATCH_BYTES`] limits: the `Record` and `Header` structures of every record,
+    /// plus the inflated record data when `compression` is not [`Compression::None`]. A batch whose
+    /// size is over the limit does not decode.
+    ///
+    /// The size is exact for the encoding that this crate writes. It is not a bound on a batch as
+    /// a client sent it, whose record data can be longer, for example with varints that are not
+    /// minimal, so measure the batch that you will encode. Decoding takes a small multiple of this
+    /// size in memory at its peak (see [`MAX_DECODED_BATCH_BYTES`]).
+    ///
+    /// [`MAX_DECODED_BATCH_BYTES`]: crate::record::MAX_DECODED_BATCH_BYTES
+    pub fn decoded_size(&self, compression: &Compression) -> Result<usize> {
+        self.records.iter().try_fold(0, |size: usize, record| {
+            decoded_record_size(record, compression, || record.size_in_bytes())
+                .map(|record_size| size.saturating_add(record_size))
+        })
+    }
+
+    /// Returns how much [`Batch::decoded_size`] grows when [`Batch::append_rebased`] appends
+    /// `other` to this batch, once the merged batch is encoded with `compression`.
+    ///
+    /// The growth is not `other.decoded_size(compression)`: the rebase changes the offset and
+    /// timestamp deltas of each record of `other`, and with them the size of their varints.
+    ///
+    /// Returns the error that [`Batch::append_rebased`] would return for `other`.
+    pub fn appended_decoded_size(&self, other: &Batch, compression: &Compression) -> Result<usize> {
+        let rebase = Rebase::onto(self, other)?;
+
+        other.records.iter().try_fold(0, |size: usize, record| {
+            let (timestamp_delta, offset_delta) = rebase.deltas(record)?;
+
+            decoded_record_size(record, compression, || {
+                record.size_in_bytes_with_deltas(timestamp_delta, offset_delta)
+            })
+            .map(|record_size| size.saturating_add(record_size))
+        })
+    }
+
+    /// Returns the greatest timestamp that a consumer reads from this batch (see
+    /// [`Batch::record_timestamp`]), whatever its header claims.
+    ///
+    /// For a [`TimestampType::CreateTime`] batch this is the greatest record timestamp, starting
+    /// from `-1` (Kafka's `NO_TIMESTAMP`), as Kafka's [`LogValidator`] computes the
+    /// `max_timestamp` that it writes to the header. For a [`TimestampType::LogAppendTime`]
+    /// batch, it is `max_timestamp`.
+    ///
+    /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L249-L281
+    pub fn max_record_timestamp(&self) -> i64 {
+        match TimestampType::from(self.attributes) {
+            TimestampType::LogAppendTime => self.max_timestamp,
+            TimestampType::CreateTime => self
+                .records
+                .iter()
+                .map(|record| self.record_timestamp(record))
+                .fold(-1, i64::max),
+        }
     }
 
     pub fn keys(&self) -> BTreeSet<Bytes> {
@@ -961,6 +1074,10 @@ mod tests {
         let before = sink.clone();
 
         assert_matches!(
+            sink.appended_decoded_size(&appended, &Compression::None),
+            Err(Error::OffsetDeltaOverflow("record offset_delta"))
+        );
+        assert_matches!(
             sink.append_rebased(appended),
             Err(Error::OffsetDeltaOverflow("record offset_delta"))
         );
@@ -988,6 +1105,10 @@ mod tests {
 
             let before = sink.clone();
 
+            assert_matches!(
+                sink.appended_decoded_size(&appended, &Compression::None),
+                Err(Error::OffsetDeltaOverflow("last_offset_delta"))
+            );
             assert_matches!(
                 sink.append_rebased(appended),
                 Err(Error::OffsetDeltaOverflow("last_offset_delta")),
@@ -1023,6 +1144,70 @@ mod tests {
         assert_eq!(1, records.len());
         assert_eq!(0, records[0].offset_delta);
         assert_eq!(None, records[0].key);
+
+        Ok(())
+    }
+
+    fn timestamped(
+        timestamp_type: TimestampType,
+        base_timestamp: i64,
+        max_timestamp: i64,
+        deltas: &[i64],
+    ) -> Result<Batch> {
+        deltas
+            .iter()
+            .zip(0..)
+            .fold(
+                Batch::builder()
+                    .attributes(BatchAttribute::default().timestamp(timestamp_type).into())
+                    .base_timestamp(base_timestamp)
+                    .max_timestamp(max_timestamp)
+                    .last_offset_delta(i32::try_from(deltas.len())? - 1),
+                |builder, (&timestamp_delta, offset_delta)| {
+                    builder.record(
+                        Record::builder()
+                            .timestamp_delta(timestamp_delta)
+                            .offset_delta(offset_delta)
+                            .value(Some(Bytes::from_static(b"v"))),
+                    )
+                },
+            )
+            .build()
+    }
+
+    #[test]
+    fn max_record_timestamp_is_the_largest_record_not_the_last() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, 1_000, -1, &[0, 300, 100])?;
+        assert_eq!(1_300, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    /// A record whose `base_timestamp + timestamp_delta` wraps has the wrapped timestamp, as
+    /// Java's `long` addition gives a consumer, so it is below the record before it here.
+    #[test]
+    fn max_record_timestamp_takes_a_wrapped_record_timestamp() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, i64::MAX - 10, -1, &[5, 11])?;
+        assert_eq!(i64::MIN, batch.record_timestamp(&batch.records[1]));
+        assert_eq!(i64::MAX - 5, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    #[test]
+    fn max_record_timestamp_of_a_batch_without_a_timestamp_is_no_timestamp() -> Result<()> {
+        let batch = timestamped(TimestampType::CreateTime, -1, 5_000, &[0])?;
+        assert_eq!(-1, batch.max_record_timestamp());
+
+        Ok(())
+    }
+
+    /// A consumer reads `max_timestamp` for each record of a `LogAppendTime` batch, whatever its
+    /// deltas.
+    #[test]
+    fn max_record_timestamp_of_log_append_time_is_the_header() -> Result<()> {
+        let batch = timestamped(TimestampType::LogAppendTime, 1_000, 2_000, &[0, 5_000])?;
+        assert_eq!(2_000, batch.max_record_timestamp());
 
         Ok(())
     }

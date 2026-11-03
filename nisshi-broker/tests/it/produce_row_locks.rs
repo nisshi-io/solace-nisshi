@@ -19,7 +19,7 @@
 //! each acknowledged record stored once, at the offset that its produce returned.
 
 use crate::{
-    common::{POSTGRES_URL, StorageType, alphanumeric_string, storage_container},
+    common::{StorageType, alphanumeric_string, postgres_url, storage_container},
     produce::{create_time_batch, now_ms, produce_batches},
 };
 use anyhow::Result;
@@ -171,7 +171,7 @@ impl Cluster {
 }
 
 async fn connect() -> Result<Client> {
-    let (client, connection) = tokio_postgres::connect(POSTGRES_URL, NoTls).await?;
+    let (client, connection) = tokio_postgres::connect(&postgres_url(), NoTls).await?;
     _ = tokio::spawn(connection);
     Ok(client)
 }

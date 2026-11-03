@@ -49,7 +49,7 @@ pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 /// Enforced three ways against the same number: as the byte limit on the
 /// decompressing reader, as a pre-check on every wire-supplied count
 /// (`record_count`, a sequence length) before anything is decoded, and as a
-/// running [`DecodeBudget`] that every allocation made while decoding a batch
+/// running `DecodeBudget` that every allocation made while decoding a batch
 /// is charged to.
 ///
 /// The real peak per batch is a small multiple of this, not this exactly: a
@@ -59,7 +59,14 @@ pub(crate) const MAX_PREALLOCATED_ELEMENTS: usize = 1_024;
 /// live alongside the buffer that the records decode from, the spare capacity
 /// of that buffer is not charged, and the zstd decoder's window (up to
 /// 128 MiB by default) is not charged.
-pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 100 * 1024 * 1024;
+///
+/// A caller that merges batches must keep each merged batch within this
+/// limit, or the merged batch no longer decodes. [`inflated::Batch::decoded_size`]
+/// and [`inflated::Batch::appended_decoded_size`] measure a batch against it.
+///
+/// [`inflated::Batch::decoded_size`]: crate::record::inflated::Batch::decoded_size
+/// [`inflated::Batch::appended_decoded_size`]: crate::record::inflated::Batch::appended_decoded_size
+pub const MAX_DECODED_BATCH_BYTES: usize = 100 * 1024 * 1024;
 
 /// The decoded-memory budget of one batch. The inflated bytes of a compressed
 /// batch, each `Record` and each `Header` are charged as they are decoded, and

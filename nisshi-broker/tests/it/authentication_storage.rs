@@ -121,5 +121,5 @@ async fn sqlite_starts() -> Result<()> {
 #[tokio::test]
 async fn postgres_starts() -> Result<()> {
     let _guard = init_tracing()?;
-    build(Url::parse("postgres://postgres:postgres@localhost")?, true).await
+    build(Url::parse(&crate::common::postgres_url())?, true).await
 }

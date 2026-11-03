@@ -52,7 +52,8 @@ use crate::{Error, NamedGroupDetail, Result, Storage, authorized_operations};
 ///
 /// let groups = response.groups.unwrap_or_default();
 /// assert_eq!(1, groups.len());
-/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(groups[0].error_code)?);
+/// assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+/// assert_eq!("Dead", groups[0].group_state);
 /// assert_eq!(group_id, groups[0].group_id.as_str());
 /// # Ok(())
 /// # }
@@ -160,6 +161,61 @@ mod tests {
             ],
             answered
         );
+
+        Ok(())
+    }
+
+    /// Kafka answers a group that does not exist with the error NONE and the state `Dead` on
+    /// `DescribeGroups` v0 to v5, and an admin client reads the group as missing from that state.
+    /// An error of `GROUP_ID_NOT_FOUND` fails the client as unexpected.
+    #[test]
+    fn group_that_does_not_exist_answers_none_and_dead() -> Result<()> {
+        for include_authorized_operations in [false, true] {
+            let response = describe_groups_response(
+                Ok(vec![NamedGroupDetail::error_code(
+                    "missing".into(),
+                    ErrorCode::GroupIdNotFound,
+                )]),
+                Some(&["missing".to_owned()]),
+                include_authorized_operations,
+            );
+
+            let groups = response.groups.unwrap_or_default();
+            assert_eq!(1, groups.len());
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+            assert_eq!("Dead", groups[0].group_state);
+            assert_eq!("missing", groups[0].group_id);
+            assert_eq!(Some(vec![]), groups[0].members);
+            assert_eq!(
+                Some(authorized_operations::group(
+                    include_authorized_operations,
+                    ErrorCode::None.into()
+                )),
+                groups[0].authorized_operations
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A group whose stored detail can't be read keeps its error and the state `Unknown`.
+    #[test]
+    fn group_that_can_not_be_read_keeps_its_error() -> Result<()> {
+        let response = describe_groups_response(
+            Ok(vec![NamedGroupDetail::error_code(
+                "unreadable".into(),
+                ErrorCode::UnknownServerError,
+            )]),
+            Some(&["unreadable".to_owned()]),
+            false,
+        );
+
+        let groups = response.groups.unwrap_or_default();
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(groups[0].error_code)?
+        );
+        assert_eq!("Unknown", groups[0].group_state);
 
         Ok(())
     }

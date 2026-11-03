@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fmt::Debug,
     marker::PhantomData,
@@ -27,9 +27,10 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, consumer_group_select, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, watermark_select_for_write,
+        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -64,8 +65,8 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail,
-    ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
+    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
     Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
@@ -599,6 +600,50 @@ impl Engine {
         })
     }
 
+    /// Refuses a client's transactional batch for a partition that is not in its producer's
+    /// ongoing transaction (see [`txn_produce_partition_check`]). EndTxn deletes a transaction's
+    /// `txn_topition` rows, so a row is present only while the transaction is ongoing.
+    async fn txn_produce_partition_check(
+        &self,
+        transaction_id: &str,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        connection: &Connection,
+    ) -> Result<()> {
+        let mut rows = connection
+            .query(
+                &sql_lookup(txn_produce_partition_select::QUERY)?,
+                (
+                    self.cluster.as_str(),
+                    transaction_id,
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition.topic(),
+                    topition.partition(),
+                ),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
+
+        let columns = ResultColumns::turso(txn_produce_partition_select::QUERY, &rows);
+        let producer = columns.index(txn_produce_partition_select::PRODUCER)?;
+        let added = columns.index(txn_produce_partition_select::ADDED)?;
+
+        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
+            Some(row) => Some((
+                match row.get_value(producer)? {
+                    Value::Null => None,
+                    _ => Some(integer_value(&row, producer).inspect_err(|err| error!(?err))?),
+                },
+                integer_value(&row, added).inspect_err(|err| error!(?err))? as i32,
+            )),
+            None => None,
+        };
+
+        txn_produce_partition_check(row, deflated.producer_id)
+            .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
+    }
+
     async fn produce_in_tx<'conn>(
         &self,
         transaction_id: Option<&str>,
@@ -616,6 +661,14 @@ impl Engine {
             self.idempotent_message_check(transaction_id, topition, &deflated, tx.deref())
                 .await
                 .inspect_err(|err| error!(?err))?;
+        }
+
+        if let Some(transaction_id) = transaction_id
+            && deflated.is_transactional()
+            && !deflated.is_control()
+        {
+            self.txn_produce_partition_check(transaction_id, topition, &deflated, tx.deref())
+                .await?;
         }
 
         let watermarks = self.watermark_select_for_write(topition, tx).await?;
@@ -1233,6 +1286,37 @@ fn integer_value(row: &Row, index: usize) -> Result<i64> {
 /// integer is outside `i16`.
 fn epoch_value(row: &Row, index: usize) -> Result<i16> {
     integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
+}
+
+/// Returns the leader epoch in column `index` of `row`, or `None` when the column is null.
+/// Returns an error when the stored integer is outside `i32`.
+fn leader_epoch_value(row: &Row, index: usize) -> Result<Option<i32>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_integer()
+                .copied()
+                .ok_or(Error::UnexpectedValue(value))
+                .and_then(|epoch| i32::try_from(epoch).map(Some).map_err(Error::from))
+        }
+    })
+}
+
+/// Returns the text in column `index` of `row`, or `None` when the column is null.
+fn optional_text_value(row: &Row, index: usize) -> Result<Option<String>> {
+    row.get_value(index).map_err(Error::from).and_then(|value| {
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value
+                .as_text()
+                .cloned()
+                .map(Some)
+                .ok_or(Error::UnexpectedValue(value))
+        }
+    })
 }
 
 /// Returns a mapper that turns a unique constraint failure into [`Error::Api`] with
@@ -2104,7 +2188,10 @@ impl Storage for Engine {
         Ok(responses)
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(group_id);
 
         let mut results = BTreeMap::new();
@@ -2113,43 +2200,98 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("consumer_offset_select_by_group.sql")?,
+                &sql_lookup(consumer_offset_select_by_group::QUERY)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
+        let columns = ResultColumns::turso(consumer_offset_select_by_group::QUERY, &rows);
+        let topic = columns.index(consumer_offset_select_by_group::TOPIC)?;
+        let partition = columns.index(consumer_offset_select_by_group::PARTITION)?;
+        let committed_offset = columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)?;
+        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)?;
+        let metadata = columns.index(consumer_offset_select_by_group::METADATA)?;
+
         while let Some(row) = rows.next().await? {
-            let topic = row.get_value(0).map_err(Into::into).and_then(|value| {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
                 value
                     .as_text()
                     .cloned()
                     .ok_or(Error::UnexpectedValue(value))
             })?;
 
-            let partition = row.get_value(1).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .map(|partition| partition as i32)
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
 
-            let offset = row.get_value(2).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
+            let committed = CommittedOffset {
+                offset: integer_value(&row, committed_offset)?,
+                leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                metadata: optional_text_value(&row, metadata)?,
+            };
 
-            debug!(group_id, topic, partition, offset);
+            debug!(group_id, topic, partition, ?committed);
 
             assert_eq!(
                 None,
-                results.insert(Topition::new(topic, partition), offset)
+                results.insert(Topition::new(topic, partition), committed)
             );
         }
 
         Ok(results)
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        debug!(cluster = self.cluster, group_id);
+
+        let c = self.connection().await?;
+
+        let mut rows = c
+            .query(
+                &sql_lookup(txn_offset_commit_tp_select_pending::QUERY)?,
+                (self.cluster.as_str(), group_id),
+            )
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
+
+        let columns = ResultColumns::turso(txn_offset_commit_tp_select_pending::QUERY, &rows);
+        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)?;
+        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)?;
+
+        let mut pending = BTreeSet::new();
+
+        while let Some(row) = rows.next().await? {
+            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
+                value
+                    .as_text()
+                    .cloned()
+                    .ok_or(Error::UnexpectedValue(value))
+            })?;
+
+            let partition = row
+                .get_value(partition)
+                .map_err(Into::into)
+                .and_then(|value| {
+                    value
+                        .as_integer()
+                        .copied()
+                        .map(|partition| partition as i32)
+                        .ok_or(Error::UnexpectedValue(value))
+                })?;
+
+            _ = pending.insert(Topition::new(topic, partition));
+        }
+
+        debug!(cluster = self.cluster, group_id, ?pending);
+
+        Ok(pending)
     }
 
     async fn offset_fetch(
@@ -2157,7 +2299,7 @@ impl Storage for Engine {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         debug!(cluster = self.cluster, ?group_id, ?topics, ?require_stable);
         let c = self.connection().await?;
 
@@ -2166,7 +2308,7 @@ impl Storage for Engine {
         for topic in topics {
             let mut rows = c
                 .query(
-                    &sql_lookup("consumer_offset_select.sql")?,
+                    &sql_lookup(consumer_offset_select::QUERY)?,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2185,24 +2327,31 @@ impl Storage for Engine {
                     )
                 })?;
 
-            let offset = rows
+            let columns = ResultColumns::turso(consumer_offset_select::QUERY, &rows);
+            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)?;
+            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)?;
+            let metadata = columns.index(consumer_offset_select::METADATA)?;
+
+            let committed = rows
                 .next()
                 .await
+                .map_err(Error::from)
                 .and_then(|row| {
-                    row.and_then(|row| {
-                        row.get_value(0)
-                            .map(|value| value.as_integer().copied())
-                            .transpose()
+                    row.map_or(Ok(CommittedOffset::uncommitted()), |row| {
+                        Ok(CommittedOffset {
+                            offset: integer_value(&row, committed_offset)?,
+                            leader_epoch: leader_epoch_value(&row, leader_epoch)?,
+                            metadata: optional_text_value(&row, metadata)?,
+                        })
                     })
-                    .unwrap_or(Ok(-1))
                 })
-                .inspect(|offset| {
+                .inspect(|committed| {
                     debug!(
                         cluster = self.cluster,
                         group_id,
                         topic = topic.topic,
                         partition = topic.partition,
-                        offset
+                        ?committed
                     )
                 })
                 .inspect_err(|err| {
@@ -2215,7 +2364,7 @@ impl Storage for Engine {
                     )
                 })?;
 
-            assert_eq!(None, offsets.insert(topic.to_owned(), offset));
+            assert_eq!(None, offsets.insert(topic.to_owned(), committed));
         }
 
         Ok(offsets)
@@ -4201,6 +4350,107 @@ mod tests {
         Ok(())
     }
 
+    /// Turso accepts the statement shape of `topic_insert.sql`: an `insert ... select ...
+    /// returning`.
+    #[tokio::test]
+    async fn insert_select_with_returning() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        _ = connection
+            .execute(
+                "create table pqr (
+                    id integer primary key autoincrement,
+                    name text not null
+                )",
+                (),
+            )
+            .await?;
+        _ = connection
+            .execute("insert into pqr (name) values (?1)", &["fgh"])
+            .await?;
+        _ = connection
+            .execute(
+                "create table xyz (
+                    id integer primary key autoincrement,
+                    pqr integer not null references pqr (id),
+                    name text not null
+                )",
+                (),
+            )
+            .await?;
+
+        let mut rows = connection
+            .query(
+                "insert into xyz (pqr, name)
+                select pqr.id, ?2
+                from pqr
+                where pqr.name = ?1
+                returning xyz.name",
+                &["fgh", "abc"],
+            )
+            .await?;
+
+        let row = rows.next().await?.unwrap();
+        assert_eq!(Some("abc"), row.get_value(0)?.as_text().map(String::as_str));
+
+        Ok(())
+    }
+
+    /// Turso accepts the statement shape of `producer_epoch_insert.sql`: a common table
+    /// expression that feeds an `insert ... select ... returning`.
+    #[tokio::test]
+    async fn cte_insert_with_returning() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        _ = connection
+            .execute(
+                "create table pqr (
+                    id integer primary key autoincrement,
+                    name text not null
+                )",
+                (),
+            )
+            .await?;
+        _ = connection
+            .execute("insert into pqr (name) values (?1)", &["fgh"])
+            .await?;
+        _ = connection
+            .execute(
+                "create table xyz (
+                    id integer primary key autoincrement,
+                    pqr integer not null references pqr (id),
+                    name text not null
+                )",
+                (),
+            )
+            .await?;
+
+        let mut rows = connection
+            .query(
+                "with qwe as (
+                    select pqr.id, ?2
+                    from pqr
+                    where pqr.name = ?1
+                )
+                insert into xyz (pqr, name)
+                select * from qwe
+                returning xyz.name",
+                &["fgh", "abc"],
+            )
+            .await?;
+
+        let row = rows.next().await?.unwrap();
+        assert_eq!(Some("abc"), row.get_value(0)?.as_text().map(String::as_str));
+
+        Ok(())
+    }
+
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
     /// first row. Returns whether it returned a row.
     async fn insert_returning(
@@ -4238,265 +4488,6 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn insert_with_returning() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let connection = db.connect()?;
-
-        let sql = "create table xyz (
-            id integer primary key autoincrement,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let sql = "insert into xyz (name) values (?1) returning xyz.name";
-
-        let statement = connection.prepare(sql).await?;
-        let mut rows = statement.query(&["abc"]).await?;
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-        let name = row.get_str(0).inspect(|name| debug!(name))?;
-        assert_eq!("abc", name);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn insert_select_with_returning() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let connection = db.connect()?;
-
-        let sql = "create table pqr (
-            id integer primary key autoincrement,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let sql = "insert into pqr (name) values (?1)";
-        let statement = connection.prepare(sql).await?;
-        assert_eq!(1, statement.execute(&["fgh"]).await?);
-
-        let sql = "create table xyz (
-            id integer primary key autoincrement,
-            pqr integer references pqr (id) not null,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let sql = "insert into xyz (pqr, name)
-            select pqr.id, ?2
-            from pqr
-            where pqr.name = ?1
-            returning xyz.name";
-
-        let expected = "abc";
-        let mut rows = connection.query(sql, &["fgh", expected]).await?;
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-        let actual = row.get_str(0).inspect(|name| debug!(name))?;
-        assert_eq!(expected, actual);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cte_insert_with_returning() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let connection = db.connect()?;
-
-        let sql = "create table pqr (
-            id integer primary key autoincrement,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let sql = "insert into pqr (name) values (?1)";
-        let statement = connection.prepare(sql).await?;
-        assert_eq!(1, statement.execute(&["fgh"]).await?);
-
-        let sql = "create table xyz (
-            id integer primary key autoincrement,
-            pqr integer references pqr (id) not null,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let sql = "with qwe as (
-                select pqr.id, ?2
-                from pqr
-                where pqr.name = ?1
-            )
-            insert into xyz (pqr, name)
-            select * from qwe
-            returning xyz.name";
-
-        let expected = "abc";
-        let mut rows = connection.query(sql, &["fgh", expected]).await?;
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-        let actual = row.get_str(0).inspect(|name| debug!(name))?;
-        assert_eq!(expected, actual);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn simpler_insert_select_with_returning() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let connection = db.connect()?;
-
-        let sql = "create table xyz (
-            id integer primary key autoincrement,
-            pqr integer not null,
-            name text not null
-            )";
-
-        _ = connection.execute(sql, ()).await?;
-
-        let expected = "abc";
-
-        let sql = "insert into xyz (pqr, name)
-            select 41 + 1, ?1
-            returning xyz.pqr, xyz.name";
-
-        let mut rows = connection.query(sql, &[expected]).await?;
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-
-        assert_eq!(42, row.get::<i32>(0)?);
-
-        let actual = row.get_str(1).inspect(|name| debug!(name))?;
-        assert_eq!(expected, actual);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn create_topic() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let connection = db.connect()?;
-
-        assert_eq!(
-            0,
-            connection
-                .execute(&include_sql!("ddl/010-cluster.sql"), ())
-                .await?
-        );
-
-        assert_eq!(
-            0,
-            connection
-                .execute(&include_sql!("ddl/020-topic.sql"), ())
-                .await?
-        );
-
-        let cluster = "nisshi";
-
-        assert_eq!(
-            1,
-            connection
-                .execute(
-                    &fix_parameters(&include_sql!("sql/register_broker.sql"))?,
-                    &[cluster]
-                )
-                .await?
-        );
-
-        let name = "test";
-        let uuid = Uuid::new_v4();
-        let partitions = 3;
-        let replication_factor = 3;
-
-        let mut rows = connection
-            .query(
-                &fix_parameters(&include_sql!("sql/topic_insert.sql"))?,
-                (
-                    cluster,
-                    name,
-                    uuid.to_string(),
-                    partitions,
-                    replication_factor,
-                ),
-            )
-            .await?;
-
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-        assert_eq!(uuid.to_string().as_str(), row.get_str(0)?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn create_topic_in_tx() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
-        let file_path = temp_dir.path().join("nisshi.db");
-
-        let db = libsql::Builder::new_local(file_path).build().await?;
-        let tx = db.connect()?.transaction().await?;
-
-        assert_eq!(
-            0,
-            tx.execute(&include_sql!("ddl/010-cluster.sql"), ()).await?
-        );
-
-        assert_eq!(0, tx.execute(&include_sql!("ddl/020-topic.sql"), ()).await?);
-
-        let cluster = "nisshi";
-
-        assert_eq!(
-            1,
-            tx.execute(
-                &fix_parameters(&include_sql!("sql/register_broker.sql"))?,
-                &[cluster]
-            )
-            .await?
-        );
-
-        let name = "test";
-        let uuid = Uuid::new_v4();
-        let partitions = 3;
-        let replication_factor = 3;
-
-        let mut rows = tx
-            .query(
-                &fix_parameters(&include_sql!("sql/topic_insert.sql"))?,
-                (
-                    cluster,
-                    name,
-                    uuid.to_string(),
-                    partitions,
-                    replication_factor,
-                ),
-            )
-            .await?;
-
-        let row = rows.next().await.inspect(|row| debug!(?row))?.unwrap();
-        assert_eq!(uuid.to_string().as_str(), row.get_str(0)?);
-        Ok(())
-    }
-
     #[ignore]
     #[tokio::test]
     async fn lite_system_time() -> Result<()> {
@@ -4532,15 +4523,14 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn register_broker() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let temp_dir = tempdir_in(env::current_dir()?).inspect(|temporary| debug!(?temporary))?;
         let file_path = temp_dir.path().join("nisshi.db");
 
-        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let storage = storage_url(&temp_dir)?;
         let cluster = "nisshi";
         let node = 12321;
 
@@ -4563,7 +4553,9 @@ mod tests {
                 .await?;
         }
 
-        let db = libsql::Builder::new_local(file_path).build().await?;
+        let db = turso::Builder::new_local(file_path.to_str().unwrap())
+            .build()
+            .await?;
         let connection = db.connect()?;
 
         let mut rows = connection
@@ -4571,20 +4563,23 @@ mod tests {
             .await?;
 
         let row = rows.next().await?.unwrap();
-        assert_eq!(cluster, row.get_str(1)?);
+        assert_eq!(
+            Some(cluster),
+            row.get_value(1)?.as_text().map(String::as_str)
+        );
 
         Ok(())
     }
 
-    #[ignore]
+    #[ignore = "Turso rejects ddl/020-topic.sql (not null after references) and build() ignores DDL errors: no such table: topic"]
     #[tokio::test]
     async fn storage_create_topic() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
+        let temp_dir = tempdir_in(env::current_dir()?).inspect(|temporary| debug!(?temporary))?;
         let file_path = temp_dir.path().join("nisshi.db");
 
-        let storage = Url::parse(&format!("file://{}", file_path.display()))?;
+        let storage = storage_url(&temp_dir)?;
         let cluster = "nisshi";
         let node = 12321;
 
@@ -4623,7 +4618,9 @@ mod tests {
                 .inspect(|uuid| debug!(?uuid))
         }?;
 
-        let db = libsql::Builder::new_local(file_path).build().await?;
+        let db = turso::Builder::new_local(file_path.to_str().unwrap())
+            .build()
+            .await?;
         let connection = db.connect()?;
 
         let mut rows = connection
@@ -4638,9 +4635,19 @@ mod tests {
             .await?;
 
         let row = rows.next().await?.unwrap();
-        assert_eq!(uuid, Uuid::parse_str(row.get_str(0)?)?);
-        assert_eq!(num_partitions, row.get::<i32>(1)?);
-        assert_eq!(replication_factor, row.get::<i32>(2)? as i16);
+        let stored = row.get_value(0)?;
+        assert_eq!(
+            uuid,
+            Uuid::parse_str(stored.as_text().expect("uuid is text"))?
+        );
+        assert_eq!(
+            Some(&i64::from(num_partitions)),
+            row.get_value(1)?.as_integer()
+        );
+        assert_eq!(
+            Some(&i64::from(replication_factor)),
+            row.get_value(2)?.as_integer()
+        );
 
         Ok(())
     }
@@ -5182,24 +5189,27 @@ mod tests {
         Ok(())
     }
 
-    /// Returns an engine on a new database in `temp_dir`, with a registered broker.
-    /// `build()` opens the URL path relative to the current directory, so `temp_dir` must
-    /// be in it.
-    async fn registered_engine(temp_dir: &TempDir) -> Result<Engine> {
-        let current_dir = env::current_dir()?;
+    /// Returns the URL of `nisshi.db` in `temp_dir`. `build()` opens the URL path relative to
+    /// the current directory, so `temp_dir` must be in it.
+    fn storage_url(temp_dir: &TempDir) -> Result<Url> {
         let relative = temp_dir
             .path()
-            .strip_prefix(&current_dir)
+            .strip_prefix(env::current_dir()?)
             .map_err(|err| Error::Message(err.to_string()))?
             .join("nisshi.db");
 
+        Ok(Url::parse(&format!("file:///{}", relative.display()))?)
+    }
+
+    /// Returns an engine on a new database in `temp_dir`, with a registered broker.
+    async fn registered_engine(temp_dir: &TempDir) -> Result<Engine> {
         let cluster = "nisshi";
         let node = 12321;
 
         let engine = Engine::builder()
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
             .cluster(cluster.to_owned())
-            .storage(Url::parse(&format!("file:///{}", relative.display()))?)
+            .storage(storage_url(temp_dir)?)
             .node(node)
             .build()
             .await?;

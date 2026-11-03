@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     record::{self, Record, inflated},
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use nisshi_storage::{ArcDynStorage, Storage};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rand::{RngExt as _, rng};
@@ -69,12 +69,17 @@ fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
 where
     S: Storage + Clone,
 {
-    storage::services(FrameRouteService::<Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+    storage::services(
+        FrameRouteService::<Error>::builder(),
+        storage,
+        TopicCreationConfig::default(),
+        AutoCreateRefusals::default(),
+    )
+    .and_then(auth::services)
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
 }
 
 #[derive(Clone, Default)]
@@ -407,9 +412,7 @@ async fn secrets_stay_out_of_logs(storage: ArcDynStorage) -> Result<()> {
         12,
         FetchRequest::default()
             .replica_id(Some(-1))
-            // The broker returns no records to a fetch with a zero wait. With
-            // `min_bytes(1)`, this fetch returns as soon as it has a batch.
-            .max_wait_ms(500)
+            .max_wait_ms(0)
             .min_bytes(1)
             .max_bytes(Some(1024 * 1024))
             .isolation_level(Some(0))

@@ -349,7 +349,12 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
             None,
         )
         .await?;
-    assert_eq!(Some(&offset), offset_fetch.get(&good_topition));
+    assert_eq!(
+        Some(offset),
+        offset_fetch
+            .get(&good_topition)
+            .map(|committed| committed.offset)
+    );
 
     let doomed_topition = Topition::new(doomed_name.clone(), 0);
 
@@ -472,6 +477,9 @@ async fn slash_topic_name_offsets_swept(storage: impl Storage + Clone) -> Result
             .into_iter()
             .collect::<BTreeMap<_, _>>(),
         committed
+            .into_iter()
+            .map(|(topition, committed)| (topition, committed.offset))
+            .collect::<BTreeMap<_, _>>()
     );
 
     Ok(())

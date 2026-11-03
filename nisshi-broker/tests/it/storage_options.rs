@@ -20,6 +20,7 @@ use nisshi_broker::{
     Error, NODE_ID, Result, broker::Broker, coordinator::group::administrator::Controller,
 };
 use nisshi_storage::ArcDynStorage;
+use std::assert_matches;
 use url::Url;
 use uuid::Uuid;
 
@@ -57,6 +58,20 @@ fn is_unrecognized(error: &Error, expected_scheme: &str, expected_option: &str) 
     )
 }
 
+fn is_invalid_value(
+    error: &Error,
+    expected_scheme: &str,
+    expected_option: &str,
+    expected_value: &str,
+) -> bool {
+    matches!(
+        error,
+        Error::Storage(nisshi_storage::Error::InvalidStorageOptionValue {
+            scheme, option, value, ..
+        }) if scheme == expected_scheme && option == expected_option && value == expected_value
+    )
+}
+
 #[tokio::test]
 async fn memory_accepts_interval_options() -> Result<()> {
     let _guard = init_tracing()?;
@@ -90,6 +105,33 @@ async fn memory_rejects_misspelt_option() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(feature = "postgres")]
+mod postgres {
+    use super::*;
+
+    /// The engine rejects the pool size before it connects, so this test
+    /// needs no server.
+    #[tokio::test]
+    async fn rejects_invalid_pool_max_size() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let error = build("postgres://postgres:postgres@localhost?pool_max_size=1")
+            .await
+            .unwrap_err();
+        assert_matches!(
+            &error,
+            Error::Storage(nisshi_storage::Error::InvalidStorageOptionValue {
+                scheme,
+                option,
+                value,
+                ..
+            }) if scheme == "postgres" && option == "pool_max_size" && value == "1"
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -137,6 +179,27 @@ mod sqlite {
             is_unrecognized(&error, "sqlite", "vacuum_onto"),
             "{error:?}"
         );
+
+        Ok(())
+    }
+
+    /// A value that the engine can't parse stops startup instead of the engine
+    /// running with the default.
+    #[tokio::test]
+    async fn rejects_unparsable_engine_options() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for (option, value) in [
+            ("busy_timeout", "banana"),
+            ("compaction", "Single"),
+            ("mode", "Direct"),
+        ] {
+            let error = build(&url(&format!("{option}={value}"))).await.unwrap_err();
+            assert!(
+                is_invalid_value(&error, "sqlite", option, value),
+                "{option}={value}: {error:?}"
+            );
+        }
 
         Ok(())
     }

@@ -31,6 +31,13 @@ pub(super) const MAX_ENTRIES: usize = 1024;
 /// default `index.interval.bytes`.
 pub(super) const INITIAL_INTERVAL_BYTES: u64 = 4096;
 
+/// The version of the rule that builds a [`TimeIndex`]. At version 1, each
+/// batch's maximum timestamp comes from its records, or from a header that
+/// the broker rewrote from them, and never from a header as a client wrote
+/// it. The next lookup rebuilds an index at an older version (see
+/// [`TimeIndex::is_complete`] and [`TimeIndex::begin_backfill`]).
+pub(super) const VERSION: u32 = 1;
+
 /// A sparse time index of one partition: `max_timestamp -> base_offset` of
 /// some of its batches, in the partition's watermark document.
 ///
@@ -76,6 +83,12 @@ pub(super) struct TimeIndex {
     #[serde(default)]
     complete: bool,
 
+    /// The [`VERSION`] of the rule that built the index's entries and
+    /// maximum. A document written before the field existed, or rewritten
+    /// by a broker without it, decodes as version 0.
+    #[serde(default)]
+    version: u32,
+
     /// The token of the backfill in progress, set before its listing and
     /// cleared by its commit. A binary without the index rewrites the
     /// document without this field, so a commit after such a write finds
@@ -101,6 +114,7 @@ impl Default for TimeIndex {
             bytes_since_entry: 0,
             interval_bytes: INITIAL_INTERVAL_BYTES,
             complete: false,
+            version: 0,
             backfill: None,
         }
     }
@@ -112,6 +126,7 @@ impl TimeIndex {
     pub(super) fn complete() -> Self {
         Self {
             complete: true,
+            version: VERSION,
             ..Self::default()
         }
     }
@@ -127,21 +142,55 @@ impl TimeIndex {
         }
     }
 
+    /// Returns whether the index is complete at the current [`VERSION`] or a
+    /// later one. An index completed at an older version reads as
+    /// incomplete, so that the next lookup rebuilds it from the records. An
+    /// index at a later version reads as complete, so that a rollback does
+    /// not rebuild it.
     pub(super) fn is_complete(&self) -> bool {
-        self.complete
+        self.complete && self.version >= VERSION
     }
 
-    /// Marks the index complete from offset 0 onward: for a partition whose
-    /// first batch is being appended, nothing predates it; for a backfill
-    /// candidate, its listing covered every batch below the high watermark.
+    /// Returns whether the index was built by an older version's rule, and
+    /// its entries and maximum can come from headers that disagree with
+    /// their records.
+    pub(super) fn is_older_version(&self) -> bool {
+        self.version < VERSION
+    }
+
+    /// Marks the index complete from offset 0 onward, at the current
+    /// [`VERSION`]: for a partition whose first batch is being appended,
+    /// nothing predates it; for a backfill candidate, its listing covered
+    /// every batch below the high watermark.
     pub(super) fn mark_complete(&mut self) {
         self.complete = true;
+        self.version = VERSION;
     }
 
     /// Marks a backfill in progress and returns its token: `token` when
     /// none was in progress, else the token of the backfill another process
     /// began, which then covers this one's listing as well.
+    ///
+    /// When no backfill is in progress, the function first clears an index
+    /// at an older [`VERSION`], complete or not, and stamps it with the
+    /// current one. Its entries and its maximum timestamp can come from
+    /// headers that overstate their records, and [`TimeIndex::merge`] keeps
+    /// a live entry above the candidate's maximum, and the live maximum, so
+    /// an overstated header would survive the rebuild. The listing covers
+    /// every batch below the high watermark that this same write reads, so
+    /// the cleared index loses nothing that the candidate does not hold.
+    ///
+    /// The function does not clear while a backfill is in progress, because
+    /// that backfill's listing does not cover the produces after it, and a
+    /// clear would drop their maximum timestamp.
     pub(super) fn begin_backfill(&mut self, token: u64) -> u64 {
+        if self.backfill.is_none() && self.is_older_version() {
+            *self = Self {
+                version: VERSION,
+                ..Self::default()
+            };
+        }
+
         *self.backfill.get_or_insert(token)
     }
 
@@ -239,6 +288,14 @@ impl TimeIndex {
     /// backfills again.
     pub(super) fn merge(candidate: Self, live: &Self, token: u64) -> Self {
         let candidate_max = candidate.max_timestamp;
+        let owned = live.is_complete() || live.backfill == Some(token);
+        let complete = candidate.is_complete() && owned;
+
+        // An older broker's backfill can commit from the headers while this
+        // one runs, and take its token. The result then keeps the live
+        // version, so that the next backfill clears the entries it took from
+        // the headers.
+        let version = if owned { VERSION } else { live.version };
 
         let mut by_offset: BTreeMap<i64, i64> = candidate
             .entries
@@ -255,7 +312,8 @@ impl TimeIndex {
             max_timestamp: NO_TIMESTAMP,
             bytes_since_entry: 0,
             interval_bytes: candidate.interval_bytes.max(live.interval_bytes),
-            complete: candidate.complete && (live.complete || live.backfill == Some(token)),
+            complete,
+            version,
             backfill: None,
         };
 
@@ -465,5 +523,131 @@ mod tests {
         assert_eq!(TimeIndex::default(), index);
         assert!(!index.is_complete());
         Ok(())
+    }
+
+    fn completed_before_version() -> Result<TimeIndex, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"entries":{{"{}":0}},"max_timestamp":{},"complete":true}}"#,
+            T0 + 1_000,
+            T0 + 1_000
+        ))
+    }
+
+    /// An index that a broker completed before [`VERSION`] existed reads as
+    /// incomplete, so that the next lookup rebuilds it.
+    #[test]
+    fn index_completed_at_an_older_version_is_not_complete() -> Result<(), serde_json::Error> {
+        let index = completed_before_version()?;
+        assert_eq!(0, index.version);
+        assert!(!index.is_complete());
+        Ok(())
+    }
+
+    /// The backfill clears the entries and the maximum of an index completed
+    /// at an older version, so that the merge cannot keep them.
+    #[test]
+    fn begin_backfill_clears_an_index_completed_at_an_older_version()
+    -> Result<(), serde_json::Error> {
+        let mut index = completed_before_version()?;
+        assert_eq!(7, index.begin_backfill(7));
+
+        assert!(index.entries().is_empty());
+        assert_eq!(NO_TIMESTAMP, index.max_timestamp());
+        assert!(!index.is_complete());
+
+        let mut candidate = dense();
+        candidate.append(T0, 0, 1);
+        let merged = TimeIndex::merge(candidate, &index, 7);
+
+        assert!(merged.is_complete());
+        assert_eq!(&BTreeMap::from([(T0, 0)]), merged.entries());
+        assert_eq!(T0, merged.max_timestamp());
+        Ok(())
+    }
+
+    /// An older broker's backfill can leave an index incomplete with entries
+    /// from the headers, so the backfill clears an incomplete index at an
+    /// older version too.
+    #[test]
+    fn begin_backfill_clears_an_incomplete_index_at_an_older_version() {
+        let mut index = TimeIndex::default();
+        index.append(T0 + 1_000, 0, 1);
+        assert_eq!(7, index.begin_backfill(7));
+
+        assert!(index.entries().is_empty());
+        assert_eq!(NO_TIMESTAMP, index.max_timestamp());
+        assert_eq!(VERSION, index.version);
+    }
+
+    /// The backfill keeps an index at an older version while another
+    /// backfill is in progress, and joins it. That backfill's listing does
+    /// not cover a produce after it, so a clear would drop that produce's
+    /// maximum, and a lookup would answer no match for it.
+    #[test]
+    fn begin_backfill_joins_a_backfill_in_progress_without_clearing() {
+        let mut index = TimeIndex::default();
+        assert_eq!(7, index.begin_backfill(7));
+        index.append(T0, 3, 1);
+
+        // A broker without the version rewrites the document.
+        index.version = 0;
+
+        assert_eq!(7, index.begin_backfill(8));
+        assert_eq!(&BTreeMap::from([(T0, 3)]), index.entries());
+        assert_eq!(T0, index.max_timestamp());
+    }
+
+    #[test]
+    fn begin_backfill_keeps_an_index_at_the_current_version() {
+        let mut index = dense();
+        index.append(T0, 0, 1);
+        assert_eq!(7, index.begin_backfill(7));
+        assert_eq!(&BTreeMap::from([(T0, 0)]), index.entries());
+        assert!(index.is_complete());
+    }
+
+    /// A broker that knows a later version reads an index at that version
+    /// as complete, so that a rollback does not rebuild it.
+    #[test]
+    fn index_completed_at_a_later_version_is_complete() {
+        let index = TimeIndex {
+            version: VERSION + 1,
+            ..TimeIndex::complete()
+        };
+        assert!(index.is_complete());
+    }
+
+    /// The merge marks the result complete only when the live index is
+    /// complete at the current version, or carries the backfill's token. An
+    /// older broker's backfill can commit over the token, and the result
+    /// then keeps the live version, so that the next backfill clears the
+    /// entries that the older broker took from the headers.
+    #[test]
+    fn merge_over_an_older_version_keeps_the_live_version() -> Result<(), serde_json::Error> {
+        let mut candidate = dense();
+        candidate.append(T0, 0, 1);
+
+        let live = completed_before_version()?;
+        let merged = TimeIndex::merge(candidate.clone(), &live, 7);
+        assert!(!merged.is_complete());
+        assert_eq!(0, merged.version);
+
+        let mut live = TimeIndex::default();
+        assert_eq!(7, live.begin_backfill(7));
+        let merged = TimeIndex::merge(candidate, &live, 7);
+        assert!(merged.is_complete());
+        assert_eq!(VERSION, merged.version);
+        Ok(())
+    }
+
+    #[test]
+    fn index_of_a_new_partition_is_complete_at_the_current_version() {
+        assert!(TimeIndex::complete().is_complete());
+        assert_eq!(VERSION, TimeIndex::complete().version);
+
+        let mut index = TimeIndex::default();
+        index.mark_complete();
+        assert!(index.is_complete());
+        assert_eq!(VERSION, index.version);
     }
 }

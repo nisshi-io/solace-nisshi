@@ -23,7 +23,8 @@ use rama::{Layer, Service, extensions::Extensions};
 use tracing::{debug, instrument, warn};
 
 use crate::{
-    Error, MAX_REPLICATION_FACTOR, Result, config::validate_topic_config, max_message_bytes,
+    DEFAULT_NUM_PARTITIONS, Error, MAX_PARTITIONS_PER_REQUEST, MAX_REPLICATION_FACTOR, Result,
+    config::validate_topic_config, max_message_bytes,
 };
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
@@ -45,34 +46,15 @@ pub(super) fn error_result(
         .configs(Some([].into()))
 }
 
-/// Kafka 3.9.1 rejects a whole `CreateTopics` request whose topics add up
-/// to more than `MAX_PARTITIONS_PER_BATCH` (10,000) partitions, before any
-/// per-topic validation runs, including the name check
-/// ([ReplicationControlManager.java#L1152-L1169](https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L1152-L1169)).
-///
-/// nisshi counts partitions only. Kafka 3.9.1 also caps the metadata
-/// records a request produces at 10,000 (one `TopicRecord` per topic, one
-/// per config, one per partition), so a request for exactly 10,000
-/// partitions fails there with `POLICY_VIOLATION`. nisshi has no metadata
-/// records, so it deliberately allows exactly 10,000 partitions.
-const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
-
-/// Partitions created for a topic whose `num_partitions` is `-1` (the
-/// "use the broker default" sentinel). Shared between the per-topic
-/// substitution in [`ValidatedCreateTopicsRequest::try_from`] and
-/// [`total_requested_partitions`], which must count a `-1` topic the same
-/// way the substitution below will.
-const BROKER_DEFAULT_NUM_PARTITIONS: i32 = 3;
-
 /// Sum of partitions this request would create, computed before any
 /// per-topic validation runs, counted as Kafka 3.9.1 does: a topic with
 /// manual `assignments` counts one partition per assignment, a topic
-/// requesting the broker default (`-1`) counts as
-/// [`BROKER_DEFAULT_NUM_PARTITIONS`]. A topic whose `num_partitions` is
-/// otherwise invalid (`0`, or another negative value) counts as zero, so it
-/// can't pull the total under the cap; the per-topic check in `serve`
-/// rejects it on its own merits.
-fn total_requested_partitions(topics: &[CreatableTopic]) -> i64 {
+/// requesting the broker default (`-1`) counts as `num_partitions`, the
+/// value that [`validate_topic`] substitutes for it. A topic whose
+/// `num_partitions` is otherwise invalid (`0`, or another negative value)
+/// counts as zero, so it can't pull the total under the cap; the per-topic
+/// check in `serve` rejects it on its own merits.
+fn total_requested_partitions(topics: &[CreatableTopic], num_partitions: i32) -> i64 {
     topics
         .iter()
         .map(
@@ -80,7 +62,7 @@ fn total_requested_partitions(topics: &[CreatableTopic]) -> i64 {
                 (Some(assignments), _) if !assignments.is_empty() => {
                     i64::try_from(assignments.len()).unwrap_or(i64::MAX)
                 }
-                (_, -1) => i64::from(BROKER_DEFAULT_NUM_PARTITIONS),
+                (_, -1) => i64::from(num_partitions.max(0)),
                 (_, n) if n > 0 => i64::from(n),
                 _ => 0,
             },
@@ -142,7 +124,7 @@ pub struct ValidatedCreateTopicsRequest {
 /// single request may create.
 #[derive(Clone, Debug)]
 pub struct MalformedCreateTopicsRequest {
-    total: i64,
+    pub(crate) total: i64,
     topics: Vec<CreatableTopic>,
 }
 
@@ -175,16 +157,22 @@ impl MalformedCreateTopicsRequest {
     }
 }
 
-impl TryFrom<CreateTopicsRequest> for ValidatedCreateTopicsRequest {
-    type Error = MalformedCreateTopicsRequest;
-
-    fn try_from(request: CreateTopicsRequest) -> Result<Self, Self::Error> {
+impl ValidatedCreateTopicsRequest {
+    /// Validates each topic of `request`, giving a topic that asks for the broker default
+    /// (`-1`) `num_partitions` partitions.
+    ///
+    /// Returns [`MalformedCreateTopicsRequest`] when the topics add up to more than
+    /// [`MAX_PARTITIONS_PER_REQUEST`] partitions.
+    pub fn new(
+        request: CreateTopicsRequest,
+        num_partitions: i32,
+    ) -> Result<Self, MalformedCreateTopicsRequest> {
         let requested = request.topics.unwrap_or_default();
 
         // Reject the whole request, before any per-topic validation, when the partitions
         // requested across every topic exceed the cap. Kafka also runs this before the name
         // check.
-        let total = total_requested_partitions(&requested);
+        let total = total_requested_partitions(&requested, num_partitions);
         if total > MAX_PARTITIONS_PER_REQUEST {
             return Err(MalformedCreateTopicsRequest {
                 total,
@@ -194,7 +182,10 @@ impl TryFrom<CreateTopicsRequest> for ValidatedCreateTopicsRequest {
 
         Ok(Self {
             validate_only: request.validate_only.unwrap_or_default(),
-            topics: requested.into_iter().map(validate_topic).collect(),
+            topics: requested
+                .into_iter()
+                .map(|topic| validate_topic(topic, num_partitions))
+                .collect(),
             extensions: Extensions::default(),
         })
     }
@@ -205,7 +196,7 @@ impl TryFrom<CreateTopicsRequest> for ValidatedCreateTopicsRequest {
 /// so the invalid ones are answered whether or not `validate_only` is set, and a bad name
 /// (e.g. "", ".", "..", or one containing "/") can never reach a backend whose delete/list
 /// operations are prefix based.
-fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
+fn validate_topic(mut topic: CreatableTopic, default_num_partitions: i32) -> ValidatedTopic {
     let name = topic.name.clone();
 
     let explicit_partitions = topic.num_partitions != -1;
@@ -222,7 +213,7 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
 
     let num_partitions = Some(match topic.num_partitions {
         -1 => {
-            topic.num_partitions = assigned_partitions.unwrap_or(BROKER_DEFAULT_NUM_PARTITIONS);
+            topic.num_partitions = assigned_partitions.unwrap_or(default_num_partitions);
             topic.num_partitions
         }
         otherwise => otherwise,
@@ -375,12 +366,30 @@ fn validate_topic(mut topic: CreatableTopic) -> ValidatedTopic {
 
 /// A [`Layer`] converting a [`CreateTopicsRequest`] into a [`ValidatedCreateTopicsRequest`] for
 /// the wrapped [`Service`], and answering a request rejected as a whole itself.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CreateTopicsValidationLayer;
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CreateTopicsValidationLayer {
+    num_partitions: i32,
+}
+
+impl Default for CreateTopicsValidationLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CreateTopicsValidationLayer {
+    /// Returns a layer that gives a topic asking for the broker default (`-1`)
+    /// [`DEFAULT_NUM_PARTITIONS`] partitions.
     pub fn new() -> Self {
-        Self
+        Self {
+            num_partitions: DEFAULT_NUM_PARTITIONS,
+        }
+    }
+
+    /// Returns a layer with the given `num.partitions`: the partitions of a topic that asks
+    /// for the broker default (`-1`).
+    pub fn num_partitions(self, num_partitions: i32) -> Self {
+        Self { num_partitions }
     }
 }
 
@@ -388,7 +397,10 @@ impl<S> Layer<S> for CreateTopicsValidationLayer {
     type Service = CreateTopicsValidationService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        CreateTopicsValidationService { inner }
+        CreateTopicsValidationService {
+            inner,
+            num_partitions: self.num_partitions,
+        }
     }
 }
 
@@ -397,11 +409,13 @@ impl<S> Layer<S> for CreateTopicsValidationLayer {
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CreateTopicsValidationService<S> {
     inner: S,
+    num_partitions: i32,
 }
 
 impl<S> Debug for CreateTopicsValidationService<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct(stringify!(CreateTopicsValidationService))
+            .field("num_partitions", &self.num_partitions)
             .finish()
     }
 }
@@ -421,7 +435,7 @@ where
             extensions,
         } = input.into();
 
-        match ValidatedCreateTopicsRequest::try_from(request) {
+        match ValidatedCreateTopicsRequest::new(request, self.num_partitions) {
             Ok(request) => {
                 self.inner
                     .serve(ValidatedCreateTopicsRequest {
@@ -456,7 +470,7 @@ mod tests {
     use rama::{Layer as _, Service as _, extensions::Extensions};
 
     use super::{CreateTopicsValidationLayer, ValidatedCreateTopicsRequest, ValidatedTopic};
-    use crate::{Error, Result};
+    use crate::{DEFAULT_NUM_PARTITIONS, Error, Result};
 
     /// Records how many of the topics it was given were valid.
     #[derive(Clone, Debug, Default)]
@@ -528,11 +542,16 @@ mod tests {
         for (num_partitions, replication_factor) in
             [(9_667_468, -1), (-1, 3), (3, 3), (i32::MAX, i16::MAX)]
         {
-            let validated =
-                ValidatedCreateTopicsRequest::try_from(CreateTopicsRequest::default().topics(
-                    Some(vec![topic("a", num_partitions, replication_factor, 1)]),
-                ))
-                .expect("one assignment is under the cap");
+            let validated = ValidatedCreateTopicsRequest::new(
+                CreateTopicsRequest::default().topics(Some(vec![topic(
+                    "a",
+                    num_partitions,
+                    replication_factor,
+                    1,
+                )])),
+                DEFAULT_NUM_PARTITIONS,
+            )
+            .expect("one assignment is under the cap");
 
             let [ValidatedTopic::Rejected(result)] = &validated.topics[..] else {
                 panic!("{num_partitions}/{replication_factor} should be rejected");
@@ -557,8 +576,9 @@ mod tests {
 
     #[test]
     fn assignments_with_default_counts_are_valid() {
-        let validated = ValidatedCreateTopicsRequest::try_from(
+        let validated = ValidatedCreateTopicsRequest::new(
             CreateTopicsRequest::default().topics(Some(vec![topic("a", -1, -1, 2)])),
+            DEFAULT_NUM_PARTITIONS,
         )
         .expect("two assignments are under the cap");
 
@@ -566,11 +586,12 @@ mod tests {
     }
 
     /// Storage creates `num_partitions` partitions and ignores the assignments, so a topic
-    /// with six assignments must reach it asking for six partitions, not the default three.
+    /// with six assignments must reach it asking for six partitions, not the broker default.
     #[test]
     fn assignments_set_the_partition_count() {
-        let validated = ValidatedCreateTopicsRequest::try_from(
+        let validated = ValidatedCreateTopicsRequest::new(
             CreateTopicsRequest::default().topics(Some(vec![topic("a", -1, -1, 6)])),
+            DEFAULT_NUM_PARTITIONS,
         )
         .expect("six assignments are under the cap");
 
@@ -584,17 +605,85 @@ mod tests {
 
     #[test]
     fn broker_defaults_are_substituted() {
-        let validated = ValidatedCreateTopicsRequest::try_from(
-            CreateTopicsRequest::default().topics(Some(vec![topic("a", -1, -1, 0)])),
-        )
-        .expect("under the cap");
+        for num_partitions in [DEFAULT_NUM_PARTITIONS, 7] {
+            let validated = ValidatedCreateTopicsRequest::new(
+                CreateTopicsRequest::default().topics(Some(vec![topic("a", -1, -1, 0)])),
+                num_partitions,
+            )
+            .expect("under the cap");
 
-        let [ValidatedTopic::Valid(topic)] = &validated.topics[..] else {
-            panic!("a default topic is valid");
-        };
+            let [ValidatedTopic::Valid(topic)] = &validated.topics[..] else {
+                panic!("a default topic is valid");
+            };
 
-        assert_eq!(super::BROKER_DEFAULT_NUM_PARTITIONS, topic.num_partitions);
-        assert_eq!(1, topic.replication_factor);
+            assert_eq!(num_partitions, topic.num_partitions);
+            assert_eq!(1, topic.replication_factor);
+        }
+    }
+
+    /// The cap counts a topic that asks for the broker default (`-1`) with the configured
+    /// `num.partitions`, because that is the number of partitions that storage creates.
+    #[tokio::test]
+    async fn the_cap_counts_a_default_topic_as_num_partitions() -> Result<()> {
+        let inner = CountingInner::default();
+
+        let response = CreateTopicsValidationLayer::new()
+            .num_partitions(5_000)
+            .layer(inner.clone())
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default().topics(Some(vec![
+                    topic("a", -1, -1, 0),
+                    topic("b", -1, -1, 0),
+                    topic("c", -1, -1, 0),
+                ])),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        assert_eq!(0, inner.calls.load(Ordering::SeqCst));
+
+        for topic in response.topics.expect("topics") {
+            assert_eq!(
+                ErrorCode::PolicyViolation,
+                ErrorCode::try_from(topic.error_code)?
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A `num_partitions` below 1 counts a default topic as zero partitions, so it can't pull the
+    /// total of the other topics under the cap, and the default topic itself is rejected.
+    #[test]
+    fn a_non_positive_default_does_not_lower_the_total() {
+        for num_partitions in [0, -1_000_000] {
+            let malformed = ValidatedCreateTopicsRequest::new(
+                CreateTopicsRequest::default().topics(Some(vec![
+                    topic("a", 9_999, 1, 0),
+                    topic("b", 2, 1, 0),
+                    topic("c", -1, -1, 0),
+                ])),
+                num_partitions,
+            )
+            .expect_err("10,001 partitions are over the cap");
+
+            assert_eq!(10_001, malformed.total, "{num_partitions}");
+
+            let validated = ValidatedCreateTopicsRequest::new(
+                CreateTopicsRequest::default().topics(Some(vec![topic("c", -1, -1, 0)])),
+                num_partitions,
+            )
+            .expect("under the cap");
+
+            let [ValidatedTopic::Rejected(result)] = &validated.topics[..] else {
+                panic!("{num_partitions}: a default topic with no partitions is rejected");
+            };
+
+            assert_eq!(
+                ErrorCode::InvalidPartitions,
+                ErrorCode::try_from(result.error_code).expect("error code")
+            );
+        }
     }
 
     /// A rejected topic is answered on its own: the valid topic beside it still reaches the

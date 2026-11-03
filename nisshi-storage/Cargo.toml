@@ -31,8 +31,8 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-console.workspace = true
 chrono.workspace = true
+console.workspace = true
 deadpool = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 futures-core.workspace = true
@@ -43,6 +43,8 @@ governor.workspace = true
 human-units.workspace = true
 indicatif.workspace = true
 libsql = { workspace = true, optional = true }
+nisshi-sans-io.workspace = true
+nisshi-schema.workspace = true
 object_store = { workspace = true, optional = true }
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
@@ -58,8 +60,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 slatedb = {workspace = true, optional = true}
-nisshi-sans-io.workspace = true
-nisshi-schema.workspace = true
 thiserror.workspace = true
 tokio-postgres = { workspace = true, optional = true }
 tokio-postgres-rustls = { workspace = true, optional = true }
@@ -74,9 +74,9 @@ uuid.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 dotenv.workspace = true
-pretty_assertions.workspace = true
 nisshi-schema.workspace = true
 opentelemetry_sdk.workspace = true
+pretty_assertions.workspace = true
 tempfile.workspace = true
 time.workspace = true
 tracing-subscriber.workspace = true

@@ -239,7 +239,7 @@ jobs:
           "${RUNNER_TEMP}/fossa-bin/fossa" --version
       - name: FOSSA analyze and upload
         id: analyze
-        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@d07aa7fb57d0e352316223e016a5177ddc487086 # main 2026-10-28, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/sca/sca-scan@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           scanners: "fossa"
           additional_scan_params: |
@@ -255,7 +255,7 @@ jobs:
       #   gh variable set FOSSA_LICENSING_BLOCK --body false
       # and `gh variable delete FOSSA_LICENSING_BLOCK` to block again.
       - name: FOSSA licensing guard
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -273,7 +273,7 @@ jobs:
       # but not when there is no fresh analysis to read.
       - name: FOSSA vulnerability guard
         if: ${{ !cancelled() && steps.analyze.outcome == 'success' }}
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -310,7 +310,7 @@ jobs:
           ref: ${{ needs.setup.outputs.sha }}
           persist-credentials: false
       - name: Download scan image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: guardian-scan-image
       - name: Load image
@@ -494,7 +494,7 @@ jobs:
     permissions:
       contents: read
       id-token: write    # OIDC, to assume manifest_aws_role
-    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@252af7a10cf89621d64f004906b69ba71244842b # main 2026-10-13, untagged
+    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
     with:
       table_name: solace-cloud-manifest
       manifest_aws_role: arn:aws:iam::868978040651:role/github-solace-cloud-manifest-rw

@@ -33,7 +33,10 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
-use nisshi_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use nisshi_storage::{
+    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
+    TopicCreationConfig,
+};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
 use rsasl::config::SASLConfig;
@@ -270,10 +273,13 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    topic_creation: TopicCreationConfig,
+    auto_create_refusals: AutoCreateRefusals,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
+    banner: Option<String>,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
@@ -307,11 +313,14 @@ where
             advertised_listener,
             storage,
             groups,
+            topic_creation: TopicCreationConfig::default(),
+            auto_create_refusals: AutoCreateRefusals::default(),
 
             sasl_config: None,
             tls_server_config: None,
 
             silent: false,
+            banner: None,
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
@@ -525,6 +534,10 @@ where
         let ls = if self.silent {
             None
         } else {
+            if let Some(banner) = &self.banner {
+                print!("{banner}");
+            }
+
             println!("ready in {}ms", started.elapsed().as_millis(),);
 
             let ls = m.add(ProgressBar::new_spinner());
@@ -617,6 +630,8 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
+                        self.topic_creation,
+                        self.auto_create_refusals.clone(),
                         self.sasl_config.clone()
                     )?;
 
@@ -791,7 +806,9 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
+    banner: Option<String>,
     group_coordinator: GroupCoordinatorConfig,
+    topic_creation: TopicCreationConfig,
 
     cancellation: CancellationToken,
 }
@@ -820,7 +837,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
             cancellation: self.cancellation,
         }
     }
@@ -839,7 +858,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -859,7 +880,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -882,7 +905,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -904,7 +929,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -926,7 +953,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
+            banner: self.banner,
             group_coordinator: self.group_coordinator,
+            topic_creation: self.topic_creation,
 
             cancellation: self.cancellation,
         }
@@ -971,9 +1000,22 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
         Self { silent, ..self }
     }
 
+    /// Text that the broker prints to stdout once its listener is bound, before `ready in`,
+    /// unless it is silent. A broker that fails to start prints none of it.
+    pub fn banner(self, banner: Option<String>) -> Self {
+        Self { banner, ..self }
+    }
+
     pub fn group_coordinator(self, group_coordinator: GroupCoordinatorConfig) -> Self {
         Self {
             group_coordinator,
+            ..self
+        }
+    }
+
+    pub fn topic_creation(self, topic_creation: TopicCreationConfig) -> Self {
+        Self {
+            topic_creation,
             ..self
         }
     }
@@ -1054,10 +1096,13 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            topic_creation: self.topic_creation,
+            auto_create_refusals: AutoCreateRefusals::default(),
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
+            banner: self.banner,
             maintenance_interval: intervals.maintenance,
             transaction_maintenance_interval: intervals.transaction_maintenance,
             cancellation: self.cancellation,

@@ -1148,6 +1148,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll},
     };
 
@@ -1303,6 +1307,83 @@ mod tests {
         fn extensions(&self) -> &Extensions {
             &self.extensions
         }
+    }
+
+    /// How many requests a connection has served, inserted by the handler
+    /// on the connection's first request.
+    #[derive(Clone, Debug, Default, Extension)]
+    struct RequestsOnConnection(Arc<AtomicUsize>);
+
+    /// Inner service that answers each request with how many requests its
+    /// connection has served, counting this one.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct CountsRequestsOnConnection;
+
+    impl Service<BytesInput> for CountsRequestsOnConnection {
+        type Output = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, req: BytesInput) -> Result<Bytes, Error> {
+            let served = req
+                .extensions
+                .get_ref_or_insert(RequestsOnConnection::default)
+                .0
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+
+            let mut frame = header(4).to_vec();
+            frame.extend(u32::try_from(served).expect("request count").to_be_bytes());
+            Ok(Bytes::from(frame))
+        }
+    }
+
+    /// Sends a request of four zero bytes on `client` and returns the count
+    /// that [`CountsRequestsOnConnection`] answers.
+    async fn requests_served(client: &mut DuplexStream) -> Result<u32, Error> {
+        client.write_all(&header(4)).await?;
+        client.write_all(&[0; 4]).await?;
+
+        let mut response = [0; 8];
+        _ = client.read_exact(&mut response).await?;
+        Ok(u32::from_be_bytes([
+            response[4],
+            response[5],
+            response[6],
+            response[7],
+        ]))
+    }
+
+    /// An extension that a handler inserts on a connection's first request
+    /// is there on the connection's later requests, and not on another
+    /// connection, even when the listener hands both connections the same
+    /// store. Per-connection state, such as the read shares that limit a
+    /// connection's storage reads, relies on this.
+    #[tokio::test]
+    async fn extensions_a_handler_inserts_stay_with_its_connection() -> Result<(), Error> {
+        let listener = Extensions::default();
+
+        let mut connections = vec![];
+        for _ in 0..2 {
+            let (client, server) = duplex(64);
+            let extensions = listener.clone();
+
+            _ = spawn(async move {
+                TcpBytesLayer
+                    .into_layer(CountsRequestsOnConnection)
+                    .serve(DuplexStreamWithExtensions::new(server, extensions))
+                    .await
+            });
+
+            connections.push(client);
+        }
+
+        assert_eq!(1, requests_served(&mut connections[0]).await?);
+        assert_eq!(2, requests_served(&mut connections[0]).await?);
+        assert_eq!(1, requests_served(&mut connections[1]).await?);
+        assert_eq!(3, requests_served(&mut connections[0]).await?);
+        assert!(!listener.contains::<RequestsOnConnection>());
+
+        Ok(())
     }
 
     #[tokio::test]

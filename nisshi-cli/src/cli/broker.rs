@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -22,7 +24,7 @@ use std::{
 use crate::{EnvVarExp, Error, Result, cli::storage_engines, insecure_tls};
 
 use super::DEFAULT_BROKER;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use nisshi_broker::{
     NODE_ID,
     broker::Broker,
@@ -30,7 +32,7 @@ use nisshi_broker::{
 };
 use nisshi_sans_io::ErrorCode;
 use nisshi_schema::{Registry, redact_url};
-use nisshi_storage::ArcDynStorage;
+use nisshi_storage::{ArcDynStorage, DEFAULT_NUM_PARTITIONS, TopicCreationConfig};
 use owo_colors::{OwoColorize as _, Stream, Style};
 use rustls::{
     ServerConfig,
@@ -113,6 +115,14 @@ pub(super) struct Arg {
     /// How often a held JoinGroup or SyncGroup reads its group from storage, to see changes by other brokers
     #[arg(long, env = "GROUP_POLL_INTERVAL", default_value = "500ms", value_parser = positive_duration)]
     group_poll_interval: Duration,
+
+    /// Whether Metadata creates a topic that it does not know, as Kafka's auto.create.topics.enable
+    #[arg(long, env = "AUTO_CREATE_TOPICS_ENABLE", default_value_t = true, action = ArgAction::Set)]
+    auto_create_topics_enable: bool,
+
+    /// The partitions of an auto-created topic, or of one created with -1 partitions, as Kafka's num.partitions
+    #[arg(long, env = "NUM_PARTITIONS", default_value_t = DEFAULT_NUM_PARTITIONS, value_parser = clap::value_parser!(i32).range(1..))]
+    num_partitions: i32,
 
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -529,59 +539,92 @@ impl Arg {
             .group_coordinator(GroupCoordinatorConfig {
                 initial_rebalance_delay: self.group_initial_rebalance_delay,
                 poll_interval: self.group_poll_interval,
+            })
+            .topic_creation(TopicCreationConfig {
+                auto_create_topics_enable: self.auto_create_topics_enable,
+                num_partitions: self.num_partitions,
             });
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
         let broker = broker.lake_house(lake_house);
 
-        if !self.silent {
-            let sheet = Sheet::default();
+        // The broker prints the banner once its listener is bound, so that a broker that
+        // fails to start prints only the error.
+        let banner = (!self.silent).then(|| {
+            banner(
+                &listener,
+                &advertised_listener,
+                &storage_engine,
+                schema_registry_url.as_ref(),
+                self.cert.as_deref(),
+            )
+        });
 
-            println!(
-                "nisshi {} {}",
-                "broker".if_supports_color(Stream::Stdout, |text| text.style(sheet.headline)),
-                env!("CARGO_PKG_VERSION")
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.version))
-            );
-
-            println!(
-                "listener: {} (advertised: {})",
-                listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
-                advertised_listener.if_supports_color(Stream::Stdout, |text| text
-                    .style(sheet.advertised_listener))
-            );
-
-            println!(
-                "storage: {} {:?}",
-                redact_url(&storage_engine)
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
-                storage_engines()
-                    .iter()
-                    .map(|storage_engine| storage_engine
-                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
-                    .collect::<Vec<_>>()
-            );
-
-            if let Some(schema_registry) = schema_registry_url {
-                println!(
-                    "schema registry: {}",
-                    redact_url(&schema_registry).if_supports_color(Stream::Stdout, |text| text
-                        .style(sheet.schema_registry))
-                );
-            }
-
-            if let Some(cert) = self.cert.as_deref() {
-                println!(
-                    "tls: {} ({})",
-                    "enabled".if_supports_color(Stream::Stdout, |text| text.style(sheet.tls)),
-                    cert.display()
-                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.tls))
-                );
-            }
-        }
-
-        broker.build().await.map_err(Into::into)
+        broker.banner(banner).build().await.map_err(Into::into)
     }
+}
+
+/// Returns the lines that the broker prints when it starts listening: its version, listener,
+/// storage, and the schema registry and TLS certificate when it has them.
+fn banner(
+    listener: &Url,
+    advertised_listener: &Url,
+    storage_engine: &Url,
+    schema_registry: Option<&Url>,
+    cert: Option<&Path>,
+) -> String {
+    let sheet = Sheet::default();
+    let mut banner = String::new();
+
+    // Writing to a String can't fail.
+    _ = writeln!(
+        banner,
+        "nisshi {} {}",
+        "broker".if_supports_color(Stream::Stdout, |text| text.style(sheet.headline)),
+        env!("CARGO_PKG_VERSION")
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.version))
+    );
+
+    _ = writeln!(
+        banner,
+        "listener: {} (advertised: {})",
+        listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
+        advertised_listener
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.advertised_listener))
+    );
+
+    _ = writeln!(
+        banner,
+        "storage: {} {:?}",
+        redact_url(storage_engine)
+            .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
+        storage_engines()
+            .iter()
+            .map(|storage_engine| storage_engine
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
+            .collect::<Vec<_>>()
+    );
+
+    if let Some(schema_registry) = schema_registry {
+        _ = writeln!(
+            banner,
+            "schema registry: {}",
+            redact_url(schema_registry)
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.schema_registry))
+        );
+    }
+
+    if let Some(cert) = cert {
+        _ = writeln!(
+            banner,
+            "tls: {} ({})",
+            "enabled".if_supports_color(Stream::Stdout, |text| text.style(sheet.tls)),
+            cert.display()
+                .if_supports_color(Stream::Stdout, |text| text.style(sheet.tls))
+        );
+    }
+
+    banner
 }
 
 struct Sheet {
@@ -669,6 +712,43 @@ mod tests {
                 arg.advertised_listener_url.into_inner().host_str(),
             );
         });
+    }
+
+    #[test]
+    fn topic_creation_defaults_match_kafka() {
+        temp_env::with_vars_unset(["AUTO_CREATE_TOPICS_ENABLE", "NUM_PARTITIONS"], || {
+            let arg = parse(&[]).expect("defaults parse");
+
+            assert!(arg.auto_create_topics_enable);
+            assert_eq!(1, arg.num_partitions);
+        });
+    }
+
+    #[test]
+    fn auto_create_topics_enable_can_be_turned_off() {
+        let arg = parse(&["--auto-create-topics-enable=false"]).expect("false parses");
+
+        assert!(!arg.auto_create_topics_enable);
+    }
+
+    #[test]
+    fn num_partitions_sets_the_default() {
+        let arg = parse(&["--num-partitions=4"]).expect("4 parses");
+
+        assert_eq!(4, arg.num_partitions);
+    }
+
+    #[test]
+    fn num_partitions_below_one_is_rejected() {
+        for num_partitions in ["--num-partitions=0", "--num-partitions=-1"] {
+            let err = parse(&[num_partitions]).expect_err("num.partitions must be at least 1");
+
+            assert_eq!(
+                clap::error::ErrorKind::ValueValidation,
+                err.kind(),
+                "{num_partitions}"
+            );
+        }
     }
 
     #[test]

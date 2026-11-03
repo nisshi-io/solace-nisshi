@@ -94,7 +94,12 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
     let offset_fetch = storage
         .offset_fetch(Some(&group), slice::from_ref(&topition), None)
         .await?;
-    assert_eq!(Some(&offset), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(offset),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
 
@@ -112,7 +117,12 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
     let offset_fetch = storage
         .offset_fetch(Some(&group), slice::from_ref(&topition), None)
         .await?;
-    assert_ne!(Some(&offset), offset_fetch.get(&topition));
+    assert_ne!(
+        Some(offset),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -343,7 +353,7 @@ async fn committed_offset(
     storage
         .offset_fetch(Some(group_id), slice::from_ref(topition), None)
         .await
-        .map(|offsets| offsets.get(topition).copied())
+        .map(|offsets| offsets.get(topition).map(|committed| committed.offset))
         .map_err(Into::into)
 }
 
@@ -661,14 +671,24 @@ async fn empty_group_id_mixed_list(
     let offset_fetch = storage
         .offset_fetch(Some(&group_b), slice::from_ref(&topition), None)
         .await?;
-    assert_ne!(Some(&offset_b), offset_fetch.get(&topition));
+    assert_ne!(
+        Some(offset_b),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     // group_a was never named in the request, so its committed offset must
     // still be fetchable, and it must still be listable/describable.
     let offset_fetch = storage
         .offset_fetch(Some(&group_a), slice::from_ref(&topition), None)
         .await?;
-    assert_eq!(Some(&offset_a), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(offset_a),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     let groups = storage.list_groups().await?;
     assert!(groups.iter().any(|group| group.name == group_a));
@@ -783,7 +803,9 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
             .await?;
         assert_eq!(
             Some(offset),
-            offset_fetch.get(&topition),
+            offset_fetch
+                .get(&topition)
+                .map(|committed| &committed.offset),
             "group {group_id:?} fetched the wrong committed offset"
         );
 
@@ -816,7 +838,9 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
                 // is that its committed offset and state are gone.
                 assert_ne!(
                     Some(other_offset),
-                    offset_fetch.get(&topition),
+                    offset_fetch
+                        .get(&topition)
+                        .map(|committed| &committed.offset),
                     "group {other_group_id:?} offset should have been deleted by now (deleting {group_id:?})"
                 );
                 assert_ne!(
@@ -827,7 +851,9 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
             } else {
                 assert_eq!(
                     Some(other_offset),
-                    offset_fetch.get(&topition),
+                    offset_fetch
+                        .get(&topition)
+                        .map(|committed| &committed.offset),
                     "group {other_group_id:?} offset should still be intact after deleting {group_id:?}"
                 );
                 assert_eq!(
@@ -882,7 +908,10 @@ async fn slash_in_group_id_does_not_break_committed_offset_topitions(
     assert_eq!(ErrorCode::None, commit[0].1);
 
     let topitions = storage.committed_offset_topitions(group_id).await?;
-    assert_eq!(Some(&offset), topitions.get(&topition));
+    assert_eq!(
+        Some(offset),
+        topitions.get(&topition).map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -952,12 +981,12 @@ async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
             .await?;
         assert_ne!(
             Some(offset),
-            fetched.get(&deleted),
+            fetched.get(&deleted).map(|committed| &committed.offset),
             "group {group_id:?} kept its offset for the deleted topic"
         );
         assert_eq!(
             Some(offset),
-            fetched.get(&kept),
+            fetched.get(&kept).map(|committed| &committed.offset),
             "group {group_id:?} lost its offset for the kept topic"
         );
 
@@ -966,7 +995,10 @@ async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
             [(kept.clone(), *offset)]
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
-            committed,
+            committed
+                .into_iter()
+                .map(|(topition, committed)| (topition, committed.offset))
+                .collect::<BTreeMap<_, _>>(),
             "group {group_id:?}"
         );
     }
@@ -976,7 +1008,7 @@ async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
 
 mod unreadable_groups {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         time::{Duration, SystemTime},
     };
 
@@ -995,9 +1027,9 @@ mod unreadable_groups {
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use nisshi_storage::{
-        BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse,
-        NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-        ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse,
+        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
         TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
     };
     use url::Url;
@@ -1100,7 +1132,7 @@ mod unreadable_groups {
             group_id: Option<&str>,
             topics: &[Topition],
             require_stable: Option<bool>,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             self.storage
                 .offset_fetch(group_id, topics, require_stable)
                 .await
@@ -1109,8 +1141,12 @@ mod unreadable_groups {
         async fn committed_offset_topitions(
             &self,
             group_id: &str,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             self.storage.committed_offset_topitions(group_id).await
+        }
+
+        async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+            self.storage.pending_txn_offsets(group_id).await
         }
 
         async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

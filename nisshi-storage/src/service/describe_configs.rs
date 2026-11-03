@@ -20,9 +20,12 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{error, instrument};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, topic_defaults};
 
 /// A [`Service`] using its [`Storage`] taking [`DescribeConfigsRequest`] returning [`DescribeConfigsResponse`].
+///
+/// For a topic, it lists every Kafka topic config, as Kafka does: each config that the topic sets,
+/// as [`Storage::describe_config`] returns it, and each other config with its Kafka default.
 /// ```no_run
 /// use rama::Service as _;
 /// use nisshi_sans_io::{ConfigResource, DescribeConfigsRequest,
@@ -59,7 +62,10 @@ use crate::{Error, Result, Storage};
 ///
 /// let results = response.results.unwrap_or_default();
 /// assert_eq!(1, results.len());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+/// assert_eq!(
+///     ErrorCode::UnknownTopicOrPartition,
+///     ErrorCode::try_from(results[0].error_code)?
+/// );
 /// assert!(results[0].configs.as_deref().unwrap_or_default().is_empty());
 /// # Ok(())
 /// # }
@@ -89,6 +95,13 @@ where
         for resource in input.request.resources.unwrap_or_default() {
             let result = match ConfigResource::from(resource.resource_type) {
                 ConfigResource::Broker => self.describe_broker(&resource.resource_name).await,
+                ConfigResource::Topic => {
+                    self.describe_topic(
+                        &resource.resource_name,
+                        resource.configuration_keys.as_deref(),
+                    )
+                    .await
+                }
                 resource_type => {
                     self.storage
                         .describe_config(
@@ -138,6 +151,25 @@ impl<G> DescribeConfigsService<G>
 where
     G: Storage,
 {
+    /// Describes the topic `name`, as Kafka 3.9.1 does: the configs that `keys` selects from the
+    /// configs that the topic sets and Kafka's defaults for the rest.
+    ///
+    /// The defaults are added here, not in [`Storage::describe_config`], because the broker reads
+    /// a topic's configs through that method too, and treats a config that the topic doesn't set
+    /// as Nisshi's own default.
+    async fn describe_topic(
+        &self,
+        name: &str,
+        keys: Option<&[String]>,
+    ) -> Result<DescribeConfigsResult> {
+        let mut result = self
+            .storage
+            .describe_config(name, ConfigResource::Topic, keys)
+            .await?;
+        topic_defaults::add_to(&mut result, keys);
+        Ok(result)
+    }
+
     /// Describes the broker resource `name`, as Kafka 3.9.1 does
     /// ([ConfigHelper.scala#L113-L121]). It compares `name` with this broker's node id, and
     /// does not look it up as a topic.

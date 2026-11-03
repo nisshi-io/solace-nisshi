@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
@@ -38,10 +38,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version, service::deadline,
+    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, service::deadline,
 };
 
 static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -255,7 +255,7 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
@@ -268,7 +268,10 @@ where
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let start = SystemTime::now();
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
@@ -277,6 +280,17 @@ where
             )
         })?;
         self.storage.committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>> {
+        let start = SystemTime::now();
+        let _permit = self.semaphore.acquire().await.inspect(|_| {
+            SEMAPHORE_ACQUIRE_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "pending_txn_offsets")],
+            )
+        })?;
+        self.storage.pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {

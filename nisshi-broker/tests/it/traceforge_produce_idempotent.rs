@@ -92,15 +92,16 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CreateTopicsService, CreateTopicsValidationLayer,
-    Error, GroupDetail, InitProducerIdService, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService, ProducerIdResponse,
-    Result as StorageResult, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, CreateTopicsService,
+    CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService,
+    ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -465,7 +466,7 @@ impl Storage for FaultInjectingProduceStorage {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> StorageResult<BTreeMap<Topition, i64>> {
+    ) -> StorageResult<BTreeMap<Topition, CommittedOffset>> {
         self.inner
             .offset_fetch(group_id, topics, require_stable)
             .await
@@ -474,8 +475,12 @@ impl Storage for FaultInjectingProduceStorage {
     async fn committed_offset_topitions(
         &self,
         group_id: &str,
-    ) -> StorageResult<BTreeMap<Topition, i64>> {
+    ) -> StorageResult<BTreeMap<Topition, CommittedOffset>> {
         self.inner.committed_offset_topitions(group_id).await
+    }
+
+    async fn pending_txn_offsets(&self, group_id: &str) -> StorageResult<BTreeSet<Topition>> {
+        self.inner.pending_txn_offsets(group_id).await
     }
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> StorageResult<MetadataResponse> {
