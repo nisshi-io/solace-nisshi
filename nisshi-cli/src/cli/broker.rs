@@ -167,9 +167,9 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
                 Ok(certs)
             }
         })
-        .map_err(|source| Error::TlsCertificate {
+        .map_err(|cause| Error::TlsCertificate {
             path: filename.to_path_buf(),
-            source,
+            cause,
         })
 }
 
@@ -185,9 +185,9 @@ fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>
     let mut passphrase =
         fs::read(filename)
             .map(Zeroizing::new)
-            .map_err(|source| Error::TlsKeyPassphraseFile {
+            .map_err(|cause| Error::TlsKeyPassphraseFile {
                 path: filename.to_path_buf(),
-                source,
+                cause,
             })?;
 
     while passphrase
@@ -251,9 +251,9 @@ fn unsupported_encryption(error: &pkcs8::Error) -> Option<String> {
 }
 
 fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKeyDer<'static>> {
-    let key_error = |source| Error::TlsPrivateKey {
+    let key_error = |cause| Error::TlsPrivateKey {
         path: filename.to_path_buf(),
-        source,
+        cause,
     };
 
     let pem = fs::read_to_string(filename)
@@ -280,11 +280,11 @@ fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<Privat
 
         // A wrong passphrase may still decrypt to well-padded garbage; the
         // certificate and key are compared by `with_single_cert` afterwards.
-        return decrypt_pkcs8(section, passphrase).map_err(|source| {
-            unsupported_encryption(&source).map_or_else(
+        return decrypt_pkcs8(section, passphrase).map_err(|cause| {
+            unsupported_encryption(&cause).map_or_else(
                 || Error::TlsKeyDecrypt {
                     path: filename.to_path_buf(),
-                    source,
+                    cause,
                 },
                 |algorithm| Error::TlsKeyUnsupportedEncryption {
                     path: filename.to_path_buf(),
@@ -886,7 +886,7 @@ mod tests {
                 err,
                 Error::TlsCertificate {
                     ref path,
-                    source: TlsPkiPemError::NoItemsFound
+                    cause: TlsPkiPemError::NoItemsFound
                 } if *path == pem.key
             ),
             "{err:?}"

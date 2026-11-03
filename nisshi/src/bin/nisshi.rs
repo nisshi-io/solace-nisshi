@@ -326,51 +326,18 @@ fn report_error(err: &nisshi_cli::Error) {
             ),
             _ => report_failure!("Unknown error occurred during command: {}", err),
         },
-        nisshi_cli::Error::TlsCertificate { path, source } => report_failure!(
-            "TLS certificate {} could not be loaded: {source}. Expected one or more PEM \
-                certificates (--cert).",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsPrivateKey { path, source } => report_failure!(
-            "TLS private key {} could not be loaded: {source}. Expected a PKCS#8, SEC1 or RSA \
-                PEM key (--key).",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsKeyPassphraseRequired { path } => report_failure!(
-            "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsKeyDecrypt { path, source } => report_failure!(
-            "TLS private key {} could not be decrypted: {source}. Check the passphrase in \
-                --key-passphrase-file.",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsKeyUnsupportedEncryption { path, algorithm } => report_failure!(
-            "TLS private key {} is encrypted with {algorithm}, which is not supported. \
-                Supported: PKCS#8 PBES2 with PBKDF2-HMAC-SHA2 or scrypt and AES-CBC or Triple DES. \
-                Re-encrypt it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem -v2 aes-256-cbc \
-                -v2prf hmacWithSHA256",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsKeyLegacyEncrypted { path } => report_failure!(
-            "TLS private key {} uses legacy OpenSSL PEM encryption, which is not supported. \
-                Convert it: openssl pkcs8 -topk8 -in key.pem -out key-pkcs8.pem",
-            path.display()
-        ),
-        nisshi_cli::Error::TlsKeyPassphraseFile { path, source } => report_failure!(
-            "TLS key passphrase file {} could not be read: {source}.",
-            path.display()
-        ),
+        nisshi_cli::Error::TlsCertificate { .. }
+        | nisshi_cli::Error::TlsPrivateKey { .. }
+        | nisshi_cli::Error::TlsKeyPassphraseRequired { .. }
+        | nisshi_cli::Error::TlsKeyDecrypt { .. }
+        | nisshi_cli::Error::TlsKeyUnsupportedEncryption { .. }
+        | nisshi_cli::Error::TlsKeyLegacyEncrypted { .. }
+        | nisshi_cli::Error::TlsKeyPassphraseFile { .. }
+        | nisshi_cli::Error::TlsRequiresCertAndKey
+        | nisshi_cli::Error::LakeRequiresSchemaRegistry { .. } => report_failure!("{err}"),
         nisshi_cli::Error::Tls(error) => report_failure!(
             "TLS configuration rejected: {error}. Check that --key is the private key for the \
                 certificate in --cert and, for an encrypted key, that the passphrase is correct."
-        ),
-        nisshi_cli::Error::TlsRequiresCertAndKey => {
-            report_failure!("TLS requires both --cert and --key.")
-        }
-        nisshi_cli::Error::LakeRequiresSchemaRegistry { lake } => report_failure!(
-            "{lake} requires --schema-registry: a data lake writer validates every record \
-                against a schema."
         ),
         _ => report_failure!("Unknown error occurred during command: {}", err),
     }
