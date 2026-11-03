@@ -101,6 +101,11 @@ pub(super) struct Arg {
     storage_engine: EnvVarExp<Url>,
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
+    ///
+    /// `global` propagates this argument into every top-level tool, because `Cli` flattens this
+    /// struct. clap merges the matches of a tool that declares its own `schema_registry` into this
+    /// one, so every such tool must declare it as `EnvVarExp<Url>`, or reading it here panics. The test
+    /// `an_argument_with_a_global_arguments_name_has_its_type` checks this for every tool.
     #[arg(long, env = "SCHEMA_REGISTRY", global = true)]
     schema_registry: Option<EnvVarExp<Url>>,
 
