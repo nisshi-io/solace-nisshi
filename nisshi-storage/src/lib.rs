@@ -211,6 +211,7 @@ pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
 mod operation;
+mod produce_path;
 mod producer;
 mod proxy;
 mod service;

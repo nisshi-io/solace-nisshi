@@ -127,7 +127,7 @@ use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, produce_path,
     service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
 };
 
@@ -715,11 +715,19 @@ impl Storage for RequestChannelService {
         // batches the channel holds is the number of slots, not the number of waiting produces.
         // The produce then reaches the storage without the decoded batch, which decodes it again.
         let start = Instant::now();
+
+        let capacity = self.tx.capacity();
+        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[StorageOperation::Produce.attribute()]);
+        debug!(operation = %StorageOperation::Produce, capacity);
+
         let Ok(permit) = self.tx.try_reserve() else {
             drop(inflated);
+            produce_path::fallback();
 
             return self.produce(transaction_id, topition, deflated).await;
         };
+
+        produce_path::direct();
 
         let request = Request::Produce {
             transaction_id: transaction_id.map(|s| s.to_string()),
@@ -1642,6 +1650,7 @@ mod tests {
                     transaction_id: None,
                     topition: topition.clone(),
                     batch: deflated::Batch::default(),
+                    inflated: None,
                 },
                 "produce",
             ),

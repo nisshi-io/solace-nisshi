@@ -149,6 +149,7 @@ async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Res
 
     let (inflated, dropped) = probe();
     let topition = Topition::new("abc", 0);
+    let waiting_topition = Topition::new("xyz", 3);
 
     // The first produce takes the channel's only slot, and nothing receives it yet.
     let first = channel.produce(None, &topition, deflated::Batch::default());
@@ -157,7 +158,12 @@ async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Res
         yield_now().await;
 
         channel
-            .produce_inflated(None, &topition, deflated::Batch::default(), inflated)
+            .produce_inflated(
+                Some("transaction"),
+                &waiting_topition,
+                deflated::Batch::default(),
+                inflated,
+            )
             .await
     };
 
@@ -169,6 +175,7 @@ async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Res
         let held = !dropped.load(Ordering::SeqCst);
 
         let mut sent_without = true;
+        let mut received = Vec::new();
         for offset in 0..2 {
             let ChannelRequest {
                 request,
@@ -176,20 +183,27 @@ async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Res
                 ..
             } = receiver.recv().await.expect("a produce request");
 
-            let Request::Produce { inflated, .. } = request else {
+            let Request::Produce {
+                transaction_id,
+                topition,
+                inflated,
+                ..
+            } = request
+            else {
                 panic!("{request:?}");
             };
             sent_without &= inflated.is_none();
+            received.push((transaction_id, topition));
 
             reply
                 .send(Ok(Response::Produce(Ok(offset))))
                 .expect("the producer");
         }
 
-        (held, sent_without)
+        (held, sent_without, received)
     };
 
-    let (first, second, (held, sent_without)) = tokio::join!(first, second, serve);
+    let (first, second, (held, sent_without, received)) = tokio::join!(first, second, serve);
 
     assert_eq!(0, first?);
     assert_eq!(1, second?);
@@ -197,6 +211,17 @@ async fn a_produce_that_waits_for_a_channel_slot_holds_no_decoded_batch() -> Res
     assert!(
         sent_without,
         "a produce reached storage with a decoded batch"
+    );
+
+    // A waiting produce that lost its transaction id would be stored as a non-transactional
+    // batch.
+    assert_eq!(
+        vec![
+            (None, topition),
+            (Some("transaction".to_owned()), waiting_topition)
+        ],
+        received,
+        "the waiting produce did not forward its transaction id and topition"
     );
 
     Ok(())

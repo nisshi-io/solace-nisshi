@@ -46,7 +46,7 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    UpdateError, Version, produce_path,
     service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
 };
 
@@ -202,13 +202,15 @@ where
         let start = SystemTime::now();
         let Ok(_permit) = self.semaphore.try_acquire() else {
             drop(inflated);
+            produce_path::fallback();
 
             return self.produce(transaction_id, topition, deflated).await;
         };
 
+        produce_path::direct();
         SEMAPHORE_ACQUIRE_DURATION.record(
             elapsed_millis(start),
-            &[KeyValue::new("operation", "produce")],
+            &[StorageOperation::Produce.attribute()],
         );
 
         self.storage
@@ -713,9 +715,14 @@ mod tests {
         let permit = proxy.semaphore.clone().acquire_owned().await?;
 
         let (inflated, dropped) = probe();
-        let tp = Topition::new("abc", 0);
+        let tp = Topition::new("xyz", 3);
 
-        let produce = proxy.produce_inflated(None, &tp, deflated::Batch::default(), inflated);
+        let produce = proxy.produce_inflated(
+            Some("transaction"),
+            &tp,
+            deflated::Batch::default(),
+            inflated,
+        );
 
         let release = async {
             // Every branch has been polled once after this yield, so the produce is waiting.
@@ -734,7 +741,13 @@ mod tests {
                 ..
             } = rx.recv().await.expect("a produce request");
 
-            let Request::Produce { inflated, .. } = request else {
+            let Request::Produce {
+                transaction_id,
+                topition,
+                inflated,
+                ..
+            } = request
+            else {
                 panic!("{request:?}");
             };
 
@@ -742,14 +755,27 @@ mod tests {
                 .send(Ok(Response::Produce(Ok(0))))
                 .expect("the producer");
 
-            inflated.is_none()
+            (transaction_id, topition, inflated.is_none())
         };
 
-        let (offset, held, sent_without) = tokio::join!(produce, release, answer);
+        let (offset, held, (transaction_id, topition, sent_without)) =
+            tokio::join!(produce, release, answer);
 
         assert_eq!(0, offset?);
         assert!(!held, "the waiting produce still held the decoded batch");
         assert!(sent_without, "the produce reached storage with the batch");
+
+        // A waiting produce that lost its transaction id would be stored as a non-transactional
+        // batch.
+        assert_eq!(
+            Some("transaction"),
+            transaction_id.as_deref(),
+            "the waiting produce did not forward the transaction id"
+        );
+        assert_eq!(
+            tp, topition,
+            "the waiting produce did not forward the topition"
+        );
 
         Ok(())
     }
