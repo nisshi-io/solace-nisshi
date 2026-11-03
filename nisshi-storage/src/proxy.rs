@@ -215,6 +215,17 @@ where
         self.storage.offset_stage(topition).await
     }
 
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        let start = SystemTime::now();
+        let _permit = self.semaphore.acquire().await.inspect(|_| {
+            SEMAPHORE_ACQUIRE_DURATION.record(
+                elapsed_millis(start),
+                &[KeyValue::new("operation", "current_offset_stage")],
+            )
+        })?;
+        self.storage.current_offset_stage(topition).await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,

@@ -144,6 +144,7 @@ pub enum Request {
         max_wait: Duration,
     },
     OffsetStage(Topition),
+    CurrentOffsetStage(Topition),
     ListOffsets {
         isolation_level: IsolationLevel,
         offsets: Vec<(Topition, ListOffset)>,
@@ -257,6 +258,7 @@ impl Display for Request {
             Self::OffsetCommit { .. } => f.write_str("OffsetCommit"),
             Self::OffsetFetch { .. } => f.write_str("OffsetFetch"),
             Self::OffsetStage(_) => f.write_str("OffsetStage"),
+            Self::CurrentOffsetStage(_) => f.write_str("CurrentOffsetStage"),
             Self::PendingTxnOffsets(_) => f.write_str("PendingTxnOffsets"),
             Self::Produce { .. } => f.write_str("Produce"),
             Self::RegisterBroker(_) => f.write_str("RegisterBroker"),
@@ -301,6 +303,7 @@ pub enum Response {
     OffsetCommit(Result<Vec<(Topition, ErrorCode)>>),
     OffsetFetch(Result<BTreeMap<Topition, CommittedOffset>>),
     OffsetStage(Result<OffsetStage>),
+    CurrentOffsetStage(Result<OffsetStage>),
     PendingTxnOffsets(Result<BTreeSet<Topition>>),
     Ping(Result<()>),
     Produce(Result<i64>),
@@ -638,6 +641,15 @@ impl Storage for RequestChannelService {
     #[instrument(skip_all)]
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         serve_and_extract!(self, Request::OffsetStage(topition.to_owned()), OffsetStage)
+    }
+
+    #[instrument(skip_all)]
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        serve_and_extract!(
+            self,
+            Request::CurrentOffsetStage(topition.to_owned()),
+            CurrentOffsetStage
+        )
     }
 
     #[instrument(skip_all)]
@@ -1243,6 +1255,9 @@ where
             )),
             Request::OffsetStage(topition) => Ok(Response::OffsetStage(
                 self.storage.offset_stage(&topition).await,
+            )),
+            Request::CurrentOffsetStage(topition) => Ok(Response::CurrentOffsetStage(
+                self.storage.current_offset_stage(&topition).await,
             )),
             Request::ListOffsets {
                 isolation_level,
