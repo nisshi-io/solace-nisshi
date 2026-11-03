@@ -27,7 +27,7 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    Error, METER, OffsetStage, Result, Storage, Topition,
+    Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
     service::{
         deadline::{self, Missed},
         read_share::FetchReadShare,
@@ -132,17 +132,17 @@ where
 /// Records a read of `tp` at `offset` that [`before`] abandoned, in the
 /// `nisshi_storage_read_deadline_exceeded` counter and the log.
 ///
-/// `operation` is the [`Storage`] method that was read: `fetch` for the
-/// records, `offset_stage` or `current_offset_stage` for the offsets. The
-/// counter carries it with the stage of the read, so a slow engine is told
-/// apart from a request that was too wide for its deadline.
+/// `operation` is the [`Storage`] method that was read: [`StorageOperation::Fetch`] for
+/// the records, [`StorageOperation::OffsetStage`] or [`StorageOperation::CurrentOffsetStage`]
+/// for the offsets. The counter carries it with the stage of the read, so a slow engine is
+/// told apart from a request that was too wide for its deadline.
 ///
 /// A read that was never started logs at debug: once a slow backend has
 /// spent the read deadline, every partition after it is not started, and a
 /// warning for each of them would blame partitions that were never read.
 fn missed(
     tp: &Topition,
-    operation: &'static str,
+    operation: StorageOperation,
     offset: i64,
     missed: Missed,
     started_at: Instant,
@@ -154,10 +154,10 @@ fn missed(
 
     match missed {
         Missed::NotStarted => {
-            debug!(?tp, operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
+            debug!(?tp, %operation, offset, stage, elapsed = ?started_at.elapsed(), "fetch read not started")
         }
         Missed::Queued | Missed::QueuedForConnectionShare | Missed::Reading => {
-            warn!(?tp, operation, offset, stage, limit, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
+            warn!(?tp, %operation, offset, stage, limit, elapsed = ?started_at.elapsed(), "fetch read deadline exceeded")
         }
     }
 }
@@ -347,11 +347,17 @@ where
         // isolation level, as in Kafka.
         let offset_stage = match before(partition_deadline, self.storage.offset_stage(&tp)).await {
             Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
+                return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
             }
             Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
             Err(reason) => {
-                missed(&tp, "offset_stage", fetch_offset, reason, started_at);
+                missed(
+                    &tp,
+                    StorageOperation::OffsetStage,
+                    fetch_offset,
+                    reason,
+                    started_at,
+                );
                 return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
             }
         };
@@ -392,13 +398,16 @@ where
         let offset_stage = if ahead_of_cached_high_watermark {
             match before(partition_deadline, self.storage.current_offset_stage(&tp)).await {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, "current_offset_stage"));
+                    return Ok(Self::unknown_to_storage(
+                        &tp,
+                        StorageOperation::CurrentOffsetStage,
+                    ));
                 }
                 Ok(current) => current.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
                     missed(
                         &tp,
-                        "current_offset_stage",
+                        StorageOperation::CurrentOffsetStage,
                         fetch_offset,
                         reason,
                         started_at,
@@ -466,11 +475,11 @@ where
             .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, "fetch"));
+                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
                 }
                 Ok(fetched) => fetched,
                 Err(reason) => {
-                    missed(&tp, "fetch", offset, reason, started_at);
+                    missed(&tp, StorageOperation::Fetch, offset, reason, started_at);
                     stalled = true;
                     break;
                 }
@@ -539,11 +548,17 @@ where
             .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, "offset_stage"));
+                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
                 }
                 Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
-                    missed(&tp, "offset_stage", offset, reason, started_at);
+                    missed(
+                        &tp,
+                        StorageOperation::OffsetStage,
+                        offset,
+                        reason,
+                        started_at,
+                    );
                     Self::covering(offset_stage, offset, isolation)
                 }
             }
@@ -680,8 +695,8 @@ where
     /// connection. The answer is counted in `nisshi_fetch_unknown_partition`
     /// with `source` `storage`, because a count that does not stop shows
     /// metadata and storage that disagree.
-    fn unknown_to_storage(tp: &Topition, operation: &'static str) -> PartitionData {
-        debug!(?tp, operation, "storage reports the partition unknown");
+    fn unknown_to_storage(tp: &Topition, operation: StorageOperation) -> PartitionData {
+        debug!(?tp, %operation, "storage reports the partition unknown");
 
         FETCH_UNKNOWN_PARTITION.add(
             1,

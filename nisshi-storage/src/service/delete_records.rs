@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, Topition,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, StorageOperation, Topition,
     service::{
         deadline::{DELETE_RECORDS_DEADLINE, started_before},
         storage_error_code,
@@ -87,7 +87,7 @@ where
                     .partitions(Some(vec![partition.clone()]));
 
                 let answer = started_before(
-                    "delete_records",
+                    StorageOperation::DeleteRecords,
                     deadline,
                     self.storage.delete_records(slice::from_ref(&request)),
                 )

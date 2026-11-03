@@ -65,7 +65,7 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
     ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
-    SemaphoreProxy, StartupFailure, Storage, StoredEpochs, TopicId, Topition,
+    SemaphoreProxy, StartupFailure, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
@@ -76,6 +76,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
 };
+use policy_operation::PolicyOperation;
 use rama::{Layer as _, Service as _};
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
@@ -98,6 +99,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub mod factory;
+mod policy_operation;
 
 macro_rules! include_sql {
     ($e: expr) => {
@@ -1552,7 +1554,7 @@ impl Delegate {
                     .inspect(|_| {
                         DELEGATE_REQUEST_DURATION.record(
                             elapsed_millis(start),
-                            &[KeyValue::new("operation", "policy_compact_single")],
+                            &[PolicyOperation::CompactSingle.attribute()],
                         )
                     })
                     .map_err(Into::into)
@@ -1587,7 +1589,7 @@ impl Delegate {
                 Ok(compacted).inspect(|_| {
                     DELEGATE_REQUEST_DURATION.record(
                         elapsed_millis(start),
-                        &[KeyValue::new("operation", "policy_compact_multi")],
+                        &[PolicyOperation::CompactMulti.attribute()],
                     )
                 })
             }
@@ -1643,7 +1645,7 @@ impl Delegate {
             .inspect(|_| {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "policy_delete")],
+                    &[PolicyOperation::Delete.attribute()],
                 )
             })
     }
@@ -1980,7 +1982,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "register_broker")],
+                    &[StorageOperation::RegisterBroker.attribute()],
                 )
             })
     }
@@ -1991,7 +1993,7 @@ impl Storage for Engine {
         self.inner.brokers().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "brokers")],
+                &[StorageOperation::Brokers.attribute()],
             )
         })
     }
@@ -2005,7 +2007,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "create_topic")],
+                    &[StorageOperation::CreateTopic.attribute()],
                 )
             })
     }
@@ -2019,7 +2021,7 @@ impl Storage for Engine {
         self.inner.delete_records(topics).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_records")],
+                &[StorageOperation::DeleteRecords.attribute()],
             )
         })
     }
@@ -2030,7 +2032,7 @@ impl Storage for Engine {
         self.inner.delete_topic(topic).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_topic")],
+                &[StorageOperation::DeleteTopic.attribute()],
             )
         })
     }
@@ -2047,7 +2049,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "incremental_alter_resource")],
+                    &[StorageOperation::IncrementalAlterResource.attribute()],
                 )
             })
     }
@@ -2066,7 +2068,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "produce")],
+                    &[StorageOperation::Produce.attribute()],
                 )
             })
     }
@@ -2095,7 +2097,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "fetch")],
+                    &[StorageOperation::Fetch.attribute()],
                 )
             })
     }
@@ -2106,7 +2108,7 @@ impl Storage for Engine {
         self.inner.offset_stage(topition).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_stage")],
+                &[StorageOperation::OffsetStage.attribute()],
             )
         })
     }
@@ -2125,7 +2127,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "offset_commit")],
+                    &[StorageOperation::OffsetCommit.attribute()],
                 )
             })
     }
@@ -2142,7 +2144,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "committed_offset_topitions")],
+                    &[StorageOperation::CommittedOffsetTopitions.attribute()],
                 )
             })
     }
@@ -2153,7 +2155,7 @@ impl Storage for Engine {
         self.inner.pending_txn_offsets(group_id).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "pending_txn_offsets")],
+                &[StorageOperation::PendingTxnOffsets.attribute()],
             )
         })
     }
@@ -2172,7 +2174,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "offset_fetch")],
+                    &[StorageOperation::OffsetFetch.attribute()],
                 )
             })
     }
@@ -2190,7 +2192,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "list_offsets")],
+                    &[StorageOperation::ListOffsets.attribute()],
                 )
             })
     }
@@ -2201,7 +2203,7 @@ impl Storage for Engine {
         self.inner.metadata(topics).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "metadata")],
+                &[StorageOperation::Metadata.attribute()],
             )
         })
     }
@@ -2220,7 +2222,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "describe_config")],
+                    &[StorageOperation::DescribeConfig.attribute()],
                 )
             })
     }
@@ -2239,7 +2241,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "describe_topic_partitions")],
+                    &[StorageOperation::DescribeTopicPartitions.attribute()],
                 )
             })
     }
@@ -2250,7 +2252,7 @@ impl Storage for Engine {
         self.inner.list_groups().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "list_groups")],
+                &[StorageOperation::ListGroups.attribute()],
             )
         })
     }
@@ -2264,7 +2266,7 @@ impl Storage for Engine {
         self.inner.delete_groups(group_ids).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_groups")],
+                &[StorageOperation::DeleteGroups.attribute()],
             )
         })
     }
@@ -2282,7 +2284,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "describe_groups")],
+                    &[StorageOperation::DescribeGroups.attribute()],
                 )
             })
     }
@@ -2293,7 +2295,7 @@ impl Storage for Engine {
         self.inner.group_with_version(group_id).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "group_with_version")],
+                &[StorageOperation::GroupWithVersion.attribute()],
             )
         })
     }
@@ -2312,7 +2314,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "update_group")],
+                    &[StorageOperation::UpdateGroup.attribute()],
                 )
             })
     }
@@ -2337,7 +2339,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "init_producer")],
+                    &[StorageOperation::InitProducer.attribute()],
                 )
             })
     }
@@ -2357,7 +2359,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "txn_add_offsets")],
+                    &[StorageOperation::TxnAddOffsets.attribute()],
                 )
             })
     }
@@ -2374,7 +2376,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "txn_add_partitions")],
+                    &[StorageOperation::TxnAddPartitions.attribute()],
                 )
             })
     }
@@ -2388,7 +2390,7 @@ impl Storage for Engine {
         self.inner.txn_offset_commit(offsets).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_offset_commit")],
+                &[StorageOperation::TxnOffsetCommit.attribute()],
             )
         })
     }
@@ -2408,7 +2410,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "txn_end")],
+                    &[StorageOperation::TxnEnd.attribute()],
                 )
             })
     }
@@ -2419,7 +2421,7 @@ impl Storage for Engine {
         self.inner.maintain(now).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "maintain")],
+                &[StorageOperation::Maintain.attribute()],
             )
         })
     }
@@ -2430,7 +2432,7 @@ impl Storage for Engine {
         self.inner.maintain_transactions(now).await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "maintain_transactions")],
+                &[StorageOperation::MaintainTransactions.attribute()],
             )
         })
     }
@@ -2449,7 +2451,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "aborted_transactions")],
+                    &[StorageOperation::AbortedTransactions.attribute()],
                 )
             })
     }
@@ -2460,7 +2462,7 @@ impl Storage for Engine {
         self.inner.cluster_id().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "cluster_id")],
+                &[StorageOperation::ClusterId.attribute()],
             )
         })
     }
@@ -2470,7 +2472,7 @@ impl Storage for Engine {
         let start = SystemTime::now();
         self.inner.node().await.inspect(|_| {
             ENGINE_REQUEST_DURATION
-                .record(elapsed_millis(start), &[KeyValue::new("operation", "node")])
+                .record(elapsed_millis(start), &[StorageOperation::Node.attribute()])
         })
     }
 
@@ -2480,7 +2482,7 @@ impl Storage for Engine {
         self.inner.advertised_listener().await.inspect(|_| {
             ENGINE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "advertised_listener")],
+                &[StorageOperation::AdvertisedListener.attribute()],
             )
         })
     }
@@ -2498,7 +2500,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "delete_user_scram_credential")],
+                    &[StorageOperation::DeleteUserScramCredential.attribute()],
                 )
             })
     }
@@ -2517,7 +2519,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "upsert_user_scram_credential")],
+                    &[StorageOperation::UpsertUserScramCredential.attribute()],
                 )
             })
     }
@@ -2535,7 +2537,7 @@ impl Storage for Engine {
             .inspect(|_| {
                 ENGINE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "user_scram_credential")],
+                    &[StorageOperation::UserScramCredential.attribute()],
                 )
             })
     }
@@ -2545,7 +2547,7 @@ impl Storage for Engine {
         let start = SystemTime::now();
         self.inner.ping().await.inspect(|_| {
             ENGINE_REQUEST_DURATION
-                .record(elapsed_millis(start), &[KeyValue::new("operation", "ping")])
+                .record(elapsed_millis(start), &[StorageOperation::Ping.attribute()])
         })
     }
 }
@@ -2851,7 +2853,7 @@ impl Storage for Delegate {
             .inspect(|_| {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "register_broker")],
+                    &[StorageOperation::RegisterBroker.attribute()],
                 )
             })
     }
@@ -2880,7 +2882,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "brokers")],
+                &[StorageOperation::Brokers.attribute()],
             )
         })
     }
@@ -2964,7 +2966,7 @@ impl Storage for Delegate {
         pc.commit(tx).await.and(Ok(uuid)).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "create_topic")],
+                &[StorageOperation::CreateTopic.attribute()],
             )
         })
     }
@@ -3120,7 +3122,7 @@ impl Storage for Delegate {
         pc.commit(tx).await.and(Ok(ErrorCode::None)).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_topic")],
+                &[StorageOperation::DeleteTopic.attribute()],
             )
         })
     }
@@ -3164,7 +3166,7 @@ impl Storage for Delegate {
                 .inspect(|_| {
                     DELEGATE_REQUEST_DURATION.record(
                         elapsed_millis(start),
-                        &[KeyValue::new("operation", "incremental_alter_resource")],
+                        &[StorageOperation::IncrementalAlterResource.attribute()],
                     )
                 })
             }
@@ -3176,7 +3178,7 @@ impl Storage for Delegate {
             .inspect(|_| {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "incremental_alter_resource")],
+                    &[StorageOperation::IncrementalAlterResource.attribute()],
                 )
             }),
         }
@@ -3231,7 +3233,7 @@ impl Storage for Delegate {
 
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "produce")],
+                    &[StorageOperation::Produce.attribute()],
                 )
             })
     }
@@ -3547,7 +3549,7 @@ impl Storage for Delegate {
             if let Ok(elapsed) = started_at.elapsed() {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed.as_millis() as u64,
-                    &[KeyValue::new("operation", "fetch")],
+                    &[StorageOperation::Fetch.attribute()],
                 )
             }
         })
@@ -3598,7 +3600,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_stage")],
+                &[StorageOperation::OffsetStage.attribute()],
             )
         })
     }
@@ -3682,7 +3684,7 @@ impl Storage for Delegate {
         Ok(responses).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_commit")],
+                &[StorageOperation::OffsetCommit.attribute()],
             )
         })
     }
@@ -3734,7 +3736,7 @@ impl Storage for Delegate {
         Ok(results).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "committed_offset_topitions")],
+                &[StorageOperation::CommittedOffsetTopitions.attribute()],
             )
         })
     }
@@ -3772,7 +3774,7 @@ impl Storage for Delegate {
         Ok(pending).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "pending_txn_offsets")],
+                &[StorageOperation::PendingTxnOffsets.attribute()],
             )
         })
     }
@@ -3855,7 +3857,7 @@ impl Storage for Delegate {
         Ok(offsets).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_fetch")],
+                &[StorageOperation::OffsetFetch.attribute()],
             )
         })
     }
@@ -3977,7 +3979,7 @@ impl Storage for Delegate {
             debug!(?r);
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "list_offsets")],
+                &[StorageOperation::ListOffsets.attribute()],
             )
         })
     }
@@ -4240,7 +4242,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "metadata")],
+                &[StorageOperation::Metadata.attribute()],
             )
         })
     }
@@ -4304,7 +4306,7 @@ impl Storage for Delegate {
             .inspect(|_| {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "describe_config")],
+                    &[StorageOperation::DescribeConfig.attribute()],
                 )
             })
         } else {
@@ -4319,7 +4321,7 @@ impl Storage for Delegate {
             .inspect(|_| {
                 DELEGATE_REQUEST_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "describe_config")],
+                    &[StorageOperation::DescribeConfig.attribute()],
                 )
             })
         }
@@ -4522,7 +4524,7 @@ impl Storage for Delegate {
         Ok(responses).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "describe_topic_partitions")],
+                &[StorageOperation::DescribeTopicPartitions.attribute()],
             )
         })
     }
@@ -4556,7 +4558,7 @@ impl Storage for Delegate {
         Ok(listed_groups).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "list_groups")],
+                &[StorageOperation::ListGroups.attribute()],
             )
         })
     }
@@ -4617,7 +4619,7 @@ impl Storage for Delegate {
         Ok(results).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_groups")],
+                &[StorageOperation::DeleteGroups.attribute()],
             )
         })
     }
@@ -4693,7 +4695,7 @@ impl Storage for Delegate {
         Ok(results).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "describe_groups")],
+                &[StorageOperation::DescribeGroups.attribute()],
             )
         })
     }
@@ -4719,7 +4721,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "group_with_version")],
+                &[StorageOperation::GroupWithVersion.attribute()],
             )
         })
     }
@@ -4814,7 +4816,7 @@ impl Storage for Delegate {
         outcome.inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "update_group")],
+                &[StorageOperation::UpdateGroup.attribute()],
             )
         })
     }
@@ -4839,7 +4841,7 @@ impl Storage for Delegate {
                 return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
                     DELEGATE_REQUEST_DURATION.record(
                         elapsed_millis(start),
-                        &[KeyValue::new("operation", "init_producer")],
+                        &[StorageOperation::InitProducer.attribute()],
                     )
                 });
             }
@@ -4884,7 +4886,7 @@ impl Storage for Delegate {
                             return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
                                 DELEGATE_REQUEST_DURATION.record(
                                     elapsed_millis(start),
-                                    &[KeyValue::new("operation", "init_producer")],
+                                    &[StorageOperation::InitProducer.attribute()],
                                 )
                             });
                         }
@@ -4904,7 +4906,7 @@ impl Storage for Delegate {
                             return Ok(ProducerIdResponse { error, id, epoch }).inspect(|_| {
                                 DELEGATE_REQUEST_DURATION.record(
                                     elapsed_millis(start),
-                                    &[KeyValue::new("operation", "init_producer")],
+                                    &[StorageOperation::InitProducer.attribute()],
                                 )
                             });
                         }
@@ -4988,7 +4990,7 @@ impl Storage for Delegate {
                             return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
                                 DELEGATE_REQUEST_DURATION.record(
                                     elapsed_millis(start),
-                                    &[KeyValue::new("operation", "init_producer")],
+                                    &[StorageOperation::InitProducer.attribute()],
                                 )
                             });
                         }
@@ -5195,7 +5197,7 @@ impl Storage for Delegate {
                         .inspect(|_| {
                             DELEGATE_REQUEST_DURATION.record(
                                 elapsed_millis(start),
-                                &[KeyValue::new("operation", "init_producer")],
+                                &[StorageOperation::InitProducer.attribute()],
                             )
                         })
                     } else {
@@ -5208,7 +5210,7 @@ impl Storage for Delegate {
                         .inspect(|_| {
                             DELEGATE_REQUEST_DURATION.record(
                                 elapsed_millis(start),
-                                &[KeyValue::new("operation", "init_producer")],
+                                &[StorageOperation::InitProducer.attribute()],
                             )
                         })
                     }
@@ -5222,7 +5224,7 @@ impl Storage for Delegate {
                     .inspect(|_| {
                         DELEGATE_REQUEST_DURATION.record(
                             elapsed_millis(start),
-                            &[KeyValue::new("operation", "init_producer")],
+                            &[StorageOperation::InitProducer.attribute()],
                         )
                     })
                 }
@@ -5247,7 +5249,7 @@ impl Storage for Delegate {
         Ok(ErrorCode::None).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_add_offsets")],
+                &[StorageOperation::TxnAddOffsets.attribute()],
             )
         })
     }
@@ -5341,7 +5343,7 @@ impl Storage for Delegate {
                 Ok(TxnAddPartitionsResponse::VersionZeroToThree(results)).inspect(|_| {
                     DELEGATE_REQUEST_DURATION.record(
                         elapsed_millis(start),
-                        &[KeyValue::new("operation", "txn_add_partitions")],
+                        &[StorageOperation::TxnAddPartitions.attribute()],
                     )
                 })
             }
@@ -5475,7 +5477,7 @@ impl Storage for Delegate {
         Ok(topics).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_offset_commit")],
+                &[StorageOperation::TxnOffsetCommit.attribute()],
             )
         })
     }
@@ -5501,7 +5503,7 @@ impl Storage for Delegate {
         pc.commit(tx).await.and(Ok(error_code)).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_end")],
+                &[StorageOperation::TxnEnd.attribute()],
             )
         })
     }
@@ -5550,7 +5552,7 @@ impl Storage for Delegate {
         Ok(()).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "maintain")],
+                &[StorageOperation::Maintain.attribute()],
             )
         })
     }
@@ -5561,7 +5563,7 @@ impl Storage for Delegate {
         Ok(self.cluster.clone()).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "cluster_id")],
+                &[StorageOperation::ClusterId.attribute()],
             )
         })
     }
@@ -5571,7 +5573,7 @@ impl Storage for Delegate {
 
         Ok(self.node).inspect(|_| {
             DELEGATE_REQUEST_DURATION
-                .record(elapsed_millis(start), &[KeyValue::new("operation", "node")])
+                .record(elapsed_millis(start), &[StorageOperation::Node.attribute()])
         })
     }
 
@@ -5581,7 +5583,7 @@ impl Storage for Delegate {
         Ok(self.advertised_listener.clone()).inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "advertised_listener")],
+                &[StorageOperation::AdvertisedListener.attribute()],
             )
         })
     }
@@ -5605,7 +5607,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_user_scram_credential")],
+                &[StorageOperation::DeleteUserScramCredential.attribute()],
             )
         })
     }
@@ -5639,7 +5641,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "upsert_user_scram_credential")],
+                &[StorageOperation::UpsertUserScramCredential.attribute()],
             )
         })
     }
@@ -5680,7 +5682,7 @@ impl Storage for Delegate {
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "upsert_user_scram_credential")],
+                &[StorageOperation::UpsertUserScramCredential.attribute()],
             )
         })
     }
@@ -5691,7 +5693,7 @@ impl Storage for Delegate {
         let c = self.pool.get().await?;
         let _ = c.query("ping.sql", ()).await?;
         DELEGATE_REQUEST_DURATION
-            .record(elapsed_millis(start), &[KeyValue::new("operation", "ping")]);
+            .record(elapsed_millis(start), &[StorageOperation::Ping.attribute()]);
         Ok(())
     }
 }

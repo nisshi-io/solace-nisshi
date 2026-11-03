@@ -31,7 +31,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use opentelemetry::{KeyValue, metrics::Histogram};
+use opentelemetry::metrics::Histogram;
 use tokio::{sync::Semaphore, time::Instant};
 use tracing::instrument;
 use url::Url;
@@ -40,7 +40,7 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, service::deadline,
 };
 
@@ -90,7 +90,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "register_broker")],
+                &[StorageOperation::RegisterBroker.attribute()],
             )
         })?;
         self.storage.register_broker(broker_registration).await
@@ -101,7 +101,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "create_topic")],
+                &[StorageOperation::CreateTopic.attribute()],
             )
         })?;
         self.storage.create_topic(topic, validate_only).await
@@ -115,7 +115,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "incremental_alter_resource")],
+                &[StorageOperation::IncrementalAlterResource.attribute()],
             )
         })?;
         self.storage.incremental_alter_resource(resource).await
@@ -129,7 +129,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_records")],
+                &[StorageOperation::DeleteRecords.attribute()],
             )
         })?;
         self.storage.delete_records(topics).await
@@ -140,7 +140,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_topic")],
+                &[StorageOperation::DeleteTopic.attribute()],
             )
         })?;
         self.storage.delete_topic(topic).await
@@ -151,7 +151,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "brokers")],
+                &[StorageOperation::Brokers.attribute()],
             )
         })?;
         self.storage.brokers().await
@@ -168,7 +168,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "produce")],
+                &[StorageOperation::Produce.attribute()],
             )
         })?;
         self.storage
@@ -190,7 +190,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "fetch")],
+                &[StorageOperation::Fetch.attribute()],
             )
         })?;
 
@@ -209,7 +209,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_stage")],
+                &[StorageOperation::OffsetStage.attribute()],
             )
         })?;
         self.storage.offset_stage(topition).await
@@ -220,7 +220,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "current_offset_stage")],
+                &[StorageOperation::CurrentOffsetStage.attribute()],
             )
         })?;
         self.storage.current_offset_stage(topition).await
@@ -237,7 +237,7 @@ where
             .inspect(|_| {
                 SEMAPHORE_ACQUIRE_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "list_offsets")],
+                    &[StorageOperation::ListOffsets.attribute()],
                 )
             })?;
         self.storage.list_offsets(isolation_level, offsets).await
@@ -253,7 +253,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_commit")],
+                &[StorageOperation::OffsetCommit.attribute()],
             )
         })?;
         self.storage
@@ -271,7 +271,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "offset_fetch")],
+                &[StorageOperation::OffsetFetch.attribute()],
             )
         })?;
         self.storage
@@ -287,7 +287,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "committed_offset_topitions")],
+                &[StorageOperation::CommittedOffsetTopitions.attribute()],
             )
         })?;
         self.storage.committed_offset_topitions(group_id).await
@@ -298,7 +298,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "pending_txn_offsets")],
+                &[StorageOperation::PendingTxnOffsets.attribute()],
             )
         })?;
         self.storage.pending_txn_offsets(group_id).await
@@ -309,7 +309,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "metadata")],
+                &[StorageOperation::Metadata.attribute()],
             )
         })?;
         self.storage.metadata(topics).await
@@ -325,7 +325,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "upsert_user_scram_credential")],
+                &[StorageOperation::UpsertUserScramCredential.attribute()],
             )
         })?;
         self.storage
@@ -342,7 +342,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_user_scram_credential")],
+                &[StorageOperation::DeleteUserScramCredential.attribute()],
             )
         })?;
         self.storage
@@ -359,7 +359,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "user_scram_credential")],
+                &[StorageOperation::UserScramCredential.attribute()],
             )
         })?;
         self.storage.user_scram_credential(user, mechanism).await
@@ -375,7 +375,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "describe_config")],
+                &[StorageOperation::DescribeConfig.attribute()],
             )
         })?;
         self.storage.describe_config(name, resource, keys).await
@@ -386,7 +386,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "list_groups")],
+                &[StorageOperation::ListGroups.attribute()],
             )
         })?;
         self.storage.list_groups().await
@@ -400,7 +400,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "delete_groups")],
+                &[StorageOperation::DeleteGroups.attribute()],
             )
         })?;
         self.storage.delete_groups(group_ids).await
@@ -415,7 +415,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "describe_groups")],
+                &[StorageOperation::DescribeGroups.attribute()],
             )
         })?;
         self.storage
@@ -433,7 +433,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "describe_topic_partitions")],
+                &[StorageOperation::DescribeTopicPartitions.attribute()],
             )
         })?;
         self.storage
@@ -446,7 +446,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "group_with_version")],
+                &[StorageOperation::GroupWithVersion.attribute()],
             )
         })?;
         self.storage.group_with_version(group_id).await
@@ -466,7 +466,7 @@ where
             .inspect(|_| {
                 SEMAPHORE_ACQUIRE_DURATION.record(
                     elapsed_millis(start),
-                    &[KeyValue::new("operation", "update_group")],
+                    &[StorageOperation::UpdateGroup.attribute()],
                 )
             })
             .map_err(|err| UpdateError::Error(err.into()))?;
@@ -484,7 +484,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "init_producer")],
+                &[StorageOperation::InitProducer.attribute()],
             )
         })?;
         self.storage
@@ -508,7 +508,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_add_offsets")],
+                &[StorageOperation::TxnAddOffsets.attribute()],
             )
         })?;
         self.storage
@@ -524,7 +524,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_add_partitions")],
+                &[StorageOperation::TxnAddPartitions.attribute()],
             )
         })?;
         self.storage.txn_add_partitions(partitions).await
@@ -538,7 +538,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_offset_commit")],
+                &[StorageOperation::TxnOffsetCommit.attribute()],
             )
         })?;
         self.storage.txn_offset_commit(offsets).await
@@ -555,7 +555,7 @@ where
         let _permit = self.semaphore.acquire().await.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
-                &[KeyValue::new("operation", "txn_end")],
+                &[StorageOperation::TxnEnd.attribute()],
             )
         })?;
         self.storage

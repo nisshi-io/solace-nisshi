@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    Error, ListOffsetResponse, Result, Storage, Topition,
+    Error, ListOffsetResponse, Result, Storage, StorageOperation, Topition,
     service::{
         deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
         read_share::ListOffsetsReadShare,
@@ -146,7 +146,7 @@ where
             .enumerate()
             .map(|(index, offset)| async move {
                 let answer = within(
-                    "list_offsets",
+                    StorageOperation::ListOffsets,
                     deadline,
                     self.storage
                         .list_offsets(isolation_level, slice::from_ref(offset)),
@@ -483,7 +483,7 @@ mod tests {
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
         MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, SemaphoreProxy, Storage, TopicId, Topition,
+        Result, ScramCredential, SemaphoreProxy, Storage, StorageOperation, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
         Version,
         service::{
@@ -1155,7 +1155,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         let outcome = within(
-            "test",
+            StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
             proxy.list_offsets(
                 IsolationLevel::ReadUncommitted,
@@ -1181,7 +1181,7 @@ mod tests {
         let service = RequestChannelService::new(tx.clone());
 
         let outcome = within(
-            "test",
+            StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
             service.list_offsets(
                 IsolationLevel::ReadUncommitted,

@@ -32,7 +32,7 @@ use std::{cell::Cell, future::Future, pin::pin, sync::LazyLock};
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::time::{Duration, Instant, timeout_at};
 
-use crate::METER;
+use crate::{METER, StorageOperation};
 
 /// How long ListOffsets may spend in storage, under franz-go's flat 10s.
 ///
@@ -122,11 +122,8 @@ impl Missed {
 
     /// Returns the attributes of the `nisshi_storage_read_deadline_exceeded`
     /// counter for this read of `operation`.
-    pub(crate) fn attributes(self, operation: &'static str) -> Vec<KeyValue> {
-        let mut attributes = vec![
-            KeyValue::new("operation", operation),
-            KeyValue::new("stage", self.stage()),
-        ];
+    pub(crate) fn attributes(self, operation: StorageOperation) -> Vec<KeyValue> {
+        let mut attributes = vec![operation.attribute(), KeyValue::new("stage", self.stage())];
         attributes.extend(self.limit().map(|limit| KeyValue::new("limit", limit)));
         attributes
     }
@@ -216,7 +213,7 @@ where
 /// engine does not always stop a write that its caller drops: the write can
 /// carry on, or leave its connection busy for the next caller.
 pub(crate) async fn started_before<F>(
-    operation: &'static str,
+    operation: StorageOperation,
     deadline: Instant,
     call: F,
 ) -> Result<F::Output, Missed>
@@ -234,7 +231,7 @@ where
 /// Runs [`bounded`], counting each abandoned read in the
 /// `nisshi_storage_read_deadline_exceeded` counter under `operation`.
 pub(crate) async fn within<F>(
-    operation: &'static str,
+    operation: StorageOperation,
     deadline: Instant,
     read: F,
 ) -> Result<F::Output, Missed>
@@ -247,7 +244,7 @@ where
 /// Runs [`within`], counting each abandoned read in `exceeded`.
 async fn within_counting<F>(
     exceeded: &Counter<u64>,
-    operation: &'static str,
+    operation: StorageOperation,
     deadline: Instant,
     read: F,
 ) -> Result<F::Output, Missed>
@@ -284,7 +281,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finishes_before_the_deadline() {
         let deadline = Instant::now() + Duration::from_secs(1);
-        assert_eq!(Ok(7), within("test", deadline, async { 7 }).await);
+        assert_eq!(
+            Ok(7),
+            within(StorageOperation::Fetch, deadline, async { 7 }).await
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -294,7 +294,7 @@ mod tests {
 
         assert_eq!(
             Err(Missed::Reading),
-            within("test", deadline, pending::<()>()).await
+            within(StorageOperation::Fetch, deadline, pending::<()>()).await
         );
         assert_eq!(Duration::from_secs(1), started_at.elapsed());
     }
@@ -314,7 +314,7 @@ mod tests {
 
         assert_eq!(
             Err(Missed::NotStarted),
-            within("test", deadline, read).await
+            within(StorageOperation::Fetch, deadline, read).await
         );
         assert!(!polled.load(Ordering::SeqCst));
     }
@@ -328,7 +328,7 @@ mod tests {
 
         assert_eq!(
             Ok(7),
-            started_before("test", deadline, async {
+            started_before(StorageOperation::DeleteRecords, deadline, async {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 7
             })
@@ -352,7 +352,7 @@ mod tests {
 
         assert_eq!(
             Err(Missed::NotStarted),
-            started_before("test", deadline, call).await
+            started_before(StorageOperation::DeleteRecords, deadline, call).await
         );
         assert!(!polled.load(Ordering::SeqCst));
     }
@@ -365,14 +365,14 @@ mod tests {
 
         assert_eq!(
             Err(Missed::Queued),
-            within("test", deadline, queued(pending::<()>())).await
+            within(StorageOperation::Fetch, deadline, queued(pending::<()>())).await
         );
 
         let deadline = Instant::now() + Duration::from_secs(1);
 
         assert_eq!(
             Err(Missed::Reading),
-            within("test", deadline, async {
+            within(StorageOperation::Fetch, deadline, async {
                 queued(async {}).await;
                 pending::<()>().await
             })
@@ -386,8 +386,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
 
         let (queued_read, reading) = tokio::join!(
-            within("test", deadline, queued(pending::<()>())),
-            within("test", deadline, pending::<()>())
+            within(StorageOperation::Fetch, deadline, queued(pending::<()>())),
+            within(StorageOperation::Fetch, deadline, pending::<()>())
         );
 
         assert_eq!(Err(Missed::Queued), queued_read);
@@ -396,7 +396,11 @@ mod tests {
 
     /// Sums the `nisshi_storage_read_deadline_exceeded` counter for
     /// `operation` and `stage`.
-    fn exceeded(exporter: &InMemoryMetricExporter, operation: &str, stage: &str) -> u64 {
+    fn exceeded(
+        exporter: &InMemoryMetricExporter,
+        operation: StorageOperation,
+        stage: &str,
+    ) -> u64 {
         exporter
             .get_finished_metrics()
             .expect("finished metrics")
@@ -415,7 +419,7 @@ mod tests {
                                 })
                             };
 
-                            has("operation", operation) && has("stage", stage)
+                            has("operation", operation.as_str()) && has("stage", stage)
                         })
                         .map(SumDataPoint::value)
                         .sum::<u64>(),
@@ -442,31 +446,58 @@ mod tests {
 
         assert_eq!(
             Ok(7),
-            within_counting(&counter, "on_time", deadline(), async { 7 }).await
+            within_counting(&counter, StorageOperation::ListOffsets, deadline(), async {
+                7
+            })
+            .await
         );
         assert_eq!(
             Err(Missed::Reading),
-            within_counting(&counter, "stalled", deadline(), pending::<()>()).await
+            within_counting(
+                &counter,
+                StorageOperation::Fetch,
+                deadline(),
+                pending::<()>()
+            )
+            .await
         );
         assert_eq!(
             Err(Missed::Reading),
-            within_counting(&counter, "stalled", deadline(), pending::<()>()).await
+            within_counting(
+                &counter,
+                StorageOperation::Fetch,
+                deadline(),
+                pending::<()>()
+            )
+            .await
         );
         assert_eq!(
             Err(Missed::Queued),
-            within_counting(&counter, "stalled", deadline(), queued(pending::<()>())).await
+            within_counting(
+                &counter,
+                StorageOperation::Fetch,
+                deadline(),
+                queued(pending::<()>())
+            )
+            .await
         );
         assert_eq!(
             Err(Missed::NotStarted),
-            within_counting(&counter, "stalled", Instant::now(), async {}).await
+            within_counting(&counter, StorageOperation::Fetch, Instant::now(), async {}).await
         );
 
         provider.force_flush().expect("flush");
 
-        assert_eq!(0, exceeded(&exporter, "on_time", "reading"));
-        assert_eq!(2, exceeded(&exporter, "stalled", "reading"));
-        assert_eq!(1, exceeded(&exporter, "stalled", "queued"));
-        assert_eq!(1, exceeded(&exporter, "stalled", "not_started"));
+        assert_eq!(
+            0,
+            exceeded(&exporter, StorageOperation::ListOffsets, "reading")
+        );
+        assert_eq!(2, exceeded(&exporter, StorageOperation::Fetch, "reading"));
+        assert_eq!(1, exceeded(&exporter, StorageOperation::Fetch, "queued"));
+        assert_eq!(
+            1,
+            exceeded(&exporter, StorageOperation::Fetch, "not_started")
+        );
     }
 
     /// A read abandoned while it waits for its connection's read share and
@@ -489,7 +520,7 @@ mod tests {
             Err(Missed::QueuedForConnectionShare),
             within_counting(
                 &counter,
-                "stalled",
+                StorageOperation::Fetch,
                 deadline(),
                 queued_for_connection_share(pending::<()>())
             )
@@ -497,16 +528,28 @@ mod tests {
         );
         assert_eq!(
             Err(Missed::Queued),
-            within_counting(&counter, "stalled", deadline(), queued(pending::<()>())).await
+            within_counting(
+                &counter,
+                StorageOperation::Fetch,
+                deadline(),
+                queued(pending::<()>())
+            )
+            .await
         );
         assert_eq!(
             Err(Missed::Queued),
-            within_counting(&counter, "stalled", deadline(), queued(pending::<()>())).await
+            within_counting(
+                &counter,
+                StorageOperation::Fetch,
+                deadline(),
+                queued(pending::<()>())
+            )
+            .await
         );
 
         provider.force_flush().expect("flush");
 
-        assert_eq!(3, exceeded(&exporter, "stalled", "queued"));
+        assert_eq!(3, exceeded(&exporter, StorageOperation::Fetch, "queued"));
         assert_eq!(1, exceeded_waiting_for(&exporter, "connection"));
         assert_eq!(2, exceeded_waiting_for(&exporter, "engine"));
     }

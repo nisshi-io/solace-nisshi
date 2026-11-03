@@ -208,6 +208,7 @@ mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
+mod operation;
 mod producer;
 mod proxy;
 mod service;
@@ -218,6 +219,7 @@ pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replic
 pub use batch::ProduceRequestBatcher;
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
+pub use operation::StorageOperation;
 pub use producer::{
     OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
 };
