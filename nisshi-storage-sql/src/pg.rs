@@ -5424,7 +5424,7 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 });
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
@@ -5437,7 +5437,7 @@ mod tests {
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
     /// service of compose.yaml on its default port.
-    static CONNECTION: LazyLock<String> = LazyLock::new(|| {
+    pub(crate) static CONNECTION: LazyLock<String> = LazyLock::new(|| {
         std::env::var("NISSHI_TEST_DATABASE_URL")
             .unwrap_or_else(|_| String::from("postgres://postgres:postgres@localhost"))
     });
