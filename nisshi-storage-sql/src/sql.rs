@@ -115,20 +115,69 @@ pub(crate) trait QueryRow: Sized {
     fn read<R: driver::DriverRow>(reader: &Self::Reader, row: &R) -> Result<Self>;
 }
 
+/// Returns the kind of `error` when a row reader returned it: `missing_column`,
+/// `duplicate_column` or `unreadable_column`. Returns `None` for any other error.
+///
+/// Each engine counts a column error in its SQL error counter with this kind. The query has run
+/// by then, so the driver reports no error, and a count of the driver's errors alone shows a
+/// query that doesn't match its row, or a corrupt stored row, as healthy.
+pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::MissingColumn { .. } => Some("missing_column"),
+        Error::DuplicateColumn { .. } => Some("duplicate_column"),
+        Error::UnreadableColumn { .. } => Some("unreadable_column"),
+        _ => None,
+    }
+}
+
+/// Counts each column error of one query in an engine's SQL error counter, with the labels that
+/// the engine gives the query and the error's [`column_error_kind`] as `kind`.
+pub(crate) struct ColumnErrorCount {
+    counter: &'static Counter<u64>,
+    attributes: Vec<KeyValue>,
+}
+
+impl ColumnErrorCount {
+    /// Returns a count in `counter`, with the query's labels `attributes`.
+    pub(crate) fn new(counter: &'static Counter<u64>, attributes: Vec<KeyValue>) -> Self {
+        Self {
+            counter,
+            attributes,
+        }
+    }
+
+    /// Counts `error` when a row reader returned it, and ignores any other error.
+    pub(crate) fn record(&self, error: &Error) {
+        if let Some(kind) = column_error_kind(error) {
+            let mut attributes = self.attributes.clone();
+            attributes.push(KeyValue::new("kind", kind));
+            self.counter.add(1, &attributes);
+        }
+    }
+}
+
 /// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
 /// [`QueryRow`], in order. It reads a row only when the caller reaches it.
 pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
     driver_cursor: R,
     reader: T::Reader,
+    column_errors: ColumnErrorCount,
 }
 
 impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
     /// Returns a cursor over the result with `columns`, which reads each row from
-    /// `driver_cursor`.
-    pub(crate) fn new(columns: &result_columns::ResultColumns, driver_cursor: R) -> Result<Self> {
-        T::reader(columns).map(|reader| Self {
+    /// `driver_cursor` and counts each column error in `column_errors`.
+    pub(crate) fn new(
+        columns: &result_columns::ResultColumns,
+        driver_cursor: R,
+        column_errors: ColumnErrorCount,
+    ) -> Result<Self> {
+        let reader = T::reader(columns).inspect_err(|err| column_errors.record(err))?;
+
+        Ok(Self {
             driver_cursor,
             reader,
+            column_errors,
         })
     }
 
@@ -139,6 +188,7 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
             .await?
             .map(|row| T::read(&self.reader, &row))
             .transpose()
+            .inspect_err(|err| self.column_errors.record(err))
     }
 }
 
@@ -157,6 +207,7 @@ pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
 use nisshi_storage::{Error, ProduceEpoch, Result, StoredEpochs};
+use opentelemetry::{KeyValue, metrics::Counter};
 use std::{
     cmp::Ordering,
     hash::{DefaultHasher, Hash, Hasher as _},
@@ -847,5 +898,35 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Each error that a row reader returns has a kind for the SQL error counters, and a
+    /// driver's error has none, because the engine counts it where the driver returns it.
+    #[test]
+    fn column_error_kind() {
+        assert_eq!(
+            Some("missing_column"),
+            super::column_error_kind(&Error::MissingColumn {
+                query: "q.sql",
+                column: "c",
+                found: vec![],
+            })
+        );
+        assert_eq!(
+            Some("duplicate_column"),
+            super::column_error_kind(&Error::DuplicateColumn {
+                query: "q.sql",
+                column: "c",
+            })
+        );
+        assert_eq!(
+            Some("unreadable_column"),
+            super::column_error_kind(&Error::UnreadableColumn {
+                query: "q.sql",
+                column: "c",
+                source: Box::new(Error::UnexpectedNull),
+            })
+        );
+        assert_eq!(None, super::column_error_kind(&Error::UnexpectedNull));
     }
 }

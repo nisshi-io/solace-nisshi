@@ -16,7 +16,7 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
+        Cache, ColumnErrorCount, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
         consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
         idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
@@ -510,7 +510,17 @@ impl PoolConnection {
         params: impl IntoParams,
     ) -> Result<QueryRowCursor<Rows, T>> {
         let rows = self.query(query, params).await?;
-        QueryRowCursor::new(&ResultColumns::libsql(query, &rows), rows)
+        QueryRowCursor::new(
+            &ResultColumns::libsql(query, &rows),
+            rows,
+            self.column_error_count(query),
+        )
+    }
+
+    /// Returns the count of `query`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, query: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(&SQL_ERROR, vec![KeyValue::new("key", query.to_owned())])
     }
 
     /// Runs `query`, and returns the first row of its result as `T`, or `None` when the result
@@ -537,7 +547,8 @@ impl PoolConnection {
             .inspect(|rows| debug!(?rows))
             .inspect_err(|err| self.record_query_error(query, start, err))?;
 
-        let reader = T::reader(&ResultColumns::libsql(query, &rows))?;
+        let reader = T::reader(&ResultColumns::libsql(query, &rows))
+            .inspect_err(|err| self.column_error_count(query).record(err))?;
 
         // libSQL reports an error of the statement's first step from this call, not from
         // `query`.
@@ -547,7 +558,8 @@ impl PoolConnection {
             .inspect(|row| debug!(?row))
             .inspect_err(|err| self.record_query_error(query, start, err))?
             .map(|row| T::read(&reader, &row))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|err| self.column_error_count(query).record(err))?;
 
         let attributes = [KeyValue::new("sql", query.to_owned())];
 

@@ -27,7 +27,7 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
+        Cache, ColumnErrorCount, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
         consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
         idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
@@ -382,8 +382,25 @@ impl Engine {
         query: &'static str,
         params: impl IntoParams,
     ) -> Result<QueryRowCursor<turso::Rows, T>> {
-        let rows = connection.query(&sql_lookup(query)?, params).await?;
-        QueryRowCursor::new(&ResultColumns::turso(query, &rows), rows)
+        let sql = sql_lookup(query)?;
+        let rows = connection.query(&sql, params).await?;
+        QueryRowCursor::new(
+            &ResultColumns::turso(query, &rows),
+            rows,
+            self.column_error_count(&sql),
+        )
+    }
+
+    /// Returns the count of `sql`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, sql: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(
+            &SQL_ERROR,
+            vec![
+                KeyValue::new("sql", sql.to_owned()),
+                KeyValue::new("cluster_id", self.cluster.clone()),
+            ],
+        )
     }
 
     /// Runs `query` on `connection`, and returns the first row of its result as `T`, or `None`
@@ -414,7 +431,8 @@ impl Engine {
             SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
         })?;
 
-        let reader = T::reader(&ResultColumns::turso(query, &rows))?;
+        let reader = T::reader(&ResultColumns::turso(query, &rows))
+            .inspect_err(|err| self.column_error_count(&sql).record(err))?;
 
         let row = rows
             .next()
@@ -425,7 +443,8 @@ impl Engine {
                 SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
             })?
             .map(|row| T::read(&reader, &row))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|err| self.column_error_count(&sql).record(err))?;
 
         let attributes = [
             KeyValue::new("sql", sql),
