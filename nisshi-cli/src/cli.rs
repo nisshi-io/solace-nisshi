@@ -214,7 +214,9 @@ impl Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnvVarExp;
     use clap::CommandFactory;
+    use url::Url;
 
     fn long_help(tool: &str) -> String {
         Cli::command()
@@ -240,29 +242,113 @@ mod tests {
     }
 
     const REGISTRY: &str = "file://./etc/schema";
+    const OTHER_REGISTRY: &str = "s3://nisshi/";
 
     /// Parses `nisshi <args>` with `SCHEMA_REGISTRY` set to `env`, or unset.
-    fn parses(env: Option<&str>, args: &[&str]) {
+    fn parse(env: Option<&str>, args: &[&str]) -> Cli {
         temp_env::with_var("SCHEMA_REGISTRY", env, || {
-            if let Err(e) =
-                Cli::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
-            {
-                panic!("{args:?} with SCHEMA_REGISTRY={env:?}: {e}");
-            }
+            Cli::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+                .unwrap_or_else(|e| panic!("{args:?} with SCHEMA_REGISTRY={env:?}: {e}"))
         })
+    }
+
+    /// Asserts that `nisshi <args>` parses, with `SCHEMA_REGISTRY` set to `env`, or unset.
+    fn parses(env: Option<&str>, args: &[&str]) {
+        let _ = parse(env, args);
+    }
+
+    /// Returns the schema registry that `nisshi cat <subcommand> t <args>` hands to `cat`.
+    fn cat_schema_registry(subcommand: &str, env: Option<&str>, args: &[&str]) -> Option<Url> {
+        let args = [&["cat", subcommand, "t"], args].concat();
+        match parse(env, &args).command {
+            Some(Command::Cat {
+                command:
+                    cat::Command::Produce {
+                        schema_registry, ..
+                    }
+                    | cat::Command::Consume {
+                        schema_registry, ..
+                    },
+            }) => schema_registry.map(EnvVarExp::into_inner),
+            other => panic!("{args:?}: expected a cat produce or consume, got {other:?}"),
+        }
+    }
+
+    fn registry(url: &str) -> Option<Url> {
+        Some(Url::parse(url).expect(url))
     }
 
     /// The broker's `--schema-registry` is `global`, so clap merges the matches of a tool that
     /// declares its own into the flattened broker arguments. Parsing only `cat`'s arguments
     /// hides that: it has to go through `Cli`.
     #[test]
-    fn cat_parses_schema_registry_from_flag_and_environment() {
-        for args in [["cat", "produce", "t"], ["cat", "consume", "t"]] {
-            let with_flag = [&args[..], &["--schema-registry", REGISTRY]].concat();
-            parses(None, &with_flag);
-            parses(Some(REGISTRY), &args);
-            parses(None, &args);
+    fn cat_gets_its_schema_registry_from_flag_and_environment() {
+        for subcommand in ["produce", "consume"] {
+            let flag = ["--schema-registry", OTHER_REGISTRY];
+            assert_eq!(cat_schema_registry(subcommand, None, &[]), None);
+            assert_eq!(
+                cat_schema_registry(subcommand, Some(REGISTRY), &[]),
+                registry(REGISTRY),
+            );
+            assert_eq!(
+                cat_schema_registry(subcommand, None, &flag),
+                registry(OTHER_REGISTRY),
+            );
+            // The flag wins over the environment variable.
+            assert_eq!(
+                cat_schema_registry(subcommand, Some(REGISTRY), &flag),
+                registry(OTHER_REGISTRY),
+            );
         }
+    }
+
+    #[test]
+    fn cat_expands_a_variable_in_its_schema_registry() {
+        temp_env::with_var("REGISTRY_FROM_VARIABLE", Some(REGISTRY), || {
+            for subcommand in ["produce", "consume"] {
+                assert_eq!(
+                    cat_schema_registry(
+                        subcommand,
+                        None,
+                        &["--schema-registry", "${REGISTRY_FROM_VARIABLE}"],
+                    ),
+                    registry(REGISTRY),
+                );
+            }
+        });
+    }
+
+    /// An argument that clap merges into a `global` one must have the global's type, or reading
+    /// the merged value panics at run time. Walks every command, so a tool added later is covered.
+    #[test]
+    fn an_argument_with_a_global_arguments_name_has_its_type() {
+        fn check(command: &clap::Command, globals: &[&clap::Arg], path: &str) {
+            for arg in command.get_arguments() {
+                if let Some(global) = globals
+                    .iter()
+                    .find(|global| global.get_id() == arg.get_id())
+                {
+                    assert_eq!(
+                        arg.get_value_parser().type_id(),
+                        global.get_value_parser().type_id(),
+                        "`{path}` declares `--{}` with another type than the global argument",
+                        arg.get_id(),
+                    );
+                }
+            }
+            let mut inherited = globals.to_vec();
+            inherited.extend(command.get_arguments().filter(|arg| arg.is_global_set()));
+            for subcommand in command.get_subcommands() {
+                check(
+                    subcommand,
+                    &inherited,
+                    &format!("{path} {}", subcommand.get_name()),
+                );
+            }
+        }
+
+        let cli = Cli::command();
+        check(&cli, &[], cli.get_name());
     }
 
     #[test]
