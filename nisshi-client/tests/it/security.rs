@@ -162,6 +162,10 @@ struct SaslPolicy {
     token: Vec<u8>,
 
     session_lifetime_ms: i64,
+
+    /// The iteration count that the broker's server-first message asks for, when the broker
+    /// serves SCRAM. The broker then refuses the client's proof.
+    scram_iterations: Option<u32>,
 }
 
 impl SaslPolicy {
@@ -170,8 +174,27 @@ impl SaslPolicy {
             enabled: vec!["PLAIN"],
             token: [&[0][..], USERNAME.as_bytes(), &[0], PASSWORD.as_bytes()].concat(),
             session_lifetime_ms: 0,
+            scram_iterations: None,
         }
     }
+
+    fn scram(mechanism: &'static str, iterations: u32) -> Self {
+        Self {
+            enabled: vec![mechanism],
+            token: vec![],
+            session_lifetime_ms: 0,
+            scram_iterations: Some(iterations),
+        }
+    }
+}
+
+/// The server-first message that answers `client_first`: the client's nonce with a server nonce
+/// after it, a salt, and `iterations`.
+fn scram_server_first(client_first: &[u8], iterations: u32) -> Bytes {
+    let client_first = std::str::from_utf8(client_first).unwrap();
+    let nonce = client_first.split(",r=").nth(1).unwrap();
+
+    Bytes::from(format!("r={nonce}server,s=c2FsdHNhbHQ=,i={iterations}"))
 }
 
 #[derive(Default)]
@@ -287,7 +310,16 @@ where
 
                 seen.tokens.lock().unwrap().push(auth_bytes.clone());
 
-                if auth_bytes[..] == policy.token[..] {
+                if let (Some(iterations), 1) =
+                    (policy.scram_iterations, seen.tokens.lock().unwrap().len())
+                {
+                    SaslAuthenticateResponse::default()
+                        .error_code(ErrorCode::None.into())
+                        .error_message(None)
+                        .auth_bytes(scram_server_first(&auth_bytes, iterations))
+                        .session_lifetime_ms(Some(0))
+                        .into()
+                } else if auth_bytes[..] == policy.token[..] {
                     authenticated = true;
 
                     SaslAuthenticateResponse::default()
@@ -527,12 +559,12 @@ async fn a_pool_presents_its_client_certificate_to_a_broker_that_asks() {
     )
     .await;
 
-    assert!(
-        metadata(broker.builder(Security::default().tls(tls(&authority, None))))
-            .await
-            .is_err(),
-        "the broker accepted a client without a certificate"
-    );
+    let error = metadata(broker.builder(Security::default().tls(tls(&authority, None))))
+        .await
+        .expect_err("the broker accepted a client without a certificate");
+
+    assert!(error.tls_failure().is_some(), "{error}");
+    assert!(!error.is_connect_failure(), "{error}");
 
     assert_eq!(
         Some("fake".to_owned()),
@@ -542,6 +574,28 @@ async fn a_pool_presents_its_client_certificate_to_a_broker_that_asks() {
         .await
         .unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_login_without_the_client_certificate_that_the_broker_asks_for_is_a_tls_failure() {
+    let authority = Authority::new();
+    let broker = Broker::start(
+        Some(server_config(
+            authority.server(&["127.0.0.1"]),
+            Some(&authority),
+        )),
+        Some(SaslPolicy::plain()),
+    )
+    .await;
+
+    let security = Security::default()
+        .tls(tls(&authority, None))
+        .sasl(Sasl::new(SaslMechanism::Plain, USERNAME, PASSWORD));
+
+    let error = metadata(broker.builder(security)).await.unwrap_err();
+
+    assert!(error.tls_failure().is_some(), "{error}");
+    assert!(!error.is_connect_failure(), "{error}");
 }
 
 #[tokio::test]
@@ -635,12 +689,56 @@ async fn a_login_to_a_broker_without_sasl_says_so() {
 
     let error = metadata(broker.builder(security)).await.unwrap_err();
 
+    assert!(error.sasl_not_used(), "{error}");
+    assert!(error.login_failure().is_none(), "{error}");
+    assert!(!error.is_connect_failure(), "{error}");
+}
+
+/// Logs in with SCRAM to a fake broker that asks for `iterations`, and returns the login's error
+/// and the number of SaslAuthenticate tokens that the client sent before it stopped.
+async fn scram_login(mechanism: SaslMechanism, iterations: u32) -> (Error, usize) {
+    let broker = Broker::start(None, Some(SaslPolicy::scram(mechanism.name(), iterations))).await;
+
+    let security = Security::default().sasl(Sasl::new(mechanism, USERNAME, PASSWORD));
+
+    let error = metadata(broker.builder(security)).await.unwrap_err();
+    let sent = broker.seen.tokens.lock().unwrap().len();
+
+    (error, sent)
+}
+
+#[tokio::test]
+async fn a_scram_login_refuses_an_iteration_count_outside_the_range_that_kafka_allows() {
+    for mechanism in [SaslMechanism::ScramSha256, SaslMechanism::ScramSha512] {
+        for iterations in [1, 4095, (1 << 20) + 1, u32::MAX] {
+            let (error, sent) = scram_login(mechanism, iterations).await;
+
+            let reason = error.login_failure().unwrap_or_default();
+            assert!(
+                reason.contains(&format!("asked for {iterations} SCRAM iterations")),
+                "{mechanism:?} {iterations}: {error}"
+            );
+
+            // The client stopped after the broker's server-first message, so it never sent a
+            // proof that costs few guesses to attack.
+            assert_eq!(1, sent, "{mechanism:?} {iterations}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_scram_login_derives_its_proof_for_the_smallest_iteration_count_that_kafka_allows() {
+    let (error, sent) = scram_login(SaslMechanism::ScramSha256, 4096).await;
+
+    // The fake broker refuses every proof, so the login gets past the iteration check and fails
+    // on the credentials.
     assert!(
         error
             .login_failure()
-            .is_some_and(|reason| reason.contains("does not use SASL")),
+            .is_some_and(|reason| reason.contains("invalid credentials")),
         "{error}"
     );
+    assert_eq!(2, sent);
 }
 
 /// The broker closes a connection whose session lifetime has run out, unless the client logs

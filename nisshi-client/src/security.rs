@@ -36,8 +36,11 @@ use nisshi_sans_io::{
 };
 use opentelemetry::KeyValue;
 use rsasl::{
+    callback::{Request, SessionCallback, SessionData},
     config::SASLConfig,
-    prelude::{Mechname, SASLClient, State},
+    mechanisms::scram::properties::Iterations,
+    prelude::{Mechname, SASLClient, SessionError, State},
+    property::{AuthId, Password},
 };
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
@@ -282,14 +285,22 @@ impl Tls {
     }
 }
 
+/// Returns the error that rustls reports through `error`, when it does.
+///
+/// A broker that asks for a client certificate and gets none sends its `CertificateRequired`
+/// alert after the client finishes a TLS 1.3 handshake, so it reaches the client on its first
+/// read, not in the handshake.
+pub(crate) fn rustls_cause(error: &io::Error) -> Option<&RustlsError> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<RustlsError>())
+}
+
 /// The error of a failed TLS handshake. A certificate or protocol error that rustls reports, and
 /// a peer that closes the connection during the handshake, as a listener that does not speak TLS
 /// does, are TLS failures. Anything else is an I/O error.
 fn handshake_failure(error: io::Error) -> Error {
-    if let Some(cause) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<RustlsError>())
-    {
+    if let Some(cause) = rustls_cause(&error) {
         return Error::Tls(cause.to_string());
     }
 
@@ -442,6 +453,59 @@ impl fmt::Debug for Sasl {
     }
 }
 
+/// The fewest PBKDF2 iterations that a SCRAM login accepts from the broker: the minimum that
+/// [Kafka's client enforces][Kafka's check] for SCRAM-SHA-256 and SCRAM-SHA-512. A smaller count lets whoever answers for the broker
+/// recover the password from the client's proof with little work, and a SASL_PLAINTEXT
+/// connection lets an attacker on the network answer for the broker.
+///
+/// [Kafka's check]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/scram/internals/ScramSaslClient.java#L127-L128
+const SCRAM_MIN_ITERATIONS: u32 = 4096;
+
+/// The most PBKDF2 iterations that a SCRAM login accepts from the broker. The client derives the
+/// key on the tokio worker that runs the login, and the pool's create timeout can't interrupt
+/// it, so a count that the broker's answer sets without limit would hold the worker. Kafka's
+/// brokers set at most 16384 and Kafka's client has no maximum.
+const SCRAM_MAX_ITERATIONS: u32 = 1 << 20;
+
+/// The iteration count that the broker asked for is outside the range that the client accepts.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the broker asked for {0} SCRAM iterations, and the client accepts {min} to {max}",
+    min = SCRAM_MIN_ITERATIONS,
+    max = SCRAM_MAX_ITERATIONS
+)]
+struct ScramIterationsOutOfRange(u32);
+
+/// Gives a SCRAM login its credentials, and refuses an iteration count outside the range that the
+/// client accepts before the client derives a key from the password.
+struct ScramCredentials {
+    username: String,
+    password: Zeroizing<String>,
+}
+
+impl SessionCallback for ScramCredentials {
+    fn callback(
+        &self,
+        _session_data: &SessionData,
+        context: &rsasl::callback::Context<'_>,
+        request: &mut Request<'_>,
+    ) -> Result<(), SessionError> {
+        if let Some(&iterations) = context.get_ref::<Iterations>()
+            && !(SCRAM_MIN_ITERATIONS..=SCRAM_MAX_ITERATIONS).contains(&iterations)
+        {
+            return Err(SessionError::Boxed(Box::new(ScramIterationsOutOfRange(
+                iterations,
+            ))));
+        }
+
+        _ = request
+            .satisfy::<AuthId>(self.username.as_str())?
+            .satisfy::<Password>(self.password.as_bytes())?;
+
+        Ok(())
+    }
+}
+
 /// What a login tells the pool about the connection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Session {
@@ -534,12 +598,7 @@ impl Exchange<'_> {
                     handshake.mechanisms.unwrap_or_default().join(", ")
                 )));
             }
-            Ok(ErrorCode::IllegalSaslState) => {
-                return Err(Error::Authentication(
-                    "the listener does not use SASL (broker started without --authentication?)"
-                        .into(),
-                ));
-            }
+            Ok(ErrorCode::IllegalSaslState) => return Err(Error::SaslNotUsed),
             Ok(code) => return Err(Error::Authentication(format!("SaslHandshake: {code}"))),
             Err(_) => {
                 return Err(Error::Authentication(format!(
@@ -611,12 +670,13 @@ impl Exchange<'_> {
         let mechanism = Mechname::parse(sasl.mechanism.name().as_bytes())
             .map_err(|error| Error::Authentication(error.to_string()))?;
 
-        let config = SASLConfig::with_credentials(
-            None,
-            sasl.username.clone(),
-            sasl.password.as_str().to_owned(),
-        )
-        .map_err(|error| Error::Authentication(error.to_string()))?;
+        let config = SASLConfig::builder()
+            .with_default_mechanisms()
+            .with_callback(ScramCredentials {
+                username: sasl.username.clone(),
+                password: sasl.password.clone(),
+            })
+            .map_err(|error| Error::Authentication(error.to_string()))?;
 
         let mut session = SASLClient::new(config)
             .start_suggested(&[mechanism])

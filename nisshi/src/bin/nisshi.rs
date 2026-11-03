@@ -38,6 +38,12 @@ const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
 /// the option and the environment variable that give the command its broker.
 fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
     match error {
+        _ if error.sasl_not_used() => format!(
+            "The broker's listener does not use SASL, so the command must not log in: it is a \
+            PLAINTEXT or SSL listener, or a Nisshi broker started without --authentication. \
+            Remove --sasl-username (and unset a stray SASL_USERNAME), or point {broker_option} \
+            at the broker's SASL listener."
+        ),
         _ if error.login_failure().is_some() => format!(
             "The broker refused the login: {}. Check --sasl-username, the password in \
             SASL_PASSWORD (or --sasl-password-file) and --sasl-mechanism.",

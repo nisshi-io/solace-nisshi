@@ -193,7 +193,11 @@ nisshi topic list --broker tcp://broker.example.com:9092 \
 ```
 
 Nisshi's own broker enables SCRAM-SHA-256 and SCRAM-SHA-512 only. `plain` is for another
-Kafka broker that enables it, and only with TLS, because PLAIN sends the password in clear text. Each connection
+Kafka broker that enables it, and only with TLS, because PLAIN sends the password in clear text.
+The mechanism name is not case sensitive, so Kafka's `SCRAM-SHA-512` works too. A SCRAM login
+stops when the broker asks for fewer than 4096 iterations, which is the minimum that Kafka's
+client enforces, or for more than 1,048,576. A user that `nisshi user create --iterations`
+made with fewer than 4096 cannot log in with these commands. Each connection
 logs in once, as it opens, and a broker that limits the session lifetime has the command open a
 new connection, which logs in again, a little before the limit. `proxy` has none of these
 options.

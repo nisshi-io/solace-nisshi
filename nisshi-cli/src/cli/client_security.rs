@@ -102,7 +102,7 @@ pub(super) struct ClientSecurity {
     sasl_password_file: Option<PathBuf>,
 
     /// The SASL mechanism to log in with, requires --sasl-username
-    #[arg(long, env = "SASL_MECHANISM", value_enum)]
+    #[arg(long, env = "SASL_MECHANISM", value_enum, ignore_case = true)]
     sasl_mechanism: Option<Mechanism>,
 }
 
@@ -228,11 +228,40 @@ impl ClientSecurity {
 mod tests {
     use std::fs;
 
-    use clap::Parser;
+    use clap::{CommandFactory as _, Parser};
     use nisshi_client::{Sasl, SaslMechanism, Security};
 
-    use super::ClientSecurity;
+    use super::{ClientSecurity, Mechanism, SASL_PASSWORD};
     use crate::Error;
+
+    /// Every environment variable that the options read, so that no test sees the developer's
+    /// `.env`, which the justfile loads.
+    const ENVIRONMENT: [&str; 9] = [
+        SASL_PASSWORD,
+        "SASL_USERNAME",
+        "SASL_PASSWORD_FILE",
+        "SASL_MECHANISM",
+        "TLS_CA_FILE",
+        "TLS_CERT_FILE",
+        "TLS_KEY_FILE",
+        "TLS_KEY_PASSPHRASE_FILE",
+        "TLS_SERVER_NAME",
+    ];
+
+    /// Runs `run` with each variable in `ENVIRONMENT` unset, except the ones in `set`.
+    fn with_environment<T>(set: &[(&str, &str)], run: impl FnOnce() -> T) -> T {
+        temp_env::with_vars(
+            ENVIRONMENT.map(|name| {
+                (
+                    name,
+                    set.iter()
+                        .find(|(variable, _)| *variable == name)
+                        .map(|(_, value)| *value),
+                )
+            }),
+            run,
+        )
+    }
 
     #[derive(Parser)]
     struct Wrapper {
@@ -240,23 +269,24 @@ mod tests {
         security: ClientSecurity,
     }
 
-    fn parse(args: &[&str]) -> Result<ClientSecurity, clap::Error> {
+    fn parse_arguments(args: &[&str]) -> Result<ClientSecurity, clap::Error> {
         Wrapper::try_parse_from(std::iter::once("tool").chain(args.iter().copied()))
             .map(|wrapper| wrapper.security)
     }
 
+    fn parse(args: &[&str]) -> Result<ClientSecurity, clap::Error> {
+        with_environment(&[], || parse_arguments(args))
+    }
+
     fn build(args: &[&str], password: Option<&str>) -> crate::Result<Security> {
-        temp_env::with_vars(
-            [
-                ("SASL_PASSWORD", password),
-                ("SASL_USERNAME", None),
-                ("SASL_PASSWORD_FILE", None),
-                ("SASL_MECHANISM", None),
-                ("TLS_CERT_FILE", None),
-                ("TLS_KEY_FILE", None),
-            ],
-            || parse(args).expect("arguments parse").build(),
-        )
+        let set: Vec<(&str, &str)> = password
+            .map(|password| (SASL_PASSWORD, password))
+            .into_iter()
+            .collect();
+
+        with_environment(&set, || {
+            parse_arguments(args).expect("arguments parse").build()
+        })
     }
 
     fn sasl(mechanism: SaslMechanism, password: &str) -> Security {
@@ -373,6 +403,45 @@ mod tests {
             build(&["--tls-ca-file", "/no/such/file"], None),
             Err(Error::TlsCertificate { .. })
         ));
+    }
+
+    #[test]
+    fn the_test_environment_covers_every_variable_that_an_option_reads() {
+        let options = Wrapper::command()
+            .get_arguments()
+            .filter_map(|argument| argument.get_env())
+            .map(|name| name.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert!(!options.is_empty());
+
+        for name in options {
+            assert!(ENVIRONMENT.contains(&name.as_str()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_mechanism_may_be_spelled_as_kafka_spells_it() {
+        for (spelling, mechanism) in [
+            ("PLAIN", Mechanism::Plain),
+            ("SCRAM-SHA-256", Mechanism::ScramSha256),
+            ("SCRAM-SHA-512", Mechanism::ScramSha512),
+        ] {
+            assert_eq!(
+                Some(mechanism),
+                parse(&["--sasl-mechanism", spelling])
+                    .unwrap()
+                    .sasl_mechanism
+            );
+
+            // A `.env` file that the other Kafka tools read sets it by the variable.
+            assert_eq!(
+                Some(mechanism),
+                with_environment(&[("SASL_MECHANISM", spelling)], || {
+                    parse_arguments(&[]).unwrap().sasl_mechanism
+                })
+            );
+        }
     }
 
     #[test]

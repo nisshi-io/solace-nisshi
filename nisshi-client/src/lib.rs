@@ -168,6 +168,9 @@ pub enum Error {
     Poison,
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
     Protocol(#[from] nisshi_sans_io::Error),
+    /// The client logs in with SASL, and the broker's listener does not use SASL: it is a
+    /// `PLAINTEXT` or `SSL` listener, or a Nisshi broker that started without `--authentication`.
+    SaslNotUsed,
     Service(#[from] nisshi_service::Error),
     Timeout(Duration),
     /// The TLS options can't be used: a certificate, the private key or the server name. Nothing
@@ -193,6 +196,7 @@ impl Error {
         match self {
             Self::Pool(cause) => {
                 self.login_failure().is_none()
+                    && !self.sasl_not_used()
                     && self.tls_failure().is_none()
                     && !matches!(
                         cause.downcast_ref::<PoolError<Error>>(),
@@ -219,6 +223,18 @@ impl Error {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// Returns whether the client logged in with SASL to a listener that does not use SASL.
+    pub fn sasl_not_used(&self) -> bool {
+        match self {
+            Self::SaslNotUsed => true,
+            Self::Pool(cause) => matches!(
+                cause.downcast_ref::<PoolError<Error>>(),
+                Some(PoolError::Backend(Self::SaslNotUsed))
+            ),
+            _ => false,
         }
     }
 
@@ -265,7 +281,10 @@ where
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
+        match security::rustls_cause(&value) {
+            Some(cause) => Self::Tls(cause.to_string()),
+            None => Self::Io(Arc::new(value)),
+        }
     }
 }
 
