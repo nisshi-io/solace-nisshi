@@ -63,8 +63,7 @@ fn fetch_offset_inside_a_batch_skips_the_records_before_it() {
 
 /// Fetch answers an offset below the log start with `OFFSET_OUT_OF_RANGE` and no records, and
 /// `-1` is below it. That must not look like a valid offset with nothing to read to the caller.
-/// An offset above the high watermark is answered with no error by design, so it is not covered
-/// here.
+/// An offset above the high watermark gets the same answer, so the same path fails it.
 #[test]
 fn fetch_offset_below_the_log_start_fails_with_the_error() {
     let broker = taxi();

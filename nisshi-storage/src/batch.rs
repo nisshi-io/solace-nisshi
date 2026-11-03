@@ -606,6 +606,10 @@ where
         self.storage.offset_stage(topition).await
     }
 
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.storage.current_offset_stage(topition).await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
