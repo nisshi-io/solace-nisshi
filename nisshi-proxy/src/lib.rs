@@ -136,6 +136,22 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 /// quiet.
 const ORIGIN_POOL_MAX_SIZE: usize = 256;
 
+/// Returns the `FindCoordinator` request that the proxy sends to its origin for a client's
+/// `request`.
+///
+/// A v0 client request has a `key` and no `key_type`, and the origin may be asked at v1 or
+/// later, where `key_type` is mandatory: a v0 request asks for a group coordinator, so the
+/// key type is 0.
+fn origin_find_coordinator_request(request: FindCoordinatorRequest) -> FindCoordinatorRequest {
+    FindCoordinatorRequest::default()
+        .key_type(request.key_type.or(Some(0)))
+        .coordinator_keys(
+            request
+                .coordinator_keys
+                .or(request.key.map(|key| vec![key])),
+        )
+}
+
 #[derive(Clone, Debug)]
 pub struct Proxy {
     listener: Url,
@@ -213,18 +229,7 @@ impl Proxy {
             (
                 FrameRequestLayer::<FindCoordinatorRequest>::new(),
                 MapInputLayer::new(move |input: RequestInput<FindCoordinatorRequest>| {
-                    FindCoordinatorRequest::default()
-                        .key_type(
-                            // A v0 request has no key type and the origin may be asked at v1+,
-                            // which needs one: v0 coordinators are group coordinators.
-                            input.request.key_type.or(Some(0)),
-                        )
-                        .coordinator_keys(
-                            input
-                                .request
-                                .coordinator_keys
-                                .or(input.request.key.map(|key| vec![key])),
-                        )
+                    origin_find_coordinator_request(input.request)
                 }),
                 MapOutputLayer::new(move |response: FindCoordinatorResponse| {
                     let coordinators = response.coordinators.as_ref().map(|coordinators| {
@@ -400,6 +405,33 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    #[test]
+    fn v0_find_coordinator_request_encodes_at_the_newest_version() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        // A v0 client sends a key and no key type.
+        let request = origin_find_coordinator_request(
+            FindCoordinatorRequest::default().key(Some("g".into())),
+        );
+
+        let decoded = Frame::request(
+            Header::Request {
+                api_key: FindCoordinatorRequest::KEY,
+                api_version: 4,
+                correlation_id: 0,
+                client_id: Some("abc".into()),
+            },
+            request.into(),
+        )
+        .and_then(Frame::request_from_bytes)?;
+
+        let request = FindCoordinatorRequest::try_from(decoded.body)?;
+        assert_eq!(Some(0), request.key_type);
+        assert_eq!(Some(vec![String::from("g")]), request.coordinator_keys);
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -521,7 +521,11 @@ impl Serializer for &mut Encoder {
             // here, and one guessed for the caller may be wrong, so fail.
             // Tagged fields are encoded elsewhere and never reach this
             // serializer; the `tag` check is a guard.
-            Err(Error::MandatoryFieldUnset(self.field_name()))
+            Err(Error::MandatoryFieldUnset {
+                field: self.field_name(),
+                // `is_valid` above is true only when the encoder knows the version.
+                api_version: self.api_version.unwrap_or_default(),
+            })
         } else {
             Ok(())
         }

@@ -21,11 +21,12 @@ use std::assert_matches;
 
 use crate::common::init_tracing;
 use nisshi_sans_io::{
-    Body, Error, Frame, Header, Result,
+    Body, Error, Frame, Header, JoinGroupResponse, Result,
     fetch_request::{FetchPartition, FetchRequest, FetchTopic},
 };
 
 const FETCH: i16 = 1;
+const JOIN_GROUP: i16 = 11;
 
 fn header(api_version: i16) -> Header {
     Header::Request {
@@ -79,7 +80,7 @@ fn unset_mandatory_scalar_is_an_error() -> Result<()> {
 
     assert_matches!(
         Frame::request(header(17), fetch(partition).into()),
-        Err(Error::MandatoryFieldUnset(_))
+        Err(Error::MandatoryFieldUnset { .. })
     );
 
     Ok(())
@@ -91,12 +92,14 @@ fn error_names_the_field() -> Result<()> {
 
     let partition = complete_partition().current_leader_epoch(None);
 
-    let Err(Error::MandatoryFieldUnset(name)) = Frame::request(header(17), fetch(partition).into())
+    let Err(Error::MandatoryFieldUnset { field, api_version }) =
+        Frame::request(header(17), fetch(partition).into())
     else {
         panic!("expected MandatoryFieldUnset");
     };
 
-    assert!(name.ends_with("current_leader_epoch"), "{name}");
+    assert!(field.ends_with("current_leader_epoch"), "{field}");
+    assert_eq!(17, api_version);
 
     Ok(())
 }
@@ -195,7 +198,7 @@ fn unset_mandatory_field_in_a_response_is_an_error() -> Result<()> {
             32,
             0
         ),
-        Err(Error::MandatoryFieldUnset(_))
+        Err(Error::MandatoryFieldUnset { .. })
     );
 
     _ = Frame::response(
@@ -204,6 +207,48 @@ fn unset_mandatory_field_in_a_response_is_an_error() -> Result<()> {
         32,
         0,
     )?;
+
+    Ok(())
+}
+
+fn join_group_response_without_protocol_name() -> JoinGroupResponse {
+    JoinGroupResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(0)
+        .generation_id(-1)
+        .protocol_type(None)
+        .protocol_name(None)
+        .leader("".into())
+        .skip_assignment(Some(false))
+        .member_id("m".into())
+        .members(Some(vec![]))
+}
+
+#[test]
+fn field_nullable_only_from_some_version_errors_before_it_and_encodes_null_from_it() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    // JoinGroupResponse `ProtocolName` exists from v0 and is nullable only from v7.
+    let encode = |api_version| {
+        Frame::response(
+            Header::Response { correlation_id: 0 },
+            join_group_response_without_protocol_name().into(),
+            JOIN_GROUP,
+            api_version,
+        )
+    };
+
+    assert_matches!(
+        encode(6),
+        Err(Error::MandatoryFieldUnset { api_version: 6, .. })
+    );
+
+    let decoded = encode(7).and_then(|bytes| Frame::response_from_bytes(bytes, JOIN_GROUP, 7))?;
+
+    let Body::JoinGroupResponse(decoded) = decoded.body else {
+        panic!("wrong body variant: {decoded:?}");
+    };
+    assert_eq!(None, decoded.protocol_name);
 
     Ok(())
 }

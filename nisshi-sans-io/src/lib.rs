@@ -339,6 +339,7 @@ pub trait IntoVersion {
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     ApiError(ErrorCode),
     EnvVar(VarError),
@@ -363,8 +364,12 @@ pub enum Error {
     /// A field that is mandatory and not nullable at the encoded version was left unset (`None`).
     ///
     /// The encoder has no bytes to write for it, and skipping it would shift every later field.
-    /// The value is the field's path, e.g. `Frame.FetchRequest.FetchTopic.FetchPartition.current_leader_epoch`.
-    MandatoryFieldUnset(String),
+    /// `field` is the field's path, e.g. `Frame.FetchRequest.FetchTopic.FetchPartition.current_leader_epoch`,
+    /// and `api_version` is the version that the message was encoded at.
+    MandatoryFieldUnset {
+        field: String,
+        api_version: i16,
+    },
     NoSuchField(&'static str),
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
@@ -407,8 +412,11 @@ impl Display for Error {
             Error::FromUtf8 { len, error } => {
                 write!(f, "string of {len} bytes is not valid UTF-8: {error}")
             }
-            Error::MandatoryFieldUnset(field) => {
-                write!(f, "field {field} is mandatory at this version but unset")
+            Error::MandatoryFieldUnset { field, api_version } => {
+                write!(
+                    f,
+                    "field {field} is mandatory at version {api_version} but unset"
+                )
             }
             Error::OffsetDeltaOverflow(sum) => {
                 write!(f, "{sum} overflows i32 when a batch is appended")

@@ -408,7 +408,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nisshi_sans_io::{CreateTopicsRequest, ErrorCode, create_topics_request::CreatableTopic};
+    use nisshi_sans_io::{
+        ApiKey as _, CreateTopicsRequest, ErrorCode, Frame, Header,
+        create_topics_request::CreatableTopic,
+    };
     use rama::{Layer as _, Service as _};
 
     use super::CreateTopicsService;
@@ -463,6 +466,36 @@ mod tests {
             );
             assert_eq!(vec![String::from("ab")], storage.created(), "{listing:?}");
         }
+
+        Ok(())
+    }
+
+    /// A topic that failed with a storage error, which is not a Kafka error code, still encodes
+    /// at the newest version, where `num_partitions` and `replication_factor` are mandatory.
+    #[tokio::test]
+    async fn storage_error_response_encodes_at_the_newest_version() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Error, &[]);
+        let service = CreateTopicsValidationLayer::new().layer(CreateTopicsService { storage });
+
+        let response = service
+            .serve(
+                CreateTopicsRequest::default()
+                    .topics(Some(vec![topic("a.b", 1)]))
+                    .validate_only(Some(false)),
+            )
+            .await?;
+
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(response.topics.as_ref().unwrap()[0].error_code)?
+        );
+
+        _ = Frame::response(
+            Header::Response { correlation_id: 0 },
+            response.into(),
+            CreateTopicsRequest::KEY,
+            7,
+        )?;
 
         Ok(())
     }
