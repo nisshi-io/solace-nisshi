@@ -46,6 +46,28 @@ use crate::METER;
 /// [#L144-L149]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L144-L149
 pub(crate) const LIST_OFFSETS_READ_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long DeleteRecords may spend starting storage calls, for the whole
+/// request.
+///
+/// A partition whose call has not started at this deadline answers
+/// `REQUEST_TIMED_OUT` with a low watermark of -1. A call that has started
+/// runs to its end, so the request takes longer than the deadline by at most
+/// one partition's call. A retry is safe, because a cut at or below the log
+/// start changes nothing.
+///
+/// The bound is this constant, not the request's `timeout_ms`. Kafka cuts
+/// the logs first and then waits at most `timeout_ms` for its replicas to
+/// advance the low watermark ([ReplicaManager.scala#L1317-L1336]), and
+/// answers `REQUEST_TIMED_OUT` only for a partition still waiting at the
+/// end ([DelayedDeleteRecords.scala#L55-L56]). Nisshi has no replicas, so
+/// a client's short `timeout_ms` must not cut work that Kafka completes.
+/// The value is the one of [`LIST_OFFSETS_READ_DEADLINE`], under the Java
+/// admin client's 30s `request.timeout.ms`.
+///
+/// [ReplicaManager.scala#L1317-L1336]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1317-L1336
+/// [DelayedDeleteRecords.scala#L55-L56]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedDeleteRecords.scala#L55-L56
+pub(crate) const DELETE_RECORDS_DEADLINE: Duration = Duration::from_secs(5);
+
 static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_storage_read_deadline_exceeded")
@@ -186,6 +208,29 @@ where
     }
 }
 
+/// Runs `call` to its end when `deadline` has not passed, and otherwise
+/// makes no call and returns [`Missed::NotStarted`], counting the miss in
+/// the `nisshi_storage_read_deadline_exceeded` counter under `operation`.
+///
+/// Unlike [`within`], this never drops a call that has started. A storage
+/// engine does not always stop a write that its caller drops: the write can
+/// carry on, or leave its connection busy for the next caller.
+pub(crate) async fn started_before<F>(
+    operation: &'static str,
+    deadline: Instant,
+    call: F,
+) -> Result<F::Output, Missed>
+where
+    F: Future,
+{
+    if Instant::now() >= deadline {
+        READ_DEADLINE_EXCEEDED.add(1, &Missed::NotStarted.attributes(operation));
+        return Err(Missed::NotStarted);
+    }
+
+    Ok(call.await)
+}
+
 /// Runs [`bounded`], counting each abandoned read in the
 /// `nisshi_storage_read_deadline_exceeded` counter under `operation`.
 pub(crate) async fn within<F>(
@@ -270,6 +315,44 @@ mod tests {
         assert_eq!(
             Err(Missed::NotStarted),
             within("test", deadline, read).await
+        );
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    /// A call that starts before the deadline runs to its end, past the
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn started_call_runs_past_the_deadline() {
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_secs(1);
+
+        assert_eq!(
+            Ok(7),
+            started_before("test", deadline, async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                7
+            })
+            .await
+        );
+        assert_eq!(Duration::from_secs(3), started_at.elapsed());
+    }
+
+    /// A call is never polled once the deadline has passed.
+    #[tokio::test(start_paused = true)]
+    async fn call_is_not_started_after_the_deadline() {
+        let deadline = Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let polled = Arc::new(AtomicBool::new(false));
+
+        let call = {
+            let polled = polled.clone();
+            async move { polled.store(true, Ordering::SeqCst) }
+        };
+
+        assert_eq!(
+            Err(Missed::NotStarted),
+            started_before("test", deadline, call).await
         );
         assert!(!polled.load(Ordering::SeqCst));
     }
