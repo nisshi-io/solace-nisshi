@@ -3145,16 +3145,16 @@ impl Storage for Delegate {
 
         let topic_name = match topic {
             TopicId::Id(id) => pc
-                .query_first::<topic_select_uuid::Row>(
-                    topic_select_uuid::QUERY,
+                .query_first(
+                    topic_select_uuid::NAME_QUERY,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
                 .map(|row| row.name),
 
             TopicId::Name(name) => pc
-                .query_first::<topic_select_name::Row>(
-                    topic_select_name::QUERY,
+                .query_first(
+                    topic_select_name::NAME_QUERY,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?
@@ -7809,6 +7809,48 @@ mod tests {
                 .topics
                 .iter()
                 .map(|topic| topic.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// DeleteTopics deletes a topic whose stored row can't be read, because it reads only the
+    /// topic's name, so that an operator can remove a corrupt topic without editing the database.
+    #[tokio::test]
+    async fn delete_topic_deletes_a_topic_with_an_unreadable_row() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "delete-topic-unreadable-row-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        // A UUID that doesn't parse makes the topic's row unreadable as a whole topic.
+        execute_on(
+            db_file,
+            "update topic set uuid = 'not-a-uuid' where name = ?1",
+            [topition.topic()],
+        )
+        .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            engine
+                .delete_topic(&TopicId::from(topition.topic()))
+                .await?
+        );
+
+        // A deleted topic is unknown, where a topic that is still stored with its unreadable row
+        // is a server error.
+        assert_eq!(
+            vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
+            engine
+                .metadata(Some(&[TopicId::from(topition.topic())]))
+                .await?
+                .topics
+                .iter()
+                .map(|topic| topic.error_code)
                 .collect::<Vec<_>>()
         );
 

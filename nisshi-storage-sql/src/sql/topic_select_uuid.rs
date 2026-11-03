@@ -26,5 +26,9 @@ pub(crate) const QUERY: Query<Row> = Query::new("topic_select_uuid.sql");
 /// from UTF-8, because PostgreSQL stores the key as `bytea`.
 pub(crate) const PG_QUERY: Query<Row> = Query::new("pg/topic_select_uuid.sql");
 
+/// The query, read for the topic's name only. A delete reads it this way, so that it can delete
+/// a topic whose other columns can't be read.
+pub(crate) const NAME_QUERY: Query<super::row::topic_name::Row> = Query::new(QUERY.key());
+
 /// One row of the query's result.
 pub(crate) use super::row::topic::Row;

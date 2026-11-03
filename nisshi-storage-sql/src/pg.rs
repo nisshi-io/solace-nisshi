@@ -3767,18 +3767,18 @@ impl Storage for Postgres {
 
         let topic_name = match topic {
             TopicId::Id(id) => self
-                .prepare_query_optional_row::<topic_select_uuid::Row>(
+                .prepare_query_optional_row(
                     &tx,
-                    topic_select_uuid::QUERY,
+                    topic_select_uuid::NAME_QUERY,
                     &[&self.cluster, &id],
                 )
                 .await?
                 .map(|row| row.name),
 
             TopicId::Name(name) => self
-                .prepare_query_optional_row::<topic_select_name::Row>(
+                .prepare_query_optional_row(
                     &tx,
-                    topic_select_name::QUERY,
+                    topic_select_name::NAME_QUERY,
                     &[&self.cluster, name],
                 )
                 .await?

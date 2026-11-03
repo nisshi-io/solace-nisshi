@@ -59,6 +59,20 @@ pub(crate) mod topic {
     }
 }
 
+/// A topic's name, read from a result that returns a whole [`topic::Row`].
+///
+/// A delete reads only this, so that it can delete a topic whose other columns can't be read.
+pub(crate) mod topic_name {
+    sql_row! {
+        /// One topic's name.
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub(crate) struct Row {
+            /// The topic's name.
+            name: String,
+        }
+    }
+}
+
 /// The ID of the topic or virtual topic that an insert or an upsert wrote, from its
 /// `returning` list.
 pub(crate) mod topic_id {

@@ -1591,18 +1591,18 @@ impl Storage for Engine {
 
         let topic_name = match topic {
             TopicId::Id(id) => self
-                .query_first::<topic_select_uuid::Row>(
+                .query_first(
                     &tx,
-                    topic_select_uuid::QUERY,
+                    topic_select_uuid::NAME_QUERY,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
                 .map(|row| row.name),
 
             TopicId::Name(name) => self
-                .query_first::<topic_select_name::Row>(
+                .query_first(
                     &tx,
-                    topic_select_name::QUERY,
+                    topic_select_name::NAME_QUERY,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?

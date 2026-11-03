@@ -21,5 +21,9 @@ use super::Query;
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: Query<Row> = Query::new("topic_select_name.sql");
 
+/// The query, read for the topic's name only. A delete reads it this way, so that it can delete
+/// a topic whose other columns can't be read.
+pub(crate) const NAME_QUERY: Query<super::row::topic_name::Row> = Query::new(QUERY.key());
+
 /// One row of the query's result.
 pub(crate) use super::row::topic::Row;
