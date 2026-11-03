@@ -1184,7 +1184,7 @@ impl Postgres {
             let op = OpType::try_from(config.config_operation)?;
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                self.prepare_query_optional_row::<topic_configuration_select_name::Row>(
+                self.prepare_query_optional_row(
                     &tx,
                     topic_configuration_select_name::QUERY,
                     &[&self.cluster, topic, &config.name],
@@ -1626,7 +1626,7 @@ impl Postgres {
 
             let list_offset = match offset_type {
                 ListOffset::Earliest | ListOffset::Latest => self
-                    .prepare_query_optional_row::<list_offset::Row>(
+                    .prepare_query_optional_row(
                         c,
                         query,
                         &[&self.cluster, &topition.topic(), &topition.partition()],
@@ -1635,7 +1635,7 @@ impl Postgres {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffset::Timestamp(timestamp) => self
-                    .prepare_query_optional_row::<list_offset::Row>(
+                    .prepare_query_optional_row(
                         c,
                         query,
                         &[
@@ -2359,7 +2359,7 @@ impl Postgres {
         tx: &Transaction<'_>,
     ) -> Result<()> {
         let row = self
-            .prepare_query_optional_row::<txn_produce_partition_select::Row>(
+            .prepare_query_optional_row(
                 tx,
                 txn_produce_partition_select::QUERY,
                 &[
@@ -2673,7 +2673,7 @@ impl Postgres {
         // finalized this transaction, this blocks until it commits, then sees the
         // terminal status below and no-ops instead of writing a second marker.
         let row = self
-            .prepare_query_optional_row::<txn_detail_select_status_for_update::Row>(
+            .prepare_query_optional_row(
                 tx,
                 txn_detail_select_status_for_update::QUERY,
                 &[
@@ -2837,7 +2837,7 @@ impl Postgres {
             debug!(offset_start, offset_end);
 
             for row in self
-                .prepare_query_rows::<txn_produce_offset_select_overlapping_txn::Row>(
+                .prepare_query_rows(
                     tx,
                     txn_produce_offset_select_overlapping_txn::QUERY,
                     &[
@@ -3040,7 +3040,7 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        self.prepare_query_optional_row::<producer_epoch_current_for_producer::Row>(
+        self.prepare_query_optional_row(
             client,
             producer_epoch_current_for_producer::QUERY,
             &[&self.cluster, &producer],
@@ -3072,13 +3072,9 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        self.prepare_query_one_row::<producer_insert::Row>(
-            client,
-            producer_insert::QUERY,
-            &[&self.cluster],
-        )
-        .await
-        .map(|row| row.id)
+        self.prepare_query_one_row(client, producer_insert::QUERY, &[&self.cluster])
+            .await
+            .map(|row| row.id)
     }
 
     /// Adds the next epoch to `producer`, and returns it.
@@ -3089,7 +3085,7 @@ impl Postgres {
     where
         C: GenericClient,
     {
-        self.prepare_query_one_row::<producer_epoch_insert::Row>(
+        self.prepare_query_one_row(
             client,
             producer_epoch_insert::QUERY,
             &[&self.cluster, &producer],
@@ -3553,7 +3549,7 @@ impl Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        self.prepare_query_one_row::<virtual_topic_upsert::Row>(
+        self.prepare_query_one_row(
             &c,
             virtual_topic_upsert::QUERY,
             &[&self.cluster, &topic, &key.as_bytes(), &uuid],
@@ -4112,7 +4108,7 @@ impl Storage for Postgres {
         let c = self.connection().await?;
 
         let pending = self
-            .prepare_query_rows::<txn_offset_commit_tp_select_pending::Row>(
+            .prepare_query_rows(
                 &c,
                 txn_offset_commit_tp_select_pending::QUERY,
                 &[&self.cluster, &group_id],
@@ -4146,7 +4142,7 @@ impl Storage for Postgres {
 
         for topic in topics {
             let committed = self
-                .prepare_query_optional_row::<sql::consumer_offset_select::Row>(
+                .prepare_query_optional_row(
                     &c,
                     sql::consumer_offset_select::QUERY,
                     &[
@@ -4250,7 +4246,7 @@ impl Storage for Postgres {
                             }?;
 
                             let selected = self
-                                .prepare_query_optional_row::<topic_select_name::Row>(
+                                .prepare_query_optional_row(
                                     &c,
                                     topic_select_name::QUERY,
                                     &[&self.cluster, &base_topic],
@@ -4330,7 +4326,7 @@ impl Storage for Postgres {
                         TopicId::Id(id) => {
                             debug!(?id);
                             let selected = self
-                                .prepare_query_one_row::<topic_select_uuid::Row>(
+                                .prepare_query_one_row(
                                     &c,
                                     topic_select_uuid::PG_QUERY,
                                     &[&self.cluster, &id],
@@ -4550,7 +4546,7 @@ impl Storage for Postgres {
             responses.push(match topic {
                 TopicId::Name(name) => {
                     let selected = self
-                        .prepare_query_optional_row::<topic_select_name::Row>(
+                        .prepare_query_optional_row(
                             &c,
                             topic_select_name::QUERY,
                             &[&self.cluster, &name.as_str()],
@@ -4653,11 +4649,7 @@ impl Storage for Postgres {
                 TopicId::Id(id) => {
                     debug!(?id);
                     let selected = self
-                        .prepare_query_one_row::<topic_select_uuid::Row>(
-                            &c,
-                            topic_select_uuid::QUERY,
-                            &[&self.cluster, &id],
-                        )
+                        .prepare_query_one_row(&c, topic_select_uuid::QUERY, &[&self.cluster, &id])
                         .await;
 
                     match selected {
@@ -4853,7 +4845,7 @@ impl Storage for Postgres {
                 };
 
                 match self
-                    .prepare_query_optional_row::<sql::consumer_group_select_by_name::Row>(
+                    .prepare_query_optional_row(
                         c,
                         sql::consumer_group_select_by_name::QUERY,
                         &[&self.cluster, group_id],
@@ -4944,7 +4936,7 @@ impl Storage for Postgres {
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
         let row = self
-            .prepare_query_optional_row::<sql::consumer_group_detail_insert::Row>(
+            .prepare_query_optional_row(
                 &tx,
                 sql::consumer_group_detail_insert::QUERY,
                 &[

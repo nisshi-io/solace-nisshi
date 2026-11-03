@@ -704,7 +704,7 @@ impl PoolConnection {
     /// Returns the newest epoch of `producer` in `cluster`, or `None` when the producer does not
     /// exist or has no epoch.
     async fn producer_epoch_current(&self, cluster: &str, producer: i64) -> Result<Option<i16>> {
-        self.query_first::<producer_epoch_current_for_producer::Row>(
+        self.query_first(
             producer_epoch_current_for_producer::QUERY,
             (cluster, producer),
         )
@@ -728,7 +728,7 @@ impl PoolConnection {
 
     /// Adds a producer to `cluster`, and returns its ID.
     async fn producer_insert(&self, cluster: &str) -> Result<i64> {
-        self.query_one::<producer_insert::Row>(producer_insert::QUERY, &[cluster])
+        self.query_one(producer_insert::QUERY, &[cluster])
             .await
             .map(|row| row.id)
     }
@@ -738,12 +738,9 @@ impl PoolConnection {
     /// Returns [`Error::LibSql`] with [`libsql::Error::Misuse`] when the producer does not exist,
     /// or when its newest epoch is `i16::MAX`.
     async fn producer_epoch_insert(&self, cluster: &str, producer: i64) -> Result<i16> {
-        self.query_one::<producer_epoch_insert::Row>(
-            producer_epoch_insert::QUERY,
-            (cluster, producer),
-        )
-        .await
-        .map(|row| row.epoch)
+        self.query_one(producer_epoch_insert::QUERY, (cluster, producer))
+            .await
+            .map(|row| row.epoch)
     }
 }
 
@@ -816,7 +813,7 @@ impl Delegate {
             let name = config.name.as_str();
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                c.query_first::<topic_configuration_select_name::Row>(
+                c.query_first(
                     topic_configuration_select_name::QUERY,
                     (self.cluster.as_str(), topic, name),
                 )
@@ -1004,7 +1001,7 @@ impl Delegate {
         connection: &PoolConnection,
     ) -> Result<()> {
         let row = connection
-            .query_first::<txn_produce_partition_select::Row>(
+            .query_first(
                 txn_produce_partition_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -1287,7 +1284,7 @@ impl Delegate {
         let mut overlaps = vec![];
 
         let mut rows = connection
-            .query_rows::<txn_select_produced_topitions::Row>(
+            .query_rows(
                 txn_select_produced_topitions::QUERY,
                 (
                     self.cluster.as_str(),
@@ -1343,7 +1340,7 @@ impl Delegate {
             debug!(offset, ?topition);
 
             let row = connection
-                .query_first::<txn_produce_offset_select_offset_range::Row>(
+                .query_first(
                     txn_produce_offset_select_offset_range::QUERY,
                     (
                         self.cluster.as_str(),
@@ -1364,7 +1361,7 @@ impl Delegate {
                 debug!(offset_start, offset_end);
 
                 let mut rows = connection
-                    .query_rows::<txn_produce_offset_select_overlapping_txn::Row>(
+                    .query_rows(
                         txn_produce_offset_select_overlapping_txn::QUERY,
                         (
                             self.cluster.as_str(),
@@ -1545,7 +1542,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query_rows::<sql::lite_policy_compact_compaction::Row>(
+            .query_rows(
                 sql::lite_policy_compact_compaction::QUERY,
                 (topition, key, max_offset_id),
             )
@@ -1567,7 +1564,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let row = pc
-            .query_first::<sql::lite_policy_compact_max_offset_id::Row>(
+            .query_first(
                 sql::lite_policy_compact_max_offset_id::QUERY,
                 (topition, key),
             )
@@ -1583,10 +1580,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query_rows::<sql::lite_policy_compact_distinct_k::Row>(
-                sql::lite_policy_compact_distinct_k::QUERY,
-                [topition],
-            )
+            .query_rows(sql::lite_policy_compact_distinct_k::QUERY, [topition])
             .await?;
 
         let mut keys = BTreeSet::new();
@@ -1607,7 +1601,7 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query_rows::<sql::lite_policy_compact_topitions::Row>(
+            .query_rows(
                 sql::lite_policy_compact_topitions::QUERY,
                 [self.cluster.as_str()],
             )
@@ -1773,7 +1767,7 @@ impl Delegate {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        c.query_one::<virtual_topic_upsert::Row>(
+        c.query_one(
             virtual_topic_upsert::QUERY,
             (self.cluster.as_str(), topic, key, uuid.to_string()),
         )
@@ -2987,7 +2981,7 @@ impl Storage for Delegate {
                 (topic.replication_factor as i32),
             );
 
-            pc.query_one::<topic_insert::Row>(topic_insert::QUERY, parameters.clone())
+            pc.query_one(topic_insert::QUERY, parameters.clone())
                 .await
                 .map_err(unique_constraint(ErrorCode::TopicAlreadyExists))
                 .inspect(|row| debug!(?parameters, ?row))
@@ -2999,14 +2993,10 @@ impl Storage for Delegate {
         for partition in 0..topic.num_partitions {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
-            let topition = pc
-                .query_first::<topition_insert::Row>(topition_insert::QUERY, params)
-                .await?;
+            let topition = pc.query_first(topition_insert::QUERY, params).await?;
             debug!(?topition);
 
-            let watermark = pc
-                .query_first::<watermark_insert::Row>(watermark_insert::QUERY, params)
-                .await?;
+            let watermark = pc.query_first(watermark_insert::QUERY, params).await?;
             debug!(?watermark);
         }
 
@@ -3022,10 +3012,7 @@ impl Storage for Delegate {
                 );
 
                 let id = pc
-                    .query_one::<topic_configuration_upsert::Row>(
-                        topic_configuration_upsert::QUERY,
-                        params,
-                    )
+                    .query_one(topic_configuration_upsert::QUERY, params)
                     .await
                     .inspect_err(|err| error!(?err, ?config))?;
                 debug!(?id, ?config);
@@ -3360,7 +3347,7 @@ impl Storage for Delegate {
 
         let mut records = if let Some(key) = key_filter {
             let key_bytes = key.as_bytes().to_vec();
-            c.query_rows::<record_fetch::Row>(
+            c.query_rows(
                 record_fetch::KEYED_QUERY,
                 (
                     self.cluster.as_str(),
@@ -3375,7 +3362,7 @@ impl Storage for Delegate {
             .await
             .inspect_err(|err| error!(?err))?
         } else {
-            c.query_rows::<record_fetch::Row>(
+            c.query_rows(
                 record_fetch::QUERY,
                 (
                     self.cluster.as_str(),
@@ -3417,7 +3404,7 @@ impl Storage for Delegate {
                     .value(value);
 
                 let mut headers = c
-                    .query_rows::<header_fetch::Row>(
+                    .query_rows(
                         header_fetch::QUERY,
                         (
                             self.cluster.as_str(),
@@ -3522,7 +3509,7 @@ impl Storage for Delegate {
                         .value(value);
 
                     let mut headers = c
-                        .query_rows::<header_fetch::Row>(
+                        .query_rows(
                             header_fetch::QUERY,
                             (
                                 self.cluster.as_str(),
@@ -3715,7 +3702,7 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query_rows::<sql::consumer_offset_select_by_group::Row>(
+            .query_rows(
                 sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
@@ -3759,7 +3746,7 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query_rows::<txn_offset_commit_tp_select_pending::Row>(
+            .query_rows(
                 txn_offset_commit_tp_select_pending::QUERY,
                 (self.cluster.as_str(), group_id),
             )
@@ -3800,7 +3787,7 @@ impl Storage for Delegate {
 
         for topic in topics {
             let mut rows = c
-                .query_rows::<sql::consumer_offset_select::Row>(
+                .query_rows(
                     sql::consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
@@ -3889,7 +3876,7 @@ impl Storage for Delegate {
 
             let list_offset = match offset_type {
                 ListOffset::Earliest | ListOffset::Latest => c
-                    .query_first::<list_offset::Row>(
+                    .query_first(
                         query,
                         (
                             self.cluster.as_str(),
@@ -3901,7 +3888,7 @@ impl Storage for Delegate {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffset::Timestamp(timestamp) => c
-                    .query_first::<list_offset::Row>(
+                    .query_first(
                         query,
                         (
                             self.cluster.as_str(),
@@ -4014,7 +4001,7 @@ impl Storage for Delegate {
                             }?;
 
                             let mut rows = c
-                                .query_rows::<topic_select_name::Row>(
+                                .query_rows(
                                     topic_select_name::QUERY,
                                     (self.cluster.as_str(), base_topic),
                                 )
@@ -4093,7 +4080,7 @@ impl Storage for Delegate {
                             debug!(?id);
 
                             let mut rows = c
-                                .query_rows::<topic_select_uuid::Row>(
+                                .query_rows(
                                     topic_select_uuid::QUERY,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
@@ -4177,10 +4164,7 @@ impl Storage for Delegate {
                 let mut responses = vec![];
 
                 let mut rows = c
-                    .query_rows::<topic_by_cluster::Row>(
-                        topic_by_cluster::QUERY,
-                        &[self.cluster.as_str()],
-                    )
+                    .query_rows(topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
                 while let Some(topic_by_cluster::Row {
@@ -4339,7 +4323,7 @@ impl Storage for Delegate {
             responses.push(match topic {
                 TopicId::Name(name) => {
                     let selected = c
-                        .query_first::<topic_select_name::Row>(
+                        .query_first(
                             topic_select_name::QUERY,
                             (self.cluster.as_str(), name.as_str()),
                         )
@@ -4440,7 +4424,7 @@ impl Storage for Delegate {
                 TopicId::Id(id) => {
                     debug!(?id);
                     let selected = c
-                        .query_first::<topic_select_uuid::Row>(
+                        .query_first(
                             topic_select_uuid::QUERY,
                             (self.cluster.as_str(), id.to_string().as_str()),
                         )
@@ -4665,7 +4649,7 @@ impl Storage for Delegate {
                 };
 
                 match c
-                    .query_first::<sql::consumer_group_select_by_name::Row>(
+                    .query_first(
                         sql::consumer_group_select_by_name::QUERY,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
@@ -4770,7 +4754,7 @@ impl Storage for Delegate {
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(%detail))?;
 
         let row = pc
-            .query_first::<sql::consumer_group_detail_insert::Row>(
+            .query_first(
                 sql::consumer_group_detail_insert::QUERY,
                 (
                     self.cluster.as_str(),
@@ -4908,7 +4892,7 @@ impl Storage for Delegate {
                 }
 
                 let txn_producer = pc
-                    .query_first::<txn_select_name::Row>(
+                    .query_first(
                         txn_select_name::QUERY,
                         (self.cluster.as_str(), transaction_id),
                     )
@@ -5104,10 +5088,7 @@ impl Storage for Delegate {
                 let tx = pc.transaction().await?;
 
                 let mut rows = pc
-                    .query_rows::<producer_insert::Row>(
-                        producer_insert::QUERY,
-                        &[self.cluster.as_str()],
-                    )
+                    .query_rows(producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
                 if let Some(producer_insert::Row { id: producer }) = rows.next().await? {
@@ -5118,7 +5099,7 @@ impl Storage for Delegate {
                     }
 
                     let mut rows = pc
-                        .query_rows::<producer_epoch_insert::Row>(
+                        .query_rows(
                             producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
                         )
@@ -5477,7 +5458,7 @@ impl Storage for Delegate {
             let connection = self.pool.get().await?;
 
             let mut rows = connection
-                .query_rows::<sql::maintain_vacuum::Row>(sql::maintain_vacuum::QUERY, ())
+                .query_rows(sql::maintain_vacuum::QUERY, ())
                 .await?;
 
             if let Some(sql::maintain_vacuum::Row {
@@ -5596,7 +5577,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         let row = pc
-            .query_first::<sql::scram_credential_select::Row>(
+            .query_first(
                 sql::scram_credential_select::QUERY,
                 (self.cluster.as_str(), user, i32::from(mechanism)),
             )
@@ -7411,7 +7392,7 @@ mod tests {
 
         assert_matches!(
             connection
-                .query_one::<topic_by_cluster::Row>(topic_by_cluster::QUERY, ["nisshi"])
+                .query_one(topic_by_cluster::QUERY, ["nisshi"])
                 .await,
             Err(Error::LibSql(err))
                 if matches!(&*err, libsql::Error::Misuse(message) if message.contains("more than one row"))
@@ -7431,7 +7412,7 @@ mod tests {
         let connection = connection_with_two_topics(db_file).await?;
 
         let mut names: Vec<String> = connection
-            .query_leading_rows::<topic_by_cluster::Row>(topic_by_cluster::QUERY, ["nisshi"], 2)
+            .query_leading_rows(topic_by_cluster::QUERY, ["nisshi"], 2)
             .await?
             .into_iter()
             .map(|topic| topic.name)

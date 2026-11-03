@@ -195,7 +195,7 @@ impl Engine {
             let name = config.name.as_str();
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                self.query_first::<topic_configuration_select_name::Row>(
+                self.query_first(
                     &tx,
                     topic_configuration_select_name::QUERY,
                     (self.cluster.as_str(), topic, name),
@@ -492,7 +492,7 @@ impl Engine {
         connection: &Connection,
         producer: i64,
     ) -> Result<Option<i16>> {
-        self.query_first::<producer_epoch_current_for_producer::Row>(
+        self.query_first(
             connection,
             producer_epoch_current_for_producer::QUERY,
             (self.cluster.as_str(), producer),
@@ -508,7 +508,7 @@ impl Engine {
         connection: &Connection,
         transaction_id: &str,
     ) -> Result<Option<producer_epoch_for_current_txn::Row>> {
-        self.query_first::<producer_epoch_for_current_txn::Row>(
+        self.query_first(
             connection,
             producer_epoch_for_current_txn::QUERY,
             (self.cluster.as_str(), transaction_id),
@@ -518,13 +518,9 @@ impl Engine {
 
     /// Adds a producer to the cluster, and returns its ID.
     async fn producer_insert(&self, connection: &Connection) -> Result<i64> {
-        self.query_one::<producer_insert::Row>(
-            connection,
-            producer_insert::QUERY,
-            &[self.cluster.as_str()],
-        )
-        .await
-        .map(|row| row.id)
+        self.query_one(connection, producer_insert::QUERY, &[self.cluster.as_str()])
+            .await
+            .map(|row| row.id)
     }
 
     /// Adds the next epoch to `producer`, and returns it.
@@ -532,7 +528,7 @@ impl Engine {
     /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the producer does
     /// not exist, or when its newest epoch is `i16::MAX`.
     async fn producer_epoch_insert(&self, connection: &Connection, producer: i64) -> Result<i16> {
-        self.query_one::<producer_epoch_insert::Row>(
+        self.query_one(
             connection,
             producer_epoch_insert::QUERY,
             (self.cluster.as_str(), producer),
@@ -680,7 +676,7 @@ impl Engine {
         connection: &Connection,
     ) -> Result<()> {
         let row = self
-            .query_first::<txn_produce_partition_select::Row>(
+            .query_first(
                 connection,
                 txn_produce_partition_select::QUERY,
                 (
@@ -891,7 +887,7 @@ impl Engine {
         let mut overlaps = vec![];
 
         let mut rows = self
-            .query_rows::<txn_select_produced_topitions::Row>(
+            .query_rows(
                 tx,
                 txn_select_produced_topitions::QUERY,
                 (
@@ -948,7 +944,7 @@ impl Engine {
             debug!(offset, ?topition);
 
             let row = self
-                .query_first::<txn_produce_offset_select_offset_range::Row>(
+                .query_first(
                     tx,
                     txn_produce_offset_select_offset_range::QUERY,
                     (
@@ -970,7 +966,7 @@ impl Engine {
                 debug!(offset_start, offset_end);
 
                 let mut rows = self
-                    .query_rows::<txn_produce_offset_select_overlapping_txn::Row>(
+                    .query_rows(
                         tx,
                         txn_produce_offset_select_overlapping_txn::QUERY,
                         (
@@ -1431,7 +1427,7 @@ impl Storage for Engine {
                 (topic.replication_factor as i32),
             );
 
-            self.query_one::<topic_insert::Row>(&tx, topic_insert::QUERY, parameters.clone())
+            self.query_one(&tx, topic_insert::QUERY, parameters.clone())
                 .await
                 .inspect_err(|err| error!(?err))
                 .map_err(unique_constraint(ErrorCode::TopicAlreadyExists))
@@ -1444,14 +1440,10 @@ impl Storage for Engine {
         for partition in 0..topic.num_partitions {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
-            let topition = self
-                .query_one::<topition_insert::Row>(&tx, topition_insert::QUERY, params)
-                .await?;
+            let topition = self.query_one(&tx, topition_insert::QUERY, params).await?;
             debug!(?topition);
 
-            let watermark = self
-                .query_one::<watermark_insert::Row>(&tx, watermark_insert::QUERY, params)
-                .await?;
+            let watermark = self.query_one(&tx, watermark_insert::QUERY, params).await?;
             debug!(?watermark);
         }
 
@@ -1467,11 +1459,7 @@ impl Storage for Engine {
                 );
 
                 let id = self
-                    .query_one::<topic_configuration_upsert::Row>(
-                        &tx,
-                        topic_configuration_upsert::QUERY,
-                        params,
-                    )
+                    .query_one(&tx, topic_configuration_upsert::QUERY, params)
                     .await
                     .inspect_err(|err| error!(?err, ?config))?;
                 debug!(?id, ?config);
@@ -1749,7 +1737,7 @@ impl Storage for Engine {
         let c = self.connection().await?;
 
         let mut records = self
-            .query_rows::<record_fetch::Row>(
+            .query_rows(
                 &c,
                 record_fetch::QUERY,
                 (
@@ -1791,7 +1779,7 @@ impl Storage for Engine {
                     .value(value);
 
                 let mut headers = self
-                    .query_rows::<header_fetch::Row>(
+                    .query_rows(
                         &c,
                         header_fetch::QUERY,
                         (
@@ -1896,7 +1884,7 @@ impl Storage for Engine {
                         .value(value);
 
                     let mut headers = self
-                        .query_rows::<header_fetch::Row>(
+                        .query_rows(
                             &c,
                             header_fetch::QUERY,
                             (
@@ -2069,7 +2057,7 @@ impl Storage for Engine {
         let c = self.connection().await?;
 
         let mut rows = self
-            .query_rows::<sql::consumer_offset_select_by_group::Row>(
+            .query_rows(
                 &c,
                 sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
@@ -2107,7 +2095,7 @@ impl Storage for Engine {
         let c = self.connection().await?;
 
         let mut rows = self
-            .query_rows::<txn_offset_commit_tp_select_pending::Row>(
+            .query_rows(
                 &c,
                 txn_offset_commit_tp_select_pending::QUERY,
                 (self.cluster.as_str(), group_id),
@@ -2141,7 +2129,7 @@ impl Storage for Engine {
 
         for topic in topics {
             let mut rows = self
-                .query_rows::<sql::consumer_offset_select::Row>(
+                .query_rows(
                     &c,
                     sql::consumer_offset_select::QUERY,
                     (
@@ -2223,7 +2211,7 @@ impl Storage for Engine {
 
             let list_offset = match offset_type {
                 ListOffsetRequest::Earliest | ListOffsetRequest::Latest => self
-                    .query_first::<list_offset::Row>(
+                    .query_first(
                         &c,
                         query,
                         (
@@ -2236,7 +2224,7 @@ impl Storage for Engine {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffsetRequest::Timestamp(timestamp) => self
-                    .query_first::<list_offset::Row>(
+                    .query_first(
                         &c,
                         query,
                         (
@@ -2328,7 +2316,7 @@ impl Storage for Engine {
                     responses.push(match topic {
                         TopicId::Name(name) => {
                             let mut rows = self
-                                .query_rows::<topic_select_name::Row>(
+                                .query_rows(
                                     &c,
                                     topic_select_name::QUERY,
                                     (self.cluster.as_str(), name.as_str()),
@@ -2408,7 +2396,7 @@ impl Storage for Engine {
                         TopicId::Id(id) => {
                             debug!(?id);
                             let mut rows = self
-                                .query_rows::<topic_select_uuid::Row>(
+                                .query_rows(
                                     &c,
                                     topic_select_uuid::QUERY,
                                     (self.cluster.as_str(), id.to_string().as_str()),
@@ -2493,11 +2481,7 @@ impl Storage for Engine {
                 let mut responses = vec![];
 
                 let mut rows = self
-                    .query_rows::<topic_by_cluster::Row>(
-                        &c,
-                        topic_by_cluster::QUERY,
-                        &[self.cluster.as_str()],
-                    )
+                    .query_rows(&c, topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
                 while let Some(topic_by_cluster::Row {
@@ -2637,7 +2621,7 @@ impl Storage for Engine {
             responses.push(match topic {
                 TopicId::Name(name) => {
                     let selected = self
-                        .query_first::<topic_select_name::Row>(
+                        .query_first(
                             &c,
                             topic_select_name::QUERY,
                             (self.cluster.as_str(), name.as_str()),
@@ -2739,7 +2723,7 @@ impl Storage for Engine {
                 TopicId::Id(id) => {
                     debug!(?id);
                     let selected = self
-                        .query_first::<topic_select_uuid::Row>(
+                        .query_first(
                             &c,
                             topic_select_uuid::QUERY,
                             (self.cluster.as_str(), id.to_string().as_str()),
@@ -2935,7 +2919,7 @@ impl Storage for Engine {
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
                 let row = self
-                    .query_first::<sql::consumer_group_select_by_name::Row>(
+                    .query_first(
                         &c,
                         sql::consumer_group_select_by_name::QUERY,
                         (self.cluster.as_str(), group_id.as_str()),
@@ -3026,7 +3010,7 @@ impl Storage for Engine {
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
         let row = self
-            .query_first::<sql::consumer_group_detail_insert::Row>(
+            .query_first(
                 &tx,
                 sql::consumer_group_detail_insert::QUERY,
                 (
@@ -3143,7 +3127,7 @@ impl Storage for Engine {
                 }
 
                 let txn_producer = self
-                    .query_first::<txn_select_name::Row>(
+                    .query_first(
                         &tx,
                         txn_select_name::QUERY,
                         (self.cluster.as_str(), transaction_id),
@@ -3344,11 +3328,7 @@ impl Storage for Engine {
                     .await?;
 
                 let mut rows = self
-                    .query_rows::<producer_insert::Row>(
-                        &tx,
-                        producer_insert::QUERY,
-                        &[self.cluster.as_str()],
-                    )
+                    .query_rows(&tx, producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
                 if let Some(producer_insert::Row { id: producer }) =
@@ -3366,7 +3346,7 @@ impl Storage for Engine {
                     }
 
                     let mut rows = self
-                        .query_rows::<producer_epoch_insert::Row>(
+                        .query_rows(
                             &tx,
                             producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
