@@ -19,7 +19,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -40,9 +40,9 @@ use object_store::{
     ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
     path::Path,
 };
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::timeout};
 
-use crate::dynostore::{DynoStore, tests::init_tracing};
+use crate::dynostore::{CONCURRENT_RECLAIM_DELETES, DynoStore, tests::init_tracing};
 
 /// Returns the base offsets of the batch objects stored under one partition's
 /// `records/` prefix, in ascending order.
@@ -113,9 +113,22 @@ struct DeleteHold {
     release: Arc<Notify>,
 }
 
+impl DeleteHold {
+    /// Waits until the held delete starts. A `maintain` that never reaches
+    /// a delete fails the test here, and not after nextest's 5 minute limit.
+    async fn wait_until_entered(&self) {
+        assert!(
+            timeout(Duration::from_secs(30), self.entered.notified())
+                .await
+                .is_ok(),
+            "maintain did not start the delete that the test holds"
+        );
+    }
+}
+
 /// An object store that counts the listings of batch objects, can fail
-/// every delete and every listing of batch objects, and can hold the next
-/// delete.
+/// every delete and every listing of batch objects, can hold the next
+/// delete, and can slow every delete and record how many deletes overlap.
 #[derive(Clone, Debug, Default)]
 struct Counting {
     inner: Arc<InMemory>,
@@ -123,6 +136,9 @@ struct Counting {
     deletes_fail: Arc<AtomicBool>,
     lists_fail: Arc<AtomicBool>,
     held_delete: Arc<Mutex<Option<DeleteHold>>>,
+    deletes_are_slow: Arc<AtomicBool>,
+    deletes_in_flight: Arc<AtomicUsize>,
+    most_deletes_in_flight: Arc<AtomicUsize>,
 }
 
 impl Counting {
@@ -205,6 +221,25 @@ impl ObjectStore for Counting {
                     })
                 })
                 .boxed();
+        }
+
+        if self.deletes_are_slow.load(Ordering::SeqCst) {
+            let inner = self.inner.clone();
+            let in_flight = self.deletes_in_flight.clone();
+            let most = self.most_deletes_in_flight.clone();
+
+            return stream::once(async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                _ = most.fetch_max(now, Ordering::SeqCst);
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                _ = in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                inner.delete_stream(locations)
+            })
+            .flatten()
+            .boxed();
         }
 
         self.inner.delete_stream(locations)
@@ -461,7 +496,7 @@ async fn maintain_does_not_recreate_the_watermark_of_a_deleted_topic() -> Result
     let hold = counting.hold_next_delete()?;
 
     let delete_the_topic = async {
-        hold.entered.notified().await;
+        hold.wait_until_entered().await;
 
         let outcome = storage.delete_topic(&TopicId::Name(name.into())).await;
 
@@ -479,6 +514,113 @@ async fn maintain_does_not_recreate_the_watermark_of_a_deleted_topic() -> Result
         counting.inner.head(&watermark_location(&topition)).await,
         Err(object_store::Error::NotFound { .. })
     );
+
+    Ok(())
+}
+
+/// A topic that is deleted and created again under the same name while
+/// `maintain` deletes the old topic's batch objects does not get the old
+/// topic's cut as its `reclaimed` mark from that reclaim.
+#[tokio::test]
+async fn maintain_does_not_mark_a_recreated_topic_as_reclaimed() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "reborn";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    let hold = counting.hold_next_delete()?;
+
+    let recreate_the_topic = async {
+        hold.wait_until_entered().await;
+
+        _ = storage.delete_topic(&TopicId::Name(name.into())).await?;
+        create_topic(&storage, name).await?;
+
+        hold.release.notify_one();
+
+        Ok::<_, Error>(())
+    };
+
+    let (maintained, recreated) =
+        tokio::join!(storage.maintain(SystemTime::now()), recreate_the_topic);
+
+    maintained?;
+    recreated?;
+
+    // The new topic's document does not hold a `reclaimed` key until its own
+    // first reclaim, and it can be absent altogether.
+    let document = match counting.inner.get(&watermark_location(&topition)).await {
+        Ok(found) => found.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => Bytes::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    assert!(
+        !String::from_utf8_lossy(&document).contains("reclaimed"),
+        "the old topic's cut was written into the new topic's watermark: {}",
+        String::from_utf8_lossy(&document)
+    );
+
+    Ok(())
+}
+
+/// A pass reclaims many partitions at once, and no more than
+/// `CONCURRENT_RECLAIM_DELETES` of them delete batch objects at the same time.
+#[tokio::test]
+async fn maintain_limits_how_many_partitions_delete_at_once() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let names = (0..2 * CONCURRENT_RECLAIM_DELETES)
+        .map(|n| format!("wide-{n}"))
+        .collect::<Vec<_>>();
+
+    for name in &names {
+        create_topic(&storage, name).await?;
+        let topition = Topition::new(name, 0);
+
+        for _ in 0..4 {
+            _ = produce_batch(&storage, &topition, 1).await?;
+        }
+
+        assert_eq!(
+            (ErrorCode::None, 3),
+            delete_records_partition(&storage, name, 3).await?
+        );
+    }
+
+    counting.deletes_are_slow.store(true, Ordering::SeqCst);
+
+    storage.maintain(SystemTime::now()).await?;
+
+    // The delete is slow, so the partitions that the pass visits together
+    // reach it together, and only the limit keeps them apart.
+    assert_eq!(
+        CONCURRENT_RECLAIM_DELETES,
+        counting.most_deletes_in_flight.load(Ordering::SeqCst)
+    );
+
+    for name in &names {
+        assert_eq!(
+            vec![3],
+            stored_base_offsets(&counting.inner, &Topition::new(name, 0)).await?
+        );
+    }
 
     Ok(())
 }
