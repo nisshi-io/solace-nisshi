@@ -552,7 +552,6 @@ mod turso {
     }
 
     #[tokio::test]
-    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
     async fn alter_single_topic() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -568,7 +567,6 @@ mod turso {
     }
 
     #[tokio::test]
-    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
     async fn single_topic() -> Result<()> {
         let _guard = init_tracing()?;
 

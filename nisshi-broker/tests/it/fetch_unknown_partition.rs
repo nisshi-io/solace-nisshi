@@ -210,7 +210,6 @@ mod lite {
 mod turso {
     use super::*;
 
-    #[ignore = "the turso backend fails its connection check in tests"]
     #[tokio::test]
     async fn partition_index_outside_topic() -> Result<()> {
         run(StorageType::Turso).await

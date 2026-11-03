@@ -242,9 +242,4 @@ backend!(in_memory, "dynostore", StorageType::InMemory);
 backend!(lite, "libsql", StorageType::Lite);
 backend!(pg, "postgres", StorageType::Postgres);
 backend!(slatedb, "slatedb", StorageType::SlateDb);
-backend!(
-    #[ignore = "the turso backend fails its connection check in tests"]
-    turso,
-    "turso",
-    StorageType::Turso
-);
+backend!(turso, "turso", StorageType::Turso);
