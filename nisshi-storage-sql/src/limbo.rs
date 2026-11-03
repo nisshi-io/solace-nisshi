@@ -3748,7 +3748,6 @@ mod tests {
     /// Each query that Turso runs returns every column that its module's `RowReader` reads, once.
     /// The broker reads a query's rows only on the paths that run it, so this test finds a query
     /// that doesn't match its row before a rare path does.
-    #[ignore = "Turso fails to parse the DDL of the consumer_group, producer and topic tables"]
     #[tokio::test]
     async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
         let directory = tempdir()?;
@@ -3768,6 +3767,11 @@ mod tests {
             }
         }
 
+        // Turso's schema has no `virtual_topic` table, which this query reads, so a lookup of a
+        // topic by its ID fails on Turso. The test expects the failure instead of skipping the
+        // query, so that it fails when Turso's schema gains the table, and this entry goes.
+        let known_failures = [topic_select_uuid::QUERY.key()];
+
         for row_query in sql::row_queries(sql::SqlEngine::Turso) {
             let checked = match connection.prepare(sql::SQL.get(row_query.query)?).await {
                 Ok(statement) => (row_query.check_columns)(&ResultColumns::turso_statement(
@@ -3777,8 +3781,10 @@ mod tests {
                 Err(error) => Err(error.into()),
             };
 
-            if let Err(error) = checked {
-                failures.push(format!("{}: {error:?}", row_query.query));
+            match (checked, known_failures.contains(&row_query.query)) {
+                (Ok(()), false) | (Err(_), true) => {}
+                (Ok(()), true) => failures.push(format!("{}: now passes", row_query.query)),
+                (Err(error), false) => failures.push(format!("{}: {error:?}", row_query.query)),
             }
         }
 
