@@ -452,8 +452,9 @@ async fn lake_sink_older_epoch_batch_held_at_watermark_put_is_refused_after_bump
 }
 
 /// A lake-sink partition with no stored sequence for the producer, as after an upgrade from a
-/// broker that kept none for it, gets the answers of the sequence check alone: the fence holds
-/// nothing for the producer, and nothing records where an epoch started.
+/// broker that kept none for it, accepts the producer's first batch at any sequence, as Kafka
+/// does for a partition that holds no state for a producer: the fence holds nothing for the
+/// producer, and nothing records where an epoch started.
 #[tokio::test]
 async fn lake_sink_partition_without_producer_state_answers_as_the_sequence_check()
 -> Result<(), Error> {
@@ -463,17 +464,17 @@ async fn lake_sink_partition_without_producer_state_answers_as_the_sequence_chec
         lake_sink_storage(HeldPutStore::new(held_put_store::is_watermark)).await?;
     let producer = storage.init_producer(None, 0, Some(-1), Some(-1)).await?;
 
-    // The producer continues a sequence that the partition never stored.
-    assert_matches!(
+    // The partition stored no sequence for the producer, so it accepts sequence 5.
+    assert_eq!(
+        0,
         storage
             .produce(None, &topition, idempotent_batch(producer.id, 0, 5)?)
-            .await,
-        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+            .await?
     );
 
     // The producer bumps its epoch and restarts at sequence 0.
     assert_eq!(
-        0,
+        1,
         storage
             .produce(None, &topition, idempotent_batch(producer.id, 1, 0)?)
             .await?

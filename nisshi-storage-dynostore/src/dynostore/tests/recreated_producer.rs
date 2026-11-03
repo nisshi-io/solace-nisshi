@@ -26,7 +26,7 @@ use nisshi_sans_io::{
 use nisshi_storage::{Error, Storage as _, Topition};
 use object_store::memory::InMemory;
 
-use crate::dynostore::{DynoStore, IdempotentBatch, ProducerDetail, tests::init_tracing};
+use crate::dynostore::{DynoStore, IdempotentBatch, tests::init_tracing};
 
 fn storage() -> Result<DynoStore, Error> {
     DynoStore::new("nisshi", 111, InMemory::new())
@@ -476,15 +476,4 @@ async fn a_recreated_producer_that_the_advance_refuses_is_not_kept() -> Result<(
     assert_eq!(vec![2], producers(&storage).await?);
 
     Ok(())
-}
-
-#[test]
-fn a_producer_that_never_lost_state_stores_nothing_extra() {
-    let producer: ProducerDetail =
-        serde_json::from_str(r#"{"sequences":{"0":{"orders":{"0":3}}}}"#).expect("producer");
-
-    assert!(!producer.state_was_lost);
-
-    let written = serde_json::to_string(&producer).expect("encode");
-    assert!(!written.contains("state_was_lost"), "{written}");
 }

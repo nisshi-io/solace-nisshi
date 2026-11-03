@@ -587,54 +587,19 @@ struct ProducerDetail {
     /// empty, so a producer that never bumps its epoch adds nothing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     epoch_starts: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, i64>>>,
-    /// Whether the broker recreated the producer from a batch, after it lost the producer's
-    /// state while the client kept its sequences. A batch to a partition that holds no state
-    /// for the producer may then start at any sequence, as Kafka accepts a producer's first
-    /// batch to a partition at any sequence.
-    ///
-    /// A producer that the broker never lost state for starts a new partition at sequence 0.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    state_was_lost: bool,
 }
 
 impl ProducerDetail {
     /// The state of a producer that the broker allocated and no longer holds: no partitions, and
     /// the epoch that the client sent.
     ///
-    /// The client resumes at the sequence it had, so this producer's first batch to a
-    /// partition may start at any sequence, as in Kafka. Kafka checks this in
-    /// [`ProducerAppendInfo.checkSequence`].
-    ///
-    /// [`ProducerAppendInfo.checkSequence`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    /// The client resumes at the sequence it had, and a partition that holds no state for a
+    /// producer accepts any first sequence, as in Kafka.
     fn recreated(epoch: ProducerEpoch) -> Self {
         Self {
             sequences: BTreeMap::from([(epoch, BTreeMap::new())]),
-            state_was_lost: true,
             ..Default::default()
         }
-    }
-
-    /// Returns whether a batch to the partition that `stored` describes may start at any
-    /// sequence: the broker lost the producer's state, and the partition holds none for it.
-    ///
-    /// Returns [`ErrorCode::InvalidRecord`] for a resumed batch with a negative `base_sequence`,
-    /// as Kafka's [`LogValidator`] does for any batch of a producer.
-    ///
-    /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L513-L516
-    fn resumes_without_state(
-        &self,
-        stored: &StoredEpochs,
-        base_sequence: Sequence,
-    ) -> Result<bool> {
-        if !(self.state_was_lost && stored.partition.is_none()) {
-            return Ok(false);
-        }
-
-        if base_sequence < 0 {
-            return Err(Error::Api(ErrorCode::InvalidRecord));
-        }
-
-        Ok(true)
     }
 
     /// Returns the epochs that a batch from this producer to `topition` is checked against.
@@ -720,8 +685,8 @@ impl ProducerDetail {
             ProduceEpoch::Start => self.start_epoch(epoch, topition, base_offset),
         };
 
-        // The batch starts at the partition's next sequence, except the first batch of a
-        // producer whose state the broker lost, which may start at any sequence.
+        // The batch starts at the partition's next sequence, except a batch to a partition
+        // that holds no state for the producer, which may start at any sequence.
         *sequence = produced_batches::next_sequence(base_sequence, last_offset_delta);
 
         self.batches
@@ -817,7 +782,6 @@ fn allocate_producer_id(
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
             batches: BTreeMap::new(),
             epoch_starts: BTreeMap::new(),
-            state_was_lost: false,
         },
     );
 
@@ -2364,21 +2328,14 @@ impl DynoStore {
                     return Err(Error::Api(ErrorCode::UnknownServerError));
                 };
 
-                let resumes = pd.resumes_without_state(&stored, batch.base_sequence)?;
-
-                // The epoch check also refuses a first sequence above 0 on a partition that
-                // holds no state, so a resuming batch is checked as if it started at 0.
                 let produce_epoch = stored
-                    .check_batch(
-                        batch.producer_epoch,
-                        if resumes { 0 } else { batch.base_sequence },
-                    )
+                    .check_batch(batch.producer_epoch, batch.base_sequence)
                     .inspect_err(|error| {
                         debug!(?error, ?stored, producer_epoch = batch.producer_epoch)
                     })
                     .map_err(Error::Api)?;
 
-                if resumes {
+                if stored.partition_has_no_state() {
                     return Ok(SequenceCheck::Append);
                 }
 
@@ -2509,15 +2466,9 @@ impl DynoStore {
                         return Err(Error::Api(ErrorCode::UnknownServerError));
                     };
 
-                    let resumes = pd.resumes_without_state(&stored, base_sequence)?;
-
                     // with_mut stores each change that this closure makes, also when it
-                    // then answers an error, so every check runs before any change. The epoch
-                    // check also refuses a first sequence above 0 on a partition that holds no
-                    // state, so a resuming batch is checked as if it started at 0.
-                    let produce_epoch = match stored
-                        .check_batch(producer_epoch, if resumes { 0 } else { base_sequence })
-                    {
+                    // then answers an error, so every check runs before any change.
+                    let produce_epoch = match stored.check_batch(producer_epoch, base_sequence) {
                         Ok(produce_epoch) => produce_epoch,
 
                         // A batch that the producer's next epoch superseded after it got its
@@ -2562,7 +2513,7 @@ impl DynoStore {
                     // advance the sequence first. This write is then a second
                     // copy, and the client gets an error for it instead of
                     // the duplicate's offset.
-                    if !resumes
+                    if !stored.partition_has_no_state()
                         && let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
                             sequence,
                             remembered_batches,

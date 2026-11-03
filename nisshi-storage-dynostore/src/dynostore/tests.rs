@@ -42,6 +42,7 @@ mod list_offsets;
 mod list_offsets_storage_error;
 mod metadata_read_error;
 mod offset_commit_unknown_partition;
+mod partition_without_producer_state;
 mod ping;
 mod post_write_failure_reason;
 mod produce_topic_guard;

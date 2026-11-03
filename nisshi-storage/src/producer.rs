@@ -113,12 +113,24 @@ pub enum ProduceEpoch {
     /// transactional producer's newest epoch.
     Continue,
 
-    /// The batch starts its epoch on the partition, at sequence 0. The backend stores the
-    /// epoch for the producer when the producer does not have it yet.
+    /// The batch starts its epoch on the partition: at sequence 0 when the partition holds an
+    /// older epoch for the producer, and at any sequence when the partition holds no state for
+    /// the producer. The backend stores the epoch for the producer when the producer does not
+    /// have it yet.
     Start,
 }
 
 impl StoredEpochs {
+    /// Whether the partition holds no state for the producer, at any epoch. A batch to such a
+    /// partition may start at any sequence, as in Kafka ([ProducerAppendInfo.java]), so a
+    /// backend does not compare its first sequence with a next sequence, and stores the sequence
+    /// after the batch.
+    ///
+    /// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    pub fn partition_has_no_state(&self) -> bool {
+        self.partition.is_none()
+    }
+
     /// Checks a produced batch's epoch and first sequence against these epochs.
     ///
     /// An idempotent producer bumps its own epoch after an error ([KIP-360]): it keeps its
@@ -126,7 +138,8 @@ impl StoredEpochs {
     /// the epoch for each partition. It accepts any epoch higher than the partition's whose
     /// first sequence is 0, and answers
     /// [`OutOfOrderSequenceNumber`](ErrorCode::OutOfOrderSequenceNumber) for any other
-    /// sequence ([ProducerAppendInfo.java]). We compare with the partition's epoch too,
+    /// sequence. A partition that holds no state for the producer accepts any epoch and any
+    /// first sequence ([ProducerAppendInfo.java]). We compare with the partition's epoch too,
     /// because the Java client retries a batch at its old epoch on one partition after it
     /// bumps the epoch for another ([RecordAccumulator.java]).
     ///
@@ -137,6 +150,10 @@ impl StoredEpochs {
     ///
     /// Returns [`OLDER_EPOCH_ERROR`] for an epoch lower than the partition's, as Kafka answers
     /// for a client's batch ([ProducerAppendInfo.java]).
+    ///
+    /// Returns [`InvalidRecord`](ErrorCode::InvalidRecord) for a negative first sequence on a
+    /// partition that holds no state for the producer, as Kafka's [`LogValidator`] does for a
+    /// batch with a producer ID.
     ///
     /// Returns [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch) for:
     /// - a transactional producer's epoch other than its newest. Kafka's coordinator answers
@@ -155,6 +172,7 @@ impl StoredEpochs {
     ///
     /// [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
     /// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L513-L516
     /// [AddPartitionsToTxnManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AddPartitionsToTxnManager.scala#L225-L228
     /// [TransactionManager.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L535-L542
     /// [RecordAccumulator.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L920-L935
@@ -168,6 +186,10 @@ impl StoredEpochs {
         // the client bump its epoch and send again.
         if self.newest == i16::MAX {
             return Err(ErrorCode::ProducerFenced);
+        }
+
+        if self.partition_has_no_state() && base_sequence < 0 {
+            return Err(ErrorCode::InvalidRecord);
         }
 
         if self.transactional {
@@ -187,7 +209,7 @@ impl StoredEpochs {
             Some(Ordering::Greater) | None if epoch_is_exhausted(producer_epoch) => {
                 Err(ErrorCode::InvalidProducerEpoch)
             }
-            Some(Ordering::Greater) | None if base_sequence != 0 => {
+            Some(Ordering::Greater) if base_sequence != 0 => {
                 Err(ErrorCode::OutOfOrderSequenceNumber)
             }
             Some(Ordering::Greater) | None => Ok(ProduceEpoch::Start),
@@ -359,9 +381,51 @@ mod tests {
         assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(5, 0));
         assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(4, 0));
         assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(6, 0));
+    }
+
+    #[test]
+    fn partition_without_state_accepts_any_first_sequence() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert!(unwritten.partition_has_no_state());
+        assert!(!IDEMPOTENT.partition_has_no_state());
+
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(5, 1));
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(4, 1_000));
+        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(6, i32::MAX));
+    }
+
+    #[test]
+    fn partition_without_state_refuses_a_negative_first_sequence() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert_eq!(Err(ErrorCode::InvalidRecord), unwritten.check_batch(5, -1));
         assert_eq!(
-            Err(ErrorCode::OutOfOrderSequenceNumber),
-            unwritten.check_batch(5, 1)
+            Err(ErrorCode::InvalidRecord),
+            StoredEpochs {
+                partition: None,
+                ..TRANSACTIONAL
+            }
+            .check_batch(3, -5)
+        );
+    }
+
+    #[test]
+    fn partition_without_state_still_refuses_an_exhausted_epoch() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert_eq!(
+            Err(ErrorCode::InvalidProducerEpoch),
+            unwritten.check_batch(32766, 5)
         );
     }
 

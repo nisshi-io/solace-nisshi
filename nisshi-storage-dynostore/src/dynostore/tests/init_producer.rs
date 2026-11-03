@@ -59,7 +59,6 @@ async fn seed(
                         .collect(),
                     batches: BTreeMap::new(),
                     epoch_starts: BTreeMap::new(),
-                    state_was_lost: false,
                 },
             );
 

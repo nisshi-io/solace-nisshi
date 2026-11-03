@@ -523,7 +523,8 @@ impl Engine {
                 sequence,
             );
 
-            let increment = idempotent_sequence_check(sequence, deflated)?;
+            let increment =
+                idempotent_sequence_check(sequence, stored.partition_has_no_state(), deflated)?;
 
             debug!(increment);
 

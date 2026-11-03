@@ -75,6 +75,7 @@ pub mod produce_crc;
 pub mod produce_fetch;
 pub mod produce_idempotent_duplicate;
 pub mod produce_idempotent_epoch_bump;
+pub mod produce_idempotent_first_sequence;
 #[cfg(feature = "postgres")]
 pub mod produce_idempotent_race;
 pub mod produce_invalid_acks;

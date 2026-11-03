@@ -607,8 +607,27 @@ pub(crate) fn txn_produce_partition_check(
 /// Checks a batch's first sequence against `sequence`, the next sequence stored for its
 /// producer's epoch on the partition, and returns how far the batch advances it.
 ///
-/// The caller checks the batch's epoch first, with [`idempotent_epoch_check`].
-pub(crate) fn idempotent_sequence_check(sequence: i32, deflated: &deflated::Batch) -> Result<i32> {
+/// A partition that holds no state for the producer (`partition_has_no_state`) accepts any
+/// first sequence, as Kafka does. The stored sequence then starts at 0, so the batch advances it
+/// to the sequence after the batch, which wraps to 0 past `i32::MAX` as Kafka's
+/// [`DefaultRecordBatch.incrementSequence`] does.
+///
+/// The caller checks the batch's epoch first, with [`idempotent_epoch_check`], which refuses a
+/// negative first sequence on such a partition.
+///
+/// [`DefaultRecordBatch.incrementSequence`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L556-L560
+pub(crate) fn idempotent_sequence_check(
+    sequence: i32,
+    partition_has_no_state: bool,
+    deflated: &deflated::Batch,
+) -> Result<i32> {
+    if partition_has_no_state {
+        let after_batch =
+            i64::from(deflated.base_sequence) + i64::from(deflated.last_offset_delta) + 1;
+
+        return Ok((after_batch % (i64::from(i32::MAX) + 1)) as i32);
+    }
+
     match sequence.cmp(&deflated.base_sequence) {
         Ordering::Equal => Ok(deflated.last_offset_delta + 1),
 
