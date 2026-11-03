@@ -202,6 +202,10 @@ pub struct ProduceRequestBatcher<G> {
     /// The largest decoded size of a merged batch, [`MAX_DECODED_BATCH_BYTES`] outside tests.
     decoded_limit: usize,
 
+    /// The error that a test makes every merge fail with, after [`combine`] has run.
+    #[cfg(test)]
+    merge_error: Option<Error>,
+
     requests: Arc<Mutex<BTreeMap<TopitionProducerId, Vec<BatchRequest>>>>,
     responses: Arc<Mutex<BTreeMap<Uuid, BatchResponse>>>,
 }
@@ -233,6 +237,8 @@ where
             minimum_size: Default::default(),
             maximum_delay: Default::default(),
             decoded_limit: MAX_DECODED_BATCH_BYTES,
+            #[cfg(test)]
+            merge_error: None,
 
             requests: Arc::new(Mutex::new(BTreeMap::new())),
             responses: Arc::new(Mutex::new(BTreeMap::new())),
@@ -249,6 +255,16 @@ where
     pub fn with_maximum_delay(self, maximum_delay: Option<Duration>) -> Self {
         Self {
             maximum_delay,
+            ..self
+        }
+    }
+
+    /// Makes every merge fail with `merge_error`, because no batch that decodes makes the merge
+    /// fail with an error other than an offset delta overflow.
+    #[cfg(test)]
+    fn with_merge_error(self, merge_error: Error) -> Self {
+        Self {
+            merge_error: Some(merge_error),
             ..self
         }
     }
@@ -335,6 +351,9 @@ where
                     rejected: Vec::new(),
                 },
             };
+
+        #[cfg(test)]
+        let runs = self.merge_error.clone().map_or(runs, Err);
 
         // A batch that does not decode fails only its own producer, on every path below. The
         // others in the flush are written as if the bad batch had not been queued.
@@ -908,6 +927,10 @@ struct Combined {
 /// it had not been queued, so that one producer's bad batch fails only that producer. Kafka
 /// validates each batch on its own ([`UnifiedLog.analyzeAndValidateRecords`]) and has no
 /// cross-request coalescing.
+///
+/// This holds only for a queue that `send_queued` merges. A queue that it writes as sent, such as
+/// one of mixed codecs, never reaches this function, so each of its batches goes to the storage
+/// as sent.
 ///
 /// An offset delta that overflows an `i32`, or another error from the merge itself, fails the
 /// merge of the whole queue, and the result still lists each batch that did not decode.
@@ -2434,6 +2457,54 @@ mod tests {
                 .produced(&topition)?
                 .map_or(0, |batches| batches.len())
         );
+
+        Ok(())
+    }
+
+    /// A merge that fails with an error other than an offset delta overflow answers each producer
+    /// whose batch decoded with that error, and the producer whose batch does not decode with its
+    /// own error. Nothing is written.
+    #[tokio::test(start_paused = true)]
+    async fn merge_error_fails_every_decoded_producer_and_keeps_the_rejected_error() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_merge_error(Error::Api(ErrorCode::UnknownServerError));
+        let topition = Topition::new("abc", 0);
+        let attributes: i16 = BatchAttribute::default().into();
+
+        let first_batch = batch_of(PRODUCER_ID, attributes, &Bytes::from_static(b"first"))?;
+
+        let mut undecodable_batch =
+            batch_of(PRODUCER_ID, attributes, &Bytes::from_static(b"second"))?;
+        let len = undecodable_batch.record_data.len();
+        undecodable_batch.record_data = undecodable_batch.record_data.slice(0..len / 2);
+
+        let third_batch = batch_of(PRODUCER_ID, attributes, &Bytes::from_static(b"third"))?;
+
+        let first_produce = spawn_produce(&batcher, &topition, first_batch);
+        yield_now().await;
+        let second_produce = spawn_produce(&batcher, &topition, undecodable_batch);
+        yield_now().await;
+        let third_produce = spawn_produce(&batcher, &topition, third_batch);
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_matches!(
+            first_produce.await.expect("join_handle"),
+            Err(Error::Api(ErrorCode::UnknownServerError))
+        );
+        assert_matches!(
+            second_produce.await.expect("join_handle"),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+        assert_matches!(
+            third_produce.await.expect("join_handle"),
+            Err(Error::Api(ErrorCode::UnknownServerError))
+        );
+
+        assert_eq!(None, recorder.produced(&topition)?);
 
         Ok(())
     }
