@@ -3695,7 +3695,7 @@ impl Storage for Engine {
 
     async fn ping(&self) -> Result<()> {
         let c = self.connection().await?;
-        let _ = c.query(sql::PING, ()).await?;
+        let _ = c.query(&sql_lookup(sql::PING)?, ()).await?;
         Ok(())
     }
 }
