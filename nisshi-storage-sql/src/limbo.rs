@@ -84,7 +84,7 @@ use opentelemetry::{
 };
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use turso::{
     Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
     transaction::TransactionBehavior,
@@ -2388,9 +2388,15 @@ impl Storage for Engine {
                                     .topic_authorized_operations(Some(-2147483648)),
 
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -2460,9 +2466,15 @@ impl Storage for Engine {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -2494,7 +2506,7 @@ impl Storage for Engine {
                     is_internal,
                     partitions,
                     replication_factor,
-                }) = rows.next().await?
+                }) = rows.next_readable().await?
                 {
                     let error_code = ErrorCode::None.into();
                     let topic_id = Some(uuid.into_bytes());
@@ -2701,9 +2713,15 @@ impl Storage for Engine {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownServerError.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownServerError,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -2797,9 +2815,15 @@ impl Storage for Engine {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownTopicOrPartition,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

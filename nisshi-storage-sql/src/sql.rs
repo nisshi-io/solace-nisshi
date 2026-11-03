@@ -190,6 +190,23 @@ pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
     }
 }
 
+/// Returns the error code that a Metadata or DescribeTopicPartitions response gives a topic whose
+/// read failed with `error`. `query_error_code` is the code for any error other than a column
+/// error, such as a failed query.
+///
+/// A column error means that the topic's stored row is corrupt, or that the query doesn't match
+/// its row, and a retry fixes neither. The topic then gets `UNKNOWN_SERVER_ERROR`, which a client
+/// does not retry, instead of `UNKNOWN_TOPIC_OR_PARTITION`. That code tells a client that the
+/// topic does not exist, and a client that may create topics then asks the broker to create it,
+/// which fails because the topic exists, on each metadata refresh.
+pub(crate) fn topic_read_error_code(error: &Error, query_error_code: ErrorCode) -> ErrorCode {
+    if column_error_kind(error).is_some() {
+        ErrorCode::UnknownServerError
+    } else {
+        query_error_code
+    }
+}
+
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
 /// the engine gives the query and the error's [`column_error_kind`] as `kind`.
 pub(crate) struct ColumnErrorCount {
@@ -239,6 +256,20 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
             reader,
             column_errors,
         })
+    }
+
+    /// Returns the next row that the reader can read as `T`, or `None` after the last row.
+    ///
+    /// It skips each row with an unreadable column, which the reader logs and counts, so that one
+    /// corrupt row does not hide the rows after it. Use it only where a result without that row
+    /// is still a correct answer, such as a list of the cluster's topics.
+    pub(crate) async fn next_readable(&mut self) -> Result<Option<T>> {
+        loop {
+            match self.next().await {
+                Err(Error::UnreadableColumn { .. }) => continue,
+                next => return next,
+            }
+        }
     }
 
     /// Returns the next row as `T`, or `None` after the last row.

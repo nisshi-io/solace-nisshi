@@ -4072,9 +4072,15 @@ impl Storage for Delegate {
                                     .topic_authorized_operations(Some(-2147483648)),
 
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4144,9 +4150,15 @@ impl Storage for Delegate {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4177,7 +4189,7 @@ impl Storage for Delegate {
                     is_internal,
                     partitions,
                     replication_factor,
-                }) = rows.next().await?
+                }) = rows.next_readable().await?
                 {
                     let error_code = ErrorCode::None.into();
                     let topic_id = Some(uuid.into_bytes());
@@ -4402,9 +4414,15 @@ impl Storage for Delegate {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownServerError.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownServerError,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -4497,9 +4515,15 @@ impl Storage for Delegate {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownTopicOrPartition,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -7717,6 +7741,75 @@ mod tests {
                 NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
             ],
             engine.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A topic whose stored row can't be read is a server error in Metadata, not an unknown
+    /// topic, so that a client does not try to create it again. A list of every topic leaves it
+    /// out, and keeps the cluster's other topics.
+    #[tokio::test]
+    async fn metadata_answers_unknown_server_error_for_an_unreadable_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "metadata-unreadable-topic-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, healthy) = engine_with_topic(db_file).await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("unreadable".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // SQLite stores text that isn't a number as text in an `int` column, and the reader of
+        // `partitions` then can't read it as an integer.
+        execute_on(
+            db_file,
+            "update topic set partitions = 'x' where name = ?1",
+            ["unreadable"],
+        )
+        .await?;
+
+        let named = engine
+            .metadata(Some(&[
+                TopicId::from("unreadable"),
+                TopicId::from(healthy.topic()),
+            ]))
+            .await?;
+
+        assert_eq!(
+            vec![
+                (
+                    Some("unreadable".to_owned()),
+                    i16::from(ErrorCode::UnknownServerError)
+                ),
+                (Some(healthy.topic().to_owned()), i16::from(ErrorCode::None)),
+            ],
+            named
+                .topics
+                .iter()
+                .map(|topic| (topic.name.clone(), topic.error_code))
+                .collect::<Vec<_>>()
+        );
+
+        let listed = engine.metadata(None).await?;
+
+        assert_eq!(
+            vec![Some(healthy.topic().to_owned())],
+            listed
+                .topics
+                .iter()
+                .map(|topic| topic.name.clone())
+                .collect::<Vec<_>>()
         );
 
         Ok(())

@@ -4310,9 +4310,15 @@ impl Storage for Postgres {
                                     .topic_authorized_operations(Some(-2147483648)),
 
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4375,9 +4381,15 @@ impl Storage for Postgres {
                                         .topic_authorized_operations(Some(-2147483648))
                                 }
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    warn!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            sql::topic_read_error_code(
+                                                &reason,
+                                                ErrorCode::UnknownTopicOrPartition,
+                                            )
+                                            .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4396,23 +4408,27 @@ impl Storage for Postgres {
                 let mut responses = vec![];
 
                 match self
-                    .prepare_query_rows::<topic_by_cluster::Row>(
-                        &c,
-                        topic_by_cluster::QUERY,
-                        &[&self.cluster],
-                    )
+                    .prepare_query_result(&c, topic_by_cluster::QUERY.key(), &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))
                 {
-                    Ok(rows) => {
+                    Ok((columns, rows, column_errors)) => {
+                        let reader = topic_by_cluster::Row::reader(&columns)
+                            .inspect_err(|err| column_errors.record(err))?;
+
+                        // The loop skips each row with an unreadable column, which the reader
+                        // logs, so that one corrupt row does not hide the cluster's other topics.
                         for topic_by_cluster::Row {
                             uuid,
                             name,
                             is_internal,
                             partitions,
                             replication_factor,
-                        } in rows
-                        {
+                        } in rows.iter().filter_map(|row| {
+                            topic_by_cluster::Row::read(&reader, row)
+                                .inspect_err(|err| column_errors.record(err))
+                                .ok()
+                        }) {
                             let error_code = ErrorCode::None.into();
                             let topic_id = Some(uuid.into_bytes());
                             let name = Some(name);
@@ -4611,9 +4627,15 @@ impl Storage for Postgres {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownServerError.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownServerError,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -4693,9 +4715,15 @@ impl Storage for Postgres {
                         }
 
                         Err(reason) => {
-                            debug!(?reason);
+                            warn!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    sql::topic_read_error_code(
+                                        &reason,
+                                        ErrorCode::UnknownTopicOrPartition,
+                                    )
+                                    .into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
