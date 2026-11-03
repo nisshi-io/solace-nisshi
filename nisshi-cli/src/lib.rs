@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use std::{collections::HashMap, env::vars, fmt, path::PathBuf, result, str::FromStr};
+use std::{collections::HashMap, env::vars, path::PathBuf, result, str::FromStr};
 
 mod cli;
 mod insecure_tls;
@@ -23,61 +23,82 @@ use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error(transparent)]
     Box(#[from] Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
     Cat(Box<nisshi_cat::Error>),
+    #[error(transparent)]
     Client(Box<nisshi_client::Error>),
+    #[error(transparent)]
     DotEnv(#[from] dotenv::Error),
+    #[error(transparent)]
     Generate(#[from] nisshi_generator::Error),
+    #[error(transparent)]
     InvalidLength(#[from] sha2::digest::InvalidLength),
     /// A data lake subcommand (`iceberg`, `delta`, `parquet`) was given
     /// without `--schema-registry`, which every lake writer requires.
-    LakeRequiresSchemaRegistry {
-        lake: &'static str,
-    },
+    #[error("the {lake} subcommand requires --schema-registry")]
+    LakeRequiresSchemaRegistry { lake: &'static str },
+    #[error(transparent)]
     Perf(#[from] nisshi_perf::Error),
+    #[error(transparent)]
     Proxy(#[from] nisshi_proxy::Error),
+    #[error(transparent)]
     Regex(#[from] regex::Error),
+    #[error(transparent)]
     SansIo(#[from] nisshi_sans_io::Error),
+    #[error(transparent)]
     Schema(Box<nisshi_schema::Error>),
+    #[error(transparent)]
     Server(Box<nisshi_broker::Error>),
+    #[error(transparent)]
     Tls(#[from] rustls::Error),
     /// The `--cert` file could not be read or parsed as PEM certificates.
+    #[error("cannot read the --cert file {}: {source}", path.display())]
     TlsCertificate {
         path: PathBuf,
         source: rustls::pki_types::pem::Error,
     },
     /// The `--key` file could not be read or parsed as a PEM private key.
+    #[error("cannot read the --key file {}: {source}", path.display())]
     TlsPrivateKey {
         path: PathBuf,
         source: rustls::pki_types::pem::Error,
     },
     /// The `--key` file is encrypted but no `--key-passphrase-file` was given.
-    TlsKeyPassphraseRequired {
-        path: PathBuf,
-    },
+    #[error(
+        "the --key file {} is encrypted, so --key-passphrase-file is required",
+        path.display()
+    )]
+    TlsKeyPassphraseRequired { path: PathBuf },
     /// The passphrase did not decrypt the key.
-    TlsKeyDecrypt {
-        path: PathBuf,
-        source: pkcs8::Error,
-    },
+    #[error("cannot decrypt the --key file {}: {source}", path.display())]
+    TlsKeyDecrypt { path: PathBuf, source: pkcs8::Error },
     /// The key is encrypted with an algorithm this build does not support,
     /// named by `algorithm` (a friendly name, or the OID when unknown).
-    TlsKeyUnsupportedEncryption {
-        path: PathBuf,
-        algorithm: String,
-    },
+    #[error(
+        "the --key file {} is encrypted with {algorithm}, which is not supported",
+        path.display()
+    )]
+    TlsKeyUnsupportedEncryption { path: PathBuf, algorithm: String },
     /// Legacy OpenSSL PEM encryption (`Proc-Type: 4,ENCRYPTED`) is not supported.
-    TlsKeyLegacyEncrypted {
-        path: PathBuf,
-    },
+    #[error(
+        "the --key file {} uses legacy OpenSSL PEM encryption, which is not supported",
+        path.display()
+    )]
+    TlsKeyLegacyEncrypted { path: PathBuf },
     /// The `--key-passphrase-file` could not be read.
+    #[error("cannot read the --key-passphrase-file {}: {source}", path.display())]
     TlsKeyPassphraseFile {
         path: PathBuf,
         source: std::io::Error,
     },
     /// `--cert` and `--key` must be supplied together.
+    #[error("--cert and --key must be given together")]
     TlsRequiresCertAndKey,
+    #[error(transparent)]
     Topic(#[from] nisshi_topic::Error),
+    #[error("invalid URL: {0}")]
     Url(#[from] url::ParseError),
 }
 
@@ -102,12 +123,6 @@ impl From<nisshi_schema::Error> for Error {
 impl From<nisshi_broker::Error> for Error {
     fn from(value: nisshi_broker::Error) -> Self {
         Self::Server(Box::new(value))
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
     }
 }
 
@@ -161,5 +176,66 @@ where
             .replace(s)
             .and_then(|s| T::from_str(&s).map_err(Into::into))
             .map(|t| Self(t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::assert_matches;
+
+    #[test]
+    fn invalid_url_option_reads_as_a_sentence() {
+        let err = EnvVarExp::<url::Url>::from_str("foo").unwrap_err();
+
+        assert_matches!(err, Error::Url(_));
+        assert_eq!("invalid URL: relative URL without a base", err.to_string());
+    }
+
+    #[test]
+    fn clap_reports_an_invalid_schema_registry_url_as_a_sentence() {
+        use clap::Parser as _;
+
+        let err = Cli::try_parse_from(["nisshi", "broker", "--schema-registry", "foo"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("invalid URL: relative URL without a base"),
+            "{err}"
+        );
+        assert!(!err.contains("RelativeUrlWithoutBase"), "{err}");
+    }
+
+    #[test]
+    fn struct_variants_do_not_print_debug_output() {
+        let path = PathBuf::from("/etc/nisshi/tls.key");
+
+        let messages = [
+            Error::LakeRequiresSchemaRegistry { lake: "iceberg" }.to_string(),
+            Error::TlsRequiresCertAndKey.to_string(),
+            Error::TlsKeyPassphraseRequired { path: path.clone() }.to_string(),
+            Error::TlsKeyLegacyEncrypted { path: path.clone() }.to_string(),
+            Error::TlsKeyUnsupportedEncryption {
+                path,
+                algorithm: "DES-CBC".into(),
+            }
+            .to_string(),
+        ];
+
+        for message in &messages {
+            assert!(
+                !message.contains('{') && !message.contains("path:"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            "the iceberg subcommand requires --schema-registry",
+            messages[0]
+        );
+        assert_eq!(
+            "the --key file /etc/nisshi/tls.key is encrypted, so --key-passphrase-file is required",
+            messages[2]
+        );
     }
 }
