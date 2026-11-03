@@ -54,7 +54,8 @@ static FETCH_AHEAD_OF_CACHED_HIGH_WATERMARK: LazyLock<Counter<u64>> = LazyLock::
         .u64_counter("nisshi_fetch_ahead_of_cached_high_watermark")
         .with_description(
             "Partition reads above this broker's cached high watermark that a fresh read of the \
-             store found in range, and that the broker then served",
+             store found in range, and that the broker then read from the log (once per poll \
+             round, whether or not records came back)",
         )
         .build()
 });
@@ -132,9 +133,9 @@ where
 /// `nisshi_storage_read_deadline_exceeded` counter and the log.
 ///
 /// `operation` is the [`Storage`] method that was read: `fetch` for the
-/// records, `offset_stage` for the offsets. The counter carries it with
-/// the stage of the read, so a slow engine is told apart from a request
-/// that was too wide for its deadline.
+/// records, `offset_stage` or `current_offset_stage` for the offsets. The
+/// counter carries it with the stage of the read, so a slow engine is told
+/// apart from a request that was too wide for its deadline.
 ///
 /// A read that was never started logs at debug: once a slow backend has
 /// spent the read deadline, every partition after it is not started, and a
