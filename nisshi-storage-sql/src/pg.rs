@@ -7393,7 +7393,7 @@ mod tests {
 
         let Some(storage) = storage_with_schema(
             "retention_bytes_sweep_stops_reading_at_the_limit",
-            CONNECTION,
+            &CONNECTION,
             &cluster,
         )
         .await?
