@@ -15,7 +15,10 @@
 //! A partition that holds no state for an idempotent producer accepts the producer's first batch
 //! at any sequence, as in Kafka.
 
-use std::assert_matches;
+use std::{
+    assert_matches, io,
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -131,6 +134,76 @@ async fn a_first_sequence_that_is_negative_is_refused_and_stores_nothing() -> Re
             .produce(None, &topition, idempotent_batch(producer, 40)?)
             .await?
     );
+
+    Ok(())
+}
+
+/// Collects the log lines that a test writes, so that the test can look for one.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLog {
+    fn lines_containing(&self, text: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().expect("log lock"))
+            .lines()
+            .filter(|line| line.contains(text))
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn a_first_batch_above_sequence_zero_is_logged_once_for_its_partition() -> Result<(), Error> {
+    let log = CapturedLog::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish(),
+    );
+
+    let storage = storage()?;
+    create_topic(&storage, "abc", 2).await?;
+    let producer = storage.init_producer(None, 0, Some(-1), Some(-1)).await?.id;
+    let message = "accepted a producer's first batch to a partition at a sequence above 0";
+
+    // A first batch at sequence 0 starts the producer's sequence in the ordinary way.
+    _ = storage
+        .produce(
+            None,
+            &Topition::new("abc", 1),
+            idempotent_batch(producer, 0)?,
+        )
+        .await?;
+    assert_eq!(0, log.lines_containing(message));
+
+    // The partition holds no state for the producer, so it accepts sequence 5 and logs it.
+    let first = Topition::new("abc", 0);
+    _ = storage
+        .produce(None, &first, idempotent_batch(producer, 5)?)
+        .await?;
+    assert_eq!(1, log.lines_containing(message));
+    assert_eq!(1, log.lines_containing(&format!("producer_id={producer}")));
+
+    // The next batch continues the sequence that the partition now holds, so nothing is logged.
+    _ = storage
+        .produce(None, &first, idempotent_batch(producer, 6)?)
+        .await?;
+    assert_eq!(1, log.lines_containing(message));
 
     Ok(())
 }

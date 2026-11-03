@@ -113,20 +113,34 @@ pub enum ProduceEpoch {
     /// transactional producer's newest epoch.
     Continue,
 
-    /// The batch starts its epoch on the partition: at sequence 0 when the partition holds an
-    /// older epoch for the producer, and at any sequence when the partition holds no state for
-    /// the producer. The backend stores the epoch for the producer when the producer does not
-    /// have it yet.
+    /// The batch starts its epoch on the partition, at sequence 0 or, for a backend that asks
+    /// for [`FirstSequence::Any`], at any sequence when the partition holds no state for the
+    /// producer. The backend stores the epoch for the producer when the producer does not have
+    /// it yet.
     Start,
 }
 
+/// Which first sequence a backend accepts from a producer that the partition holds no state
+/// for.
+///
+/// Kafka accepts any first sequence there ([ProducerAppendInfo.java]), and tells a duplicate
+/// from a gap below the stored sequence by the last five batches it remembers. A backend that
+/// keeps no such record answers every sequence below the stored one as a duplicate, so it must
+/// not let a later batch be stored ahead of an earlier one that failed: it asks for
+/// [`FirstSequence::Zero`].
+///
+/// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirstSequence {
+    /// Only sequence 0, as for an epoch bump. The Postgres, libSQL and Turso engines use it.
+    Zero,
+
+    /// Any non-negative sequence. A backend that remembers its recent batches can use it.
+    Any,
+}
+
 impl StoredEpochs {
-    /// Whether the partition holds no state for the producer, at any epoch. A batch to such a
-    /// partition may start at any sequence, as in Kafka ([ProducerAppendInfo.java]), so a
-    /// backend does not compare its first sequence with a next sequence, and stores the sequence
-    /// after the batch.
-    ///
-    /// [ProducerAppendInfo.java]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    /// Whether the partition holds no state for the producer, at any epoch.
     pub fn partition_has_no_state(&self) -> bool {
         self.partition.is_none()
     }
@@ -138,8 +152,9 @@ impl StoredEpochs {
     /// the epoch for each partition. It accepts any epoch higher than the partition's whose
     /// first sequence is 0, and answers
     /// [`OutOfOrderSequenceNumber`](ErrorCode::OutOfOrderSequenceNumber) for any other
-    /// sequence. A partition that holds no state for the producer accepts any epoch and any
-    /// first sequence ([ProducerAppendInfo.java]). We compare with the partition's epoch too,
+    /// sequence. A partition that holds no state for the producer accepts any epoch, and any
+    /// first sequence too in Kafka ([ProducerAppendInfo.java]); see [`FirstSequence`]. We
+    /// compare with the partition's epoch too,
     /// because the Java client retries a batch at its old epoch on one partition after it
     /// bumps the epoch for another ([RecordAccumulator.java]).
     ///
@@ -151,9 +166,9 @@ impl StoredEpochs {
     /// Returns [`OLDER_EPOCH_ERROR`] for an epoch lower than the partition's, as Kafka answers
     /// for a client's batch ([ProducerAppendInfo.java]).
     ///
-    /// Returns [`InvalidRecord`](ErrorCode::InvalidRecord) for a negative first sequence on a
-    /// partition that holds no state for the producer, as Kafka's [`LogValidator`] does for a
-    /// batch with a producer ID.
+    /// With [`FirstSequence::Any`], returns [`InvalidRecord`](ErrorCode::InvalidRecord) for a
+    /// negative first sequence on a partition that holds no state for the producer, as Kafka's
+    /// [`LogValidator`] does for a batch with a producer ID.
     ///
     /// Returns [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch) for:
     /// - a transactional producer's epoch other than its newest. Kafka's coordinator answers
@@ -176,10 +191,11 @@ impl StoredEpochs {
     /// [AddPartitionsToTxnManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AddPartitionsToTxnManager.scala#L225-L228
     /// [TransactionManager.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L535-L542
     /// [RecordAccumulator.java]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java#L920-L935
-    pub fn check_batch(
+    pub fn check_batch_for(
         &self,
         producer_epoch: i16,
         base_sequence: i32,
+        first_sequence: FirstSequence,
     ) -> Result<ProduceEpoch, ErrorCode> {
         // Only a zombie producer sends from a retired producer ID, so the broker answers
         // PRODUCER_FENCED, which the client treats as fatal. INVALID_PRODUCER_EPOCH makes
@@ -188,7 +204,10 @@ impl StoredEpochs {
             return Err(ErrorCode::ProducerFenced);
         }
 
-        if self.partition_has_no_state() && base_sequence < 0 {
+        if first_sequence == FirstSequence::Any
+            && self.partition_has_no_state()
+            && base_sequence < 0
+        {
             return Err(ErrorCode::InvalidRecord);
         }
 
@@ -212,8 +231,22 @@ impl StoredEpochs {
             Some(Ordering::Greater) if base_sequence != 0 => {
                 Err(ErrorCode::OutOfOrderSequenceNumber)
             }
+            None if base_sequence != 0 && first_sequence == FirstSequence::Zero => {
+                Err(ErrorCode::OutOfOrderSequenceNumber)
+            }
             Some(Ordering::Greater) | None => Ok(ProduceEpoch::Start),
         }
+    }
+
+    /// Checks a produced batch as [`check_batch_for`](Self::check_batch_for) does, for a backend
+    /// that accepts only sequence 0 from a producer the partition holds no state for
+    /// ([`FirstSequence::Zero`]).
+    pub fn check_batch(
+        &self,
+        producer_epoch: i16,
+        base_sequence: i32,
+    ) -> Result<ProduceEpoch, ErrorCode> {
+        self.check_batch_for(producer_epoch, base_sequence, FirstSequence::Zero)
     }
 
     /// Whether the partition has moved an idempotent producer on from a batch's epoch: the
@@ -384,6 +417,27 @@ mod tests {
     }
 
     #[test]
+    fn partition_without_state_takes_only_sequence_zero_from_a_backend_that_asks_for_zero() {
+        let unwritten = StoredEpochs {
+            partition: None,
+            ..IDEMPOTENT
+        };
+
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            unwritten.check_batch(5, 1)
+        );
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            unwritten.check_batch(5, -1)
+        );
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            unwritten.check_batch_for(5, 1_000, FirstSequence::Zero)
+        );
+    }
+
+    #[test]
     fn partition_without_state_accepts_any_first_sequence() {
         let unwritten = StoredEpochs {
             partition: None,
@@ -393,9 +447,24 @@ mod tests {
         assert!(unwritten.partition_has_no_state());
         assert!(!IDEMPOTENT.partition_has_no_state());
 
-        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(5, 1));
-        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(4, 1_000));
-        assert_eq!(Ok(ProduceEpoch::Start), unwritten.check_batch(6, i32::MAX));
+        for base_sequence in [0, 1, 1_000, i32::MAX] {
+            assert_eq!(
+                Ok(ProduceEpoch::Start),
+                unwritten.check_batch_for(5, base_sequence, FirstSequence::Any)
+            );
+        }
+    }
+
+    #[test]
+    fn a_partition_with_state_wants_sequence_zero_for_a_newer_epoch_whatever_is_asked() {
+        assert_eq!(
+            Err(ErrorCode::OutOfOrderSequenceNumber),
+            IDEMPOTENT.check_batch_for(4, 1, FirstSequence::Any)
+        );
+        assert_eq!(
+            Ok(ProduceEpoch::Start),
+            IDEMPOTENT.check_batch_for(4, 0, FirstSequence::Any)
+        );
     }
 
     #[test]
@@ -405,14 +474,17 @@ mod tests {
             ..IDEMPOTENT
         };
 
-        assert_eq!(Err(ErrorCode::InvalidRecord), unwritten.check_batch(5, -1));
+        assert_eq!(
+            Err(ErrorCode::InvalidRecord),
+            unwritten.check_batch_for(5, -1, FirstSequence::Any)
+        );
         assert_eq!(
             Err(ErrorCode::InvalidRecord),
             StoredEpochs {
                 partition: None,
                 ..TRANSACTIONAL
             }
-            .check_batch(3, -5)
+            .check_batch_for(3, -5, FirstSequence::Any)
         );
     }
 
@@ -425,7 +497,7 @@ mod tests {
 
         assert_eq!(
             Err(ErrorCode::InvalidProducerEpoch),
-            unwritten.check_batch(32766, 5)
+            unwritten.check_batch_for(32766, 5, FirstSequence::Any)
         );
     }
 

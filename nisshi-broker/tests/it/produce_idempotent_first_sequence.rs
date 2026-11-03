@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A partition that holds no state for an idempotent producer accepts the producer's first batch
-//! at any sequence, as in Kafka. A producer that the broker lost state for (or whose topic was
-//! deleted) resumes at the sequence it had, and a client that is answered an error for that
-//! never recovers.
+//! What a partition that holds no state for an idempotent producer answers to the producer's first
+//! batch.
+//!
+//! The DynoStore engine (the in-memory engine here) accepts any first sequence, as Kafka does,
+//! because it remembers its recent batches and so tells a batch it stored from a gap. The
+//! Postgres, libSQL and Turso engines keep no such record: they answer every sequence below the
+//! stored one as a duplicate, which a Java producer completes as a success. They accept only
+//! sequence 0 as a first batch, so that a later batch is never stored ahead of an earlier one that
+//! failed and is then sent again.
 
 use std::assert_matches;
 
@@ -143,8 +148,80 @@ where
     Ok(())
 }
 
+pub async fn a_batch_that_overtook_a_failed_first_batch_does_not_make_its_resend_a_duplicate<G>(
+    storage: G,
+) -> Result<()>
+where
+    G: Storage,
+{
+    let (topition, producer) = topic_and_producer(&storage).await?;
+
+    // The first batch (sequence 0, three records) never reaches storage. The second batch
+    // (sequence 3) is accepted as the producer's first.
+    assert_eq!(0, produce(&storage, &topition, producer, 3, 1).await?);
+
+    // The client sends the first batch again, whole or in pieces. Neither matches a batch that the
+    // engine remembers, so each is out of order. A duplicate answer would make the client
+    // report records delivered that were never stored.
+    assert_matches!(
+        produce(&storage, &topition, producer, 0, 3).await,
+        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+    );
+    assert_matches!(
+        produce(&storage, &topition, producer, 0, 1).await,
+        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+    );
+    assert_eq!(1, storage.offset_stage(&topition).await?.high_watermark());
+
+    Ok(())
+}
+
+pub async fn a_first_sequence_above_zero_is_out_of_order_and_stores_nothing<G>(
+    storage: G,
+) -> Result<()>
+where
+    G: Storage,
+{
+    let (topition, producer) = topic_and_producer(&storage).await?;
+
+    for base_sequence in [5, -3] {
+        assert_matches!(
+            produce(&storage, &topition, producer, base_sequence, 1).await,
+            Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+        );
+    }
+    assert_eq!(0, storage.offset_stage(&topition).await?.high_watermark());
+
+    // The refused batches left no state, so the producer still starts at sequence 0.
+    assert_eq!(0, produce(&storage, &topition, producer, 0, 2).await?);
+
+    Ok(())
+}
+
+pub async fn a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed<G>(
+    storage: G,
+) -> Result<()>
+where
+    G: Storage,
+{
+    let (topition, producer) = topic_and_producer(&storage).await?;
+
+    // The first batch (sequence 0, three records) never reaches storage. The engine keeps no
+    // record of recent batches, so it refuses the second batch (sequence 3) instead of storing it
+    // ahead of the first, because it could not tell the first batch's resend from a duplicate.
+    assert_matches!(
+        produce(&storage, &topition, producer, 3, 1).await,
+        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+    );
+    assert_eq!(0, produce(&storage, &topition, producer, 0, 3).await?);
+    assert_eq!(3, produce(&storage, &topition, producer, 3, 1).await?);
+
+    Ok(())
+}
+
+/// Runs each listed test above against one engine.
 macro_rules! backend_tests {
-    ($module:ident, $feature:literal, $storage:path) => {
+    ($module:ident, $feature:literal, $storage:path, [$($test:ident),+ $(,)?]) => {
         #[cfg(feature = $feature)]
         mod $module {
             use nisshi_broker::Result;
@@ -157,27 +234,13 @@ macro_rules! backend_tests {
                 $storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
             }
 
-            #[tokio::test]
-            async fn a_new_partition_accepts_any_first_sequence() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::a_new_partition_accepts_any_first_sequence(storage().await?).await
-            }
-
-            #[tokio::test]
-            async fn a_new_partition_accepts_the_largest_first_sequence_and_wraps() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::a_new_partition_accepts_the_largest_first_sequence_and_wraps(
-                    storage().await?,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn a_negative_first_sequence_is_refused_and_stores_nothing() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::a_negative_first_sequence_is_refused_and_stores_nothing(storage().await?)
-                    .await
-            }
+            $(
+                #[tokio::test]
+                async fn $test() -> Result<()> {
+                    let _guard = init_tracing()?;
+                    super::$test(storage().await?).await
+                }
+            )+
         }
     };
 }
@@ -194,7 +257,41 @@ async fn turso_storage(cluster: uuid::Uuid, node: i32) -> Result<nisshi_storage:
     .await
 }
 
-backend_tests!(in_memory, "dynostore", crate::common::memory_storage);
-backend_tests!(lite, "libsql", crate::common::lite_storage);
-backend_tests!(pg, "postgres", crate::common::postgres_storage);
-backend_tests!(turso, "turso", turso_storage);
+backend_tests!(
+    in_memory,
+    "dynostore",
+    crate::common::memory_storage,
+    [
+        a_new_partition_accepts_any_first_sequence,
+        a_new_partition_accepts_the_largest_first_sequence_and_wraps,
+        a_negative_first_sequence_is_refused_and_stores_nothing,
+        a_batch_that_overtook_a_failed_first_batch_does_not_make_its_resend_a_duplicate,
+    ]
+);
+backend_tests!(
+    lite,
+    "libsql",
+    crate::common::lite_storage,
+    [
+        a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
+    ]
+);
+backend_tests!(
+    pg,
+    "postgres",
+    crate::common::postgres_storage,
+    [
+        a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
+    ]
+);
+backend_tests!(
+    turso,
+    "turso",
+    turso_storage,
+    [
+        a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
+    ]
+);

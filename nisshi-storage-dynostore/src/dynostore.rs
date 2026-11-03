@@ -65,12 +65,12 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate_produced, max_message_bytes, offload,
-    producer_claim,
+    FirstSequence, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
+    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate_produced,
+    max_message_bytes, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -2328,14 +2328,34 @@ impl DynoStore {
                     return Err(Error::Api(ErrorCode::UnknownServerError));
                 };
 
+                // dynostore remembers its recent batches, so it can tell a duplicate from a gap
+                // below a stored sequence, and takes any first sequence as Kafka does.
                 let produce_epoch = stored
-                    .check_batch(batch.producer_epoch, batch.base_sequence)
+                    .check_batch_for(
+                        batch.producer_epoch,
+                        batch.base_sequence,
+                        FirstSequence::Any,
+                    )
                     .inspect_err(|error| {
                         debug!(?error, ?stored, producer_epoch = batch.producer_epoch)
                     })
                     .map_err(Error::Api)?;
 
                 if stored.partition_has_no_state() {
+                    // The partition holds no state for the producer, so this rule accepts a
+                    // producer that started its sequence elsewhere, such as one the broker
+                    // expired or whose state was lost. Nothing else shows where a gap in a
+                    // producer's sequence began.
+                    if batch.base_sequence != 0 {
+                        info!(
+                            producer_id = batch.producer_id,
+                            producer_epoch = batch.producer_epoch,
+                            ?topition,
+                            base_sequence = batch.base_sequence,
+                            "accepted a producer's first batch to a partition at a sequence above 0"
+                        );
+                    }
+
                     return Ok(SequenceCheck::Append);
                 }
 
@@ -2468,7 +2488,11 @@ impl DynoStore {
 
                     // with_mut stores each change that this closure makes, also when it
                     // then answers an error, so every check runs before any change.
-                    let produce_epoch = match stored.check_batch(producer_epoch, base_sequence) {
+                    let produce_epoch = match stored.check_batch_for(
+                        producer_epoch,
+                        base_sequence,
+                        FirstSequence::Any,
+                    ) {
                         Ok(produce_epoch) => produce_epoch,
 
                         // A batch that the producer's next epoch superseded after it got its

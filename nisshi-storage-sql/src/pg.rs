@@ -1934,8 +1934,7 @@ impl Postgres {
                 sequence,
             );
 
-            let increment =
-                idempotent_sequence_check(sequence, stored.partition_has_no_state(), deflated)?;
+            let increment = idempotent_sequence_check(sequence, deflated)?;
 
             debug!(increment);
 
