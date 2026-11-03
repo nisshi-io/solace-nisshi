@@ -14,7 +14,10 @@
 
 use crate::{
     database_file,
-    schema::{Action, Migration, RecordedSchema, Schema, plan, upgraded_compatibility},
+    schema::{
+        Action, Migration, RecordedSchema, Schema, announce_upgrade, check_unversioned_tables,
+        plan, report_upgrade, upgraded_compatibility,
+    },
     sql::{
         Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
@@ -1801,6 +1804,11 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// A change to [`DDL`] needs a step here that makes the same change to a file of the version
 /// before it, and a new [`SCHEMA_VERSION`]. A step is a file in `migrations/`.
 ///
+/// Both this list and the create SQL in `ddl/` reach the same schema, and nothing compares the
+/// two results while this list is empty. The change that adds the first step must also add that
+/// comparison: a test that builds a file from a frozen version-1 copy of the DDL plus every step,
+/// builds another from the create SQL, and compares `sqlite_schema` and `pragma table_info`.
+///
 /// A step runs in the transaction that holds the write lock. Brokers that wait for that lock fail
 /// with `SQLITE_BUSY` when a step outlasts their `busy_timeout`. A step that fails rolls the whole
 /// upgrade back and stops the broker.
@@ -1934,6 +1942,8 @@ async fn ensure_schema_of(
     }
 
     if let (Action::Upgrade(steps), Some(recorded)) = (action, recorded) {
+        announce_upgrade(recorded, steps);
+        let started = Instant::now();
         // The rollback is explicit because a transaction that is dropped sends none: the file's
         // connection is closed when this function returns, and that discards the changes.
         if let Err(err) = upgrade_schema(&tx, recorded, steps).await {
@@ -1942,11 +1952,7 @@ async fn ensure_schema_of(
         }
         tx.commit().await?;
 
-        info!(
-            from_version = recorded.version,
-            schema_version = schema.version,
-            "upgraded the schema"
-        );
+        report_upgrade(recorded, steps, started.elapsed());
         return Ok(());
     }
 
@@ -1960,17 +1966,9 @@ async fn ensure_schema_of(
         .await?
         .is_some();
 
-    // The tables that an earlier release created without recording a version may lack tables of
-    // schema version 1, which `create` would add with `if not exists`. When this release's schema
-    // is newer, `create` would add the tables of that newer version instead, and a step would
-    // then change tables that don't match what it expects. The release refuses such a file, and
-    // the operator starts a release that records version 1 first.
-    if has_tables && !schema.migrations.is_empty() {
+    if let Err(err) = check_unversioned_tables(has_tables, schema) {
         _ = tx.rollback().await;
-        return Err(Error::OutdatedSchema {
-            recorded_version: 0,
-            schema_version: schema.version,
-        });
+        return Err(err);
     }
 
     for (name, ddl) in create.iter() {
@@ -2014,7 +2012,14 @@ async fn upgrade_schema(
         _ = tx
             .execute_batch(step.sql)
             .await
-            .inspect_err(|err| error!(to_version = step.to_version, ?err))?;
+            .inspect_err(|err| {
+                error!(
+                    from_version = recorded.version,
+                    to_version = step.to_version,
+                    ?err,
+                    "a schema upgrade step failed, so the upgrade is rolled back and the file stays at its earlier version"
+                );
+            })?;
     }
 
     let Some(last) = steps.last() else {
@@ -7712,17 +7717,39 @@ mod tests {
 
     /// A step that upgrades a file of version 1 to version 2. It adds a table and a row, so that a
     /// step that runs twice fails on the row, and a step that runs in part leaves the table.
-    const UPGRADE_TO_2: &[Migration] = &[Migration {
+    const MARKER_SQL: &str = "create table upgrade_marker (id integer primary key); \
+                              insert into upgrade_marker (id) values (1);";
+
+    const STEP_TO_2: Migration = Migration {
         to_version: 2,
         oldest_compatible_version: 1,
-        sql: "create table upgrade_marker (id integer primary key); \
-              insert into upgrade_marker (id) values (1);",
-    }];
+        breaks_previous_release: false,
+        sql: MARKER_SQL,
+    };
+
+    /// A step that upgrades a file of version 2 to version 3. It needs the table of
+    /// [`STEP_TO_2`], so that it fails when it runs before that step.
+    const STEP_TO_3: Migration = Migration {
+        to_version: 3,
+        oldest_compatible_version: 1,
+        breaks_previous_release: false,
+        sql: "create table upgrade_marker_child \
+              (id integer primary key references upgrade_marker (id)); \
+              insert into upgrade_marker_child (id) select id from upgrade_marker;",
+    };
+
+    const UPGRADE_TO_2: &[Migration] = &[STEP_TO_2];
 
     const SCHEMA_2: Schema = Schema {
         version: 2,
         oldest_compatible_version: 1,
         migrations: UPGRADE_TO_2,
+    };
+
+    const SCHEMA_3: Schema = Schema {
+        version: 3,
+        oldest_compatible_version: 1,
+        migrations: &[STEP_TO_2, STEP_TO_3],
     };
 
     async fn upgrade_to_2(db: &Database) -> Result<()> {
@@ -7834,6 +7861,7 @@ mod tests {
             migrations: &[Migration {
                 to_version: 2,
                 oldest_compatible_version: 1,
+                breaks_previous_release: false,
                 sql: "create table upgrade_marker (id integer primary key); \
                       insert into no_such_table (id) values (1);",
             }],
@@ -7916,6 +7944,124 @@ mod tests {
             .map(|row| row.get::<i32>(0))
             .transpose()?;
         assert_eq!(oldest, Some(2));
+        Ok(())
+    }
+
+    /// Returns the version and the `oldest_compatible_version` that `db` records.
+    async fn recorded_versions(db: &Database) -> Result<(i32, i32)> {
+        db.connect()?
+            .query(
+                "select version, oldest_compatible_version from nisshi_schema_version",
+                (),
+            )
+            .await?
+            .next()
+            .await?
+            .map(|row| Ok::<_, Error>((row.get::<i32>(0)?, row.get::<i32>(1)?)))
+            .transpose()?
+            .ok_or_else(|| Error::Message(String::from("no recorded version")))
+    }
+
+    /// A step that leaves a schema that only version 2 can use must make the file record that.
+    /// The release of version 1 must then refuse the file and change nothing.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_records_the_compatibility_of_its_step() -> Result<()> {
+        const BREAKING: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 2,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 2,
+                breaks_previous_release: true,
+                sql: MARKER_SQL,
+            }],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+        assert_eq!(recorded_versions(&db).await?, (1, 1));
+
+        ensure_schema_of(&db, Duration::from_secs(5), &BREAKING, &DDL).await?;
+        assert_eq!(recorded_versions(&db).await?, (2, 2));
+
+        assert_matches!(
+            ensure_schema(&db, Duration::from_secs(5)).await,
+            Err(Error::IncompatibleSchema {
+                recorded_version: 2,
+                oldest_compatible_version: 2,
+                schema_version: 1,
+            })
+        );
+        assert_eq!(recorded_versions(&db).await?, (2, 2));
+        assert_eq!(count(&db, "upgrade_marker").await?, 1);
+        Ok(())
+    }
+
+    /// An upgrade from version 1 to version 3 must run both steps in order, in one transaction,
+    /// and record version 3.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_over_two_steps() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        ensure_schema_of(&db, Duration::from_secs(5), &SCHEMA_3, &DDL).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(3));
+        assert_eq!(count(&db, "upgrade_marker").await?, 1);
+        assert_eq!(count(&db, "upgrade_marker_child").await?, 1);
+        Ok(())
+    }
+
+    /// A file of version 2 has run the first step already. The upgrade to version 3 must run only
+    /// the second step: the first one fails when it runs again, because its table exists.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_runs_only_the_steps_after_the_recorded_version() -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+        upgrade_to_2(&db).await?;
+
+        ensure_schema_of(&db, Duration::from_secs(5), &SCHEMA_3, &DDL).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(3));
+        assert_eq!(count(&db, "upgrade_marker_child").await?, 1);
+        Ok(())
+    }
+
+    /// When the second step of an upgrade from version 1 fails, the first step's changes must be
+    /// undone too, and the file must still record version 1.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_every_step_when_the_last_one_fails() -> Result<()> {
+        const BROKEN_STEP_TO_3: Migration = Migration {
+            sql: "insert into no_such_table (id) values (1);",
+            ..STEP_TO_3
+        };
+        const BROKEN_3: Schema = Schema {
+            migrations: &[STEP_TO_2, BROKEN_STEP_TO_3],
+            ..SCHEMA_3
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_matches!(
+            ensure_schema_of(&db, Duration::from_secs(5), &BROKEN_3, &DDL).await,
+            Err(_)
+        );
+
+        assert_eq!(recorded_version(&db).await?, Some(1));
+        assert_matches!(count(&db, "upgrade_marker").await, Err(_));
         Ok(())
     }
 

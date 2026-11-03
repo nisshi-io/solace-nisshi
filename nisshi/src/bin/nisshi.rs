@@ -394,14 +394,21 @@ fn report_error(err: &nisshi_cli::Error) {
                             use. This release has schema version {schema_version}: upgrade Nisshi."
                     ),
                     nisshi_storage::Error::OutdatedSchema {
+                        recorded_version: 0,
+                        schema_version,
+                    } => report_failure!(
+                        "storage {storage} has Nisshi tables but records no schema version, and \
+                            this release has schema version {schema_version} with steps that \
+                            upgrade only a recorded version. Start a release that records schema \
+                            version 1 once, such as 0.8, then start this one."
+                    ),
+                    nisshi_storage::Error::OutdatedSchema {
                         recorded_version,
                         schema_version,
                     } => report_failure!(
                         "storage {storage} records schema version {recorded_version}, which is \
                             older than this release's schema version {schema_version}, and \
-                            this release has no step that upgrades it. Version 0 means the \
-                            database has Nisshi tables but records no version: start a release \
-                            that records schema version 1 first, such as 0.8, then this one."
+                            this release has no step that upgrades it."
                     ),
                     #[cfg(feature = "postgres")]
                     nisshi_storage::Error::TokioPostgres(err)
