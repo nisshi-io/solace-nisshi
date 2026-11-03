@@ -35,3 +35,11 @@ sql_row! {
         value: Option<bytes::Bytes>,
     }
 }
+
+/// The offset of each header's record in the same result, read without the header's key and
+/// value.
+///
+/// The PostgreSQL engine groups the headers by their record's offset, and reads a whole [`Row`]
+/// only for the records that it returns before the fetch's deadline, so that it does not copy a
+/// header that it then drops.
+pub(crate) use super::row::record_offset as offset;

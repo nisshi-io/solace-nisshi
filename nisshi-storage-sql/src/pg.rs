@@ -1439,17 +1439,28 @@ impl Postgres {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let mut headers: BTreeMap<i64, Vec<header_fetch_range::Row>> = BTreeMap::new();
-            for header in self
-                .prepare_query_rows(
+            let (header_columns, header_rows, header_column_errors) = self
+                .prepare_query_result(
                     &tx,
-                    header_fetch_range::QUERY,
+                    header_fetch_range::QUERY.key(),
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
                 )
                 .await
-                .inspect_err(|err| error!(?err))?
-            {
-                headers.entry(header.offset_id).or_default().push(header);
+                .inspect_err(|err| error!(?err))?;
+
+            let header_reader = header_fetch_range::RowReader::new(&header_columns)
+                .inspect_err(|err| header_column_errors.record(err))?;
+            let header_offset_reader = header_fetch_range::offset::RowReader::new(&header_columns)
+                .inspect_err(|err| header_column_errors.record(err))?;
+
+            // The loop below reads a header's key and value only for a record that it builds,
+            // so that a fetch that stops at its deadline does not copy a header that it drops.
+            let mut headers: BTreeMap<i64, Vec<&Row>> = BTreeMap::new();
+            for header in &header_rows {
+                let offset = header_offset_reader
+                    .read_row(header)
+                    .inspect_err(|err| header_column_errors.record(err))?;
+                headers.entry(offset.offset_id).or_default().push(header);
             }
 
             for record in iter::once(Ok(first)).chain(records) {
@@ -1515,6 +1526,9 @@ impl Postgres {
                     .value(value);
 
                 for header in headers.remove(&offset).unwrap_or_default() {
+                    let header = header_reader
+                        .read_row(header)
+                        .inspect_err(|err| header_column_errors.record(err))?;
                     let mut header_builder = Header::builder();
 
                     if let Some(key) = header.key {
