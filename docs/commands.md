@@ -171,11 +171,16 @@ environment variable when the option is absent. The `.env` file is read too.
 | `--tls-cert-file <PEM>`, `--tls-key-file <PEM>` | `TLS_CERT_FILE`, `TLS_KEY_FILE` | The client certificate chain and private key, for a broker that asks for one. Give both |
 | `--tls-key-passphrase-file <file>` | `TLS_KEY_PASSPHRASE_FILE` | The passphrase of an encrypted PKCS#8 key, as for the broker's `--key-passphrase-file` |
 | `--tls-server-name <name>` | `TLS_SERVER_NAME` | Check the broker's certificate against this name instead of the host of `--broker` |
-| `--tls-no-hostname-check` | | Accept a certificate for another name. The certificate chain is still checked. This is Kafka's empty `ssl.endpoint.identification.algorithm` |
+| `--tls-no-hostname-check` | | Accept a certificate for another name. The certificate chain is still checked. This is Kafka's empty `ssl.endpoint.identification.algorithm`. Without `--tls-ca-file`, the system's CA certificates sign the chain, so a certificate that any public CA issued for any name passes, and the command prints a warning. Give `--tls-ca-file` with this option |
 | `--sasl-username <name>` | `SASL_USERNAME` | Log in with SASL as this user |
 | | `SASL_PASSWORD` | The password |
 | `--sasl-password-file <file>` | `SASL_PASSWORD_FILE` | A file with the password (a trailing newline is not part of it), in place of `SASL_PASSWORD`. Setting both is an error |
 | `--sasl-mechanism <mechanism>` | `SASL_MECHANISM` | `plain`, `scram-sha-256` or `scram-sha-512` (the default) |
+
+These variable names are the same ones that other Kafka tools and CI setups use. A shell or
+`.env` that already sets `SASL_USERNAME` makes every one of these commands log in, and one that
+sets `TLS_CA_FILE` makes them connect over TLS, even when you pass no option. Unset the variable
+for a command that must connect in plaintext.
 
 There is no option for the password itself, because an option is in your shell history and
 in the process list. `SASL_PASSWORD` and `SASL_USERNAME` together are Kafka's `SASL_SSL` with

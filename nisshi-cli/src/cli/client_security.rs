@@ -117,6 +117,12 @@ impl ClientSecurity {
             || self.tls_no_hostname_check
     }
 
+    /// Whether the name check is off while the system's CA certificates sign the broker's
+    /// certificate, so that a certificate which a public CA issued for any name passes.
+    fn accepts_any_public_certificate(&self) -> bool {
+        self.tls_no_hostname_check && self.tls_ca_file.is_none()
+    }
+
     fn tls_config(&self) -> Result<Option<Tls>> {
         if !self.tls_enabled() {
             return Ok(None);
@@ -196,6 +202,13 @@ impl ClientSecurity {
         {
             eprintln!(
                 "warning: SASL PLAIN without TLS sends the password in clear text; add --tls"
+            );
+        }
+
+        if self.accepts_any_public_certificate() {
+            eprintln!(
+                "warning: --tls-no-hostname-check without --tls-ca-file accepts a certificate that \
+                 any public CA issued for any name; add --tls-ca-file"
             );
         }
 
@@ -360,6 +373,21 @@ mod tests {
             build(&["--tls-ca-file", "/no/such/file"], None),
             Err(Error::TlsCertificate { .. })
         ));
+    }
+
+    #[test]
+    fn no_hostname_check_warns_unless_a_ca_file_limits_the_trust() {
+        assert!(
+            parse(&["--tls-no-hostname-check"])
+                .unwrap()
+                .accepts_any_public_certificate()
+        );
+        assert!(
+            !parse(&["--tls-no-hostname-check", "--tls-ca-file", "ca.pem"])
+                .unwrap()
+                .accepts_any_public_certificate()
+        );
+        assert!(!parse(&["--tls"]).unwrap().accepts_any_public_certificate());
     }
 
     #[test]
