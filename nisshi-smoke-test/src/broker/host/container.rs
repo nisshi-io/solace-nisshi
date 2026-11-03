@@ -393,7 +393,7 @@ fn remove_container(name: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{thread, time::Duration};
 
     use super::{LOG_MIN_TIMEOUT, collect_log, time_left};
 
@@ -469,15 +469,21 @@ mod tests {
     }
 
     #[test]
-    fn collect_log_gives_each_ask_no_more_than_the_window() {
+    fn collect_log_gives_each_ask_what_is_left_of_the_window() {
+        const ASK_DURATION: Duration = Duration::from_millis(20);
         let mut timeouts = vec![];
 
         _ = collect_log(2, Duration::ZERO, WINDOW, |timeout| {
             timeouts.push(timeout);
+            // The first ask takes this long, so the second ask has at most `WINDOW` minus this
+            // long. A `collect_log` that passed `WINDOW` itself would give the second ask `WINDOW`.
+            thread::sleep(ASK_DURATION);
             Err("timed out".to_owned())
         });
 
-        assert!(timeouts.iter().all(|timeout| *timeout <= WINDOW));
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[0] > WINDOW - ASK_DURATION, "{timeouts:?}");
+        assert!(timeouts[1] <= WINDOW - ASK_DURATION, "{timeouts:?}");
     }
 
     #[test]
