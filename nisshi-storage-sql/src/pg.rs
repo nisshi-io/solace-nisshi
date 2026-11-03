@@ -107,10 +107,11 @@ use uuid::Uuid;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        ColumnErrorCount, QueryRow, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        result_columns::ResultColumns, topic_configuration_select, topic_configuration_select_keys,
-        topic_select, txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        ColumnErrorCount, Query, QueryRow, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, result_columns::ResultColumns,
+        topic_configuration_select, topic_configuration_select_keys, topic_select,
+        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
         txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -1859,7 +1860,7 @@ impl Postgres {
         debug!(transaction_id, ?deflated);
 
         let epochs = self
-            .prepare_query_optional_row::<producer_epochs_select::Row>(
+            .prepare_query_optional_row(
                 tx,
                 producer_epochs_select::QUERY,
                 &[
@@ -2100,7 +2101,7 @@ impl Postgres {
         // the broker reads `message.timestamp.type` through here for each topic of each produce
         // request.
         let rows = self
-            .prepare_query_rows::<topic_configuration_select_keys::Row>(
+            .prepare_query_rows(
                 c,
                 topic_configuration_select_keys::QUERY,
                 &[&self.cluster.as_str(), &name, &keys],
@@ -2137,7 +2138,7 @@ impl Postgres {
         }
 
         Ok(Some(
-            self.prepare_query_rows::<topic_configuration_select::Row>(
+            self.prepare_query_rows(
                 c,
                 topic_configuration_select::QUERY,
                 &[&self.cluster.as_str(), &name],
@@ -2244,9 +2245,10 @@ impl Postgres {
     async fn prepare_query_rows<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<T>> {
+        let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
         let reader = T::reader(&ResultColumns::postgres(query, &statement))
             .inspect_err(|err| self.column_error_count(sql).record(err))?;
@@ -2277,9 +2279,10 @@ impl Postgres {
     async fn prepare_query_optional_row<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<T>> {
+        let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
         let reader = T::reader(&ResultColumns::postgres(query, &statement))
             .inspect_err(|err| self.column_error_count(sql).record(err))?;

@@ -27,9 +27,9 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, ColumnErrorCount, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
-        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, consumer_group_select,
+        consumer_offset_select, consumer_offset_select_by_group, default_hash,
+        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         txn_offset_commit_tp_select_pending, txn_produce_partition_check,
         txn_produce_partition_select, watermark_select_for_write,
@@ -379,9 +379,10 @@ impl Engine {
     async fn query_rows<T: QueryRow>(
         &self,
         connection: &Connection,
-        query: &'static str,
+        query: Query<T>,
         params: impl IntoParams,
     ) -> Result<QueryRowCursor<turso::Rows, T>> {
+        let query = query.key();
         let sql = sql_lookup(query)?;
         let rows = connection.query(&sql, params).await?;
         QueryRowCursor::new(
@@ -411,9 +412,10 @@ impl Engine {
     async fn query_first<T: QueryRow>(
         &self,
         connection: &Connection,
-        query: &'static str,
+        query: Query<T>,
         params: impl IntoParams,
     ) -> Result<Option<T>> {
+        let query = query.key();
         let sql = sql_lookup(query)?;
 
         // The params hold record data, so we log only the SQL.
@@ -527,7 +529,7 @@ impl Engine {
         debug!(transaction_id, ?deflated);
 
         let epochs = self
-            .query_first::<producer_epochs_select::Row>(
+            .query_first(
                 connection,
                 producer_epochs_select::QUERY,
                 (
@@ -2907,7 +2909,7 @@ impl Storage for Engine {
 
         if rows.next().await?.is_some() {
             let mut rows = self
-                .query_rows::<topic_configuration_select::Row>(
+                .query_rows(
                     &c,
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
@@ -3219,11 +3221,7 @@ impl Storage for Engine {
         let mut listed_groups = vec![];
 
         let mut rows = self
-            .query_rows::<consumer_group_select::Row>(
-                &c,
-                consumer_group_select::QUERY,
-                &[self.cluster.as_str()],
-            )
+            .query_rows(&c, consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
         while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {

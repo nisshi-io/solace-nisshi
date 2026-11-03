@@ -16,9 +16,9 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, ColumnErrorCount, QueryRow, QueryRowCursor, consumer_group_select, consumer_offset_select,
-        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, consumer_group_select,
+        consumer_offset_select, consumer_offset_select_by_group, default_hash,
+        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
         result_columns::ResultColumns, topic_configuration_select, topic_select,
         txn_offset_commit_tp_select_pending, txn_produce_partition_check,
         txn_produce_partition_select, watermark_select_for_write,
@@ -506,9 +506,10 @@ impl PoolConnection {
     /// Runs `query`, and returns its rows, each read as `T` when the caller reaches it.
     async fn query_rows<T: QueryRow>(
         &self,
-        query: &'static str,
+        query: Query<T>,
         params: impl IntoParams,
     ) -> Result<QueryRowCursor<Rows, T>> {
+        let query = query.key();
         let rows = self.query(query, params).await?;
         QueryRowCursor::new(
             &ResultColumns::libsql(query, &rows),
@@ -531,9 +532,10 @@ impl PoolConnection {
     #[instrument(skip_all)]
     async fn query_first<T: QueryRow>(
         &self,
-        query: &'static str,
+        query: Query<T>,
         params: impl IntoParams,
     ) -> Result<Option<T>> {
+        let query = query.key();
         // The params hold record data and SCRAM credentials, so we log only the SQL.
         debug!(sql = query);
 
@@ -836,7 +838,7 @@ impl Delegate {
         connection: &PoolConnection,
     ) -> Result<()> {
         let epochs = connection
-            .query_first::<producer_epochs_select::Row>(
+            .query_first(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -4312,7 +4314,7 @@ impl Storage for Delegate {
 
         if rows.next().await?.is_some() {
             let mut rows = c
-                .query_rows::<topic_configuration_select::Row>(
+                .query_rows(
                     topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
@@ -4579,10 +4581,7 @@ impl Storage for Delegate {
         let mut listed_groups = vec![];
 
         let mut rows = c
-            .query_rows::<consumer_group_select::Row>(
-                consumer_group_select::QUERY,
-                &[self.cluster.as_str()],
-            )
+            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
         while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {

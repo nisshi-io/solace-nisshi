@@ -101,9 +101,50 @@ macro_rules! sql_row {
     };
 }
 
+/// A query whose result an engine reads as rows of `R`: the query's name in the SQL cache, typed
+/// with its row.
+///
+/// The query's module declares it as `QUERY`, beside the row. An engine's query helpers take a
+/// `Query<T>` and return rows of `T`, so a call site can't pass one query with another query's
+/// row, which compiles and reads the wrong columns when both have columns of the same names.
+pub(crate) struct Query<R> {
+    key: &'static str,
+    row: PhantomData<fn() -> R>,
+}
+
+impl<R> Query<R> {
+    /// Returns the query that the SQL cache holds under `key`.
+    pub(crate) const fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            row: PhantomData,
+        }
+    }
+
+    /// Returns the query's name in the SQL cache.
+    pub(crate) const fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+// A derive would require `R: Clone` and `R: Copy`, which a row is not.
+impl<R> Clone for Query<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for Query<R> {}
+
+impl<R> fmt::Debug for Query<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Query").field(&self.key).finish()
+    }
+}
+
 /// A row of one query's result, which [`sql_row!`] declares, read by column name. An engine's query
-/// helpers take the row type, as in `query_first::<topic_select_name::Row>`, and return each row
-/// read as it.
+/// helpers take the row's [`Query`], as in `query_first(topic_select_name::QUERY, params)`, and
+/// return each row read as it.
 pub(crate) trait QueryRow: Sized {
     /// The reader that finds each column of a result by its name, before the first row.
     type Reader;
@@ -210,7 +251,9 @@ use nisshi_storage::{Error, ProduceEpoch, Result, StoredEpochs};
 use opentelemetry::{KeyValue, metrics::Counter};
 use std::{
     cmp::Ordering,
+    fmt,
     hash::{DefaultHasher, Hash, Hasher as _},
+    marker::PhantomData,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -277,7 +320,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/consumer_group_select_by_name.sql"),
         ),
         (
-            consumer_group_select::QUERY,
+            consumer_group_select::QUERY.key(),
             include_sql!("sql/consumer_group_select.sql"),
         ),
         (
@@ -412,7 +455,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/producer_epoch_insert_given.sql"),
         ),
         (
-            producer_epochs_select::QUERY,
+            producer_epochs_select::QUERY.key(),
             include_sql!("sql/producer_epochs_select.sql"),
         ),
         (
@@ -485,7 +528,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_configuration_delete.sql"),
         ),
         (
-            topic_configuration_select::QUERY,
+            topic_configuration_select::QUERY.key(),
             include_sql!("sql/topic_configuration_select.sql"),
         ),
         (
@@ -519,7 +562,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("pg/topic_select_uuid.sql"),
         ),
         (
-            topic_configuration_select_keys::QUERY,
+            topic_configuration_select_keys::QUERY.key(),
             include_sql!("pg/topic_configuration_select_keys.sql"),
         ),
         (
@@ -680,11 +723,11 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/watermark_insert.sql"),
         ),
         (
-            watermark_select_for_write::QUERY,
+            watermark_select_for_write::QUERY.key(),
             include_sql!("sql/watermark_select_for_write.sql"),
         ),
         (
-            watermark_select_for_write::LITE_QUERY,
+            watermark_select_for_write::LITE_QUERY.key(),
             include_sql!("lite/watermark_select_for_write.sql"),
         ),
         (

@@ -19,8 +19,10 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the producer ID, `$3` the
 //! topic's name, and `$4` the partition's index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "producer_epochs_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("producer_epochs_select.sql");
 
 sql_row! {
     /// The epochs that a produced batch is checked against.
