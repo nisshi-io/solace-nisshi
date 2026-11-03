@@ -361,6 +361,28 @@ impl Meta {
             .unwrap_or(BTreeMap::new())
     }
 
+    /// Whether the broker once allocated `producer_id`: it is below the newest producer ID,
+    /// which [`Meta::forget_producer`] never removes. An ID above it was never allocated.
+    fn once_allocated(&self, producer_id: ProducerId) -> bool {
+        producer_id > 0
+            && self
+                .producers
+                .last_key_value()
+                .is_some_and(|(newest, _)| producer_id < *newest)
+    }
+
+    /// Removes the producer and returns whether it did. The newest producer ID stays, because
+    /// [`allocate_producer_id`] adds one to it for the next ID, and [`Meta::once_allocated`]
+    /// treats an ID above it as one that the broker never allocated.
+    fn forget_producer(&mut self, producer_id: ProducerId) -> bool {
+        let is_newest = self
+            .producers
+            .last_key_value()
+            .is_some_and(|(newest, _)| *newest == producer_id);
+
+        !is_newest && self.producers.remove(&producer_id).is_some()
+    }
+
     /// Whether a transactional ID owns the producer ID.
     fn transactional_id_owns(&self, producer_id: ProducerId) -> bool {
         self.transactions
@@ -565,9 +587,56 @@ struct ProducerDetail {
     /// empty, so a producer that never bumps its epoch adds nothing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     epoch_starts: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, i64>>>,
+    /// Whether the broker recreated the producer from a batch, after it lost the producer's
+    /// state while the client kept its sequences. A batch to a partition that holds no state
+    /// for the producer may then start at any sequence, as Kafka accepts a producer's first
+    /// batch to a partition at any sequence.
+    ///
+    /// A producer that the broker never lost state for starts a new partition at sequence 0.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    state_was_lost: bool,
 }
 
 impl ProducerDetail {
+    /// The state of a producer that the broker allocated and no longer holds: no partitions, and
+    /// the epoch that the client sent.
+    ///
+    /// The client resumes at the sequence it had, so this producer's first batch to a
+    /// partition may start at any sequence, as in Kafka. Kafka checks this in
+    /// [`ProducerAppendInfo.checkSequence`].
+    ///
+    /// [`ProducerAppendInfo.checkSequence`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/ProducerAppendInfo.java#L96-L143
+    fn recreated(epoch: ProducerEpoch) -> Self {
+        Self {
+            sequences: BTreeMap::from([(epoch, BTreeMap::new())]),
+            state_was_lost: true,
+            ..Default::default()
+        }
+    }
+
+    /// Returns whether a batch to the partition that `stored` describes may start at any
+    /// sequence: the broker lost the producer's state, and the partition holds none for it.
+    ///
+    /// Returns [`ErrorCode::InvalidRecord`] for a resumed batch with a negative `base_sequence`,
+    /// as Kafka's [`LogValidator`] does for any batch of a producer.
+    ///
+    /// [`LogValidator`]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L513-L516
+    fn resumes_without_state(
+        &self,
+        stored: &StoredEpochs,
+        base_sequence: Sequence,
+    ) -> Result<bool> {
+        if !(self.state_was_lost && stored.partition.is_none()) {
+            return Ok(false);
+        }
+
+        if base_sequence < 0 {
+            return Err(Error::Api(ErrorCode::InvalidRecord));
+        }
+
+        Ok(true)
+    }
+
     /// Returns the epochs that a batch from this producer to `topition` is checked against.
     fn stored_epochs(&self, transactional: bool, topition: &Topition) -> Option<StoredEpochs> {
         let newest = *self.sequences.keys().next_back()?;
@@ -651,7 +720,9 @@ impl ProducerDetail {
             ProduceEpoch::Start => self.start_epoch(epoch, topition, base_offset),
         };
 
-        *sequence += last_offset_delta + 1;
+        // The batch starts at the partition's next sequence, except the first batch of a
+        // producer whose state the broker lost, which may start at any sequence.
+        *sequence = produced_batches::next_sequence(base_sequence, last_offset_delta);
 
         self.batches
             .entry(epoch)
@@ -746,6 +817,7 @@ fn allocate_producer_id(
             sequences: BTreeMap::from([(0, BTreeMap::new())]),
             batches: BTreeMap::new(),
             epoch_starts: BTreeMap::new(),
+            state_was_lost: false,
         },
     );
 
@@ -2264,9 +2336,24 @@ impl DynoStore {
         let check = self
             .meta
             .with(&self.object_store, |meta| {
-                let Some(pd) = meta.producers.get(&batch.producer_id) else {
-                    debug!(producer_id = batch.producer_id, ?meta.producers);
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                // A producer that the broker no longer holds is not an unknown one. Kafka
+                // accepts its next batch as the first of a new producer, and a Java client that
+                // is answered UNKNOWN_PRODUCER_ID retries with the same producer ID and never
+                // recovers.
+                let recreated;
+
+                let pd = match meta.producers.get(&batch.producer_id) {
+                    Some(pd) => pd,
+
+                    None if meta.once_allocated(batch.producer_id) => {
+                        recreated = ProducerDetail::recreated(batch.producer_epoch);
+                        &recreated
+                    }
+
+                    None => {
+                        debug!(producer_id = batch.producer_id, ?meta.producers);
+                        return Err(Error::Api(ErrorCode::UnknownProducerId));
+                    }
                 };
 
                 let Some(stored) = pd.stored_epochs(
@@ -2277,13 +2364,25 @@ impl DynoStore {
                     return Err(Error::Api(ErrorCode::UnknownServerError));
                 };
 
-                let (sequence, remembered_batches) = match stored
-                    .check_batch(batch.producer_epoch, batch.base_sequence)
+                let resumes = pd.resumes_without_state(&stored, batch.base_sequence)?;
+
+                // The epoch check also refuses a first sequence above 0 on a partition that
+                // holds no state, so a resuming batch is checked as if it started at 0.
+                let produce_epoch = stored
+                    .check_batch(
+                        batch.producer_epoch,
+                        if resumes { 0 } else { batch.base_sequence },
+                    )
                     .inspect_err(|error| {
                         debug!(?error, ?stored, producer_epoch = batch.producer_epoch)
                     })
-                    .map_err(Error::Api)?
-                {
+                    .map_err(Error::Api)?;
+
+                if resumes {
+                    return Ok(SequenceCheck::Append);
+                }
+
+                let (sequence, remembered_batches) = match produce_epoch {
                     ProduceEpoch::Continue => (
                         pd.next_sequence(batch.producer_epoch, topition),
                         pd.remembered_batches(batch.producer_epoch, topition),
@@ -2388,86 +2487,120 @@ impl DynoStore {
             .with_mut(&self.object_store, |meta| {
                 let transactional = transactional || meta.transactional_id_owns(producer_id);
 
-                let Some(pd) = meta.producers.get_mut(&producer_id) else {
-                    debug!(producer_id, ?meta.producers);
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                };
+                let recreated =
+                    !meta.producers.contains_key(&producer_id) && meta.once_allocated(producer_id);
 
-                let Some(stored) = pd.stored_epochs(transactional, topition) else {
-                    debug!(producer_id, "no epoch");
-                    return Err(Error::Api(ErrorCode::UnknownServerError));
-                };
-
-                // with_mut stores each change that this closure makes, also when it
-                // then answers an error, so every check runs before any change.
-                let produce_epoch = match stored.check_batch(producer_epoch, base_sequence) {
-                    Ok(produce_epoch) => produce_epoch,
-
-                    // A batch that the producer's next epoch superseded after it got its
-                    // offset is in the log ahead of that epoch's batches, and Kafka
-                    // acknowledges such a batch too. Its sequence belongs to the older epoch,
-                    // so nothing advances. This compares offsets instead of relying on the
-                    // watermark fence, because the fence does not cover a producer that the
-                    // watermark has forgotten.
-                    Err(error)
-                        if stored.is_superseded(producer_epoch)
-                            && pd.is_ahead_of_next_epoch(producer_epoch, topition, offset) =>
-                    {
-                        info!(
-                            ?error,
-                            ?stored,
-                            producer_id,
-                            producer_epoch,
-                            offset,
-                            ?topition,
-                            "acknowledged a batch that a newer epoch superseded after it was \
-                             given its offset"
-                        );
-                        return Ok(());
-                    }
-
-                    Err(error) => {
-                        debug!(?error, ?stored, producer_epoch);
-                        return Err(Error::Api(error));
-                    }
-                };
-
-                let (sequence, remembered_batches) = match produce_epoch {
-                    ProduceEpoch::Continue => (
-                        pd.next_sequence(producer_epoch, topition),
-                        pd.remembered_batches(producer_epoch, topition),
-                    ),
-
-                    ProduceEpoch::Start => (0, None),
-                };
-
-                // A concurrent retry of the same batch can be stored and
-                // advance the sequence first. This write is then a second
-                // copy, and the client gets an error for it instead of
-                // the duplicate's offset.
-                if let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
-                    sequence,
-                    remembered_batches,
-                    base_sequence,
-                    last_offset_delta,
-                )
-                .inspect_err(|_| debug!(sequence, base_sequence))?
-                {
-                    debug!(sequence, base_sequence);
-                    return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
+                if recreated {
+                    _ = meta
+                        .producers
+                        .insert(producer_id, ProducerDetail::recreated(producer_epoch));
                 }
 
-                debug!(sequence, delta = last_offset_delta + 1);
-                pd.advance(
-                    producer_epoch,
-                    produce_epoch,
-                    topition,
-                    base_sequence,
-                    last_offset_delta,
-                    offset,
-                );
+                // with_mut stores the recreated entry also when a check below refuses the
+                // batch, so the entry goes again then.
+                let outcome = (|| -> Result<()> {
+                    let Some(pd) = meta.producers.get_mut(&producer_id) else {
+                        debug!(producer_id, ?meta.producers);
+                        return Err(Error::Api(ErrorCode::UnknownProducerId));
+                    };
 
-                Ok(())
+                    let Some(stored) = pd.stored_epochs(transactional, topition) else {
+                        debug!(producer_id, "no epoch");
+                        return Err(Error::Api(ErrorCode::UnknownServerError));
+                    };
+
+                    let resumes = pd.resumes_without_state(&stored, base_sequence)?;
+
+                    // with_mut stores each change that this closure makes, also when it
+                    // then answers an error, so every check runs before any change. The epoch
+                    // check also refuses a first sequence above 0 on a partition that holds no
+                    // state, so a resuming batch is checked as if it started at 0.
+                    let produce_epoch = match stored
+                        .check_batch(producer_epoch, if resumes { 0 } else { base_sequence })
+                    {
+                        Ok(produce_epoch) => produce_epoch,
+
+                        // A batch that the producer's next epoch superseded after it got its
+                        // offset is in the log ahead of that epoch's batches, and Kafka
+                        // acknowledges such a batch too. Its sequence belongs to the older epoch,
+                        // so nothing advances. This compares offsets instead of relying on the
+                        // watermark fence, because the fence does not cover a producer that the
+                        // watermark has forgotten.
+                        Err(error)
+                            if stored.is_superseded(producer_epoch)
+                                && pd.is_ahead_of_next_epoch(producer_epoch, topition, offset) =>
+                        {
+                            info!(
+                                ?error,
+                                ?stored,
+                                producer_id,
+                                producer_epoch,
+                                offset,
+                                ?topition,
+                                "acknowledged a batch that a newer epoch superseded after it was \
+                             given its offset"
+                            );
+                            return Ok(());
+                        }
+
+                        Err(error) => {
+                            debug!(?error, ?stored, producer_epoch);
+                            return Err(Error::Api(error));
+                        }
+                    };
+
+                    let (sequence, remembered_batches) = match produce_epoch {
+                        ProduceEpoch::Continue => (
+                            pd.next_sequence(producer_epoch, topition),
+                            pd.remembered_batches(producer_epoch, topition),
+                        ),
+
+                        ProduceEpoch::Start => (0, None),
+                    };
+
+                    // A concurrent retry of the same batch can be stored and
+                    // advance the sequence first. This write is then a second
+                    // copy, and the client gets an error for it instead of
+                    // the duplicate's offset.
+                    if !resumes
+                        && let SequenceCheck::Duplicate { .. } = produced_batches::check_sequence(
+                            sequence,
+                            remembered_batches,
+                            base_sequence,
+                            last_offset_delta,
+                        )
+                        .inspect_err(|_| debug!(sequence, base_sequence))?
+                    {
+                        debug!(sequence, base_sequence);
+                        return Err(Error::Api(ErrorCode::DuplicateSequenceNumber));
+                    }
+
+                    debug!(sequence, delta = last_offset_delta + 1);
+                    pd.advance(
+                        producer_epoch,
+                        produce_epoch,
+                        topition,
+                        base_sequence,
+                        last_offset_delta,
+                        offset,
+                    );
+
+                    Ok(())
+                })();
+
+                if recreated && outcome.is_err() {
+                    _ = meta.forget_producer(producer_id);
+                } else if recreated {
+                    info!(
+                        producer_id,
+                        producer_epoch,
+                        ?topition,
+                        base_sequence,
+                        "recreated a producer that the broker no longer held, from its next batch"
+                    );
+                }
+
+                outcome
             })
             .await
             .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
