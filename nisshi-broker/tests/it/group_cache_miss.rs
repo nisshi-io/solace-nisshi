@@ -36,7 +36,8 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::common::{
-    Formed, form_group, init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage,
+    Formed, form_group, init_tracing, lite_storage, memory_storage, postgres_storage,
+    slate_storage, turso_storage,
 };
 
 fn heartbeat_error(body: &Body) -> Result<i16> {
@@ -180,6 +181,27 @@ async fn lite_staggered() -> Result<()> {
 async fn lite_restart() -> Result<()> {
     let (cluster, node) = ids();
     restart(lite_storage(cluster, node).await?).await
+}
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn turso_simultaneous() -> Result<()> {
+    let (cluster, node) = ids();
+    overlap(turso_storage(cluster, node).await?, SIMULTANEOUS).await
+}
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn turso_staggered() -> Result<()> {
+    let (cluster, node) = ids();
+    overlap(turso_storage(cluster, node).await?, STAGGERED).await
+}
+
+#[cfg(feature = "turso")]
+#[tokio::test]
+async fn turso_restart() -> Result<()> {
+    let (cluster, node) = ids();
+    restart(turso_storage(cluster, node).await?).await
 }
 
 #[cfg(feature = "slatedb")]

@@ -3118,7 +3118,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine does not implement retention or compaction yet"]
     #[tokio::test]
     async fn compact_only() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3132,7 +3131,6 @@ mod turso {
         super::compact_only(sc).await
     }
 
-    #[ignore = "the Turso engine does not implement retention or compaction yet"]
     #[tokio::test]
     async fn delete_only() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3146,7 +3144,6 @@ mod turso {
         super::delete_only(sc).await
     }
 
-    #[ignore = "the Turso engine does not implement retention or compaction yet"]
     #[tokio::test]
     async fn delete_no_retention_ms_only() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3160,7 +3157,6 @@ mod turso {
         super::delete_no_retention_ms_only(sc).await
     }
 
-    #[ignore = "the Turso engine does not implement retention or compaction yet"]
     #[tokio::test]
     async fn compact_delete_001() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3174,7 +3170,6 @@ mod turso {
         super::compact_delete_001(sc).await
     }
 
-    #[ignore = "the Turso engine does not implement retention or compaction yet"]
     #[tokio::test]
     async fn compact_delete_002() -> Result<()> {
         let _guard = init_tracing()?;
