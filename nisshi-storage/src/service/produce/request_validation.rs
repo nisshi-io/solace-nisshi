@@ -16,20 +16,18 @@ use std::fmt::{self, Debug};
 
 use nisshi_sans_io::{
     Ack, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    produce_request::{PartitionProduceData, TopicProduceData},
-    record::deflated,
+    produce_request::PartitionProduceData,
 };
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::{batch_validation, rejection::Rejection, response};
+use super::response;
 use crate::{Error, Result};
 
-/// A [`ProduceRequest`] whose `acks` is valid, with each partition's batch checked for the
-/// faults that need no storage to find.
+/// A [`ProduceRequest`] whose `acks` is valid.
 ///
 /// [`ProduceService`](super::ProduceService) takes this instead of a [`ProduceRequest`], so it
-/// never parses those fields itself.
+/// never parses that field itself.
 #[derive(Clone, Debug)]
 pub struct ValidatedProduceRequest {
     pub(super) topics: Vec<ValidatedTopic>,
@@ -43,83 +41,7 @@ pub struct ValidatedProduceRequest {
 pub struct ValidatedTopic {
     pub(super) name: String,
     pub(super) transaction_id: Option<String>,
-    pub(super) partitions: Vec<ValidatedPartition>,
-}
-
-/// A partition of a [`ProduceRequest`], with its batch or the reason to reject it.
-#[derive(Clone, Debug)]
-pub(super) struct ValidatedPartition {
-    pub(super) index: i32,
-    pub(super) batch: Result<deflated::Batch, Rejection>,
-}
-
-impl ValidatedPartition {
-    /// Returns `partition` of `topic` with the batch that the partition carries, or the
-    /// [`Rejection`] that the partition gets, which this function logs.
-    fn new(topic: &str, partition: PartitionProduceData) -> Self {
-        let index = partition.index;
-
-        // The decoder turns a zero-length records field into `None`, so it
-        // counts as zero batches.
-        let batches = partition
-            .records
-            .map(|records| records.batches)
-            .unwrap_or_default();
-
-        // Kafka allows exactly one batch per partition from Produce v3, the
-        // first version that carries record batches, which is the only format
-        // this broker decodes. Kafka checks the count before it validates any
-        // batch, so this check runs before `batch_validation::rejection`. See
-        // [ProduceRequest.java#L225-L246].
-        //
-        // [ProduceRequest.java#L225-L246]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
-        let batch_count = batches.len();
-        let Ok([batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
-            const REASON: &str =
-                "a produce request must contain exactly one record batch per partition";
-
-            warn!(
-                topic,
-                partition = index,
-                batch_count,
-                reason = REASON,
-                "rejecting produce request",
-            );
-
-            return Self {
-                index,
-                batch: Err(Rejection::new(ErrorCode::InvalidRecord, REASON)),
-            };
-        };
-
-        let batch = match batch_validation::rejection(&batch) {
-            Some(rejection) => {
-                let rejection = Rejection::from(rejection);
-                rejection.log(topic, index, &batch);
-                Err(rejection)
-            }
-            None => Ok(batch),
-        };
-
-        Self { index, batch }
-    }
-}
-
-impl ValidatedTopic {
-    fn new(topic: TopicProduceData, transaction_id: Option<String>) -> Self {
-        let partitions = topic
-            .partition_data
-            .unwrap_or_default()
-            .into_iter()
-            .map(|partition| ValidatedPartition::new(&topic.name, partition))
-            .collect();
-
-        Self {
-            name: topic.name,
-            transaction_id,
-            partitions,
-        }
-    }
+    pub(super) partitions: Vec<PartitionProduceData>,
 }
 
 /// A [`Layer`] that gives its inner [`Service`] a [`ValidatedProduceRequest`], and answers a
@@ -197,7 +119,11 @@ where
             .serve(ValidatedProduceRequest {
                 topics: topics
                     .into_iter()
-                    .map(|topic| ValidatedTopic::new(topic, request.transactional_id.clone()))
+                    .map(|topic| ValidatedTopic {
+                        name: topic.name,
+                        transaction_id: request.transactional_id.clone(),
+                        partitions: topic.partition_data.unwrap_or_default(),
+                    })
                     .collect(),
             })
             .await

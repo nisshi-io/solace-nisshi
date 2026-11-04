@@ -14,9 +14,14 @@
 
 mod acks_zero;
 mod batch_validation;
+mod partition;
 mod rejection;
 mod request_validation;
 mod response;
+mod schema;
+mod store;
+#[cfg(test)]
+mod test_support;
 mod timestamps;
 mod topic;
 mod topic_configuration;
@@ -33,11 +38,17 @@ use tracing::{debug, instrument};
 
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
+    batch_validation::{BatchValidationLayer, BatchValidationService},
+    partition::PartitionProduce,
     request_validation::{
         ProduceRequestValidationLayer, ProduceRequestValidationService, ValidatedProduceRequest,
         ValidatedTopic,
     },
+    schema::{SchemaValidationLayer, SchemaValidationService},
+    store::StorePartitionService,
+    timestamps::{TimestampLayer, TimestampService},
     topic::ProduceTopicService,
+    topic_configuration::TopicConfiguration,
 };
 use crate::{Error, Result, Storage};
 
@@ -203,24 +214,34 @@ impl<S> ApiKey for ProduceService<S> {
     const KEY: i16 = ProduceRequest::KEY;
 }
 
-impl<G> ProduceService<ProduceTopicService<G>>
+/// The steps that [`ProduceService::new`] applies to each partition of a topic, in order: the
+/// batch checks, the timestamp validation, the schema validation, and the write to storage.
+pub type StoredPartitions<G> =
+    BatchValidationService<TimestampService<SchemaValidationService<StorePartitionService<G>>>>;
+
+impl<G> ProduceService<ProduceTopicService<G, StoredPartitions<G>>>
 where
-    G: Storage,
+    G: Storage + Clone,
 {
-    /// Returns a service that stores batches in `storage`, and does not validate them against a
-    /// schema.
+    /// Returns a service that validates the batches of a request, and stores them in `storage`.
+    /// The service does not validate them against a schema.
     pub fn new(storage: G) -> Self {
-        Self {
-            topics: ProduceTopicService::new(storage),
-        }
+        Self::with_schemas(storage, None)
     }
 
-    /// Returns this service with `schemas`: the registry that holds the schema of each topic. A
-    /// batch for a topic that has a schema must match it before the service stores the batch,
-    /// unless the topic's `schema.validation` is `false`.
-    pub fn with_schemas(self, schemas: Option<Registry>) -> Self {
+    /// Returns a service like [`ProduceService::new`] that also validates each batch against the
+    /// schema of its topic in `schemas`, the registry that holds the schema of each topic, unless
+    /// the topic's `schema.validation` is `false`.
+    pub fn with_schemas(storage: G, schemas: Option<Registry>) -> Self {
+        let partitions = (
+            BatchValidationLayer::new(),
+            TimestampLayer::new(),
+            SchemaValidationLayer::new(schemas),
+        )
+            .into_layer(StorePartitionService::new(storage.clone()));
+
         Self {
-            topics: self.topics.with_schemas(schemas),
+            topics: ProduceTopicService::new(storage, partitions),
         }
     }
 }

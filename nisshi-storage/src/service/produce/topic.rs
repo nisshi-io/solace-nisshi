@@ -12,233 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    convert::Infallible,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{convert::Infallible, sync::Arc};
 
 use nisshi_sans_io::{
-    ErrorCode, TimestampType,
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
+    record::deflated,
 };
-use nisshi_schema::Registry;
 use rama::Service;
-use tracing::{debug, error, instrument, warn};
+use tracing::{error, instrument};
 
 use super::{
-    rejection::storage_error_code,
-    request_validation::{ValidatedPartition, ValidatedTopic},
-    response,
-    timestamps::{NO_TIMESTAMP, validate_timestamps_offloaded},
-    topic_configuration::TopicConfiguration,
+    partition::PartitionProduce, rejection::storage_error_code, request_validation::ValidatedTopic,
+    response, topic_configuration::TopicConfiguration,
 };
-use crate::{Error, Storage, Topition};
+use crate::Storage;
 
 /// A [`Service`] using its [`Storage`] taking [`ValidatedTopic`] returning
 /// [`TopicProduceResponse`].
 ///
-/// The service answers each partition of the topic, in order, with its own response. A failure
-/// is the response of the partition that it happened to, or of every partition when the service
-/// cannot read the topic's configuration, so the service itself does not fail.
+/// The service reads the topic's configuration, and answers each partition of the topic, in order,
+/// with what `partitions` answers for the partition. When the service cannot read the
+/// configuration it answers every partition with the error code of the failure, so the service
+/// itself does not fail.
 #[derive(Clone, Debug)]
-pub struct ProduceTopicService<G> {
+pub struct ProduceTopicService<G, S> {
     storage: G,
-    schemas: Option<Registry>,
+    partitions: S,
 }
 
-impl<G> ProduceTopicService<G>
+impl<G, S> ProduceTopicService<G, S>
 where
     G: Storage,
+    S: Service<
+            PartitionProduce<Vec<deflated::Batch>>,
+            Output = PartitionProduceResponse,
+            Error = Infallible,
+        >,
 {
-    /// Returns a service that stores batches in `storage`, and does not validate them against a
-    /// schema.
-    pub fn new(storage: G) -> Self {
+    /// Returns a service that reads the configuration of a topic from `storage`, and serves each
+    /// partition of the topic with `partitions`.
+    pub fn new(storage: G, partitions: S) -> Self {
         Self {
             storage,
-            schemas: None,
-        }
-    }
-
-    /// Returns this service with `schemas`: the registry that holds the schema of each topic. A
-    /// batch for a topic that has a schema must match it before the service stores the batch,
-    /// unless the topic's `schema.validation` is `false`.
-    pub fn with_schemas(self, schemas: Option<Registry>) -> Self {
-        Self { schemas, ..self }
-    }
-
-    #[instrument(skip_all)]
-    async fn partition(
-        &self,
-        transaction_id: Option<&str>,
-        name: &str,
-        configuration: &TopicConfiguration,
-        partition: ValidatedPartition,
-    ) -> PartitionProduceResponse {
-        let ValidatedPartition { index, batch } = partition;
-
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(rejection) => return rejection.into_response(index),
-        };
-
-        let timestamp_type = configuration.timestamp_type;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or_default();
-
-        let (batch, inflated) =
-            match validate_timestamps_offloaded(batch, timestamp_type, now).await {
-                Ok((validated, Ok(inflated))) => (validated, inflated),
-                Ok((validated, Err(rejection))) => {
-                    rejection.log(name, index, &validated);
-                    return rejection.into_response(index);
-                }
-                Err(err) => {
-                    error!(?err);
-                    return response::partition_error(index, ErrorCode::UnknownServerError);
-                }
-            };
-
-        let producer_id = batch.producer_id;
-        let producer_epoch = batch.producer_epoch;
-        let base_sequence = batch.base_sequence;
-
-        // The batch is validated here, on the records that the timestamp step decoded, and before
-        // storage moves the high watermark, so that a batch rejected here leaves no state behind.
-        // Storage does not validate the schema, because it would decode the batch a second time.
-        if let Some(schemas) = &self.schemas
-            && configuration.schema_validation()
-            && let Err(error) = schemas
-                .validate(name, &inflated)
-                .await
-                .inspect(|validation| debug!(?validation))
-                .inspect_err(|err| debug!(?err))
-        {
-            return produce_failure(
-                name,
-                index,
-                producer_id,
-                producer_epoch,
-                base_sequence,
-                error.into(),
-            );
-        }
-
-        // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
-        let log_append_time_ms = match timestamp_type {
-            TimestampType::CreateTime => NO_TIMESTAMP,
-            TimestampType::LogAppendTime => now,
-        };
-
-        let tp = Topition::new(name, index);
-
-        match self.storage.produce(transaction_id, &tp, batch).await {
-            Ok(base_offset) => PartitionProduceResponse::default()
-                .index(index)
-                .error_code(ErrorCode::None.into())
-                .base_offset(base_offset)
-                .log_append_time_ms(Some(log_append_time_ms))
-                .log_start_offset(Some(0))
-                .record_errors(Some([].into()))
-                .error_message(None)
-                .current_leader(None),
-
-            Err(error) => produce_failure(
-                name,
-                index,
-                producer_id,
-                producer_epoch,
-                base_sequence,
-                error,
-            ),
+            partitions,
         }
     }
 }
 
-/// Returns the response for a batch that `storage.produce()` or the schema validation failed with
-/// `error`, and logs the failure once, with the partition: a rejection that the client caused is
-/// a warning, and an internal failure is an error.
-fn produce_failure(
-    name: &str,
-    index: i32,
-    producer_id: i64,
-    producer_epoch: i16,
-    base_sequence: i32,
-    error: Error,
-) -> PartitionProduceResponse {
-    let error_code = storage_error_code(&error);
-
-    if error_code == ErrorCode::UnknownServerError {
-        error!(
-            topic = name,
-            partition = index,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            ?error,
-            "produce failed"
-        );
-    } else if let Error::MessageTooLarge { size, limit } = error {
-        warn!(
-            topic = name,
-            partition = index,
-            producer_id,
-            size,
-            limit,
-            "rejecting produce batch larger than max.message.bytes"
-        );
-    } else {
-        warn!(
-            topic = name,
-            partition = index,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            ?error_code,
-            %error,
-            "rejecting produce batch"
-        );
-    }
-
-    let response = response::partition_error(index, error_code);
-
-    // Kafka sends the same message, so that the producer's `RecordTooLargeException` names both
-    // sizes.
-    if let Error::MessageTooLarge { size, limit, .. } = error {
-        response.error_message(Some(format!(
-            "The record batch size in the append to {name}-{index} is {size} bytes which exceeds \
-             the maximum configured value of {limit}."
-        )))
-    } else {
-        response
-    }
-}
-
-impl<G> Service<ValidatedTopic> for ProduceTopicService<G>
+impl<G, S> Service<ValidatedTopic> for ProduceTopicService<G, S>
 where
     G: Storage,
+    S: Service<
+            PartitionProduce<Vec<deflated::Batch>>,
+            Output = PartitionProduceResponse,
+            Error = Infallible,
+        >,
 {
     type Output = TopicProduceResponse;
     type Error = Infallible;
 
     #[instrument(skip_all)]
     async fn serve(&self, topic: ValidatedTopic) -> Result<Self::Output, Self::Error> {
-        let mut partitions = Vec::with_capacity(topic.partitions.len());
+        let mut responses = Vec::with_capacity(topic.partitions.len());
 
         match TopicConfiguration::read(&self.storage, &topic.name).await {
             Ok(configuration) => {
+                let configuration = Arc::new(configuration);
+
                 for partition in topic.partitions {
-                    partitions.push(
-                        self.partition(
-                            topic.transaction_id.as_deref(),
-                            &topic.name,
-                            &configuration,
-                            partition,
-                        )
-                        .await,
-                    )
+                    // The decoder turns a zero-length records field into `None`, so it counts as
+                    // zero batches.
+                    let batches = partition
+                        .records
+                        .map(|records| records.batches)
+                        .unwrap_or_default();
+
+                    let Ok(response) = self
+                        .partitions
+                        .serve(PartitionProduce {
+                            topic: topic.name.clone(),
+                            index: partition.index,
+                            transaction_id: topic.transaction_id.clone(),
+                            configuration: Arc::clone(&configuration),
+                            batch: batches,
+                        })
+                        .await;
+
+                    responses.push(response);
                 }
             }
 
@@ -251,7 +111,7 @@ where
 
                 let error_code = storage_error_code(&error);
 
-                partitions.extend(
+                responses.extend(
                     topic
                         .partitions
                         .iter()
@@ -262,6 +122,6 @@ where
 
         Ok(TopicProduceResponse::default()
             .name(topic.name)
-            .partition_responses(Some(partitions)))
+            .partition_responses(Some(responses)))
     }
 }

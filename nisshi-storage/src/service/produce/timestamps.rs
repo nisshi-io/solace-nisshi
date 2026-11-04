@@ -12,16 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{
+    convert::Infallible,
+    fmt::{self, Debug},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use nisshi_sans_io::{
     ErrorCode, TimestampType,
-    produce_response::BatchIndexAndErrorMessage,
+    produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse},
     record::{deflated, inflated},
 };
+use rama::{Layer, Service};
+use tracing::{error, instrument};
 
 use super::{
     batch_validation::corrupt_batch,
     inflate_produced,
+    partition::PartitionProduce,
     rejection::{Rejection, undecodable_batch},
+    response,
 };
 use crate::{Result, offload};
 
@@ -263,6 +273,90 @@ pub(super) async fn validate_timestamps_offloaded(
         Ok((batch, outcome))
     })
     .await
+}
+
+/// A [`Layer`] that validates the timestamps of a batch against the topic's
+/// `message.timestamp.type`, and gives its inner [`Service`] the batch with its timestamps set,
+/// and the same batch decoded.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TimestampLayer;
+
+impl TimestampLayer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> Layer<S> for TimestampLayer {
+    type Service = TimestampService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TimestampService { inner }
+    }
+}
+
+/// A [`Service`] passing a batch to `inner` after the timestamp validation has set its timestamps
+/// for the topic's `message.timestamp.type`, with the batch decoded, or answering the partition
+/// with the error code for a batch that the client must not store.
+///
+/// The service answers `UNKNOWN_SERVER_ERROR` for a broker-side failure.
+#[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TimestampService<S> {
+    inner: S,
+}
+
+impl<S> Debug for TimestampService<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(TimestampService)).finish()
+    }
+}
+
+impl<S> Service<PartitionProduce<deflated::Batch>> for TimestampService<S>
+where
+    S: Service<
+            PartitionProduce<(deflated::Batch, inflated::Batch)>,
+            Output = PartitionProduceResponse,
+            Error = Infallible,
+        >,
+{
+    type Output = PartitionProduceResponse;
+    type Error = Infallible;
+
+    #[instrument(skip_all)]
+    async fn serve(
+        &self,
+        request: PartitionProduce<deflated::Batch>,
+    ) -> Result<Self::Output, Self::Error> {
+        let (request, batch) = request.take_batch();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+
+        match validate_timestamps_offloaded(batch, request.configuration.timestamp_type(), now)
+            .await
+        {
+            Ok((batch, Ok(inflated))) => {
+                self.inner
+                    .serve(request.with_batch((batch, inflated)))
+                    .await
+            }
+
+            Ok((batch, Err(rejection))) => {
+                rejection.log(&request.topic, request.index, &batch);
+                Ok(rejection.into_response(request.index))
+            }
+
+            Err(err) => {
+                error!(?err);
+                Ok(response::partition_error(
+                    request.index,
+                    ErrorCode::UnknownServerError,
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +786,113 @@ mod validate_timestamps_tests {
         assert_eq!(batch.computed_crc(), batch.crc);
 
         Ok(())
+    }
+
+    mod service {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use nisshi_sans_io::TimestampType;
+
+        use super::*;
+        use crate::{
+            message_timestamp_type,
+            service::produce::test_support::{RecordingPartitions, error_code, partition_produce},
+        };
+
+        type Decoded = (deflated::Batch, inflated::Batch);
+
+        fn now_ms() -> i64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or_default()
+        }
+
+        #[tokio::test]
+        async fn a_batch_within_the_window_is_passed_on_with_its_decoded_records() -> Result<()> {
+            let inner = RecordingPartitions::<Decoded>::default();
+            let now = now_ms();
+
+            let Ok(response) = TimestampLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(batch(now, -1, &[0, 5])?, &[]))
+                .await;
+
+            assert_eq!(ErrorCode::None, error_code(&response));
+
+            let served = inner.served();
+            assert_eq!(1, served.len());
+
+            let (deflated, inflated) = &served[0];
+            assert_eq!(2, inflated.records.len());
+            assert_eq!(now + 5, deflated.max_timestamp);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_record_ahead_of_the_window_is_rejected_and_not_passed_on() -> Result<()> {
+            let inner = RecordingPartitions::<Decoded>::default();
+
+            let Ok(response) = TimestampLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(
+                    batch(now_ms() + 2 * TIMESTAMP_AFTER_MAX_MS, -1, &[0])?,
+                    &[],
+                ))
+                .await;
+
+            assert_eq!(ErrorCode::InvalidTimestamp, error_code(&response));
+            assert!(inner.served().is_empty());
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_log_append_time_topic_stamps_the_batch_with_the_time_of_the_append() -> Result<()>
+        {
+            let inner = RecordingPartitions::<Decoded>::default();
+            let before = now_ms();
+
+            let Ok(response) = TimestampLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(
+                    batch(before, -1, &[0])?,
+                    &[(message_timestamp_type::KEY, "LogAppendTime")],
+                ))
+                .await;
+
+            assert_eq!(ErrorCode::None, error_code(&response));
+
+            let served = inner.served();
+            assert_eq!(1, served.len());
+
+            let (deflated, _) = &served[0];
+            assert_eq!(
+                TimestampType::LogAppendTime,
+                TimestampType::from(deflated.attributes)
+            );
+            assert!(deflated.max_timestamp >= before);
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_batch_that_does_not_decode_is_rejected_and_not_passed_on() -> Result<()> {
+            let inner = RecordingPartitions::<Decoded>::default();
+
+            let mut undecodable = batch(now_ms(), -1, &[0])?;
+            undecodable.record_data = bytes::Bytes::from_static(&[0xff, 0xff, 0xff]);
+
+            let Ok(response) = TimestampLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(undecodable, &[]))
+                .await;
+
+            assert_eq!(ErrorCode::InvalidRecord, error_code(&response));
+            assert!(inner.served().is_empty());
+
+            Ok(())
+        }
     }
 }

@@ -17,6 +17,10 @@ use nisshi_sans_io::{
     produce_request::TopicProduceData,
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
 };
+use tracing::{error, warn};
+
+use super::rejection::storage_error_code;
+use crate::Error;
 
 /// Returns the response for the partition at `index` that answers with `error_code`.
 pub(super) fn partition_error(index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
@@ -51,4 +55,63 @@ pub(super) fn produce_response(responses: Vec<TopicProduceResponse>) -> ProduceR
         .responses(Some(responses))
         .throttle_time_ms(Some(0))
         .node_endpoints(None)
+}
+
+/// Returns the response for a batch that `storage.produce()` or the schema validation failed with
+/// `error`, and logs the failure once, with the partition: a rejection that the client caused is
+/// a warning, and an internal failure is an error.
+pub(super) fn produce_failure(
+    name: &str,
+    index: i32,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    error: Error,
+) -> PartitionProduceResponse {
+    let error_code = storage_error_code(&error);
+
+    if error_code == ErrorCode::UnknownServerError {
+        error!(
+            topic = name,
+            partition = index,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            ?error,
+            "produce failed"
+        );
+    } else if let Error::MessageTooLarge { size, limit } = error {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id,
+            size,
+            limit,
+            "rejecting produce batch larger than max.message.bytes"
+        );
+    } else {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            ?error_code,
+            %error,
+            "rejecting produce batch"
+        );
+    }
+
+    let response = partition_error(index, error_code);
+
+    // Kafka sends the same message, so that the producer's `RecordTooLargeException` names both
+    // sizes.
+    if let Error::MessageTooLarge { size, limit, .. } = error {
+        response.error_message(Some(format!(
+            "The record batch size in the append to {name}-{index} is {size} bytes which exceeds \
+             the maximum configured value of {limit}."
+        )))
+    } else {
+        response
+    }
 }

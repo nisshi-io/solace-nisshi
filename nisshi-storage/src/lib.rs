@@ -230,21 +230,24 @@ pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, Top
 
 pub use service::{
     AcksZeroLayer, AcksZeroService, AlterUserScramCredentialsService, AutoCreateRefusals,
-    ChannelRequestLayer, ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, CreateTopicsValidationLayer, CreateTopicsValidationService,
-    DeleteAclsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    BatchValidationLayer, BatchValidationService, ChannelRequestLayer, ChannelRequestService,
+    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
+    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
+    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, PartitionProduce,
     ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
     ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
-    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response,
+    RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
+    SchemaValidationService, StorePartitionService, StoredPartitions, TimestampLayer,
+    TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
+    ValidatedProduceRequest, ValidatedTopic, bounded_channel, describe_groups_response,
+    inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]

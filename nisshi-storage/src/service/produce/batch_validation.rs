@@ -12,9 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::{BatchAttribute, ErrorCode, record::deflated};
+use std::{
+    convert::Infallible,
+    fmt::{self, Debug},
+};
 
-use super::rejection::Rejection;
+use nisshi_sans_io::{
+    BatchAttribute, ErrorCode, produce_response::PartitionProduceResponse, record::deflated,
+};
+use rama::{Layer, Service};
+use tracing::{instrument, warn};
+
+use super::{partition::PartitionProduce, rejection::Rejection};
 
 /// The message sent with `CORRUPT_MESSAGE` for a batch whose CRC does not
 /// match its contents.
@@ -56,7 +65,7 @@ pub(super) const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///
 /// [DefaultRecordBatch.java#L393-L398]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L393-L398
 /// [UnifiedLog.scala#L1189-L1193]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1189-L1193
-pub(super) fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
+fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
     if batch.computed_crc() != batch.crc {
         return Some((ErrorCode::CorruptMessage, CRC_MISMATCH));
     }
@@ -97,6 +106,94 @@ pub(super) fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static 
 /// [`rejection`] answers it.
 pub(super) fn corrupt_batch() -> Rejection {
     Rejection::new(ErrorCode::CorruptMessage, CRC_MISMATCH)
+}
+
+/// A [`Layer`] that gives its inner [`Service`] the one batch of a partition, after the checks
+/// that need no storage: the number of batches, and the fields of the batch header.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BatchValidationLayer;
+
+impl BatchValidationLayer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> Layer<S> for BatchValidationLayer {
+    type Service = BatchValidationService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        BatchValidationService { inner }
+    }
+}
+
+/// A [`Service`] passing the one batch of a partition to `inner`, or answering the partition with
+/// the error code that Kafka gives a partition whose batches it must reject: `INVALID_RECORD` for
+/// a partition that does not have exactly one batch, and the code of the failed check for a
+/// batch whose header fails one.
+#[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BatchValidationService<S> {
+    inner: S,
+}
+
+impl<S> Debug for BatchValidationService<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(BatchValidationService)).finish()
+    }
+}
+
+impl<S> Service<PartitionProduce<Vec<deflated::Batch>>> for BatchValidationService<S>
+where
+    S: Service<
+            PartitionProduce<deflated::Batch>,
+            Output = PartitionProduceResponse,
+            Error = Infallible,
+        >,
+{
+    type Output = PartitionProduceResponse;
+    type Error = Infallible;
+
+    #[instrument(skip_all)]
+    async fn serve(
+        &self,
+        request: PartitionProduce<Vec<deflated::Batch>>,
+    ) -> Result<Self::Output, Self::Error> {
+        let (request, batches) = request.take_batch();
+
+        // Kafka allows exactly one batch per partition from Produce v3, the
+        // first version that carries record batches, which is the only format
+        // this broker decodes. Kafka checks the count before it validates any
+        // batch, so this check runs before `rejection`. See
+        // [ProduceRequest.java#L225-L246].
+        //
+        // [ProduceRequest.java#L225-L246]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
+        let batch_count = batches.len();
+        let Ok([batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
+            const REASON: &str =
+                "a produce request must contain exactly one record batch per partition";
+
+            warn!(
+                topic = request.topic,
+                partition = request.index,
+                batch_count,
+                reason = REASON,
+                "rejecting produce request",
+            );
+
+            return Ok(
+                Rejection::new(ErrorCode::InvalidRecord, REASON).into_response(request.index)
+            );
+        };
+
+        if let Some(rejection) = rejection(&batch) {
+            let rejection = Rejection::from(rejection);
+            rejection.log(&request.topic, request.index, &batch);
+
+            return Ok(rejection.into_response(request.index));
+        }
+
+        self.inner.serve(request.with_batch(batch)).await
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +291,78 @@ mod tests {
             )),
             rejection(&batch)
         );
+    }
+
+    mod service {
+        use super::*;
+        use crate::service::produce::test_support::{
+            INDEX, RecordingPartitions, error_code, partition_produce,
+        };
+
+        fn valid_batch() -> deflated::Batch {
+            with_valid_crc(deflated::Batch {
+                record_count: 1,
+                last_offset_delta: 0,
+                ..Default::default()
+            })
+        }
+
+        #[tokio::test]
+        async fn a_partition_without_a_batch_is_an_invalid_record() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+
+            let Ok(response) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(vec![], &[]))
+                .await;
+
+            assert_eq!(ErrorCode::InvalidRecord, error_code(&response));
+            assert_eq!(INDEX, response.index);
+            assert!(inner.served().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_partition_with_two_batches_is_an_invalid_record() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+
+            let Ok(response) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(vec![valid_batch(), valid_batch()], &[]))
+                .await;
+
+            assert_eq!(ErrorCode::InvalidRecord, error_code(&response));
+            assert!(inner.served().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_batch_that_fails_a_header_check_is_answered_with_its_error_code() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+
+            let mut batch = valid_batch();
+            batch.crc ^= 1;
+
+            let Ok(response) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(vec![batch], &[]))
+                .await;
+
+            assert_eq!(ErrorCode::CorruptMessage, error_code(&response));
+            assert_eq!(Some(CRC_MISMATCH), response.error_message.as_deref(),);
+            assert!(inner.served().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_valid_batch_is_passed_to_the_inner_service() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+            let batch = valid_batch();
+
+            let Ok(response) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(vec![batch.clone()], &[]))
+                .await;
+
+            assert_eq!(ErrorCode::None, error_code(&response));
+            assert_eq!(vec![batch], inner.served());
+        }
     }
 }

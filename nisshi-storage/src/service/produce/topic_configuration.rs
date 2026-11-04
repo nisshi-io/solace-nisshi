@@ -15,7 +15,8 @@
 use std::str::FromStr as _;
 
 use nisshi_sans_io::{
-    ConfigResource, TimestampType, describe_configs_response::DescribeConfigsResourceResult,
+    ConfigResource, TimestampType,
+    describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     topic_config,
 };
 use tracing::debug;
@@ -24,9 +25,8 @@ use crate::{Result, Storage, message_timestamp_type};
 
 /// The configuration of a topic that a Produce reads before it validates a partition.
 #[derive(Clone, Debug)]
-pub(super) struct TopicConfiguration {
-    /// The topic's `message.timestamp.type`, as [`message_timestamp_type::described`] reads it.
-    pub(super) timestamp_type: TimestampType,
+pub struct TopicConfiguration {
+    timestamp_type: TimestampType,
     configs: Vec<DescribeConfigsResourceResult>,
 }
 
@@ -41,7 +41,7 @@ impl TopicConfiguration {
     ///
     /// The read asks for every config, because a stored `tansu.*` alias of a key that
     /// [`TopicConfiguration::schema_validation`] reads is not named by that key.
-    pub(super) async fn read<G>(storage: &G, name: &str) -> Result<Self>
+    pub async fn read<G>(storage: &G, name: &str) -> Result<Self>
     where
         G: Storage,
     {
@@ -49,6 +49,12 @@ impl TopicConfiguration {
             .describe_config(name, ConfigResource::Topic, None)
             .await?;
 
+        Self::described(name, described)
+    }
+
+    /// Returns the configuration of the topic `name` from `described`, its `DescribeConfigs`
+    /// result for every config, with the errors of [`message_timestamp_type::described`].
+    pub fn described(name: &str, described: DescribeConfigsResult) -> Result<Self> {
         let configs = described.configs.clone().unwrap_or_default();
 
         message_timestamp_type::described(name, described).map(|timestamp_type| Self {
@@ -57,10 +63,16 @@ impl TopicConfiguration {
         })
     }
 
+    /// Returns the topic's `message.timestamp.type`, as [`message_timestamp_type::described`]
+    /// reads it.
+    pub fn timestamp_type(&self) -> TimestampType {
+        self.timestamp_type
+    }
+
     /// Returns whether the topic's `schema.validation` turns validation against the topic's
     /// schema on. A topic that does not set the key, or sets a value that is not a boolean,
     /// validates.
-    pub(super) fn schema_validation(&self) -> bool {
+    pub fn schema_validation(&self) -> bool {
         let schema_validation = topic_config::lookup(
             self.configs
                 .iter()

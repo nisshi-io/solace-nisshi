@@ -212,9 +212,7 @@ async fn a_batch_that_breaks_the_schema_does_not_fail_the_batch_queued_beside_it
     let batcher = ProduceRequestBatcher::new(storage.clone())
         .with_maximum_delay(Some(Duration::from_millis(100)));
 
-    let produce = ProduceService::new(batcher)
-        .with_schemas(Some(schemas))
-        .with_validation();
+    let produce = ProduceService::with_schemas(batcher, Some(schemas)).with_validation();
 
     // Both requests join the queue inside one delay, so the batcher would write them as one batch.
     let (valid, invalid) = tokio::join!(

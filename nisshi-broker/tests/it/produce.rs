@@ -1454,8 +1454,7 @@ pub(crate) async fn produce_batches_with_schemas(
 ) -> Result<PartitionProduceResponse> {
     // A caller spawns this future. The compiler cannot prove that the three nested layer futures
     // are `Send` for every lifetime, so the box ends the nesting.
-    let response = ProduceService::new(storage)
-        .with_schemas(schemas)
+    let response = ProduceService::with_schemas(storage, schemas)
         .with_validation()
         .boxed()
         .serve(RequestInput {
