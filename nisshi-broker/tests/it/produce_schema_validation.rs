@@ -24,7 +24,7 @@ use nisshi_sans_io::{
     topic_config,
 };
 use nisshi_schema::Registry;
-use nisshi_storage::{ArcDynStorage, Storage};
+use nisshi_storage::{ArcDynStorage, Storage, max_message_bytes};
 use rand::{prelude::*, rng};
 use serde_json::json;
 use url::Url;
@@ -72,6 +72,17 @@ async fn produce_person(
     schemas: Option<Registry>,
     age: i64,
 ) -> Result<ErrorCode> {
+    produce_person_to_partition(storage_type, configs, schemas, 0, age).await
+}
+
+/// [`produce_person`] to `partition`, which the topic has only when it is 0.
+async fn produce_person_to_partition(
+    storage_type: StorageType,
+    configs: Vec<CreatableTopicConfig>,
+    schemas: Option<Registry>,
+    partition: i32,
+    age: i64,
+) -> Result<ErrorCode> {
     let cluster = Uuid::now_v7();
     let node = rng().random_range(0..i32::MAX);
 
@@ -98,7 +109,8 @@ async fn produce_person(
         .await?;
 
     let response =
-        produce_batches_with_schemas(storage, schemas, TOPIC, 0, vec![person_batch(age)?]).await?;
+        produce_batches_with_schemas(storage, schemas, TOPIC, partition, vec![person_batch(age)?])
+            .await?;
 
     ErrorCode::try_from(response.error_code).map_err(Into::into)
 }
@@ -107,6 +119,13 @@ fn schema_validation(value: &str) -> CreatableTopicConfig {
     CreatableTopicConfig::default()
         .name(topic_config::SCHEMA_VALIDATION.into())
         .value(Some(value.into()))
+}
+
+/// A `max.message.bytes` that is smaller than a batch of one person.
+fn small_max_message_bytes() -> CreatableTopicConfig {
+    CreatableTopicConfig::default()
+        .name(max_message_bytes::KEY.into())
+        .value(Some("100".into()))
 }
 
 macro_rules! engine {
@@ -148,6 +167,43 @@ macro_rules! engine {
                 Ok(())
             }
 
+            /// Kafka checks the size of a batch before it validates a record, and the Java
+            /// producer splits a batch that is too large, so the valid records land.
+            #[tokio::test]
+            async fn a_batch_over_max_message_bytes_that_breaks_the_schema_is_message_too_large()
+            -> Result<()> {
+                assert_eq!(
+                    ErrorCode::MessageTooLarge,
+                    produce_person(
+                        $storage_type,
+                        vec![small_max_message_bytes()],
+                        Some(person_schemas()?),
+                        -1
+                    )
+                    .await?
+                );
+                Ok(())
+            }
+
+            /// Schema validation runs before the storage engine looks for the partition, so a
+            /// batch that breaks the schema does not reach the partition check.
+            #[tokio::test]
+            async fn a_batch_that_breaks_the_schema_is_an_invalid_record_for_an_unknown_partition()
+            -> Result<()> {
+                assert_eq!(
+                    ErrorCode::InvalidRecord,
+                    produce_person_to_partition(
+                        $storage_type,
+                        vec![],
+                        Some(person_schemas()?),
+                        7,
+                        -1
+                    )
+                    .await?
+                );
+                Ok(())
+            }
+
             #[tokio::test]
             async fn a_service_without_schemas_stores_a_record_that_breaks_the_schema() -> Result<()>
             {
@@ -164,3 +220,125 @@ macro_rules! engine {
 engine!(in_memory, "dynostore", StorageType::InMemory);
 engine!(lite, "libsql", StorageType::Lite);
 engine!(pg, "postgres", StorageType::Postgres);
+
+/// The broker hands the registry that it is built with to its Produce handler.
+#[cfg(feature = "dynostore")]
+mod broker {
+    use anyhow::{Result, anyhow};
+    use nisshi_sans_io::{
+        ApiKey as _, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, ProduceRequest,
+        ProduceResponse,
+        create_topics_request::CreatableTopic,
+        produce_request::{PartitionProduceData, TopicProduceData},
+        record::deflated::Frame,
+    };
+    use tokio::net::TcpStream;
+
+    use super::{TOPIC, person_batch, person_schemas};
+    use crate::common::wire::{round_trip, spawn_broker_with_schemas};
+
+    /// Creates the `person` topic on `stream`'s broker, and produces one person of `age` to it.
+    /// Returns the error code of the partition's response.
+    async fn produce_person(schemas: bool, age: i64) -> Result<ErrorCode> {
+        let schemas = if schemas {
+            Some(person_schemas().map_err(|err| anyhow!("{err:?}"))?)
+        } else {
+            None
+        };
+
+        let broker = spawn_broker_with_schemas(schemas).await?;
+        let mut stream = TcpStream::connect(broker.addr).await?;
+
+        let created = CreateTopicsResponse::try_from(
+            round_trip(
+                &mut stream,
+                CreateTopicsRequest::KEY,
+                7,
+                1,
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(TOPIC.into())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    ))
+                    .into(),
+            )
+            .await?
+            .body,
+        )?;
+        assert_eq!(
+            Some(i16::from(ErrorCode::None)),
+            created
+                .topics
+                .unwrap_or_default()
+                .first()
+                .map(|topic| topic.error_code)
+        );
+
+        let produced = ProduceResponse::try_from(
+            round_trip(
+                &mut stream,
+                ProduceRequest::KEY,
+                9,
+                2,
+                ProduceRequest::default()
+                    .acks(1)
+                    .timeout_ms(5_000)
+                    .topic_data(Some(
+                        [TopicProduceData::default()
+                            .name(TOPIC.into())
+                            .partition_data(Some(
+                                [PartitionProduceData::default()
+                                    .index(0)
+                                    .records(Some(Frame {
+                                        batches: vec![
+                                            person_batch(age).map_err(|err| anyhow!("{err:?}"))?,
+                                        ],
+                                    }))]
+                                .into(),
+                            ))]
+                        .into(),
+                    ))
+                    .into(),
+            )
+            .await?
+            .body,
+        )?;
+
+        let partition = produced
+            .responses
+            .unwrap_or_default()
+            .first()
+            .and_then(|topic| topic.partition_responses.as_deref())
+            .and_then(|partitions| partitions.first())
+            .map(|partition| partition.error_code)
+            .ok_or_else(|| anyhow!("the response has no partition"))?;
+
+        ErrorCode::try_from(partition).map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn a_broker_with_a_registry_rejects_a_record_that_breaks_the_schema() -> Result<()> {
+        assert_eq!(ErrorCode::InvalidRecord, produce_person(true, -1).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_broker_with_a_registry_stores_a_record_that_matches_the_schema() -> Result<()> {
+        assert_eq!(ErrorCode::None, produce_person(true, 21).await?);
+        Ok(())
+    }
+
+    /// The control for the test above: a broker that has no registry stores the same record, so
+    /// the rejection there comes from the registry.
+    #[tokio::test]
+    async fn a_broker_without_a_registry_stores_a_record_that_breaks_the_schema() -> Result<()> {
+        assert_eq!(ErrorCode::None, produce_person(false, -1).await?);
+        Ok(())
+    }
+}

@@ -301,6 +301,9 @@ where
     G: Coordinator,
     S: Storage + Clone + 'static,
 {
+    /// Returns a broker that serves `storage`, and does not validate the records of a Produce
+    /// against a schema. The storage engine does not validate them either, so call
+    /// [`Broker::schemas`] to validate them against a registry.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: i32,
@@ -337,6 +340,14 @@ where
 
             meter_provider: None,
         }
+    }
+
+    /// Returns this broker with `schemas` as the registry that it validates the records of each
+    /// Produce against. A topic that has no schema in the registry has nothing to validate
+    /// against, and a topic with `nisshi.schema.validation` set to `false` is not validated unless
+    /// it has a lake sink.
+    pub fn schemas(self, schemas: Option<Registry>) -> Self {
+        Self { schemas, ..self }
     }
 
     pub fn builder() -> PhantomBuilder {

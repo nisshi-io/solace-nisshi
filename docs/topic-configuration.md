@@ -18,7 +18,7 @@ Nisshi keys start with `nisshi.`. SlateDB, Turso and the null engine ignore `nis
 | `nisshi.batch` | `false` | proxy | Batches the Produce requests that the proxy receives for the topic. |
 | `nisshi.batch.timeout_ms` | `10000` | proxy | Longest time in milliseconds that the proxy holds a batch before it sends it. |
 | `nisshi.batch.max_records` | `1000` | proxy | Number of records at which the proxy sends a batch. |
-| `nisshi.schema.validation` | `true` | every engine except SlateDB | With a schema registry, validates each produced message against the topic's schema. Set to `false` to accept any message. |
+| `nisshi.schema.validation` | `true` | every engine except SlateDB | With a schema registry, validates each produced message against the topic's schema. Set to `false` to accept any message, except on a topic with `nisshi.lake.sink`, which always validates. |
 | `nisshi.virtual` | `false` | PostgreSQL, libSQL | Makes `topic/key` a topic that has the records of `topic` with the record key `key`. |
 | `nisshi.lake.sink` | `false` | PostgreSQL, libSQL, S3, Google Cloud Storage, memory | With a schema registry and a data lake, stores the topic's records only in the lake table, not in the topic, so a fetch returns none of them. When a lake is configured, the broker writes every topic's records to it whatever this key says. |
 | `nisshi.lake.partition` | none | Delta Lake | Comma separated columns that the table is partitioned by. |

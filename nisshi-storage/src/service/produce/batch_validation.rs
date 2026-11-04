@@ -23,7 +23,9 @@ use nisshi_sans_io::{
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::{partition::PartitionProduce, rejection::Rejection};
+use crate::max_message_bytes;
+
+use super::{partition::PartitionProduce, rejection::Rejection, response};
 
 /// The message sent with `CORRUPT_MESSAGE` for a batch whose CRC does not
 /// match its contents.
@@ -192,6 +194,32 @@ where
             return Ok(rejection.into_response(request.index));
         }
 
+        // Kafka checks the size of each batch against `max.message.bytes` before it validates a
+        // record, so a batch over the limit is answered with `MESSAGE_TOO_LARGE` even when its
+        // records also break the schema. The Java producer splits such a batch, and the valid
+        // records land. See [UnifiedLog.scala#L1181-L1187].
+        //
+        // [UnifiedLog.scala#L1181-L1187]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1181-L1187
+        //
+        // The check runs only for a topic that exists. Kafka looks up the partition before it
+        // checks the size, and storage answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic that it
+        // does not hold before it checks the size too.
+        if request.configuration.exists()
+            && let Err(error) = max_message_bytes::ensure_batch_fits(
+                &batch,
+                request.configuration.max_message_bytes(),
+            )
+        {
+            return Ok(response::produce_failure(
+                &request.topic,
+                request.index,
+                batch.producer_id,
+                batch.producer_epoch,
+                batch.base_sequence,
+                error,
+            ));
+        }
+
         self.inner.serve(request.with_batch(batch)).await
     }
 }
@@ -294,9 +322,16 @@ mod tests {
     }
 
     mod service {
+        use nisshi_sans_io::describe_configs_response::{
+            DescribeConfigsResourceResult, DescribeConfigsResult,
+        };
+
         use super::*;
-        use crate::service::produce::test_support::{
-            INDEX, RecordingPartitions, error_code, partition_produce,
+        use crate::{
+            TopicConfiguration,
+            service::produce::test_support::{
+                INDEX, RecordingPartitions, error_code, partition_produce,
+            },
         };
 
         fn valid_batch() -> deflated::Batch {
@@ -349,6 +384,55 @@ mod tests {
             assert_eq!(ErrorCode::CorruptMessage, error_code(&response));
             assert_eq!(Some(CRC_MISMATCH), response.error_message.as_deref(),);
             assert!(inner.served().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_batch_over_max_message_bytes_is_message_too_large() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+
+            let Ok(response) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(partition_produce(
+                    vec![valid_batch()],
+                    &[(max_message_bytes::KEY, "10")],
+                ))
+                .await;
+
+            assert_eq!(ErrorCode::MessageTooLarge, error_code(&response));
+            assert!(inner.served().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_batch_over_max_message_bytes_for_an_unknown_topic_is_passed_on() {
+            let inner = RecordingPartitions::<deflated::Batch>::default();
+            let batch = valid_batch();
+
+            let request = PartitionProduce {
+                topic: "person".into(),
+                index: INDEX,
+                transaction_id: None,
+                configuration: std::sync::Arc::new(
+                    TopicConfiguration::described(
+                        "person",
+                        DescribeConfigsResult::default()
+                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .configs(Some(vec![
+                                DescribeConfigsResourceResult::default()
+                                    .name(max_message_bytes::KEY.into())
+                                    .value(Some("10".into())),
+                            ])),
+                    )
+                    .expect("an unknown topic has a configuration"),
+                ),
+                batch: vec![batch.clone()],
+            };
+
+            let Ok(_) = BatchValidationLayer::new()
+                .layer(inner.clone())
+                .serve(request)
+                .await;
+
+            assert_eq!(vec![batch], inner.served());
         }
 
         #[tokio::test]

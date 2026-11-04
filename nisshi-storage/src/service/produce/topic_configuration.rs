@@ -15,17 +15,19 @@
 use std::str::FromStr as _;
 
 use nisshi_sans_io::{
-    ConfigResource, TimestampType,
+    ConfigResource, ErrorCode, TimestampType,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     topic_config,
 };
 use tracing::debug;
 
-use crate::{Result, Storage, message_timestamp_type};
+use crate::{Result, Storage, max_message_bytes, message_timestamp_type};
 
 /// The configuration of a topic that a Produce reads before it validates a partition.
 #[derive(Clone, Debug)]
 pub struct TopicConfiguration {
+    topic: String,
+    exists: bool,
     timestamp_type: TimestampType,
     configs: Vec<DescribeConfigsResourceResult>,
 }
@@ -39,14 +41,23 @@ impl TopicConfiguration {
     /// correctly. Kafka also applies a config change asynchronously, and an append that is in
     /// progress can use the old type.
     ///
-    /// The read asks for every config, because a stored `tansu.*` alias of a key that
-    /// [`TopicConfiguration::schema_validation`] reads is not named by that key.
+    /// The read names the configs that this type reads, with the `tansu.*` alias of each. The
+    /// PostgreSQL engine answers a read of named configs with one query, and a read of every
+    /// config with two, and a Produce reads the configuration of every topic that it writes.
     pub async fn read<G>(storage: &G, name: &str) -> Result<Self>
     where
         G: Storage,
     {
+        let keys = [
+            vec![message_timestamp_type::KEY.to_owned()],
+            topic_config::names(topic_config::SCHEMA_VALIDATION),
+            topic_config::names(topic_config::LAKE_SINK),
+            vec![max_message_bytes::KEY.to_owned()],
+        ]
+        .concat();
+
         let described = storage
-            .describe_config(name, ConfigResource::Topic, None)
+            .describe_config(name, ConfigResource::Topic, Some(&keys))
             .await?;
 
         Self::described(name, described)
@@ -57,10 +68,45 @@ impl TopicConfiguration {
     pub fn described(name: &str, described: DescribeConfigsResult) -> Result<Self> {
         let configs = described.configs.clone().unwrap_or_default();
 
+        let exists = ErrorCode::try_from(described.error_code)? == ErrorCode::None;
+
         message_timestamp_type::described(name, described).map(|timestamp_type| Self {
+            topic: name.to_owned(),
+            exists,
             timestamp_type,
             configs,
         })
+    }
+
+    /// Returns whether the storage holds the topic. The configuration of a topic that it does not
+    /// hold has the default of each config.
+    pub fn exists(&self) -> bool {
+        self.exists
+    }
+
+    /// Returns the topic's `max.message.bytes`: the size of the largest batch that the topic
+    /// stores, as [`max_message_bytes::limit`] reads it.
+    pub fn max_message_bytes(&self) -> usize {
+        max_message_bytes::limit(
+            &self.topic,
+            self.configs
+                .iter()
+                .find(|config| config.name == max_message_bytes::KEY)
+                .and_then(|config| config.value.as_deref()),
+        )
+    }
+
+    /// Returns whether the topic's `lake.sink` is `true`. A topic that does not set the key, or
+    /// sets a value that is not a boolean, has no lake sink.
+    pub fn lake_sink(&self) -> bool {
+        topic_config::lookup(
+            self.configs
+                .iter()
+                .filter_map(|config| Some((config.name.as_str(), config.value.as_deref()?))),
+            topic_config::LAKE_SINK,
+        )
+        .and_then(|value| bool::from_str(value).ok())
+        .unwrap_or(false)
     }
 
     /// Returns the topic's `message.timestamp.type`, as [`message_timestamp_type::described`]

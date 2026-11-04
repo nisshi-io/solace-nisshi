@@ -57,8 +57,8 @@ impl<S> Layer<S> for SchemaValidationLayer {
 /// answering the partition with the error code of the failed validation.
 ///
 /// The service passes the batch without validation when it has no schemas, or when the topic's
-/// `schema.validation` is `false`. A topic that has no schema in the registry has nothing to
-/// validate against.
+/// `schema.validation` is `false` and the topic has no `lake.sink`. A topic that has no schema in
+/// the registry has nothing to validate against.
 #[derive(Clone)]
 pub struct SchemaValidationService<S> {
     schemas: Option<Registry>,
@@ -94,8 +94,13 @@ where
         // The batch is validated here, on the records that the timestamp step decoded, and before
         // storage moves the high watermark, so that a batch rejected here leaves no state behind.
         // Storage does not validate the schema, because it would decode the batch a second time.
+        //
+        // A topic with a lake sink validates whatever its `schema.validation` is. The lake sink
+        // converts the records through the schema, after storage has reserved the batch's
+        // offsets, and a record that breaks the schema fails that conversion and leaves the
+        // reserved offsets empty.
         if let Some(schemas) = &self.schemas
-            && request.configuration.schema_validation()
+            && (request.configuration.schema_validation() || request.configuration.lake_sink())
             && let Err(error) = schemas
                 .validate(&request.topic, &inflated)
                 .await
@@ -208,6 +213,27 @@ mod tests {
 
         assert_eq!(ErrorCode::None, error_code(&response));
         assert_eq!(1, inner.served().len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_a_lake_sink_validates_when_schema_validation_is_off() -> Result<()> {
+        let inner = RecordingPartitions::<deflated::Batch>::default();
+
+        let Ok(response) = SchemaValidationLayer::new(Some(person_schemas()?))
+            .layer(inner.clone())
+            .serve(partition_produce(
+                person(-1)?,
+                &[
+                    (topic_config::SCHEMA_VALIDATION, "false"),
+                    (topic_config::LAKE_SINK, "true"),
+                ],
+            ))
+            .await;
+
+        assert_eq!(ErrorCode::InvalidRecord, error_code(&response));
+        assert!(inner.served().is_empty());
 
         Ok(())
     }

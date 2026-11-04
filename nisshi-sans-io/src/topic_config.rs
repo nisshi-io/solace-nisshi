@@ -301,9 +301,45 @@ pub fn resolve<'a, V>(entries: impl IntoIterator<Item = (&'a str, V)>) -> Vec<(C
     PROCESS.resolve(entries)
 }
 
+/// Returns `key`, and the `tansu.*` alias of `key` when it has one: the names under which a topic
+/// can store the value that [`lookup`] reads for `key`.
+///
+/// A caller that asks a storage engine for named configs, instead of every config, asks for each of
+/// these names.
+pub fn names(key: &str) -> Vec<String> {
+    let alias = KEYS
+        .iter()
+        .find(|candidate| !candidate.family && candidate.canonical == key)
+        .map(|candidate| candidate.alias);
+
+    std::iter::once(key)
+        .chain(alias)
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_with_an_alias_is_named_by_both() {
+        assert_eq!(
+            vec![
+                SCHEMA_VALIDATION.to_owned(),
+                "tansu.schema.validation".to_owned()
+            ],
+            names(SCHEMA_VALIDATION)
+        );
+    }
+
+    #[test]
+    fn a_key_without_an_alias_is_named_by_itself() {
+        assert_eq!(
+            vec!["max.message.bytes".to_owned()],
+            names("max.message.bytes")
+        );
+    }
 
     #[test]
     fn each_alias_is_its_key_with_the_old_prefix() {
