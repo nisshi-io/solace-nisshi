@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use super::DEFAULT_BROKER;
+use super::{DEFAULT_BROKER, client_security::ClientSecurity};
 use crate::{EnvVarExp, Result};
 use clap::Args;
 use human_units::iec::iec_unit;
@@ -67,12 +67,16 @@ pub(super) struct Arg {
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
+
+    #[command(flatten)]
+    security: ClientSecurity,
 }
 
 impl Arg {
     pub(super) async fn main(self) -> Result<ErrorCode> {
         let generate = Generate::builder()
             .broker(self.broker.into_inner())
+            .security(self.security.build()?)
             .topic(self.topic)
             .partition(self.partition)
             .schema_registry(self.schema_registry.into_inner())

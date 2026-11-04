@@ -5869,6 +5869,7 @@ dependencies = [
  "nisshi-schema",
  "nisshi-storage",
  "nisshi-topic",
+ "rcgen",
  "serde_json",
  "tempfile",
  "tokio",
@@ -6028,12 +6029,18 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "rama",
+ "rcgen",
+ "rsasl",
+ "rustls",
+ "rustls-native-certs",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
 ]
 
 [[package]]

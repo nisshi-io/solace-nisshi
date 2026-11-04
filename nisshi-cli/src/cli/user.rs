@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use tracing::debug;
 use url::Url;
 
-use super::{DEFAULT_BROKER, Outcome};
+use super::{DEFAULT_BROKER, Outcome, client_security::ClientSecurity};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -50,6 +50,9 @@ pub(super) enum Command {
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
+
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// Delete a user
@@ -64,6 +67,9 @@ pub(super) enum Command {
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
+
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 }
 
@@ -106,6 +112,12 @@ impl From<&Mechanism> for i8 {
 impl Command {
     const DEFAULT_SALT_LEN: usize = 32;
     const DEFAULT_ITERATIONS: u32 = 2u32.pow(14);
+
+    fn security(&self) -> &ClientSecurity {
+        match self {
+            Command::Create { security, .. } | Command::Delete { security, .. } => security,
+        }
+    }
 
     fn broker(&self) -> Url {
         match self {
@@ -164,6 +176,7 @@ impl Command {
 
     pub(super) async fn main(self) -> Result<Outcome> {
         let client = ConnectionManager::builder(self.broker())
+            .security(self.security().build()?)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

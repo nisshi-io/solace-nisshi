@@ -50,6 +50,26 @@ pub enum Error {
     Regex(#[from] regex::Error),
     #[error(transparent)]
     SansIo(#[from] nisshi_sans_io::Error),
+    /// `--sasl-password-file` and the `SASL_PASSWORD` environment variable are both set.
+    #[error(
+        "Both --sasl-password-file and the SASL_PASSWORD environment variable are set. Use one."
+    )]
+    SaslPasswordAmbiguous,
+    /// The `--sasl-password-file` could not be read.
+    #[error("could not read --sasl-password-file {}: {cause}", path.display())]
+    SaslPasswordFile {
+        path: PathBuf,
+        cause: std::io::Error,
+    },
+    /// `--sasl-username` was given with neither `--sasl-password-file` nor `SASL_PASSWORD`.
+    #[error(
+        "--sasl-username needs a password, in the SASL_PASSWORD environment variable or in \
+            --sasl-password-file."
+    )]
+    SaslPasswordMissing,
+    /// The `SASL_PASSWORD` environment variable is not valid Unicode.
+    #[error("The SASL_PASSWORD environment variable is not valid Unicode.")]
+    SaslPasswordNotUnicode,
     #[error("schema registry: {0}")]
     Schema(Box<nisshi_schema::Error>),
     #[error("broker: {0}")]
@@ -119,8 +139,12 @@ pub enum Error {
         path: PathBuf,
         cause: std::io::Error,
     },
-    /// `--cert` and `--key` must be supplied together.
-    #[error("TLS requires both --cert and --key.")]
+    /// The certificate and the key must be supplied together: `--cert` and `--key` for the
+    /// broker, `--tls-cert-file` and `--tls-key-file` for the other commands.
+    #[error(
+        "TLS requires both a certificate and a key: --cert and --key for the broker, \
+            --tls-cert-file and --tls-key-file for the other commands."
+    )]
     TlsRequiresCertAndKey,
     #[error(transparent)]
     Topic(#[from] nisshi_topic::Error),
@@ -252,8 +276,31 @@ mod tests {
             Error::LakeRequiresSchemaRegistry { lake: "iceberg" }.to_string()
         );
         assert_eq!(
-            "TLS requires both --cert and --key.",
+            "TLS requires both a certificate and a key: --cert and --key for the broker, \
+                --tls-cert-file and --tls-key-file for the other commands.",
             Error::TlsRequiresCertAndKey.to_string()
+        );
+        assert_eq!(
+            "Both --sasl-password-file and the SASL_PASSWORD environment variable are set. Use \
+                one.",
+            Error::SaslPasswordAmbiguous.to_string()
+        );
+        assert_eq!(
+            "--sasl-username needs a password, in the SASL_PASSWORD environment variable or in \
+                --sasl-password-file.",
+            Error::SaslPasswordMissing.to_string()
+        );
+        assert_eq!(
+            "The SASL_PASSWORD environment variable is not valid Unicode.",
+            Error::SaslPasswordNotUnicode.to_string()
+        );
+        assert_eq!(
+            "could not read --sasl-password-file /no/such/file: entity not found",
+            Error::SaslPasswordFile {
+                path: PathBuf::from("/no/such/file"),
+                cause: std::io::Error::other("entity not found"),
+            }
+            .to_string()
         );
         assert_eq!(
             "TLS private key /etc/nisshi/tls.key is encrypted: pass --key-passphrase-file <file>.",

@@ -91,12 +91,14 @@ Integrations:
 Nisshi is a single statically linked binary containing the following, described in [Commands](docs/commands.md):
 
 - [broker](docs/commands.md#broker) — an Apache Kafka®-compatible broker and schema registry
-- [topic](docs/commands.md#topic) — create, list or delete topics (development and demos; plaintext only: no TLS or SASL)
-- [user](docs/security.md#authentication) — create, list or delete users (development and demos; plaintext only: no TLS or SASL)
-- [cat](docs/commands.md#cat) — consume or produce Avro, JSON or Protobuf messages to a topic (development and demos; plaintext only: no TLS or SASL)
-- generator — generate fake messages for schema-backed topics (development and demos; plaintext only: no TLS or SASL)
-- perf — measure produce and consume throughput against a broker (development and demos; plaintext only: no TLS or SASL)
+- [topic](docs/commands.md#topic) — create, list or delete topics
+- [user](docs/security.md#authentication) — create, list or delete users
+- [cat](docs/commands.md#cat) — consume or produce Avro, JSON or Protobuf messages to a topic
+- generator — generate fake messages for schema-backed topics (development and demos)
+- perf — measure produce and consume throughput against a broker (development and demos)
 - [proxy](docs/commands.md#proxy) — an Apache Kafka®-compatible proxy (development and demos, not production)
+
+`topic`, `user`, `cat`, `generator` and `perf` connect in plaintext unless you give them [TLS and SASL options](docs/commands.md#connecting-to-a-broker-with-tls-or-sasl).
 
 ## Documentation
 

@@ -33,7 +33,7 @@ use human_units::{
     FormatDuration,
     iec::{Byte, Prefix},
 };
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     Ack, ByteSize as _, ErrorCode, ProduceRequest,
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -115,6 +115,7 @@ pub enum CancelKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Perf {
     broker: Url,
+    security: Security,
     topic: String,
     partition: i32,
     batch_size: u32,
@@ -128,6 +129,7 @@ pub struct Perf {
 #[derive(Clone, Debug)]
 pub struct Builder<B, T> {
     broker: B,
+    security: Security,
     topic: T,
     partition: i32,
     batch_size: u32,
@@ -142,6 +144,7 @@ impl Default for Builder<PhantomData<Url>, PhantomData<String>> {
     fn default() -> Self {
         Self {
             broker: Default::default(),
+            security: Default::default(),
             topic: Default::default(),
             partition: Default::default(),
             batch_size: 1,
@@ -155,9 +158,15 @@ impl Default for Builder<PhantomData<Url>, PhantomData<String>> {
 }
 
 impl<B, T> Builder<B, T> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             batch_size: self.batch_size,
@@ -172,6 +181,7 @@ impl<B, T> Builder<B, T> {
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             batch_size: self.batch_size,
@@ -219,6 +229,7 @@ impl Builder<Url, String> {
     pub fn build(self) -> Perf {
         Perf {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             batch_size: self.batch_size,
@@ -313,6 +324,7 @@ impl Perf {
         let mut set = JoinSet::new();
 
         let client = ConnectionManager::builder(self.broker)
+            .security(self.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

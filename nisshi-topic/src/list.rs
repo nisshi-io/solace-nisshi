@@ -17,7 +17,7 @@ use std::{
     io::{self, Write},
 };
 
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, MetadataResponse, metadata_response::MetadataResponseTopic,
 };
@@ -39,13 +39,20 @@ pub enum Format {
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B> {
     broker: B,
+    security: Security,
     format: Format,
 }
 
 impl<B> Builder<B> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: Url) -> Builder<Url> {
         Builder {
             broker,
+            security: self.security,
             format: self.format,
         }
     }
@@ -59,6 +66,7 @@ impl Builder<Url> {
     pub fn build(self) -> Topic {
         Topic::List(Configuration {
             broker: self.broker,
+            security: self.security,
             format: self.format,
         })
     }
@@ -67,6 +75,7 @@ impl Builder<Url> {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     format: Format,
 }
 
@@ -86,6 +95,7 @@ impl TryFrom<Configuration> for List {
 impl List {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
