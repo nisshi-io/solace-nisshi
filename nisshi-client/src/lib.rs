@@ -157,6 +157,7 @@ use security::{Session, Stream};
 
 /// Client Errors
 #[derive(thiserror::Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The broker refused the SASL login, or does not offer the mechanism. The message says why.
     Authentication(String),
