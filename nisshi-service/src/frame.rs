@@ -899,7 +899,7 @@ impl<F> ResponseService<F> {
 #[cfg(test)]
 mod tests {
     use nisshi_sans_io::{ApiVersionsResponse, Error as SansIoError};
-    use nisshi_storage::read_share::{ClientAdmission, ClientReadShares};
+    use nisshi_storage::read_share::{ClientAdmission, ClientIdentity, ClientReadShares};
     use tokio::{
         sync::Semaphore,
         time::{Duration, timeout},
@@ -944,7 +944,7 @@ mod tests {
             // client, and `None` is a request outside any client.
             let code = match admission {
                 Err(_) => ErrorCode::RequestTimedOut,
-                Ok(Ok(Some(admission))) => {
+                Ok(Ok(admission)) => {
                     let code = if admission.is_within_share() {
                         ErrorCode::None
                     } else {
@@ -953,7 +953,7 @@ mod tests {
                     self.held.lock().expect("held").push(admission);
                     code
                 }
-                Ok(_) => ErrorCode::UnknownServerError,
+                Ok(Err(_)) => ErrorCode::UnknownServerError,
             };
 
             Ok(ApiVersionsResponse::default().error_code(code.into()))
@@ -996,12 +996,7 @@ mod tests {
         assert_eq!(i16::from(ErrorCode::None), request(&service, "two").await?);
 
         // The identity is not left behind for the next request on the task.
-        assert!(
-            ClientReadShares::default()
-                .acquire(1, &Arc::new(Semaphore::new(1)))
-                .await
-                .is_ok_and(|admission| admission.is_none())
-        );
+        assert_eq!(None, ClientIdentity::current());
 
         Ok(())
     }

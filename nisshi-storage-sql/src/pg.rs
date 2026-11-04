@@ -1270,16 +1270,11 @@ const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp
 struct ReadPermits {
     /// `None` for a read that runs outside a connection's read share.
     connection_share: Option<OwnedSemaphorePermit>,
-    engine: EnginePermits,
-}
-
-/// The permits of the read from the engine's side: those that a client holds,
-/// or one from the limit for a read that runs outside a client's read share.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum EnginePermits {
-    Client(ClientAdmission),
-    Limit(OwnedSemaphorePermit),
+    /// The permit of the limit, and the one of the client's share. A read
+    /// that runs outside a client's read share holds only the first, and still
+    /// returns it through the client shares, which wake a read that waits for
+    /// a permit of the limit.
+    engine: ClientAdmission,
 }
 
 impl ReadPermits {
@@ -1301,17 +1296,7 @@ impl ReadPermits {
         limit: &Arc<Semaphore>,
     ) -> Result<Self> {
         let connection_share = connection_share.await?;
-
-        let engine = match client_shares.acquire(client_share, limit).await? {
-            Some(admission) => EnginePermits::Client(admission),
-            None => EnginePermits::Limit(
-                limit
-                    .clone()
-                    .acquire_owned()
-                    .queued_for(ReadWait::EngineReadLimit)
-                    .await?,
-            ),
-        };
+        let engine = client_shares.acquire(client_share, limit).await?;
 
         Ok(Self {
             connection_share,
