@@ -441,6 +441,12 @@ const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// resolved address, not the TLS/auth steps that follow it).
 const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The `application_name` of the broker's connections when the storage URL sets
+/// none, so a row in `pg_stat_activity` names the broker. A fixed name, because the
+/// pool opens its connections before the builder sets the cluster and node, and
+/// `client_addr` and `pid` already tell the brokers of one database apart.
+const DEFAULT_APPLICATION_NAME: &str = "nisshi";
+
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
 /// Postgres applies `-c name=value` startup options in order with last-one-wins semantics,
@@ -455,32 +461,45 @@ fn merge_statement_timeout_option(existing: Option<&str>, default_ms: u64) -> St
     }
 }
 
+/// Returns the `name=value` settings of `options`, a libpq options startup
+/// string, in order. The server reads `-c name=value`, `-cname=value` and
+/// `--name=value`, treats `-` in a name as `_` and ignores its case, so the names
+/// returned are lowercase with that done.
+fn option_settings(options: &str) -> impl Iterator<Item = (String, &str)> {
+    let mut tokens = options.split_whitespace();
+
+    std::iter::from_fn(move || {
+        loop {
+            let token = tokens.next()?;
+            let setting = match token {
+                "-c" => tokens.next(),
+                short if short.starts_with("-c") => short.strip_prefix("-c"),
+                long => long.strip_prefix("--"),
+            };
+
+            if let Some((name, value)) = setting.and_then(|setting| setting.split_once('=')) {
+                return Some((name.replace('-', "_").to_ascii_lowercase(), value));
+            }
+        }
+    })
+}
+
 /// Reads the `statement_timeout` that `options`, a libpq options startup
 /// string, sets on each connection: the last one wins, as on the server.
-/// The server reads `-c name=value`, `-cname=value` and `--name=value`.
 ///
 /// Returns `None` when `options` sets no timeout, disables it with `0`, or
 /// sets a value the server rejects, in which case no connection opens.
 fn statement_timeout_option(options: &str) -> Option<Duration> {
-    let mut tokens = options.split_whitespace();
-    let mut statement_timeout = None;
-
-    while let Some(token) = tokens.next() {
-        let setting = match token {
-            "-c" => tokens.next(),
-            short if short.starts_with("-c") => short.strip_prefix("-c"),
-            long => long.strip_prefix("--"),
-        };
-
-        if let Some(value) = setting.and_then(|setting| setting.strip_prefix("statement_timeout="))
-        {
-            statement_timeout = Some(statement_timeout_value(value));
-        }
-    }
-
-    statement_timeout
-        .flatten()
+    option_settings(options)
+        .filter(|(name, _)| name == "statement_timeout")
+        .last()
+        .and_then(|(_, value)| statement_timeout_value(value))
         .filter(|timeout| !timeout.is_zero())
+}
+
+/// Whether `options`, a libpq options startup string, sets `application_name`.
+fn options_set_application_name(options: &str) -> bool {
+    option_settings(options).any(|(name, _)| name == "application_name")
 }
 
 /// Parses a `statement_timeout` value as the server does: a number of
@@ -580,6 +599,14 @@ where
         let abandoned_statement_bound = statement_timeout_option(&options)
             .unwrap_or(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
             + ABANDONED_STATEMENT_MARGIN;
+
+        // An operator's own `application_name` wins over the default, whether it is in the URL
+        // or in `options`. The server applies a named `application_name` after `options`, so a
+        // default set here would override one that only `options` sets.
+        if pg_config.get_application_name().is_none() && !options_set_application_name(&options) {
+            _ = pg_config.application_name(DEFAULT_APPLICATION_NAME);
+        }
+
         _ = pg_config.options(options);
         _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
 
@@ -5828,6 +5855,73 @@ mod tests {
             Some(Duration::from_micros(500)),
             statement_timeout_option("-c statement_timeout=500us")
         );
+    }
+
+    /// The server reads `-` in a setting name as `_`, so a dashed spelling
+    /// is the same setting.
+    #[test]
+    fn option_settings_read_every_spelling() {
+        assert!(options_set_application_name("-c application_name=a"));
+        assert!(options_set_application_name("-capplication_name=a"));
+        assert!(options_set_application_name("--application_name=a"));
+        assert!(options_set_application_name("-c application-name=a"));
+        assert!(options_set_application_name("--application-name=a"));
+        assert!(options_set_application_name("-c Application_Name=a"));
+        assert!(options_set_application_name(
+            "-c search_path=foo -c application_name=a"
+        ));
+        assert!(!options_set_application_name(""));
+        assert!(!options_set_application_name(
+            "-c search_path=application_name"
+        ));
+        assert_eq!(
+            Some(Duration::from_secs(2)),
+            statement_timeout_option("-c statement-timeout=2s")
+        );
+    }
+
+    /// Every connection of the pool is named in `pg_stat_activity`, and a
+    /// name that the operator sets, in the URL or in `options`, wins.
+    #[tokio::test]
+    async fn connections_are_named_in_pg_stat_activity() -> Result<()> {
+        let cases = [
+            ("", "nisshi"),
+            ("?application_name=from_url", "from_url"),
+            (
+                "?options=-c%20application_name%3Dfrom_options",
+                "from_options",
+            ),
+            (
+                "?options=-c%20application-name%3Dfrom_dashes",
+                "from_dashes",
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let storage = Postgres::builder(&format!("{}{query}", *CONNECTION))?
+                .cluster(alphanumeric_string(15))
+                .node(rng().random_range(0..i32::MAX))
+                .build();
+
+            let connection = match storage.connection().await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    eprintln!("skipping connections_are_named_in_pg_stat_activity: {err:?}");
+                    return Ok(());
+                }
+            };
+
+            let row = connection
+                .query_one(
+                    "select application_name from pg_stat_activity where pid = pg_backend_pid()",
+                    &[],
+                )
+                .await?;
+
+            assert_eq!(expected, row.get::<_, &str>(0), "for {query:?}");
+        }
+
+        Ok(())
     }
 
     /// No setting, a disabled timeout and a value the server would reject

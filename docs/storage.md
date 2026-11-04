@@ -180,6 +180,8 @@ A broker opens at most 16 connections to PostgreSQL. Set `pool_max_size` in the 
 nisshi broker --storage-engine "postgres://nisshi:secret@db.example.com/nisshi?pool_max_size=32"
 ```
 
+Every connection a broker opens to PostgreSQL has the `application_name` `nisshi`, so `pg_stat_activity` shows which connections belong to a broker, for example to find the one that holds a lock. Set `application_name` in the storage URL, or `-c application_name=...` in its `options`, to use your own name, such as one per broker.
+
 Bring Nisshi back up:
 
 ```shell
