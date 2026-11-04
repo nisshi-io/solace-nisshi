@@ -557,9 +557,11 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// A step runs in the transaction that holds the schema lock, so it can't use `create index
 /// concurrently`. The transaction keeps the table locks of every step until the last step
 /// commits, and every request on those tables queues behind them. So each statement of a step
-/// gets the default statement timeout of a request, [`DEFAULT_STATEMENT_TIMEOUT_MS`], and not the
-/// 5 minutes of the setup, which a step can't raise with `SET LOCAL`. The sum of every step
-/// is not bounded. Each step also gets a [`STEP_LOCK_TIMEOUT`]: an `ALTER TABLE` queues behind a
+/// gets the statement timeout of a request: the one in the options of the storage URL, or
+/// [`DEFAULT_STATEMENT_TIMEOUT_MS`] when the URL sets none. It does not get the 5 minutes of the
+/// setup. An operator raises that timeout in the URL for the start of an upgrade. A step must not
+/// change `lock_timeout` or `statement_timeout`, because nothing resets them before the next
+/// step. The sum of every step is not bounded. Each step also gets a [`STEP_LOCK_TIMEOUT`]: an `ALTER TABLE` queues behind a
 /// long reader, and every later request on that table queues behind the `ALTER TABLE`, so a step
 /// that can't get its lock fails and is retried on the next start. A step that rewrites `record`
 /// or takes the lock for long must be split into an expand step and a contract step. A step that
@@ -2230,11 +2232,12 @@ impl Postgres {
         // The transaction holds the schema lock already, so the lock timeout bounds only the table
         // locks that the steps take. The statement timeout drops from the setup's 5 minutes to
         // the timeout of a request, because a step that holds a table lock stalls every request on
-        // that table. The brokers that wait for the schema lock keep the 5 minutes in their own
-        // sessions.
+        // that table. `DEFAULT` resets it to the value that the connection started with, which is
+        // the operator's own timeout from the URL or [`DEFAULT_STATEMENT_TIMEOUT_MS`]. The
+        // brokers that wait for the schema lock keep the 5 minutes in their own sessions.
         tx.batch_execute(&format!(
             "SET LOCAL lock_timeout = '{STEP_LOCK_TIMEOUT}'; \
-             SET LOCAL statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"
+             SET LOCAL statement_timeout TO DEFAULT"
         ))
         .await?;
 
@@ -13858,6 +13861,84 @@ mod tests {
                     .await?
                     .try_get::<_, i64>(0)?;
                 assert_eq!(columns, 0);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A schema whose step records the settings that the step runs with in a table.
+    const RECORDS_STEP_SETTINGS: Schema = Schema {
+        version: 2,
+        oldest_compatible_version: 1,
+        migrations: &[Migration {
+            to_version: 2,
+            oldest_compatible_version: 1,
+            breaks_previous_release: false,
+            sql: "create table step_settings as select \
+                  current_setting('statement_timeout') as statement_timeout, \
+                  current_setting('lock_timeout') as lock_timeout",
+        }],
+    };
+
+    /// Returns the `statement_timeout` and `lock_timeout` that the step of
+    /// [`RECORDS_STEP_SETTINGS`] saw.
+    async fn recorded_step_settings(storage: &Postgres) -> Result<(String, String)> {
+        let row = storage
+            .connection()
+            .await?
+            .query_one(
+                "select statement_timeout, lock_timeout from step_settings",
+                &[],
+            )
+            .await?;
+        Ok((row.try_get(0)?, row.try_get(1)?))
+    }
+
+    /// A step must run with the 30s default statement timeout and the step lock timeout, and not
+    /// with the 5 minutes that the setup uses.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_step_runs_with_the_default_statement_timeout() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_step_runs_with_the_default_statement_timeout",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                storage
+                    .ensure_schema_of(&RECORDS_STEP_SETTINGS, SCHEMA)
+                    .await?;
+
+                assert_eq!(
+                    recorded_step_settings(&storage).await?,
+                    ("30s".to_string(), STEP_LOCK_TIMEOUT.to_string())
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step must run with the `statement_timeout` that the operator put in the options of the
+    /// storage URL, and not with the default.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_step_runs_with_the_statement_timeout_of_the_url() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_step_runs_with_the_statement_timeout_of_the_url",
+            async |database| {
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20statement_timeout%3D45000"));
+                let storage = database.storage_at(&url)?;
+                storage.ensure_schema().await?;
+
+                storage
+                    .ensure_schema_of(&RECORDS_STEP_SETTINGS, SCHEMA)
+                    .await?;
+
+                assert_eq!(
+                    recorded_step_settings(&storage).await?,
+                    ("45s".to_string(), STEP_LOCK_TIMEOUT.to_string())
+                );
                 Ok(())
             },
         )

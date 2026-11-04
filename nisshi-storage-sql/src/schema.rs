@@ -188,12 +188,18 @@ pub(crate) fn check_unversioned_tables(has_tables: bool, schema: &Schema) -> Res
     Ok(())
 }
 
+/// Returns the `oldest_compatible_version` that `steps` raise a database of `recorded` to, or
+/// `None` when they leave it as it is.
+pub(crate) fn raised_compatibility(recorded: RecordedSchema, steps: &[Migration]) -> Option<i32> {
+    let upgraded = upgraded_compatibility(recorded, steps);
+    (upgraded > recorded.oldest_compatible_version).then_some(upgraded)
+}
+
 /// Logs that a broker starts the `steps` that upgrade a database of `recorded`, so that a log
 /// shows which upgrade a failed or slow start was running. The log warns before the first step
-/// when the upgrade raises the database's `oldest_compatible_version`, because brokers below it
-/// can no longer use the database once the upgrade commits.
+/// when the upgrade would raise the database's `oldest_compatible_version`. The upgrade can
+/// still roll back, so [`report_upgrade`] logs the warning that confirms the raise.
 pub(crate) fn announce_upgrade(recorded: RecordedSchema, steps: &[Migration]) {
-    let oldest_compatible_version = upgraded_compatibility(recorded, steps);
     info!(
         from_version = recorded.version,
         to_version = steps.last().map(|last| last.to_version),
@@ -201,15 +207,17 @@ pub(crate) fn announce_upgrade(recorded: RecordedSchema, steps: &[Migration]) {
         "upgrading the schema"
     );
 
-    if oldest_compatible_version > recorded.oldest_compatible_version {
+    if let Some(oldest_compatible_version) = raised_compatibility(recorded, steps) {
         warn!(
             oldest_compatible_version,
-            "this upgrade raises the oldest schema version that can use the database, so brokers with a schema version below it can no longer use the database once the upgrade commits: stop them"
+            "this upgrade will raise the oldest schema version that can use the database if it commits, and brokers with a schema version below it can then no longer use the database"
         );
     }
 }
 
-/// Logs that `steps` upgraded a database of `recorded` in `elapsed`.
+/// Logs that `steps` upgraded a database of `recorded` in `elapsed`. The log warns when the
+/// upgrade raised the database's `oldest_compatible_version`, because brokers below it can no
+/// longer use the database.
 pub(crate) fn report_upgrade(recorded: RecordedSchema, steps: &[Migration], elapsed: Duration) {
     info!(
         from_version = recorded.version,
@@ -218,6 +226,13 @@ pub(crate) fn report_upgrade(recorded: RecordedSchema, steps: &[Migration], elap
         ?elapsed,
         "upgraded the schema"
     );
+
+    if let Some(oldest_compatible_version) = raised_compatibility(recorded, steps) {
+        warn!(
+            oldest_compatible_version,
+            "the upgrade raised the oldest schema version that can use the database, so brokers with a schema version below it can no longer use the database: stop them"
+        );
+    }
 }
 
 /// Returns the SHA-256 digest of `statements`, in hex.
@@ -322,6 +337,36 @@ mod tests {
                 schema_version: 3,
             })
         );
+    }
+
+    #[test]
+    fn upgrade_to_a_step_that_needs_a_newer_release_raises_the_compatibility() {
+        let recorded = RecordedSchema {
+            version: 1,
+            oldest_compatible_version: 1,
+        };
+
+        assert_eq!(raised_compatibility(recorded, &[STEP_2, STEP_3]), Some(2));
+    }
+
+    #[test]
+    fn upgrade_that_keeps_the_compatibility_raises_nothing() {
+        let recorded = RecordedSchema {
+            version: 1,
+            oldest_compatible_version: 1,
+        };
+
+        assert_eq!(raised_compatibility(recorded, &[STEP_2]), None);
+    }
+
+    #[test]
+    fn upgrade_below_a_stricter_recorded_compatibility_raises_nothing() {
+        let recorded = RecordedSchema {
+            version: 1,
+            oldest_compatible_version: 3,
+        };
+
+        assert_eq!(raised_compatibility(recorded, &[STEP_2, STEP_3]), None);
     }
 
     #[test]

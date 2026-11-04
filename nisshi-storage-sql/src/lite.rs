@@ -1817,8 +1817,11 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// rebuilds a table: it creates the new table, copies the rows, drops the old table and renames
 /// the new one. The upgrade runs with `PRAGMA foreign_keys = OFF`, because `DROP TABLE` with
 /// foreign keys on deletes the table's rows first, which fires every `on delete cascade` rule of
-/// the tables that refer to it. After the last step, the upgrade runs `PRAGMA foreign_key_check`
-/// and fails when a row breaks a foreign key.
+/// the tables that refer to it. For the same reason, a step's own `delete` does not fire `on
+/// delete cascade`, unlike on PostgreSQL, so a step deletes the rows of the child tables itself.
+/// After the last step, the upgrade runs `PRAGMA foreign_key_check` and fails when a row breaks a
+/// foreign key. The check reads every row of every child table, so each upgrade takes time in
+/// proportion to the stored data, and a row that broke a key before the upgrade fails it too.
 ///
 /// A change to `ddl/` also changes what the Turso engine creates in a new database, because
 /// `limbo.rs` runs the same files with `create table if not exists` and ignores their errors. An
@@ -2044,20 +2047,23 @@ async fn upgrade_schema(
 
     // The steps ran with foreign keys off, so a row that breaks a key stays unnoticed until this
     // check. It is the last check of SQLite's procedure for rebuilding a table.
-    if tx
-        .query("PRAGMA foreign_key_check", ())
-        .await?
-        .next()
-        .await?
-        .is_some()
-    {
+    let mut broken_keys = tx.query("PRAGMA foreign_key_check", ()).await?;
+    if let Some(row) = broken_keys.next().await? {
+        // The columns of the first row of the check: the child table, the rowid of the child row
+        // (null for a table without rowid), and the parent table that the row refers to.
+        let table = row.get::<String>(0)?;
+        let rowid = row.get::<Option<i64>>(1)?;
+        let parent = row.get::<String>(2)?;
         error!(
             from_version = recorded.version,
-            "a schema upgrade step left a row that breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
+            table,
+            ?rowid,
+            parent,
+            "after the upgrade steps, a row breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
         );
-        return Err(Error::Message(
-            "a schema upgrade step left a row that breaks a foreign key".into(),
-        ));
+        return Err(Error::Message(format!(
+            "after the upgrade steps, a row of `{table}` refers to a missing row of `{parent}`"
+        )));
     }
 
     let Some(last) = steps.last() else {
@@ -8022,7 +8028,8 @@ mod tests {
 
         assert_matches!(
             ensure_schema_of(&db, Duration::from_secs(5), &BREAKS_A_KEY, &DDL).await,
-            Err(Error::Message(message)) if message.contains("foreign key")
+            Err(Error::Message(message))
+                if message.contains("`checked_child`") && message.contains("`checked_parent`")
         );
 
         assert_eq!(recorded_version(&db).await?, Some(1));
