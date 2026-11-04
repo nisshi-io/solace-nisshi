@@ -113,9 +113,17 @@ fn tls_rejection_message(rejection: &nisshi_client::TlsRejection) -> String {
             Check --tls-cert-file and --tls-key-file, and that the broker trusts the authority \
             that signed the certificate."
         ),
+        nisshi_client::TlsRejection::Negotiation(alert) => format!(
+            "The broker rejected the TLS connection: it sent the TLS alert {alert}. A broker \
+            that negotiates TLS 1.2 and requires a client certificate sends it when the command \
+            sent none, so check --tls-cert-file and --tls-key-file. It also means that the \
+            broker and the client share no TLS version or cipher suite."
+        ),
         nisshi_client::TlsRejection::Other(alert) => {
             format!("The broker rejected the TLS connection: it sent the TLS alert {alert}.")
         }
+        // `TlsRejection` is `non_exhaustive`.
+        rejection => format!("The broker rejected the TLS connection: {rejection:?}."),
     }
 }
 
@@ -604,6 +612,20 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("--tls-ca-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_fails_the_tls_negotiation_names_the_alert_and_the_options() {
+        let error = nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::Negotiation(
+            "HandshakeFailure".to_owned(),
+        ));
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("HandshakeFailure"), "{message}");
+        assert!(message.contains("--tls-cert-file"), "{message}");
+        assert!(message.contains("--tls-key-file"), "{message}");
+        assert!(message.contains("cipher suite"), "{message}");
     }
 
     #[test]

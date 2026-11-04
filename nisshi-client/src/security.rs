@@ -298,7 +298,10 @@ pub(crate) fn rustls_cause(error: &io::Error) -> Option<&RustlsError> {
 }
 
 /// Why the broker rejected a TLS connection: the alert that it sent.
+///
+/// Marked `non_exhaustive`: a later release may give another alert its own variant.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TlsRejection {
     /// The broker asks for a client certificate, and the client has none.
     CertificateRequired,
@@ -306,6 +309,13 @@ pub enum TlsRejection {
     /// The broker does not accept the client's certificate. The alert's name says why: for
     /// example, `UnknownCA` means that the broker does not trust the authority that signed it.
     ClientCertificate(String),
+
+    /// The broker found nothing to agree on with the client, and the alert's name says which:
+    /// `HandshakeFailure` is no shared cipher suite, and also what a Java broker negotiating
+    /// TLS 1.2 sends to a client that gave no certificate when it requires one (a TLS 1.3
+    /// broker sends `CertificateRequired`). `ProtocolVersion` and `InsufficientSecurity` mean no
+    /// shared version or cipher suite.
+    Negotiation(String),
 
     /// Any other alert, by name.
     Other(String),
@@ -328,6 +338,10 @@ impl TlsRejection {
             | AlertDescription::CertificateUnknown
             | AlertDescription::UnknownCA
             | AlertDescription::AccessDenied => Self::ClientCertificate(format!("{alert:?}")),
+
+            AlertDescription::HandshakeFailure
+            | AlertDescription::ProtocolVersion
+            | AlertDescription::InsufficientSecurity => Self::Negotiation(format!("{alert:?}")),
 
             _ => Self::Other(format!("{alert:?}")),
         })
@@ -850,5 +864,47 @@ impl Security {
 
     pub(crate) fn sasl_config(&self) -> Option<&Sasl> {
         self.sasl.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert_during_handshake(alert: AlertDescription) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            RustlsError::AlertReceived(alert),
+        )
+    }
+
+    /// A Java broker sends `HandshakeFailure` on TLS 1.2 when it requires a client certificate
+    /// and gets none, and when it shares no cipher suite with the client.
+    #[test]
+    fn handshake_failure_alert_during_the_handshake_is_a_negotiation_rejection() {
+        for alert in [
+            AlertDescription::HandshakeFailure,
+            AlertDescription::ProtocolVersion,
+            AlertDescription::InsufficientSecurity,
+        ] {
+            let error = handshake_failure(alert_during_handshake(alert));
+
+            assert_eq!(
+                Some(&TlsRejection::Negotiation(format!("{alert:?}"))),
+                error.tls_rejection(),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_without_a_cause_of_its_own_is_other() {
+        let error = handshake_failure(alert_during_handshake(AlertDescription::InternalError));
+
+        assert_eq!(
+            Some(&TlsRejection::Other("InternalError".to_owned())),
+            error.tls_rejection(),
+            "{error}"
+        );
     }
 }
