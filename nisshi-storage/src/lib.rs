@@ -221,7 +221,8 @@ pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
 pub use producer::{
-    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+    FirstSequence, OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted,
+    producer_claim,
 };
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
