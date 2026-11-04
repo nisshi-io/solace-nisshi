@@ -158,6 +158,62 @@ Results in the following output:
 |-----------+---------+---------------+-------------+---------------|
 ```
 
+## Output and exit codes
+
+The client tools (`topic`, `cat`, `user`, `generator`, `perf`) are meant to be driven by
+scripts as well as by people. The exit codes apply to every subcommand that connects to a broker.
+
+### `--output json`
+
+`--output table` is the default and prints what the command always has: a table, a confirmation
+line, or nothing. `--output json` prints JSON on stdout instead, in the shape of
+`nisshi topic list --output json`: the broker's per-item results as an array, as the broker sent
+them, with its field names.
+
+| Command | `--output json` prints |
+|---------|------------------------|
+| `topic list` | an array of the broker's topics |
+| `topic create`, `topic delete` | an array of the one result for the topic you named |
+| `user create`, `user delete` | an array of the one result for the user you named |
+| `cat produce` | an array of the one partition result, with `base_offset`, `error_code`, `error_message` and `record_errors` |
+| `cat consume` | always JSON, with or without the option: one array of records per batch, on its own line |
+
+The JSON is printed whether or not the broker refused the request, and its `error_code` says
+why. `--silent` hides only the confirmation line, so `--output json` prints even with it. A
+command's log lines and error messages go to stderr, so stdout holds JSON only. `generator` and
+`perf` do not take `--output` yet.
+
+```shell
+$ nisshi topic create taxi --output json
+[{"name":"taxi","topic_id":[...],"error_code":0,...}]
+```
+
+### Exit codes
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | success | The command did what it was asked to. |
+| 1 | failure | Any other failure: an input file that can't be read, a storage failure, a response that makes no sense. |
+| 2 | usage error | The command line is wrong, or a TLS or SASL option can't be used. Nothing was sent to a broker. |
+| 3 | broker unreachable | No connection opened, or the broker did not answer in time. Retrying later can succeed. |
+| 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login, rejected the TLS connection or closed the connection, or the client refused what the broker offered (a certificate it does not trust). Retrying the same command won't help. |
+
+`generator` and `perf` keep running when the broker refuses a produce request, so a refused
+produce does not end them with 4. A refused login or TLS connection still does. `nisshi perf
+consume` is not implemented and ends with 1.
+
+Releases before this one exited with 1 when the broker refused a request. A script that tests
+for `1` should test for non-zero, or for `4`.
+
+```shell
+nisshi topic create taxi
+case $? in
+  0) echo created ;;
+  3) echo "no broker at tcp://127.0.0.1:9092" ;;
+  4) echo "the broker refused: does the topic exist?" ;;
+esac
+```
+
 ## Connecting to a broker with TLS or SASL
 
 `topic`, `user`, `cat`, `generator` and `perf` connect in plaintext and don't log in, unless

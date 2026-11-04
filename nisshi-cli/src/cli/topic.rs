@@ -41,9 +41,14 @@ pub(super) enum Command {
         #[arg(long, value_parser = parse_key_val::<String, String>)]
         config: Vec<(String, String)>,
 
-        /// Print no confirmation on success (errors still print)
+        /// Print no confirmation on success (errors still print). With --output json the
+        /// result is printed anyway
         #[arg(long)]
         silent: bool,
+
+        /// Print a confirmation line, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
         #[command(flatten)]
         security: ClientSecurity,
     },
@@ -57,6 +62,10 @@ pub(super) enum Command {
         /// The name of the topic to delete
         #[clap(value_parser)]
         name: String,
+
+        /// Print nothing, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
         #[command(flatten)]
         security: ClientSecurity,
     },
@@ -75,6 +84,13 @@ pub(super) enum Command {
     },
 }
 
+fn format(output: Output) -> Format {
+    match output {
+        Output::Table => Format::Table,
+        Output::Json => Format::Json,
+    }
+}
+
 impl TryFrom<Command> for Topic {
     type Error = crate::Error;
 
@@ -86,6 +102,7 @@ impl TryFrom<Command> for Topic {
                 partitions,
                 config,
                 silent,
+                output,
                 security,
             } => Topic::create()
                 .broker(broker)
@@ -94,16 +111,19 @@ impl TryFrom<Command> for Topic {
                 .partitions(partitions)
                 .config(HashMap::from_iter(config))
                 .confirm(!silent)
+                .format(format(output))
                 .build(),
 
             Command::Delete {
                 broker,
                 name,
+                output,
                 security,
             } => Topic::delete()
                 .broker(broker)
                 .security(security.build()?)
                 .name(name)
+                .format(format(output))
                 .build(),
 
             Command::List {
@@ -113,10 +133,7 @@ impl TryFrom<Command> for Topic {
             } => Topic::list()
                 .broker(broker)
                 .security(security.build()?)
-                .format(match output {
-                    Output::Table => Format::Table,
-                    Output::Json => Format::Json,
-                })
+                .format(format(output))
                 .build(),
         })
     }
@@ -197,5 +214,33 @@ mod tests {
                 .unwrap_err()
                 .kind()
         );
+    }
+
+    fn output(args: &[&str]) -> Result<Output, clap::Error> {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))?;
+
+        match command {
+            Command::List { output, .. }
+            | Command::Create { output, .. }
+            | Command::Delete { output, .. } => Ok(output),
+        }
+    }
+
+    #[test]
+    fn create_and_delete_print_a_table_unless_asked_for_json() {
+        for subcommand in ["create", "delete"] {
+            assert_eq!(Output::Table, output(&[subcommand, "t"]).unwrap());
+            assert_eq!(
+                Output::Json,
+                output(&[subcommand, "t", "--output", "json"]).unwrap()
+            );
+            assert_eq!(
+                clap::error::ErrorKind::InvalidValue,
+                output(&[subcommand, "t", "--output", "yaml"])
+                    .unwrap_err()
+                    .kind()
+            );
+        }
     }
 }

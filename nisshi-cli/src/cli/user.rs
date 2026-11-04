@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use tracing::debug;
 use url::Url;
 
-use super::{DEFAULT_BROKER, Outcome, client_security::ClientSecurity};
+use super::{DEFAULT_BROKER, Outcome, client_security::ClientSecurity, output::Output};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -51,6 +51,11 @@ pub(super) enum Command {
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
 
+        /// Print nothing on success, or the broker's per-user results as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+
         #[command(flatten)]
         security: ClientSecurity,
     },
@@ -67,6 +72,11 @@ pub(super) enum Command {
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
+
+        /// Print nothing on success, or the broker's per-user results as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
 
         #[command(flatten)]
         security: ClientSecurity,
@@ -116,6 +126,12 @@ impl Command {
     fn security(&self) -> &ClientSecurity {
         match self {
             Command::Create { security, .. } | Command::Delete { security, .. } => security,
+        }
+    }
+
+    fn output(&self) -> Output {
+        match self {
+            Command::Create { output, .. } | Command::Delete { output, .. } => *output,
         }
     }
 
@@ -191,6 +207,20 @@ impl Command {
             .call(req)
             .await
             .inspect(|response| debug!(?response))?;
+
+        if self.output() == Output::Json {
+            // The per-user results as the broker sent them, printed whether or not one carries
+            // an error code. The `error: user ...` lines below still go to stderr.
+            // The broker has already acted, so a failure to print, such as a closed pipe, is
+            // ignored: the `error: user ...` lines below must still print and the status stand.
+            _ = writeln!(
+                io::stdout(),
+                "{}",
+                serde_json::to_string(response.results.as_deref().unwrap_or_default())
+                    .map_err(|error| crate::Error::Box(error.into()))?
+            )
+            .inspect_err(|error| debug!(?error));
+        }
 
         Ok(Outcome {
             error_code: report(&response, &mut io::stderr()),

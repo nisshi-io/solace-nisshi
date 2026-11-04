@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{DEFAULT_BROKER, client_security::ClientSecurity};
+use super::{
+    DEFAULT_BROKER,
+    client_security::ClientSecurity,
+    output::{JsonOnly, Output},
+};
 use crate::{EnvVarExp, Result};
 use clap::Subcommand;
 use nisshi_cat::Cat;
@@ -43,9 +47,15 @@ pub(super) enum Command {
         #[arg(long, env = "SCHEMA_REGISTRY")]
         schema_registry: Option<EnvVarExp<Url>>,
 
-        /// Print no confirmation on success (errors still print)
+        /// Print no confirmation on success (errors still print). With --output json the
+        /// broker's result is printed anyway
         #[arg(long)]
         silent: bool,
+
+        /// Print a confirmation line, or the broker's partition result as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
         #[command(flatten)]
         security: ClientSecurity,
     },
@@ -87,6 +97,11 @@ pub(super) enum Command {
         /// The maximum bytes to fetch from the partition
         #[arg(long, default_value = "1048576")]
         partition_max_bytes: i32,
+
+        /// Consume prints each batch of records as a JSON array on its own line, and has no
+        /// other format: this option is accepted so that every tool takes --output json
+        #[arg(long, value_enum, default_value_t = JsonOnly::Json)]
+        output: JsonOnly,
         #[command(flatten)]
         security: ClientSecurity,
     },
@@ -104,6 +119,7 @@ impl TryFrom<Command> for Cat {
                 partition,
                 schema_registry,
                 silent,
+                output,
                 security,
             } => Cat::produce()
                 .broker(broker)
@@ -113,6 +129,7 @@ impl TryFrom<Command> for Cat {
                 .schema_registry(schema_registry.map(EnvVarExp::into_inner))
                 .file_name(file)
                 .confirm(!silent)
+                .json(output == Output::Json)
                 .build(),
 
             Command::Consume {
@@ -125,6 +142,7 @@ impl TryFrom<Command> for Cat {
                 max_bytes,
                 fetch_offset,
                 partition_max_bytes,
+                output: JsonOnly::Json,
                 security,
             } => Cat::consume()
                 .broker(broker)
@@ -188,6 +206,27 @@ mod tests {
         match command {
             Command::Produce { silent, .. } => silent,
             Command::Consume { .. } => panic!("expected produce: {args:?}"),
+        }
+    }
+
+    fn output(args: &[&str]) -> Result<(), clap::Error> {
+        Wrapper::try_parse_from(std::iter::once("cat").chain(args.iter().copied())).map(|_| ())
+    }
+
+    #[test]
+    fn produce_takes_a_table_or_json_output_and_consume_only_json() {
+        assert!(output(&["produce", "t", "--output", "json"]).is_ok());
+        assert!(output(&["produce", "t", "--output", "table"]).is_ok());
+        assert!(output(&["consume", "t", "--output", "json"]).is_ok());
+        for args in [
+            ["produce", "t", "--output", "yaml"],
+            ["consume", "t", "--output", "table"],
+        ] {
+            assert_eq!(
+                clap::error::ErrorKind::InvalidValue,
+                output(&args).unwrap_err().kind(),
+                "{args:?}"
+            );
         }
     }
 

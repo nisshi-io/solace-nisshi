@@ -109,6 +109,14 @@ pub struct Cli {
 /// The `--help` note of each tool that connects to a broker as a Kafka client.
 const CLIENT_TOOL_NOTE: &str = "Connects in plaintext and does not log in, unless given the --tls options (TLS) or --sasl options (SASL PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512). Without them it can't reach a broker listener that requires TLS or SASL. The SASL password comes from the SASL_PASSWORD environment variable or --sasl-password-file, not from an option.";
 
+/// The exit statuses of the client tools, as [`crate::ExitStatus`] numbers them. Part of every client
+/// tool's `--help`, and of docs/commands.md.
+const EXIT_STATUS_NOTE: &str = "Exit status: 0 success, 1 other failure, 2 usage error (a wrong command line or an unusable TLS or SASL option), 3 broker unreachable (no connection, or no answer in time), 4 broker refused (an error code in its answer, a refused login or TLS connection, or a closed connection). generator and perf keep running when the broker refuses a produce request, so that does not end them with 4, but a refused login or TLS connection does.";
+
+fn client_tool_note() -> String {
+    format!("{CLIENT_TOOL_NOTE}\n\n{EXIT_STATUS_NOTE}")
+}
+
 /// The `--help` note of `nisshi proxy`.
 const PROXY_NOTE: &str = "For development and demos, not production.";
 
@@ -118,18 +126,18 @@ enum Command {
     Broker(Box<broker::Arg>),
 
     /// Consume or produce Avro, JSON or Protobuf messages to a topic
-    #[command(after_help = CLIENT_TOOL_NOTE)]
+    #[command(after_help = client_tool_note())]
     Cat {
         #[command(subcommand)]
         command: cat::Command,
     },
 
     /// Generate fake messages for schema-backed topics (development and demos)
-    #[command(after_help = CLIENT_TOOL_NOTE)]
+    #[command(after_help = client_tool_note())]
     Generator(Box<generator::Arg>),
 
     /// Measure produce and consume throughput against a broker (development and demos)
-    #[command(after_help = CLIENT_TOOL_NOTE)]
+    #[command(after_help = client_tool_note())]
     Perf(Box<perf::Arg>),
 
     /// Apache Kafka®-compatible proxy (development and demos)
@@ -137,14 +145,14 @@ enum Command {
     Proxy(Box<proxy::Arg>),
 
     /// Create, list or delete topics managed by the broker
-    #[command(after_help = CLIENT_TOOL_NOTE)]
+    #[command(after_help = client_tool_note())]
     Topic {
         #[command(subcommand)]
         command: topic::Command,
     },
 
     /// Create, list or delete users managed by the broker
-    #[command(after_help = CLIENT_TOOL_NOTE)]
+    #[command(after_help = client_tool_note())]
     User {
         #[command(subcommand)]
         command: user::Command,
@@ -232,6 +240,10 @@ mod tests {
         for tool in ["cat", "generator", "perf", "topic", "user"] {
             let help = long_help(tool);
             assert!(help.contains(CLIENT_TOOL_NOTE), "{tool}: {help}");
+            assert!(
+                help.contains("Exit status: 0 success, 1 other failure"),
+                "{tool}: {help}"
+            );
         }
 
         let proxy = long_help("proxy");

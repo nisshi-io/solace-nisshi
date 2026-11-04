@@ -49,6 +49,7 @@ pub struct Builder<B, T, P, S, F> {
     schema_registry: S,
     file_name: F,
     confirm: bool,
+    json: bool,
 }
 
 pub(crate) type PhantomBuilder = Builder<
@@ -74,6 +75,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
@@ -86,6 +88,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
@@ -98,6 +101,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
@@ -110,6 +114,7 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
@@ -122,7 +127,15 @@ impl<B, T, P, S, F> Builder<B, T, P, S, F> {
             schema_registry: self.schema_registry,
             file_name,
             confirm: self.confirm,
+            json: self.json,
         }
+    }
+
+    /// Print the broker's answer as JSON instead of a confirmation line: an array of the
+    /// partition's `PartitionProduceResponse`, as the broker sent it, printed whether or not it
+    /// carries an error code. Off by default, so a library caller gets no output.
+    pub fn json(self, json: bool) -> Builder<B, T, P, S, F> {
+        Self { json, ..self }
     }
 
     /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
@@ -141,6 +154,7 @@ impl Builder<Url, String, i32, Option<Url>, String> {
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }))
     }
 }
@@ -154,6 +168,7 @@ pub struct Configuration {
     pub schema_registry: Option<Url>,
     pub file_name: String,
     pub confirm: bool,
+    pub json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -414,11 +429,23 @@ impl Produce {
 
         let error_code = ErrorCode::try_from(partition_response.error_code)?;
 
+        if self.configuration.json {
+            // The response as the broker sent it, with the `error_message` and `record_errors`
+            // that carry its reason. A failure to print is ignored, as for the confirmation
+            // line below.
+            _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                serde_json::to_string(&[partition_response])?
+            )
+            .inspect_err(|error| debug!(?error));
+        }
+
         if error_code != ErrorCode::None {
             if let Some(reason) = rejection_reason(&topic, partition_response) {
                 error!("{reason}");
             }
-        } else if self.configuration.confirm {
+        } else if self.configuration.confirm && !self.configuration.json {
             let produced = Produced {
                 topic,
                 partition: self.configuration.partition,
@@ -549,6 +576,7 @@ mod tests {
             schema_registry: None,
             file_name: file_name.into(),
             confirm: true,
+            json: false,
         })
         .unwrap()
     }

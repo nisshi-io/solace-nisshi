@@ -26,13 +26,17 @@ use url::Url;
 
 use crate::{Error, Result, Topic};
 
-/// How `topic list` prints the topics.
+/// How a topic command prints its result.
+///
+/// `Json` prints the broker's per-item results as one JSON array on one line, as the broker sent
+/// them: the topics of the metadata response for `list`, and the one result for the topic that
+/// `create` or `delete` named.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Format {
     /// A table of topic names and partition counts, for people to read.
     #[default]
     Table,
-    /// The topics of the metadata response as JSON on one line, for scripts.
+    /// The broker's results as JSON on one line, for scripts.
     Json,
 }
 

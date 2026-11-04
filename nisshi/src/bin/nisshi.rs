@@ -15,13 +15,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Outcome};
+use nisshi_cli::{Cli, ExitStatus, Outcome};
 use nisshi_sans_io::ErrorCode;
-use std::{
-    io,
-    net::SocketAddr,
-    process::{ExitCode, Termination},
-};
+use std::{io, net::SocketAddr, process::ExitCode};
 use tracing::{debug, error};
 
 /// The option and the environment variable that give `cat`, `generator` and `perf` their
@@ -215,7 +211,15 @@ fn invalid_storage_option_value_message(
     format!("storage option {option}={value} is not valid for the {scheme} engine: give {expected}")
 }
 
-/// Runs the command, and exits with failure when it returns an error or a Kafka error code.
+/// Whether `subcommand` names a client tool: one that connects to a broker and prints a result.
+fn is_client_tool(subcommand: Option<&std::ffi::OsStr>) -> bool {
+    ["topic", "cat", "user", "generator", "perf"]
+        .iter()
+        .any(|tool| subcommand == Some(std::ffi::OsStr::new(tool)))
+}
+
+/// Runs the command, and exits with the [`ExitStatus`] that names how it ended: failure when it
+/// returns an error that no other status names, and refused when it returns a Kafka error code.
 ///
 /// `main` reports an error and then returns [`ExitCode::FAILURE`], instead of returning the
 /// error, because Rust prints the `Debug` form of an error that `main` returns, after the
@@ -224,7 +228,15 @@ fn invalid_storage_option_value_message(
 async fn main() -> ExitCode {
     _ = dotenv().ok();
 
-    let _guard = match otel::init(TracingFormat::Text) {
+    // A client tool prints its result on stdout, so its log lines go to stderr, where a script
+    // that parses `--output json` does not read them. The broker and the proxy log to stdout.
+    let init = if is_client_tool(std::env::args_os().nth(1).as_deref()) {
+        otel::init_stderr
+    } else {
+        otel::init
+    };
+
+    let _guard = match init(TracingFormat::Text) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("Error: {err:?}");
@@ -243,12 +255,12 @@ async fn main() -> ExitCode {
                 _ => error!("{}", outcome.error_code),
             }
 
-            outcome.error_code.report()
+            ExitStatus::of_error_code(outcome.error_code).into()
         }
 
         Err(err) => {
             report_error(&err);
-            ExitCode::FAILURE
+            ExitStatus::of_error(&err).into()
         }
     }
 }
@@ -304,6 +316,7 @@ fn report_error(err: &nisshi_cli::Error) {
         nisshi_cli::Error::Client(error) => {
             report_failure!("{}", client_error_message(error, TOPIC_BROKER_OPTION))
         }
+        nisshi_cli::Error::Box(error) => report_failure!("{error}"),
         nisshi_cli::Error::Server(error) => match &**error {
             #[cfg(any(feature = "dynostore", feature = "slatedb"))]
             nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
@@ -425,6 +438,19 @@ mod tests {
         feature_not_enabled_message, invalid_storage_option_value_message,
         listener_host_unresolved_message, listener_in_use_message,
     };
+
+    #[test]
+    fn only_the_client_tools_log_to_stderr() {
+        for tool in ["topic", "cat", "user", "generator", "perf"] {
+            assert!(super::is_client_tool(Some(tool.as_ref())), "{tool}");
+        }
+        for other in [None, Some("broker"), Some("proxy"), Some("--help")] {
+            assert!(
+                !super::is_client_tool(other.map(std::ffi::OsStr::new)),
+                "{other:?}"
+            );
+        }
+    }
 
     /// The smoke tests find a failed start by the `error: ` prefix.
     #[test]
