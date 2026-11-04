@@ -545,6 +545,9 @@ impl Error {
     /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
     /// batch took its offset, so a retry can store the batch twice.
     ///
+    /// A failure of the schema setup, such as [`Error::SchemaStepFailed`], is permanent for the
+    /// caller, because a restart of the broker retries the setup, not the caller.
+    ///
     /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
     /// [`Error::error_code`] keeps.
     ///
@@ -612,6 +615,9 @@ impl Error {
             | Self::NoEngineForScheme { .. }
             | Self::IncompatibleSchema { .. }
             | Self::OutdatedSchema { .. }
+            | Self::UnversionedSchema { .. }
+            | Self::MissingClusterTable { .. }
+            | Self::SchemaStepFailed { .. }
             | Self::InsufficientCapacity(_)
             | Self::LessThanBaseOffset { .. }
             | Self::LessThanLastOffset { .. }
