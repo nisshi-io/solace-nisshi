@@ -29,6 +29,7 @@ pub mod create_topics_validate_only;
 pub mod decode_error_log;
 pub mod delete_groups;
 pub mod delete_records;
+pub mod delete_records_many_partitions;
 pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;

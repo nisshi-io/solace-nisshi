@@ -3911,9 +3911,11 @@ impl Storage for Postgres {
         let mut c = self.connection().await?;
         let mut responses = Vec::with_capacity(topics.len());
 
-        // Each partition commits on its own, so the request holds at most one
-        // watermark row lock at a time. It cannot then deadlock with EndTxn,
-        // and a produce waits only while its own partition advances.
+        // Each partition commits on its own, so a call holds at most one
+        // watermark row lock at a time. It cannot then deadlock with EndTxn
+        // or with the other calls of the same request, which the service runs
+        // concurrently on their own connections, and a produce waits only
+        // while its own partition advances.
         for topic in topics {
             let mut partitions = Vec::with_capacity(topic.partitions.as_ref().map_or(0, Vec::len));
 

@@ -94,6 +94,9 @@ macro_rules! include_sql {
     };
 }
 
+/// How long a Turso connection waits for another connection's write lock.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("nisshi_sqlite_duration")
@@ -272,8 +275,20 @@ impl Engine {
     }
 
     async fn connection(&self) -> Result<Connection> {
-        let db = self.db.lock()?;
-        db.connect().map_err(Into::into)
+        let connection = {
+            let db = self.db.lock()?;
+            db.connect()?
+        };
+
+        // A connection has no busy handler until one is set, and a second
+        // writer then fails at once with `Busy` instead of waiting for the
+        // first. The DeleteRecords service runs one call per partition at the
+        // same time, each with its own write transaction, and the same
+        // happens to concurrent writes of different requests. The value is
+        // libSQL's default.
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+
+        Ok(connection)
     }
 
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {

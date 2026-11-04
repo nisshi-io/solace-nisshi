@@ -14,6 +14,8 @@
 
 use std::slice;
 
+use futures::{StreamExt as _, stream};
+
 use nisshi_sans_io::{
     ApiKey, DeleteRecordsRequest, DeleteRecordsResponse, ErrorCode, RequestInput,
     delete_records_request::DeleteRecordsTopic,
@@ -30,6 +32,14 @@ use crate::{
         storage_error_code,
     },
 };
+
+/// How many partitions of one DeleteRecords request are in storage at once.
+///
+/// The value is the one of `LIST_OFFSETS_CONCURRENCY`.
+/// A request takes up to this many connections of an engine's pool, and an
+/// engine that serialises its writes (libSQL by default) gains nothing from
+/// it, but loses nothing either.
+const DELETE_RECORDS_CONCURRENCY: usize = 4;
 
 /// How many failed partitions one log line names.
 const PARTITION_SAMPLE: usize = 8;
@@ -48,11 +58,12 @@ impl<G> DeleteRecordsService<G>
 where
     G: Storage,
 {
-    /// Deletes the records of each partition with its own storage call, one
-    /// partition after another, so that a storage error answers in the
-    /// partition that it belongs to (see [`storage_error_code`]) and the
-    /// other partitions still answer. Kafka also answers each partition's
-    /// failure in that partition ([ReplicaManager.scala#L1122-L1146]).
+    /// Deletes the records of each partition with its own storage call, up to
+    /// [`DELETE_RECORDS_CONCURRENCY`] at a time, so that a storage error
+    /// answers in the partition that it belongs to (see
+    /// [`storage_error_code`]) and the other partitions still answer. Kafka
+    /// also answers each partition's failure in that partition
+    /// ([ReplicaManager.scala#L1122-L1146]).
     ///
     /// An engine can fail a whole call, as libSQL, Turso and DynoStore do,
     /// and a call with every partition would then fail partitions whose
@@ -61,84 +72,119 @@ where
     /// One deadline, [`DELETE_RECORDS_DEADLINE`], bounds when the calls
     /// start. A partition whose call has not started at the deadline answers
     /// `REQUEST_TIMED_OUT`, so a degraded engine does not hold the request
-    /// past the client's own timeout, one engine timeout per partition.
+    /// past the client's own timeout, one engine timeout per partition. The
+    /// Java admin client then resends only the partitions that timed out
+    /// ([DeleteRecordsHandler.java#L147-L165]), so a request with more
+    /// partitions than one round serves still completes.
     ///
     /// A call that has started runs to its end, so the request takes longer
-    /// than the deadline by at most one partition's call. The service does
-    /// not drop a started call, because a write that its caller drops can
-    /// leave its storage engine's connection busy for the next caller.
+    /// than the deadline by at most the longest call of the last calls to
+    /// start. The service does not drop a started call, because a write that
+    /// its caller drops can leave its storage engine's connection busy for
+    /// the next caller. For that reason the loop below reads the stream to
+    /// its end and never breaks out of it.
     ///
     /// [ReplicaManager.scala#L1122-L1146]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1122-L1146
+    /// [DeleteRecordsHandler.java#L147-L165]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/internals/DeleteRecordsHandler.java#L147-L165
     async fn delete_records(&self, topics: &[DeleteRecordsTopic]) -> Vec<DeleteRecordsTopicResult> {
         let started_at = Instant::now();
         let deadline = started_at + DELETE_RECORDS_DEADLINE;
 
-        let mut responses = Vec::with_capacity(topics.len());
+        // The calls are built up front (but not started) rather than in a
+        // `StreamExt::map` closure, whose lifetimes keep `serve` from being
+        // `Send`. A call checks the deadline when the stream first polls it,
+        // that is when one of the running calls ends and frees its place.
+        let calls = topics
+            .iter()
+            .enumerate()
+            .flat_map(|(topic_index, topic)| {
+                topic.partitions.iter().flatten().enumerate().map(
+                    move |(partition_index, partition)| {
+                        (topic_index, partition_index, topic, partition)
+                    },
+                )
+            })
+            .map(
+                |(topic_index, partition_index, topic, partition)| async move {
+                    let request = DeleteRecordsTopic::default()
+                        .name(topic.name.clone())
+                        .partitions(Some(vec![partition.clone()]));
+
+                    let answer = started_before(
+                        StorageOperation::DeleteRecords,
+                        deadline,
+                        self.storage.delete_records(slice::from_ref(&request)),
+                    )
+                    .await;
+
+                    (topic_index, partition_index, topic, partition, answer)
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut answers = stream::iter(calls).buffer_unordered(DELETE_RECORDS_CONCURRENCY);
+
+        // One slot for each partition of the request, so that the response
+        // keeps the order of the request whatever order the calls end in.
+        let mut slots = topics
+            .iter()
+            .map(|topic| vec![Vec::new(); topic.partitions.as_ref().map_or(0, Vec::len)])
+            .collect::<Vec<_>>();
+
         let mut failed = Vec::new();
         let mut not_started = Vec::new();
         let mut first_error = None;
 
-        for topic in topics {
-            let mut partitions = Vec::with_capacity(topic.partitions.as_ref().map_or(0, Vec::len));
+        while let Some((topic_index, partition_index, topic, partition, answer)) =
+            answers.next().await
+        {
+            slots[topic_index][partition_index] = match answer {
+                Ok(Ok(answer)) => answer
+                    .into_iter()
+                    .flat_map(|topic| topic.partitions.unwrap_or_default())
+                    .collect(),
 
-            for partition in topic.partitions.iter().flatten() {
-                let request = DeleteRecordsTopic::default()
-                    .name(topic.name.clone())
-                    .partitions(Some(vec![partition.clone()]));
+                Ok(Err(error)) => {
+                    let topition = Topition::new(topic.name.as_str(), partition.partition_index);
+                    let error_code = storage_error_code(&error);
+                    debug!(?error, ?topition, ?error_code, "delete records");
 
-                let answer = started_before(
-                    StorageOperation::DeleteRecords,
-                    deadline,
-                    self.storage.delete_records(slice::from_ref(&request)),
-                )
-                .await;
+                    failed.push((topition, error_code));
+                    _ = first_error.get_or_insert(error);
 
-                match answer {
-                    Ok(Ok(answer)) => partitions.extend(
-                        answer
-                            .into_iter()
-                            .flat_map(|topic| topic.partitions.unwrap_or_default()),
-                    ),
-
-                    Ok(Err(error)) => {
-                        let topition =
-                            Topition::new(topic.name.as_str(), partition.partition_index);
-                        let error_code = storage_error_code(&error);
-                        debug!(?error, ?topition, ?error_code, "delete records");
-
-                        failed.push((topition, error_code));
-                        _ = first_error.get_or_insert(error);
-
-                        partitions.push(
-                            DeleteRecordsPartitionResult::default()
-                                .partition_index(partition.partition_index)
-                                .low_watermark(DELETE_RECORDS_INVALID_LOW_WATERMARK)
-                                .error_code(error_code.into()),
-                        );
-                    }
-
-                    Err(_not_started) => {
-                        not_started.push(Topition::new(
-                            topic.name.as_str(),
-                            partition.partition_index,
-                        ));
-
-                        partitions.push(
-                            DeleteRecordsPartitionResult::default()
-                                .partition_index(partition.partition_index)
-                                .low_watermark(DELETE_RECORDS_INVALID_LOW_WATERMARK)
-                                .error_code(ErrorCode::RequestTimedOut.into()),
-                        );
-                    }
+                    vec![
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            .error_code(error_code.into()),
+                    ]
                 }
-            }
 
-            responses.push(
+                Err(_not_started) => {
+                    not_started.push(Topition::new(
+                        topic.name.as_str(),
+                        partition.partition_index,
+                    ));
+
+                    vec![
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(DELETE_RECORDS_INVALID_LOW_WATERMARK)
+                            .error_code(ErrorCode::RequestTimedOut.into()),
+                    ]
+                }
+            };
+        }
+
+        let responses = topics
+            .iter()
+            .zip(slots)
+            .map(|(topic, partitions)| {
                 DeleteRecordsTopicResult::default()
                     .name(topic.name.clone())
-                    .partitions(Some(partitions)),
-            );
-        }
+                    .partitions(Some(partitions.into_iter().flatten().collect()))
+            })
+            .collect();
 
         if !not_started.is_empty() {
             warn!(
@@ -191,7 +237,10 @@ where
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -216,7 +265,7 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
-    use super::DeleteRecordsService;
+    use super::{DELETE_RECORDS_CONCURRENCY, DeleteRecordsService};
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
         GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
@@ -250,6 +299,11 @@ mod tests {
         answers: BTreeMap<(String, i32), Answer>,
         calls: Arc<Mutex<Vec<Call>>>,
         delay: Duration,
+        /// Calls in storage now, the most at once, and those that ran to
+        /// their end.
+        running: Arc<AtomicUsize>,
+        most_running: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
     }
 
     impl Stub {
@@ -261,6 +315,9 @@ mod tests {
                     .collect(),
                 calls: Arc::default(),
                 delay: Duration::ZERO,
+                running: Arc::default(),
+                most_running: Arc::default(),
+                completed: Arc::default(),
             }
         }
 
@@ -272,7 +329,9 @@ mod tests {
 
         /// The topics and partitions of each `delete_records` call.
         fn calls(&self) -> Vec<Call> {
-            self.calls.lock().expect("calls").clone()
+            let mut calls = self.calls.lock().expect("calls").clone();
+            calls.sort();
+            calls
         }
 
         fn delete(&self, topics: &[DeleteRecordsTopic]) -> Result<Vec<DeleteRecordsTopicResult>> {
@@ -372,7 +431,13 @@ mod tests {
             topics: &[DeleteRecordsTopic],
         ) -> Result<Vec<DeleteRecordsTopicResult>> {
             let answer = self.delete(topics);
+
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            _ = self.most_running.fetch_max(running, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
+            _ = self.running.fetch_sub(1, Ordering::SeqCst);
+            _ = self.completed.fetch_add(1, Ordering::SeqCst);
+
             answer
         }
 
@@ -690,7 +755,7 @@ mod tests {
             .await?
         );
 
-        // one partition to each call, in the order of the request
+        // one partition to each call
         assert_eq!(
             vec![
                 vec![(String::from("a"), vec![0])],
@@ -705,56 +770,116 @@ mod tests {
         Ok(())
     }
 
-    /// Each call takes 2s and the deadline is 5s. The third call starts at
-    /// 4s, before the deadline, so it runs to its end at 6s and answers its
-    /// cut. The fourth call would start after the deadline, so it is never
-    /// made and answers `REQUEST_TIMED_OUT`.
+    /// Each call takes 2s and the deadline is 5s. Partitions run four at a
+    /// time, so 8 partitions all start before the deadline (at 0s and 2s)
+    /// and finish at 4s. One at a time, only 3 would have started before the
+    /// deadline and the other 5 would have answered `REQUEST_TIMED_OUT`.
     #[tokio::test(start_paused = true)]
-    async fn partitions_not_started_at_the_deadline_time_out() -> Result<()> {
-        let stub = Stub::new(&[
-            ("a", 0, Answer::Cut(5)),
-            ("a", 1, Answer::Cut(6)),
-            ("a", 2, Answer::Cut(7)),
-            ("b", 0, Answer::Cut(8)),
-        ])
+    async fn many_partitions_finish_within_the_deadline() -> Result<()> {
+        let partitions = (0..8).collect::<Vec<_>>();
+        let stub = Stub::new(
+            &partitions
+                .iter()
+                .map(|partition| ("a", *partition, Answer::Cut(i64::from(*partition) + 10)))
+                .collect::<Vec<_>>(),
+        )
         .with_delay(Duration::from_secs(2));
 
         let started_at = tokio::time::Instant::now();
 
+        // in the order of the request, whatever order the calls end in
         assert_eq!(
-            vec![
-                (
-                    String::from("a"),
-                    Some(vec![
-                        (0, ErrorCode::None, 5),
-                        (1, ErrorCode::None, 6),
-                        (2, ErrorCode::None, 7),
-                    ])
-                ),
-                (
-                    String::from("b"),
-                    Some(vec![(
-                        0,
-                        ErrorCode::RequestTimedOut,
-                        DELETE_RECORDS_INVALID_LOW_WATERMARK
-                    )])
-                ),
-            ],
-            delete_records(
-                &stub,
-                vec![topic("a", Some(&[0, 1, 2])), topic("b", Some(&[0]))]
-            )
-            .await?
+            vec![(
+                String::from("a"),
+                Some(
+                    partitions
+                        .iter()
+                        .map(|partition| (*partition, ErrorCode::None, i64::from(*partition) + 10))
+                        .collect()
+                )
+            )],
+            delete_records(&stub, vec![topic("a", Some(&partitions))]).await?
         );
 
-        // the third call ran 1s past the deadline
+        assert_eq!(Duration::from_secs(4), started_at.elapsed());
+        assert_eq!(8, stub.calls().len());
+
+        Ok(())
+    }
+
+    /// No more than [`DELETE_RECORDS_CONCURRENCY`] calls are in storage at
+    /// once, and that many are.
+    #[tokio::test(start_paused = true)]
+    async fn partitions_run_at_most_the_bound_at_once() -> Result<()> {
+        let partitions = (0..10).collect::<Vec<_>>();
+        let stub = Stub::new(
+            &partitions
+                .iter()
+                .map(|partition| ("a", *partition, Answer::Cut(1)))
+                .collect::<Vec<_>>(),
+        )
+        .with_delay(Duration::from_secs(1));
+
+        _ = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
+
+        assert_eq!(4, DELETE_RECORDS_CONCURRENCY);
+        assert_eq!(4, stub.most_running.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// Each call takes 2s and the deadline is 5s, so with 20 partitions the
+    /// calls start at 0s, 2s and 4s, 12 of them. The 13th partition would
+    /// start at 6s, after the deadline, so it and the 7 after it are never
+    /// called and answer `REQUEST_TIMED_OUT`. The calls that started at 4s
+    /// run to their end at 6s: none is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn partitions_not_started_at_the_deadline_time_out() -> Result<()> {
+        let partitions = (0..20).collect::<Vec<_>>();
+        let stub = Stub::new(
+            &partitions
+                .iter()
+                .map(|partition| ("a", *partition, Answer::Cut(1)))
+                .collect::<Vec<_>>(),
+        )
+        .with_delay(Duration::from_secs(2));
+
+        let started_at = tokio::time::Instant::now();
+
+        let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
+
+        let (_, answered) = &answers[0];
+        let answered = answered.as_ref().expect("partitions");
+
+        assert_eq!(
+            partitions.clone(),
+            answered
+                .iter()
+                .map(|(partition, ..)| *partition)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            12,
+            answered
+                .iter()
+                .filter(|(_, error_code, _)| *error_code == ErrorCode::None)
+                .count()
+        );
+        assert!(answered[12..].iter().all(|answer| *answer
+            == (
+                answer.0,
+                ErrorCode::RequestTimedOut,
+                DELETE_RECORDS_INVALID_LOW_WATERMARK
+            )));
+
+        // the last calls started 1s before the deadline and ran 1s past it
         assert_eq!(
             DELETE_RECORDS_DEADLINE + Duration::from_secs(1),
             started_at.elapsed()
         );
 
-        // the fourth partition was not started, because the deadline had passed
-        assert_eq!(3, stub.calls().len());
+        assert_eq!(12, stub.calls().len());
+        assert_eq!(12, stub.completed.load(Ordering::SeqCst));
 
         Ok(())
     }
