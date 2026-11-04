@@ -683,6 +683,31 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
     name
 }
 
+/// Returns the error for a schema upgrade step from `from_version` to `to_version` that failed
+/// with `error`.
+///
+/// A database error becomes [`Error::SchemaStepFailed`], which leaves out the `DETAIL` of the
+/// server's error, because a failed constraint repeats the failing row there. A `statement_timeout`
+/// keeps the conversion of [`Error::from`], which carries no `DETAIL`.
+fn schema_step_failure(from_version: i32, to_version: i32, error: tokio_postgres::Error) -> Error {
+    let error = Error::from(error);
+    let Error::TokioPostgres(error) = &error else {
+        return error;
+    };
+    let Some(db_error) = error.as_db_error() else {
+        return Error::TokioPostgres(error.clone());
+    };
+
+    Error::SchemaStepFailed {
+        from_version,
+        to_version,
+        code: db_error.code().code().into(),
+        message: db_error.message().into(),
+        table: db_error.table().map(Into::into),
+        constraint: db_error.constraint().map(Into::into),
+    }
+}
+
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
 /// Postgres applies `-c name=value` startup options in order with last-one-wins semantics,
@@ -2180,10 +2205,14 @@ impl Postgres {
             // than the ones that the version describes. Nisshi never records a version without
             // creating `cluster`, so this database was changed from outside.
             if !has_tables {
-                return Err(Error::Message(format!(
-                    "the database records schema version {} but has no `cluster` table on the search path",
-                    recorded.version
-                )));
+                let search_path = tx
+                    .query_one("show search_path", &[])
+                    .await?
+                    .try_get::<_, String>(0)?;
+                return Err(Error::MissingClusterTable {
+                    schema_version: recorded.version,
+                    search_path,
+                });
             }
 
             announce_upgrade(recorded, steps);
@@ -2243,16 +2272,16 @@ impl Postgres {
 
         for step in steps {
             debug!(to_version = step.to_version);
-            tx.batch_execute(step.sql)
-                .await
-                .inspect_err(|err| {
-                    error!(
-                        from_version = recorded.version,
-                        to_version = step.to_version,
-                        ?err,
-                        "a schema upgrade step failed, so the upgrade is rolled back and the database stays at its earlier version"
-                    );
-                })?;
+            tx.batch_execute(step.sql).await.map_err(|err| {
+                let err = schema_step_failure(recorded.version, step.to_version, err);
+                error!(
+                    from_version = recorded.version,
+                    to_version = step.to_version,
+                    ?err,
+                    "a schema upgrade step failed, so the upgrade is rolled back and the database stays at its earlier version"
+                );
+                err
+            })?;
         }
 
         let Some(last) = steps.last() else {
@@ -13796,7 +13825,10 @@ mod tests {
 
                 assert_matches!(
                     storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
-                    Err(Error::Message(message)) if message.contains("no `cluster` table")
+                    Err(Error::MissingClusterTable {
+                        schema_version: 1,
+                        search_path,
+                    }) if search_path.contains("public")
                 );
 
                 assert_eq!(recorded_versions(&storage).await?, (1, 1));
@@ -13845,7 +13877,8 @@ mod tests {
                 .map_err(|_| Error::Message("the step waited for its table lock".into()))?;
                 assert_matches!(
                     outcome,
-                    Err(Error::TokioPostgres(err)) if err.code() == Some(&SqlState::LOCK_NOT_AVAILABLE)
+                    Err(Error::SchemaStepFailed { from_version: 1, to_version: 2, code, .. })
+                        if *code == *SqlState::LOCK_NOT_AVAILABLE.code()
                 );
                 reading.rollback().await?;
 
@@ -13861,6 +13894,58 @@ mod tests {
                     .await?
                     .try_get::<_, i64>(0)?;
                 assert_eq!(columns, 0);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails on a constraint must report the SQLSTATE, message, table and constraint,
+    /// and must not report the `DETAIL`, which repeats the failing row.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_failure_does_not_report_the_failing_row() -> Result<()> {
+        const ADDS_UNIQUE_INDEX: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "create unique index step_rows_value on step_rows (value)",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_failure_does_not_report_the_failing_row",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // Two equal rows make the unique index fail, and PostgreSQL then puts the value in
+                // the `DETAIL` of its error.
+                database
+                    .execute(
+                        "create table step_rows (value text); \
+                         insert into step_rows values ('payload-in-a-row'), ('payload-in-a-row')",
+                    )
+                    .await?;
+
+                let outcome = storage.ensure_schema_of(&ADDS_UNIQUE_INDEX, SCHEMA).await;
+
+                assert_matches!(
+                    &outcome,
+                    Err(Error::SchemaStepFailed {
+                        from_version: 1,
+                        to_version: 2,
+                        code,
+                        table: Some(table),
+                        constraint: Some(constraint),
+                        ..
+                    }) if **code == *SqlState::UNIQUE_VIOLATION.code()
+                        && &**table == "step_rows"
+                        && &**constraint == "step_rows_value"
+                );
+                assert!(!format!("{outcome:?}").contains("payload-in-a-row"));
                 Ok(())
             },
         )

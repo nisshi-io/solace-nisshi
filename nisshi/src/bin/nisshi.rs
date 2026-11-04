@@ -180,6 +180,12 @@ fn cat_error_message(error: &nisshi_cat::Error) -> String {
     }
 }
 
+/// The SQLSTATE of a statement that waited for a table lock until its `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// The SQLSTATE of a statement that the role isn't allowed to run.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
 /// Returns the message for a schema setup of `storage` that failed because of the schema version
 /// that the database records, or `None` for any other error.
 fn schema_version_message(
@@ -211,7 +217,70 @@ fn schema_version_message(
                 version 1. Correct the row in nisshi_schema_version, or restore the database \
                 from a backup."
         )),
+        nisshi_storage::Error::MissingClusterTable {
+            schema_version,
+            search_path,
+        } => Some(format!(
+            "storage {storage} records schema version {schema_version} but has no `cluster` table \
+                on the search path `{search_path}`. First check the `search_path` option in the \
+                storage URL (options=-c search_path=...): it must name the schema that holds \
+                Nisshi's tables. If it does, the tables were dropped or moved: restore the \
+                database from a backup."
+        )),
+        nisshi_storage::Error::SchemaStepFailed {
+            from_version,
+            to_version,
+            code,
+            table,
+            ..
+        } if &**code == LOCK_NOT_AVAILABLE => Some(format!(
+            "storage {storage} could not upgrade its schema from version {from_version} to \
+                {to_version}: the step waited for a lock on {} that another session holds, until \
+                its lock timeout. The upgrade rolled back and the database is unchanged. To find \
+                the session that holds the lock, look in pg_stat_activity for a session that is \
+                idle in transaction or runs a long query, and see docs/storage.md. Start the \
+                broker again to retry.",
+            table.as_deref().unwrap_or("a table"),
+        )),
+        nisshi_storage::Error::SchemaStepFailed {
+            from_version,
+            to_version,
+            code,
+            message,
+            table,
+            constraint,
+        } => Some(format!(
+            "storage {storage} failed its schema upgrade from version {from_version} to \
+                {to_version}: {message} (SQLSTATE {code}{}{}). The upgrade rolled back and the \
+                database is unchanged. Fix the cause, then start the broker again.",
+            table
+                .as_ref()
+                .map(|table| format!(", table {table}"))
+                .unwrap_or_default(),
+            constraint
+                .as_ref()
+                .map(|constraint| format!(", constraint {constraint}"))
+                .unwrap_or_default(),
+        )),
+        nisshi_storage::Error::Api(ErrorCode::RequestTimedOut) => Some(format!(
+            "storage {storage} failed its schema setup because a statement or a wait passed its \
+                time limit: a schema upgrade step, the wait for another broker's upgrade, or the \
+                wait for a database connection. The setup rolled back and the database is \
+                unchanged. Start the broker again to retry."
+        )),
         _ => None,
+    }
+}
+
+/// Returns whether `error` is a refusal of the database role to change the schema.
+fn is_insufficient_privilege(error: &nisshi_storage::Error) -> bool {
+    match error {
+        #[cfg(feature = "postgres")]
+        nisshi_storage::Error::TokioPostgres(error) => {
+            error.code().map(|code| code.code()) == Some(INSUFFICIENT_PRIVILEGE)
+        }
+        nisshi_storage::Error::SchemaStepFailed { code, .. } => &**code == INSUFFICIENT_PRIVILEGE,
+        _ => false,
     }
 }
 
@@ -419,28 +488,20 @@ fn report_error(err: &nisshi_cli::Error) {
                     startup_check_hint(storage.scheme())
                 ),
                 nisshi_storage::StartupFailure::SchemaSetup => {
-                    if let Some(message) = schema_version_message(storage, source) {
+                    if is_insufficient_privilege(source) {
+                        report_failure!(
+                            "storage {storage} failed its schema setup: {source}. The \
+                                database records no schema version that this release can \
+                                use, so the broker must change the schema, and its role \
+                                isn't allowed to. Start one broker once with the \
+                                credentials of the role that owns Nisshi's tables, then \
+                                start the others with this role. See the PostgreSQL \
+                                section of docs/storage.md."
+                        )
+                    } else if let Some(message) = schema_version_message(storage, source) {
                         report_failure!("{message}")
                     } else {
-                        match &**source {
-                            #[cfg(feature = "postgres")]
-                            nisshi_storage::Error::TokioPostgres(err)
-                                if err.code().map(|code| code.code()) == Some("42501") =>
-                            {
-                                report_failure!(
-                                    "storage {storage} failed its schema setup: {source}. The \
-                                        database records no schema version that this release can \
-                                        use, so the broker must change the schema, and its role \
-                                        isn't allowed to. Start one broker once with the \
-                                        credentials of the role that owns Nisshi's tables, then \
-                                        start the others with this role. See the PostgreSQL \
-                                        section of docs/storage.md."
-                                )
-                            }
-                            _ => report_failure!(
-                                "storage {storage} failed its schema setup: {source}"
-                            ),
-                        }
+                        report_failure!("storage {storage} failed its schema setup: {source}")
                     }
                 }
             },
@@ -508,7 +569,8 @@ mod tests {
     use super::{
         BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message, failure_line,
         feature_not_enabled_message, invalid_storage_option_value_message,
-        listener_host_unresolved_message, listener_in_use_message, schema_version_message,
+        is_insufficient_privilege, listener_host_unresolved_message, listener_in_use_message,
+        schema_version_message,
     };
 
     /// Each way that a recorded schema version stops a start tells the operator what to do next:
@@ -565,6 +627,108 @@ mod tests {
         assert!(message.contains("records schema version 0, which is not a valid version"));
         assert!(message.contains("restore the database from a backup"));
         assert!(!message.contains("records no schema version"));
+    }
+
+    /// A database that records a version but lost its `cluster` table points the operator first at
+    /// the `search_path` option of the storage URL, and names the search path in effect.
+    #[test]
+    fn schema_version_message_names_the_search_path_of_a_missing_cluster_table() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::MissingClusterTable {
+                schema_version: 1,
+                search_path: "\"$user\", public".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("records schema version 1 but has no `cluster` table"));
+        assert!(message.contains("on the search path `\"$user\", public`"));
+        assert!(message.contains("First check the `search_path` option in the storage URL"));
+        assert!(message.contains("restore the database from a backup"));
+    }
+
+    /// A step that waits for a table lock until its lock timeout is a conflict that a restart
+    /// retries, so the message says that the database is unchanged and how to find the blocker.
+    #[test]
+    fn schema_version_message_calls_a_step_lock_timeout_a_conflict_that_a_restart_retries() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::SchemaStepFailed {
+                from_version: 1,
+                to_version: 2,
+                code: "55P03".into(),
+                message: "canceling statement due to lock timeout".into(),
+                table: Some("record".into()),
+                constraint: None,
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("from version 1 to 2"));
+        assert!(message.contains("waited for a lock on record that another session holds"));
+        assert!(message.contains("the database is unchanged"));
+        assert!(message.contains("pg_stat_activity"));
+        assert!(message.contains("Start the broker again to retry"));
+    }
+
+    /// Any other failed step reports what the server says without its row data, and says that the
+    /// database is unchanged.
+    #[test]
+    fn schema_version_message_reports_a_failed_step_with_its_table_and_constraint() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::SchemaStepFailed {
+                from_version: 2,
+                to_version: 3,
+                code: "23505".into(),
+                message: "could not create unique index \"record_key\"".into(),
+                table: Some("record".into()),
+                constraint: Some("record_key".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            "storage postgres://db/nisshi failed its schema upgrade from version 2 to 3: could \
+                not create unique index \"record_key\" (SQLSTATE 23505, table record, constraint \
+                record_key). The upgrade rolled back and the database is unchanged. Fix the \
+                cause, then start the broker again.",
+            message
+        );
+    }
+
+    /// A timeout during the setup is a wait that a restart retries, and the message names each
+    /// wait that can time out.
+    #[test]
+    fn schema_version_message_calls_a_setup_timeout_a_wait_that_a_restart_retries() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::Api(nisshi_sans_io::ErrorCode::RequestTimedOut),
+        )
+        .unwrap();
+
+        assert!(message.contains("a schema upgrade step"));
+        assert!(message.contains("the wait for another broker's upgrade"));
+        assert!(message.contains("the database is unchanged"));
+        assert!(message.contains("Start the broker again to retry"));
+    }
+
+    /// A step that the role isn't allowed to run keeps the advice about the role that owns the
+    /// tables, which the CLI gives for a refused statement outside a step too.
+    #[test]
+    fn a_failed_step_with_sqlstate_42501_is_an_insufficient_privilege() {
+        let step = |code: &str| nisshi_storage::Error::SchemaStepFailed {
+            from_version: 1,
+            to_version: 2,
+            code: code.into(),
+            message: "must be owner of table cluster".into(),
+            table: None,
+            constraint: None,
+        };
+
+        assert!(is_insufficient_privilege(&step("42501")));
+        assert!(!is_insufficient_privilege(&step("55P03")));
     }
 
     #[test]

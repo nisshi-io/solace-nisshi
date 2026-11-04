@@ -343,6 +343,30 @@ pub enum Error {
         schema_version: i32,
     },
 
+    /// The database records schema `schema_version` but has no `cluster` table on the
+    /// `search_path` that the connection uses. Nisshi creates `cluster` before it records a
+    /// version, so the search path changed or someone dropped or moved the tables.
+    MissingClusterTable {
+        schema_version: i32,
+        search_path: String,
+    },
+
+    /// The step that upgrades the schema from `from_version` to `to_version` failed with the
+    /// SQLSTATE `code`, and the upgrade rolled back.
+    ///
+    /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
+    /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
+    /// or `header` holds message payloads. The fields are boxed strings, so that this variant
+    /// does not make [`Error`] larger.
+    SchemaStepFailed {
+        from_version: i32,
+        to_version: i32,
+        code: Box<str>,
+        message: Box<str>,
+        table: Option<Box<str>>,
+        constraint: Option<Box<str>>,
+    },
+
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
 

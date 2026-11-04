@@ -208,6 +208,16 @@ A release can use a database when its schema version is at least the recorded `o
 
 A database that 0.7.0-pre.3 set up records no version, and the query above fails on it until a release from 0.7.0 on starts on it and records one.
 
+A broker serves no request until its schema setup finishes. Each statement of an upgrade step must finish within the `statement_timeout` that the storage URL sets, or 30 seconds without one, and must get each table lock within 5 seconds. The steps together have no limit. A step that fails, or that waits for a lock until its timeout, rolls the whole upgrade back and leaves the database as it was, and the broker stops. Start the broker again to retry. The error names the failed step's SQLSTATE, table and constraint, and leaves out the rows that the step read. To find the session that holds a lock on `record`, run this query:
+
+```sql
+select a.pid, a.state, a.query_start, a.query
+from pg_locks l join pg_stat_activity a using (pid)
+where l.relation = 'record'::regclass;
+```
+
+A session whose `state` is `idle in transaction` holds its locks until its transaction ends. Another broker's maintenance sweep can also hold a lock for a short time. `pg_blocking_pids(pid)` lists the sessions that block a given session.
+
 Nisshi is tested on PostgreSQL 16 and later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
 
 A broker opens at most 16 connections to PostgreSQL. Set `pool_max_size` in the storage URL to change that, to a number from 2 to 262143. ListOffsets and Fetch requests can each use at most half of them, so a larger pool lets more consumers read at once. Together they can hold every connection, and then other requests wait for one, so a pool smaller than 16 makes slow reads more likely to hold up produce and group requests. When the `nisshi_storage_read_deadline_exceeded` metric rises with `wait` set to `engine_connection_pool` or `engine_read_limit`, reads are waiting for a connection or for the half of the pool that their kind of read may use, and a larger pool can help. With `wait` set to `connection_read_limit`, one client connection has more reads in flight than it may hold at once, and a larger pool does not help. The server's `max_connections` must allow `pool_max_size` connections for each broker, plus every other client's. The broker does not check this at startup, so a pool that is too large fails requests under load instead. The broker also reserves memory for every connection the pool may open, so a very large `pool_max_size` costs memory even when the connections are not open:
