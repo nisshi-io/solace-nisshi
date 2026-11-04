@@ -111,8 +111,54 @@ pub fn list_groups_response(
 
             ListGroupsResponse::default()
                 .throttle_time_ms(Some(0))
-                .error_code(err.group_request_error_code().into())
+                .error_code(err.error_code(ErrorCode::CoordinatorNotAvailable).into())
                 .groups(Some([].into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error_code_of(error: Error) -> Result<ErrorCode> {
+        let response = list_groups_response(Err(error), None);
+
+        assert_eq!(Some(vec![]), response.groups);
+
+        Ok(ErrorCode::try_from(response.error_code)?)
+    }
+
+    /// A client retries `COORDINATOR_NOT_AVAILABLE`, so it answers a failure that may clear.
+    #[test]
+    fn transient_storage_error_answers_coordinator_not_available() -> Result<()> {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            error_code_of(Error::from(std::io::Error::other("connection reset")))?
+        );
+
+        Ok(())
+    }
+
+    /// A client reports `UNKNOWN_SERVER_ERROR` at once. `COORDINATOR_NOT_AVAILABLE` would keep it
+    /// retrying a failure that a retry can't fix, until its API timeout.
+    #[test]
+    fn permanent_storage_error_answers_unknown_server_error() -> Result<()> {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            error_code_of(Error::Message("cannot parse".into()))?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn storage_error_with_a_code_keeps_that_code() -> Result<()> {
+        assert_eq!(
+            ErrorCode::GroupAuthorizationFailed,
+            error_code_of(Error::Api(ErrorCode::GroupAuthorizationFailed))?
+        );
+
+        Ok(())
     }
 }

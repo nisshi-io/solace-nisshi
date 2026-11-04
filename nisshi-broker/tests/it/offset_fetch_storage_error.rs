@@ -59,10 +59,13 @@ const OFFSET: i64 = 42;
 
 const FAILING: &str = "failing";
 const CORRUPT: &str = "corrupt";
+const UNPARSABLE: &str = "unparsable";
 const HEALTHY: &str = "healthy";
 
 /// A storage that fails to read the committed offsets of each group in
-/// `failing`, returns `UNKNOWN_SERVER_ERROR` for [`CORRUPT`], and returns
+/// `failing` with an I/O error that a retry may clear, returns
+/// `UNKNOWN_SERVER_ERROR` for [`CORRUPT`], fails [`UNPARSABLE`] with an error
+/// that a retry can't clear, and returns
 /// [`OFFSET`] for every partition of any other group.
 #[derive(Clone, Debug, Default, Hash)]
 struct FailingOffsets {
@@ -82,8 +85,12 @@ impl FailingOffsets {
         topics: &[Topition],
     ) -> nisshi_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         if self.failing.contains(group_id) {
-            Err(Error::Message(format!(
+            Err(Error::from(std::io::Error::other(format!(
                 "offsets of {group_id} are unavailable"
+            ))))
+        } else if group_id == UNPARSABLE {
+            Err(Error::Message(format!(
+                "offsets of {group_id} do not parse"
             )))
         } else if group_id == CORRUPT {
             Err(Error::Api(ErrorCode::UnknownServerError))
@@ -213,6 +220,43 @@ async fn storage_error_code_is_kept() -> Result<()> {
     );
 
     let groups = [request_group(CORRUPT)];
+
+    let response = controller
+        .offset_fetch(None, None, Some(&groups), Some(false))
+        .await
+        .and_then(|body| OffsetFetchResponse::try_from(body).map_err(Into::into))?;
+
+    let groups = response.groups.unwrap_or_default();
+    assert_eq!(1, groups.len());
+    assert_eq!(
+        i16::from(ErrorCode::UnknownServerError),
+        groups[0].error_code
+    );
+
+    Ok(())
+}
+
+/// A storage error that a retry can't fix answers `UNKNOWN_SERVER_ERROR`, which a client reports
+/// at once. `COORDINATOR_NOT_AVAILABLE` would keep it retrying until its API timeout.
+#[tokio::test]
+async fn permanent_storage_error_is_unknown_server_error() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let controller = Controller::with_storage(FailingOffsets::new(&[FAILING]))?;
+
+    let topics = request_topics();
+
+    let response = controller
+        .offset_fetch(Some(UNPARSABLE), Some(&topics), None, Some(false))
+        .await
+        .and_then(|body| OffsetFetchResponse::try_from(body).map_err(Into::into))?;
+
+    assert_eq!(
+        Some(i16::from(ErrorCode::UnknownServerError)),
+        response.error_code
+    );
+
+    let groups = [request_group(UNPARSABLE)];
 
     let response = controller
         .offset_fetch(None, None, Some(&groups), Some(false))

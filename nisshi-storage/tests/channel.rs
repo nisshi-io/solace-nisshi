@@ -18,6 +18,7 @@
 //! deterministically, independent of any backend's own behaviour.
 
 use std::{
+    assert_matches,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,6 +26,7 @@ use std::{
     time::Duration,
 };
 
+use nisshi_sans_io::ErrorCode;
 use nisshi_storage::{
     ChannelRequestLayer, Error, Request, RequestChannelService, Response, Storage, bounded_channel,
 };
@@ -242,6 +244,102 @@ async fn panicking_request_does_not_end_server_loop() -> Result<(), TestError> {
     cancellation.cancel();
     let joined = join.join_all().await;
     debug!(?joined);
+
+    Ok(())
+}
+
+/// A [`Service<Request>`] that fails every request with the error it holds.
+#[derive(Clone)]
+struct FailingService {
+    error: Error,
+}
+
+impl Service<Request> for FailingService {
+    type Output = Response;
+    type Error = Error;
+
+    async fn serve(&self, _req: Request) -> Result<Self::Output, Self::Error> {
+        Err(self.error.clone())
+    }
+}
+
+/// Starts the supervisor loop over `server` and returns a client for it.
+fn serve_over_channel<S>(server: S, cancellation: CancellationToken) -> RequestChannelService
+where
+    S: Service<Request, Output = Response, Error = Error> + Clone,
+{
+    let (sender, receiver) = bounded_channel(10);
+
+    _ = tokio::spawn(async move {
+        ChannelRequestLayer::new(cancellation)
+            .into_layer(server)
+            .serve(receiver)
+            .await
+    });
+
+    RequestChannelService::new(sender)
+}
+
+/// A storage error reaches the caller as the error that storage returned, with its error
+/// code and its classification, and not as a closed channel.
+#[tokio::test]
+async fn storage_error_reaches_the_caller_with_its_type() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let cancellation = CancellationToken::new();
+
+    let client = serve_over_channel(
+        FailingService {
+            error: Error::Api(ErrorCode::OutOfOrderSequenceNumber),
+        },
+        cancellation.clone(),
+    );
+
+    let error = client
+        .ping()
+        .await
+        .err()
+        .ok_or_else(|| TestError::Message(String::from("the request did not fail")))?;
+    assert_matches!(error, Error::Api(ErrorCode::OutOfOrderSequenceNumber));
+    assert_eq!(
+        ErrorCode::OutOfOrderSequenceNumber,
+        error.error_code(ErrorCode::KafkaStorageError)
+    );
+
+    cancellation.cancel();
+
+    Ok(())
+}
+
+/// A panic in a request's task reaches the caller as a permanent error, and a closed channel
+/// stays the transient error that its caller retries.
+#[tokio::test]
+async fn panicked_request_reaches_the_caller_as_a_permanent_error() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let cancellation = CancellationToken::new();
+    let client = serve_over_channel(FlakyService::default(), cancellation.clone());
+
+    let error = client
+        .ping()
+        .await
+        .err()
+        .ok_or_else(|| TestError::Message(String::from("the panicked request did not fail")))?;
+    assert_matches!(error, Error::Join(_));
+    assert!(!error.is_transient());
+
+    cancellation.cancel();
+
+    let (sender, receiver) = bounded_channel(1);
+    let closed = RequestChannelService::new(sender);
+    drop(receiver);
+
+    let error = closed
+        .ping()
+        .await
+        .err()
+        .ok_or_else(|| TestError::Message(String::from("a closed channel did not fail")))?;
+    assert!(error.is_transient());
 
     Ok(())
 }

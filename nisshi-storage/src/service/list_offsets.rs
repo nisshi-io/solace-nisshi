@@ -509,7 +509,10 @@ mod tests {
         /// its statement ends.
         OffsetKeepingReadShare(i64),
         Stall,
+        /// Fails with an error that a retry may fix.
         Fail,
+        /// Fails with an error that a retry can't fix.
+        FailPermanently,
         FailWith(ErrorCode),
     }
 
@@ -637,8 +640,12 @@ mod tests {
 
                 Some(Answer::FailWith(error_code)) => Err(Error::Api(*error_code)),
 
-                Some(Answer::Fail) | None => Err(Error::Message(format!(
+                Some(Answer::Fail) | None => Err(Error::from(std::io::Error::other(format!(
                     "storage failed for partition {partition}"
+                )))),
+
+                Some(Answer::FailPermanently) => Err(Error::Message(format!(
+                    "storage can't read partition {partition}"
                 ))),
             }
         }
@@ -1095,8 +1102,8 @@ mod tests {
         Ok(())
     }
 
-    /// A storage error answers `KAFKA_STORAGE_ERROR` in its own partition, an
-    /// API error answers its own code, and the other partitions still answer,
+    /// A transient storage error answers `KAFKA_STORAGE_ERROR` in its own partition, a permanent
+    /// one `UNKNOWN_SERVER_ERROR`, an API error answers its own code, and the other partitions still answer,
     /// beside one that times out.
     #[tokio::test(start_paused = true)]
     async fn storage_error_answers_in_its_partition() -> Result<()> {
@@ -1106,9 +1113,10 @@ mod tests {
             Answer::Offset(30),
             Answer::FailWith(ErrorCode::NotLeaderOrFollower),
             Answer::Stall,
+            Answer::FailPermanently,
         ]);
 
-        let partitions = list_offsets(storage.clone(), 5).await?;
+        let partitions = list_offsets(storage.clone(), 6).await?;
 
         assert_eq!(
             vec![
@@ -1117,6 +1125,7 @@ mod tests {
                 (2, ErrorCode::None, Some(30)),
                 (3, ErrorCode::NotLeaderOrFollower, Some(-1)),
                 (4, ErrorCode::RequestTimedOut, Some(-1)),
+                (5, ErrorCode::UnknownServerError, Some(-1)),
             ],
             answers(&partitions)?
         );
@@ -1126,7 +1135,7 @@ mod tests {
                 .all(|partition| partition.timestamp == Some(-1)),
             "{partitions:?}"
         );
-        assert_eq!(vec![0, 1, 2, 3, 4], storage.calls());
+        assert_eq!(vec![0, 1, 2, 3, 4, 5], storage.calls());
 
         Ok(())
     }

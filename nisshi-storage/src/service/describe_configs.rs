@@ -127,17 +127,15 @@ where
 /// ([ConfigHelper.scala#L156-L170]): the error's code, no error message, and an empty config
 /// list. The other resources in the request still get an answer.
 ///
-/// [`Error::Api`] answers its own code, and any other error answers `UNKNOWN_SERVER_ERROR`.
+/// [`Error::Api`] answers its own code, an error that a retry may fix answers
+/// `KAFKA_STORAGE_ERROR`, and any other error answers `UNKNOWN_SERVER_ERROR`.
 /// Kafka's [`ApiError.fromThrowable`] sends no message for `UNKNOWN_SERVER_ERROR`, so that it
 /// does not leak server details, or for an error whose message is the code's own description.
 ///
 /// [ConfigHelper.scala#L156-L170]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L156-L170
 /// [`ApiError.fromThrowable`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiError.java#L38-L46
 fn error_result(resource: &DescribeConfigsResource, error: &Error) -> DescribeConfigsResult {
-    let error_code = match error {
-        Error::Api(error_code) => *error_code,
-        _ => ErrorCode::UnknownServerError,
-    };
+    let error_code = error.error_code(ErrorCode::KafkaStorageError);
 
     DescribeConfigsResult::default()
         .error_code(error_code.into())
