@@ -42,7 +42,8 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version, service::deadline,
+    UpdateError, Version,
+    service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
 };
 
 static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -190,24 +191,30 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         let start = SystemTime::now();
-        let started_at = Instant::now();
-        let _permit = self.semaphore.acquire().await.inspect(|_| {
+
+        let Ok(permit) = ReadDeadline::new(StorageOperation::Fetch, deadline)
+            .timeout(
+                self.semaphore
+                    .acquire()
+                    .queued_for(ReadWait::ExclusiveEngineAccess),
+            )
+            .await
+        else {
+            return Ok(vec![]);
+        };
+
+        let _permit = permit.inspect(|_| {
             SEMAPHORE_ACQUIRE_DURATION.record(
                 elapsed_millis(start),
                 &[StorageOperation::Fetch.attribute()],
             )
         })?;
 
-        // The wait for the permit is charged to the budget, so that the
-        // read ends when its caller's budget does, rather than that long
-        // after the wait.
-        let max_wait = max_wait.saturating_sub(started_at.elapsed());
-
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -239,7 +246,10 @@ where
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         let start = SystemTime::now();
-        let _permit = deadline::queued(self.semaphore.acquire())
+        let _permit = self
+            .semaphore
+            .acquire()
+            .queued_for(ReadWait::ExclusiveEngineAccess)
             .await
             .inspect(|_| {
                 SEMAPHORE_ACQUIRE_DURATION.record(
@@ -609,31 +619,33 @@ where
 #[cfg(test)]
 mod tests {
     use nisshi_sans_io::IsolationLevel;
-    use tokio::time::{Duration, advance};
+    use tokio::time::{Duration, Instant, advance};
 
     use super::SemaphoreProxy;
     use crate::{
         Result, Storage, Topition,
-        service::{Request, RequestChannelService, Response, bounded_channel},
+        service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };
 
-    /// A read that waits for a permit reaches storage with the budget left
-    /// after the wait, so that the read ends when its caller's budget does.
+    /// A read that waits for the permit gives storage the same deadline that it was given, so the
+    /// time spent waiting counts against that deadline.
     #[tokio::test(start_paused = true)]
-    async fn fetch_charges_the_permit_wait_to_the_budget() -> Result<()> {
+    async fn fetch_keeps_its_deadline_after_waiting_for_the_permit() -> Result<()> {
         let (tx, mut rx) = bounded_channel(1);
         let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
 
         let permit = proxy.semaphore.clone().acquire_owned().await?;
         let tp = Topition::new("abc", 0);
+        let deadline = Instant::now() + Duration::from_millis(500);
 
+        let (offset, min_bytes, max_bytes) = (0, 1, 1024);
         let read = proxy.fetch(
             &tp,
-            0,
-            1,
-            1024,
+            offset,
+            min_bytes,
+            max_bytes,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(500),
+            deadline,
         );
 
         let release = async {
@@ -642,9 +654,13 @@ mod tests {
         };
 
         let answer = async {
-            let (request, reply) = rx.recv().await.expect("a fetch request");
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = rx.recv().await.expect("a fetch request");
 
-            let Request::Fetch { max_wait, .. } = request else {
+            let Request::Fetch { deadline, .. } = request else {
                 panic!("{request:?}");
             };
 
@@ -652,13 +668,43 @@ mod tests {
                 .send(Ok(Response::Fetch(Ok(vec![]))))
                 .expect("the reader");
 
-            max_wait
+            deadline
         };
 
-        let (fetched, (), max_wait) = tokio::join!(read, release, answer);
+        let (fetched, (), received) = tokio::join!(read, release, answer);
 
         assert!(fetched?.is_empty());
-        assert_eq!(Duration::from_millis(300), max_wait);
+        assert_eq!(deadline, received);
+
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_stops_waiting_for_a_permit_at_its_deadline() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
+
+        // The permit is never released, so the read waits for it until its deadline.
+        let _permit = proxy.semaphore.clone().acquire_owned().await?;
+
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(500);
+
+        let (offset, min_bytes, max_bytes) = (0, 1, 1024);
+        let fetched = proxy
+            .fetch(
+                &Topition::new("abc", 0),
+                offset,
+                min_bytes,
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                deadline,
+            )
+            .await?;
+
+        assert!(fetched.is_empty());
+        assert_eq!(Duration::from_millis(500), started_at.elapsed());
+        assert!(rx.try_recv().is_err(), "the read reached storage");
 
         Ok(())
     }

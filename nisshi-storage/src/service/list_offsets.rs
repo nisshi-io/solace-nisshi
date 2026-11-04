@@ -27,7 +27,7 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     Error, ListOffsetResponse, Result, Storage, StorageOperation, Topition,
     service::{
-        deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+        read_deadline::{LIST_OFFSETS_READ_DEADLINE, ReadDeadline},
         read_share::ListOffsetsReadShare,
         storage_error_code,
     },
@@ -145,13 +145,12 @@ where
             .iter()
             .enumerate()
             .map(|(index, offset)| async move {
-                let answer = within(
-                    StorageOperation::ListOffsets,
-                    deadline,
-                    self.storage
-                        .list_offsets(isolation_level, slice::from_ref(offset)),
-                )
-                .await;
+                let answer = ReadDeadline::new(StorageOperation::ListOffsets, deadline)
+                    .timeout(
+                        self.storage
+                            .list_offsets(isolation_level, slice::from_ref(offset)),
+                    )
+                    .await;
 
                 (index, offset, answer)
             })
@@ -209,6 +208,16 @@ where
                     )]
                 }
 
+                // Nisshi answers `REQUEST_TIMED_OUT` for a partition that it has not read by the
+                // deadline. Kafka 3.9.1 reads each partition without a time limit, so it never
+                // returns this error from ListOffsets. Nisshi differs, because a read without a
+                // deadline holds the request after its client has given up. The 3.9.1 consumer
+                // retries a partition on any error that it does not handle by name
+                // ([OffsetFetcherUtils.java#L170-L174]). Kafka 4.0 returns this error for a
+                // remote-storage lookup that expires ([DelayedRemoteListOffsets.scala]).
+                //
+                // [OffsetFetcherUtils.java#L170-L174]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/OffsetFetcherUtils.java#L170-L174
+                // [DelayedRemoteListOffsets.scala]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L144-L149
                 Err(missed) => {
                     timed_out.push((topition, missed));
 
@@ -225,10 +234,10 @@ where
         }
 
         if !timed_out.is_empty() {
-            let count = |stage: Missed| {
+            let count = |stage: &str| {
                 timed_out
                     .iter()
-                    .filter(|(_, missed)| *missed == stage)
+                    .filter(|(_, missed)| missed.stage() == stage)
                     .count()
             };
 
@@ -237,10 +246,9 @@ where
                 elapsed = ?started_at.elapsed(),
                 timed_out = timed_out.len(),
                 partitions = offsets.len(),
-                reading = count(Missed::Reading),
-                queued = count(Missed::Queued),
-                queued_for_connection_share = count(Missed::QueuedForConnectionShare),
-                not_started = count(Missed::NotStarted),
+                reading = count("reading"),
+                queued = count("queued"),
+                not_started = count("not_started"),
                 sample = ?&timed_out[..timed_out.len().min(PARTITION_SAMPLE)],
                 "list offsets answered REQUEST_TIMED_OUT for partitions unread at the deadline"
             );
@@ -488,7 +496,7 @@ mod tests {
         Version,
         service::{
             RequestChannelService, bounded_channel,
-            deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, within},
+            read_deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, ReadDeadline, ReadWait},
             read_share::ListOffsetsReadShare,
         },
     };
@@ -571,7 +579,7 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _max_wait: Duration,
+            _deadline: Instant,
         ) -> Result<Vec<deflated::Batch>> {
             unimplemented!()
         }
@@ -1163,16 +1171,22 @@ mod tests {
         // The stalled read holds the proxy's only permit once it has run.
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        let outcome = within(
+        let outcome = ReadDeadline::new(
             StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
-            proxy.list_offsets(
-                IsolationLevel::ReadUncommitted,
-                &[(Topition::new(TOPIC, 1), ListOffset::Latest)],
-            ),
         )
+        .timeout(proxy.list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(Topition::new(TOPIC, 1), ListOffset::Latest)],
+        ))
         .await;
-        assert!(matches!(outcome, Err(Missed::Queued)), "{outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                Err(Missed::Queued(ReadWait::ExclusiveEngineAccess))
+            ),
+            "{outcome:?}"
+        );
 
         permit_holder.abort();
 
@@ -1189,16 +1203,22 @@ mod tests {
 
         let service = RequestChannelService::new(tx.clone());
 
-        let outcome = within(
+        let outcome = ReadDeadline::new(
             StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
-            service.list_offsets(
-                IsolationLevel::ReadUncommitted,
-                &[(Topition::new(TOPIC, 0), ListOffset::Latest)],
-            ),
         )
+        .timeout(service.list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(Topition::new(TOPIC, 0), ListOffset::Latest)],
+        ))
         .await;
-        assert!(matches!(outcome, Err(Missed::Queued)), "{outcome:?}");
+        assert!(
+            matches!(
+                outcome,
+                Err(Missed::Queued(ReadWait::ExclusiveEngineAccess))
+            ),
+            "{outcome:?}"
+        );
 
         Ok(())
     }

@@ -728,7 +728,7 @@ where
                 min_bytes,
                 max_bytes,
                 isolation,
-                max_wait,
+                tokio::time::Instant::now() + max_wait,
             )
             .await
             .inspect_err(|err| error!(?err, fetch_offset))?
@@ -864,7 +864,7 @@ where
             1,
             50 * 1024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
         .inspect_err(|err| error!(?err))?

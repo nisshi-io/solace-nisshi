@@ -42,7 +42,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -648,10 +648,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -1237,7 +1237,7 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _max_wait: Duration,
+            _deadline: Instant,
         ) -> Result<Vec<deflated::Batch>> {
             unimplemented!()
         }

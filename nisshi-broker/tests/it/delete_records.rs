@@ -30,6 +30,7 @@ use nisshi_storage::{
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
@@ -333,7 +334,7 @@ where
             1,
             50 * 1024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(500),
+            Instant::now() + Duration::from_millis(500),
         )
         .await?
         .into_iter()

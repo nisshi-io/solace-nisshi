@@ -68,10 +68,10 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
     DeleteRecordsConcurrency, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
-    ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate, max_message_bytes, producer_claim,
+    inflate, max_message_bytes, producer_claim, read_deadline::ReadDeadline,
 };
 use opentelemetry::{
     KeyValue,
@@ -275,6 +275,52 @@ impl Engine {
     async fn connection(&self) -> Result<Connection> {
         let db = self.db.lock()?;
         db.connect().map_err(Into::into)
+    }
+
+    /// Returns the headers of the record at `offset` in `topition`.
+    async fn record_headers(
+        &self,
+        c: &Connection,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<Vec<Header>> {
+        let mut rows = c
+            .query(
+                &sql_lookup("header_fetch.sql")?,
+                (
+                    self.cluster.as_str(),
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                ),
+            )
+            .await?;
+
+        let mut headers = vec![];
+
+        while let Some(row) = rows.next().await? {
+            let mut header_builder = Header::builder();
+
+            if let Some(k) = row
+                .get_value(0)
+                .map(|value| value.as_blob().cloned())
+                .inspect_err(|err| error!(?err))?
+            {
+                header_builder = header_builder.key(Bytes::from(k));
+            }
+
+            if let Some(v) = row
+                .get_value(1)
+                .map(|value| value.as_blob().cloned())
+                .inspect_err(|err| error!(?err))?
+            {
+                header_builder = header_builder.value(Bytes::from(v));
+            }
+
+            headers.push(header_builder.build());
+        }
+
+        Ok(headers)
     }
 
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
@@ -1766,10 +1812,17 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<deflated::Batch>> {
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
+
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+
+        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
+            return Ok(vec![]);
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
@@ -1787,10 +1840,14 @@ impl Storage for Engine {
             max_bytes
         );
 
-        let c = self.connection().await?;
+        let Ok(c) = read_deadline.timeout(self.connection()).await else {
+            return Ok(vec![]);
+        };
 
-        let mut records = c
-            .query(
+        let c = c?;
+
+        let records = async {
+            c.query(
                 &sql_lookup("record_fetch.sql")?,
                 (
                     self.cluster.as_str(),
@@ -1802,11 +1859,23 @@ impl Storage for Engine {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| error!(?err))
+            .map_err(Error::from)
+        };
+
+        let Ok(records) = read_deadline.timeout(records).await else {
+            return Ok(vec![]);
+        };
+
+        let mut records = records?;
 
         let mut batches = vec![];
 
-        if let Some(row) = records.next().await? {
+        let Ok(first) = read_deadline.timeout(records.next()).await else {
+            return Ok(vec![]);
+        };
+
+        if let Some(row) = first? {
             let offset_delta = 0;
             let timestamp_delta = 0;
 
@@ -1822,8 +1891,15 @@ impl Storage for Engine {
                 .inspect(|base_offset| debug!(base_offset))
                 .inspect_err(|err| error!(?err))?;
 
-            let record_builder = {
-                let mut record_builder = Record::builder()
+            let Ok(headers) = read_deadline
+                .timeout(self.record_headers(&c, topition, base_offset))
+                .await
+            else {
+                return Ok(vec![]);
+            };
+
+            let record_builder = headers?.into_iter().fold(
+                Record::builder()
                     .offset_delta(offset_delta)
                     .timestamp_delta(timestamp_delta)
                     .key(
@@ -1837,44 +1913,9 @@ impl Storage for Engine {
                             .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
                             .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
-                    );
-
-                let mut headers = c
-                    .query(
-                        &sql_lookup("header_fetch.sql")?,
-                        (
-                            self.cluster.as_str(),
-                            topition.topic(),
-                            topition.partition(),
-                            base_offset,
-                        ),
-                    )
-                    .await?;
-
-                while let Some(header) = headers.next().await? {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .get_value(0)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
-                    }
-
-                    if let Some(v) = header
-                        .get_value(1)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                record_builder
-            };
+                    ),
+                |record_builder, header| record_builder.header(header.into()),
+            );
 
             let mut batch_builder = inflated::Batch::builder()
                 .base_offset(base_offset)
@@ -1910,7 +1951,41 @@ impl Storage for Engine {
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
-            while let Some(row) = records.next().await? {
+            loop {
+                // Turso returns from a step that waits for I/O, so the timer of `read_deadline`
+                // can stop the read between I/O steps. The read keeps each record that it
+                // finished.
+                let Ok(next) = read_deadline.timeout(records.next()).await else {
+                    break;
+                };
+
+                let Some(row) = next? else {
+                    break;
+                };
+
+                let offset = row
+                    .get_value(0)
+                    .map_err(Into::into)
+                    .and_then(|value| {
+                        value
+                            .as_integer()
+                            .copied()
+                            .ok_or(Error::UnexpectedValue(value))
+                    })
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
+
+                // The read takes the record's headers before it starts a new batch for the record,
+                // so that each batch it starts holds at least one record.
+                let Ok(headers) = read_deadline
+                    .timeout(self.record_headers(&c, topition, offset))
+                    .await
+                else {
+                    break;
+                };
+
+                let headers = headers?;
+
                 let attributes = row
                     .get_value(1)
                     .map(|value| {
@@ -1978,24 +2053,12 @@ impl Storage for Engine {
                         .producer_epoch(producer_epoch);
                 }
 
-                let offset = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                let record_builder = {
-                    let mut record_builder = Record::builder()
+                let record_builder = headers.into_iter().fold(
+                    Record::builder()
                         .offset_delta(offset_delta)
                         .timestamp_delta(timestamp_delta)
                         .key(
@@ -2011,46 +2074,9 @@ impl Storage for Engine {
                                 .map(|o| o.map(Bytes::from))
                                 .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
-                        );
-
-                    let mut headers = c
-                        .query(
-                            &sql_lookup("header_fetch.sql")?,
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
-                        let mut header_builder = Header::builder();
-
-                        if let Some(k) = header
-                            .get_value(0)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(k);
-                        }
-
-                        if let Some(v) = header
-                            .get_value(1)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(v);
-                        }
-
-                        record_builder = record_builder.header(header_builder);
-                    }
-
-                    record_builder
-                };
+                        ),
+                    |record_builder, header| record_builder.header(header.into()),
+                );
 
                 batch_builder = batch_builder
                     .record(record_builder)

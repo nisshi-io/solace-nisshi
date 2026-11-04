@@ -26,12 +26,13 @@ use std::{
     time::Duration,
 };
 
-use nisshi_sans_io::ErrorCode;
+use nisshi_sans_io::{ErrorCode, IsolationLevel};
 use nisshi_storage::{
-    ChannelRequestLayer, Error, Request, RequestChannelService, Response, Storage, bounded_channel,
+    ChannelRequest, ChannelRequestLayer, Error, Request, RequestChannelService, Response, Storage,
+    Topition, bounded_channel,
 };
 use rama::{Layer, Service};
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::{sync::oneshot, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -132,8 +133,13 @@ async fn dropped_response_receiver_does_not_end_server_loop() -> Result<(), Test
     // which always keeps its own receiver alive) so the test controls the oneshot and
     // can drop it - simulating a caller that cancelled or disconnected mid-request.
     let (resp_tx, resp_rx) = oneshot::channel();
+    let (started, _) = oneshot::channel();
     sender
-        .send((Request::Ping, resp_tx))
+        .send(ChannelRequest {
+            request: Request::Ping,
+            response: resp_tx,
+            started,
+        })
         .await
         .map_err(|_| TestError::Message(String::from("send failed")))?;
     drop(resp_rx);
@@ -340,6 +346,62 @@ async fn panicked_request_reaches_the_caller_as_a_permanent_error() -> Result<()
         .err()
         .ok_or_else(|| TestError::Message(String::from("a closed channel did not fail")))?;
     assert!(error.is_transient());
+
+    Ok(())
+}
+
+/// The supervisor answers a fetch whose deadline has passed with no batches, without serving it.
+#[tokio::test]
+async fn expired_fetch_is_answered_without_being_served() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let (sender, receiver) = bounded_channel(10);
+    let cancellation = CancellationToken::new();
+
+    let mut join = JoinSet::new();
+
+    {
+        let cancellation = cancellation.clone();
+
+        // The service answers every request it serves with a ping, so a fetch answer can only
+        // come from the supervisor.
+        let _ = join.spawn(async move {
+            ChannelRequestLayer::new(cancellation)
+                .into_layer(FlakyService::benign())
+                .serve(receiver)
+                .await
+        });
+    }
+
+    // The test sends on the raw channel, because `RequestChannelService` does not send a fetch
+    // whose deadline has passed.
+    let (response, answered) = oneshot::channel();
+    let (started, _) = oneshot::channel();
+    sender
+        .send(ChannelRequest {
+            request: Request::Fetch {
+                topition: Topition::new("abc", 0),
+                offset: 0,
+                min_bytes: 1,
+                max_bytes: 1024,
+                isolation: IsolationLevel::ReadUncommitted,
+                deadline: Instant::now(),
+            },
+            response,
+            started,
+        })
+        .await
+        .map_err(|_| TestError::Message(String::from("send failed")))?;
+
+    let answer = answered
+        .await
+        .map_err(|_| TestError::Message(String::from("no response")))?;
+
+    assert_matches!(&answer, Ok(Response::Fetch(Ok(batches))) if batches.is_empty());
+
+    cancellation.cancel();
+    let joined = join.join_all().await;
+    debug!(?joined);
 
     Ok(())
 }

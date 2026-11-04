@@ -24,7 +24,7 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime},
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
@@ -67,10 +67,10 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
     FirstSequence, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
-    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate_produced,
-    max_message_bytes, offload, producer_claim,
+    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate_produced, max_message_bytes, offload, producer_claim, read_deadline::ReadDeadline,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -88,7 +88,7 @@ use produced_batches::{ProducedBatches, SequenceCheck};
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time_index::TimeIndex;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -183,14 +183,12 @@ const FETCH_LISTING_FIRST_WINDOW: i64 = 512;
 const FETCH_LISTING_GROWTH: i64 = 8;
 
 /// The batches that a fetch reads from a partition: each batch below
-/// `high_watermark` that ends at or after `offset`, until the batches fill
-/// `max_bytes` or `deadline` passes.
+/// `high_watermark` that ends at or after `offset`, until the batches fill `max_bytes`.
 #[derive(Clone, Copy, Debug)]
 struct FetchBounds {
     offset: i64,
     max_bytes: u32,
     high_watermark: i64,
-    deadline: Option<Instant>,
 }
 
 /// Counts the fetches that list the whole partition, because the listing
@@ -1683,6 +1681,9 @@ impl DynoStore {
     /// cuts a later batch at `max_bytes`, which leaves the client a partial
     /// batch to drop.
     ///
+    /// The read stops when `read_deadline` passes, and returns the batches
+    /// that it has read.
+    ///
     /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
     async fn read_fetched_batches(
         &self,
@@ -1690,12 +1691,15 @@ impl DynoStore {
         bounds: FetchBounds,
         mut base_offsets: BoxStream<'static, Result<i64>>,
         requires_contiguous: bool,
+        read_deadline: &mut ReadDeadline,
     ) -> Result<Option<Vec<deflated::Batch>>> {
         let mut batches = vec![];
         let mut bytes_left = u64::from(bounds.max_bytes);
         let mut next_base_offset = None;
 
-        while let Some(base_offset) = base_offsets.try_next().await? {
+        while let Ok(listed) = read_deadline.timeout(base_offsets.try_next()).await
+            && let Some(base_offset) = listed?
+        {
             if requires_contiguous && next_base_offset.is_some_and(|next| base_offset != next) {
                 return Ok(None);
             }
@@ -1704,9 +1708,16 @@ impl DynoStore {
                 break;
             }
 
+            let Ok(read) = read_deadline
+                .timeout(self.read_batch(topition, base_offset))
+                .await
+            else {
+                break;
+            };
+
             // A batch deleted after the listing leaves no last offset, so the
             // batch after it is not checked.
-            let Some(mut batch) = self.read_batch(topition, base_offset).await? else {
+            let Some(mut batch) = read? else {
                 next_base_offset = None;
                 continue;
             };
@@ -1728,17 +1739,6 @@ impl DynoStore {
             }
 
             bytes_left -= size;
-
-            // The deadline ends a fetch only after it has a batch, because a
-            // fetch that answers empty when its listing is slow answers empty
-            // on every retry, and the consumer never moves (#797). The Fetch
-            // service bounds the whole read with a deadline of its own.
-            if bounds
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
         }
 
         Ok(Some(batches))
@@ -1750,13 +1750,19 @@ impl DynoStore {
         &self,
         topition: &Topition,
         bounds: FetchBounds,
+        read_deadline: &mut ReadDeadline,
     ) -> Result<Vec<deflated::Batch>> {
-        let mut base_offsets = self
+        let listing = self
             .batch_stream(topition, 0)
             .map_ok(|(base_offset, _)| base_offset)
             .try_filter(|&base_offset| ready(base_offset < bounds.high_watermark))
-            .try_collect::<BTreeSet<_>>()
-            .await?;
+            .try_collect::<BTreeSet<_>>();
+
+        let Ok(base_offsets) = read_deadline.timeout(listing).await else {
+            return Ok(vec![]);
+        };
+
+        let mut base_offsets = base_offsets?;
 
         let holding = base_offsets
             .range(..=bounds.offset)
@@ -1771,6 +1777,7 @@ impl DynoStore {
             bounds,
             stream::iter(wanted.into_iter().map(Ok)).boxed(),
             false,
+            read_deadline,
         )
         .await
         .map(Option::unwrap_or_default)
@@ -3450,11 +3457,15 @@ impl Storage for DynoStore {
         _min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        let deadline = Instant::now().checked_add(max_wait);
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
+        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
+            return Ok(vec![]);
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
@@ -3472,7 +3483,13 @@ impl Storage for DynoStore {
             offset,
             max_bytes,
             high_watermark,
-            deadline,
+        };
+
+        let Ok(holding) = read_deadline
+            .timeout(self.batch_stream_holding(topition, offset))
+            .await
+        else {
+            return Ok(vec![]);
         };
 
         // A batch key zero-pads its base offset, so key order is offset
@@ -3483,9 +3500,9 @@ impl Storage for DynoStore {
         // cannot give without listing in key order. Otherwise the fetch lists
         // the whole partition and sorts it, at a cost that grows with the
         // partition (#684).
-        if let Some(base_offsets) = self.batch_stream_holding(topition, offset).await?
+        if let Some(base_offsets) = holding?
             && let Some(batches) = self
-                .read_fetched_batches(topition, bounds, base_offsets, true)
+                .read_fetched_batches(topition, bounds, base_offsets, true, &mut read_deadline)
                 .await?
         {
             return Ok(batches);
@@ -3506,7 +3523,8 @@ impl Storage for DynoStore {
             );
         }
 
-        self.fetch_from_full_listing(topition, bounds).await
+        self.fetch_from_full_listing(topition, bounds, &mut read_deadline)
+            .await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

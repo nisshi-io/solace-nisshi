@@ -24,6 +24,7 @@
 //! fail the writes before it: the watermark, and the transaction's record of the batch.
 
 use std::{assert_matches, time::Duration};
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -89,7 +90,7 @@ async fn fetched_base_offsets(storage: &DynoStore, topition: &Topition) -> Resul
             1,
             1_048_576,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(10),
+            Instant::now() + Duration::from_secs(5),
         )
         .await?
         .iter()

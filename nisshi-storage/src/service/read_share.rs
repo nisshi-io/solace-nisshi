@@ -68,7 +68,7 @@ use tokio::{
     task::LocalKey,
 };
 
-use super::deadline;
+use super::read_deadline::{QueueWait as _, ReadWait};
 
 /// One connection's share of a storage engine's limit on reads in flight.
 ///
@@ -86,14 +86,11 @@ impl ReadShare {
             .clone()
     }
 
-    /// Waits for a permit from the share that `key` holds on this task,
-    /// creating `size` permits in it if it has none yet.
+    /// Waits for a permit from the read share that `key` holds on this task. `size` is the number
+    /// of permits that the share gets on its first use.
     ///
-    /// The wait runs in [`deadline::queued_for_connection_share`], so a read
-    /// abandoned while it waits for its share is counted under the `queued`
-    /// stage with the `connection` limit. Returns
-    /// `None` when `key` holds no share on this task, so a read that no
-    /// connection makes is limited only by its engine.
+    /// Returns `None` without waiting when the task holds no share, as for a read that does not
+    /// come from a client request.
     async fn acquire(
         key: &'static LocalKey<Self>,
         size: usize,
@@ -102,7 +99,9 @@ impl ReadShare {
             return Ok(None);
         };
 
-        deadline::queued_for_connection_share(permits.acquire_owned())
+        permits
+            .acquire_owned()
+            .queued_for(ReadWait::ConnectionReadLimit)
             .await
             .map(Some)
     }
@@ -141,9 +140,7 @@ impl FetchReadShare {
     /// [`FetchReadShare::scope`], creating `size` permits in the share if it
     /// has none yet.
     ///
-    /// Returns `None` outside a scope. A read waiting for its share is
-    /// counted under the `queued` stage, with the `connection` limit, if its
-    /// deadline passes.
+    /// Returns `None` outside a scope.
     pub async fn acquire(size: usize) -> Result<Option<OwnedSemaphorePermit>, AcquireError> {
         ReadShare::acquire(&FETCH, size).await
     }
@@ -174,9 +171,7 @@ impl ListOffsetsReadShare {
     /// [`ListOffsetsReadShare::scope`], creating `size` permits in the share
     /// if it has none yet.
     ///
-    /// Returns `None` outside a scope. A read waiting for its share is
-    /// counted under the `queued` stage, with the `connection` limit, if its
-    /// deadline passes.
+    /// Returns `None` outside a scope.
     pub async fn acquire(size: usize) -> Result<Option<OwnedSemaphorePermit>, AcquireError> {
         ReadShare::acquire(&LIST_OFFSETS, size).await
     }
@@ -189,7 +184,10 @@ mod tests {
     use tokio::time::{Duration, Instant, timeout};
 
     use super::*;
-    use crate::service::deadline::{Missed, bounded};
+    use crate::{
+        StorageOperation,
+        service::read_deadline::{Missed, ReadDeadline},
+    };
 
     #[tokio::test]
     async fn acquire_outside_a_scope_returns_none() -> Result<(), AcquireError> {
@@ -224,8 +222,10 @@ mod tests {
     async fn read_waiting_for_its_share_is_abandoned_as_queued() {
         let deadline = Instant::now() + Duration::from_secs(1);
 
+        let mut deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+
         let outcome = FetchReadShare::default()
-            .scope(bounded(deadline, async {
+            .scope(deadline.timeout(async {
                 let held = FetchReadShare::acquire(1).await;
                 assert!(held.as_ref().is_ok_and(Option::is_some), "{held:?}");
 
@@ -234,7 +234,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(Err(Missed::QueuedForConnectionShare), outcome);
+        assert_eq!(Err(Missed::Queued(ReadWait::ConnectionReadLimit)), outcome);
     }
 
     /// A permit taken in one scope counts against every scope with a clone

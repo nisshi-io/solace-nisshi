@@ -70,11 +70,12 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
     LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
-    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
-    parse_storage_option, producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
+    producer_claim,
+    read_deadline::{Missed, QueueWait as _, ReadDeadline, ReadWait},
     read_share::{FetchReadShare, ListOffsetsReadShare},
 };
 use opentelemetry::metrics::Histogram;
@@ -287,13 +288,10 @@ struct ReadLimits {
     /// ListOffsets reads that a consumer needs to start or reset. The two
     /// limits together equal the pool, so when slow reads use up both, other
     /// requests wait for a connection. A smaller limit would slow down
-    /// healthy consumers, because a fetch read holds its connection for its
-    /// whole storage budget. A read past this limit waits for a permit, and
-    /// [`FetchService`]'s deadline drops it if the wait lasts too long. One
-    /// connection holds at most [`ReadLimits::fetch_per_connection`] of these
-    /// permits.
-    ///
-    /// [`FetchService`]: nisshi_storage::FetchService
+    /// healthy consumers, because a read for a Fetch can hold its connection
+    /// until its deadline. A read past this limit waits for a permit until its
+    /// deadline. One connection holds at most
+    /// [`ReadLimits::fetch_per_connection`] of these permits.
     fetch: usize,
 }
 
@@ -1023,7 +1021,11 @@ impl ReadPermits {
         limit: &Arc<Semaphore>,
     ) -> Result<Self> {
         let connection_share = connection_share.await?;
-        let limit = deadline::queued(limit.clone().acquire_owned()).await?;
+        let limit = limit
+            .clone()
+            .acquire_owned()
+            .queued_for(ReadWait::EngineReadLimit)
+            .await?;
 
         Ok(Self {
             connection_share,
@@ -1338,9 +1340,12 @@ impl Postgres {
         .await
     }
 
-    /// Reads the records of `topition` from `offset` on `c`, in one
-    /// transaction, up to the partition's high watermark or, for
-    /// `ReadCommitted`, its last stable offset.
+    /// Reads the records of `topition` from `offset` on `c`, in one transaction, up to the
+    /// partition's high watermark or, for `ReadCommitted`, its last stable offset.
+    ///
+    /// Returns the batches that it read, and how `read_deadline` stopped the read, if it did.
+    /// `read_deadline` can stop the read during a statement. A read stopped before its commit
+    /// returns no batches. A read stopped at its commit keeps the batches that it assembled.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_on(
         &self,
@@ -1352,18 +1357,23 @@ impl Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        has_deadline_expired: impl Fn() -> bool,
-    ) -> Result<Vec<deflated::Batch>> {
-        let high_watermark = self
-            .offset_stage_on(c, base_topic, topition.partition())
+        read_deadline: &mut ReadDeadline,
+    ) -> Result<(Vec<deflated::Batch>, Option<Missed>)> {
+        let offset_stage = match read_deadline
+            .timeout(self.offset_stage_on(c, base_topic, topition.partition()))
             .await
-            .map(|offset_stage| {
-                if isolation_level == IsolationLevel::ReadCommitted {
-                    offset_stage.last_stable
-                } else {
-                    offset_stage.high_watermark
-                }
-            })?;
+        {
+            Ok(offset_stage) => offset_stage,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
+            if isolation_level == IsolationLevel::ReadCommitted {
+                offset_stage.last_stable
+            } else {
+                offset_stage.high_watermark
+            }
+        })?;
 
         debug!(
             cluster = self.cluster,
@@ -1375,45 +1385,57 @@ impl Postgres {
             max_bytes
         );
 
-        let tx = c.transaction().await?;
+        let tx = match read_deadline.timeout(c.transaction()).await {
+            Ok(tx) => tx?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        };
 
-        tx.batch_execute(FETCH_PLAN_SETTINGS)
+        match read_deadline
+            .timeout(tx.batch_execute(FETCH_PLAN_SETTINGS))
             .await
-            .inspect_err(|err| error!(?err))?;
+        {
+            Ok(settings) => settings.inspect_err(|err| error!(?err))?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        }
 
-        let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg_keyed.sql",
-                &[
-                    &self.cluster,
-                    &base_topic,
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &key,
-                    &ROWS_PER_FETCH,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg.sql",
-                &[
-                    &self.cluster,
-                    &topition.topic(),
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &ROWS_PER_FETCH,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
+        let records = async {
+            if let Some(key) = key_filter {
+                self.tx_prepare_query(
+                    &tx,
+                    "record_fetch_pg_keyed.sql",
+                    &[
+                        &self.cluster,
+                        &base_topic,
+                        &topition.partition(),
+                        &offset,
+                        &(max_bytes as i64),
+                        &high_watermark,
+                        &key,
+                        &ROWS_PER_FETCH,
+                    ],
+                )
+                .await
+            } else {
+                self.tx_prepare_query(
+                    &tx,
+                    "record_fetch_pg.sql",
+                    &[
+                        &self.cluster,
+                        &topition.topic(),
+                        &topition.partition(),
+                        &offset,
+                        &(max_bytes as i64),
+                        &high_watermark,
+                        &ROWS_PER_FETCH,
+                    ],
+                )
+                .await
+            }
+        };
+
+        let records = match read_deadline.timeout(records).await {
+            Ok(records) => records.inspect_err(|err| error!(?err))?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
         };
 
         let mut batches = vec![];
@@ -1461,15 +1483,19 @@ impl Postgres {
                 .map(|record| record.try_get::<_, i64>(0))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            for header in self
-                .tx_prepare_query(
+            let header_rows = match read_deadline
+                .timeout(self.tx_prepare_query(
                     &tx,
                     "header_fetch_range.sql",
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
-                )
+                ))
                 .await
-                .inspect_err(|err| error!(?err))?
             {
+                Ok(header_rows) => header_rows.inspect_err(|err| error!(?err))?,
+                Err(stopped) => return Ok((vec![], Some(stopped))),
+            };
+
+            for header in header_rows {
                 headers
                     .entry(header.try_get::<_, i64>(0)?)
                     .or_default()
@@ -1578,10 +1604,6 @@ impl Postgres {
                 batch_builder = batch_builder
                     .record(record_builder)
                     .last_offset_delta(offset_delta);
-
-                if has_deadline_expired() {
-                    break;
-                }
             }
 
             batches.push(
@@ -1594,11 +1616,17 @@ impl Postgres {
             batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
         }
 
-        tx.commit().await?;
-
         debug!(batches_len = batches.len());
 
-        Ok(batches)
+        // The transaction only reads, so a rollback has the same effect as a commit. When the
+        // deadline stops the commit before it starts, dropping the transaction rolls it back.
+        match read_deadline.timeout(tx.commit()).await {
+            Ok(committed) => {
+                committed?;
+                Ok((batches, None))
+            }
+            Err(stopped) => Ok((batches, Some(stopped))),
+        }
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -4158,26 +4186,35 @@ impl Storage for Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        let started_at = SystemTime::now();
-
-        let has_deadline_expired = || {
-            started_at
-                .elapsed()
-                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
-                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
-                .unwrap_or_default()
-        };
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
-        let (base_topic, key_filter): (&str, Option<&str>) =
-            self.topic_with_key(topition.topic()).await?;
+        let Ok(topic) = read_deadline
+            .timeout(self.topic_with_key(topition.topic()))
+            .await
+        else {
+            return Ok(vec![]);
+        };
 
-        let permits = self.fetch_read_permits().await?;
-        let mut connection = deadline::queued(self.abandonable_connection(permits)).await?;
-        let batches = self
+        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
+
+        let connection = async {
+            let permits = self.fetch_read_permits().await?;
+            self.abandonable_connection(permits)
+                .queued_for(ReadWait::EngineConnectionPool)
+                .await
+        };
+
+        let Ok(connection) = read_deadline.timeout(connection).await else {
+            return Ok(vec![]);
+        };
+
+        let mut connection = connection?;
+
+        let fetched = self
             .fetch_on(
                 connection.object_mut()?,
                 topition,
@@ -4187,12 +4224,20 @@ impl Storage for Postgres {
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                has_deadline_expired,
+                &mut read_deadline,
             )
             .await;
-        connection.release();
 
-        batches
+        match &fetched {
+            // The deadline stopped the read during one of its steps, so a statement may still be
+            // running on the connection. Dropping the connection cancels the statement, and
+            // returns the connection to the pool once the statement has ended.
+            Ok((_, Some(Missed::Queued(_) | Missed::Reading))) => drop(connection),
+            // No statement is running, so the connection goes straight back to the pool.
+            Ok((_, Some(Missed::NotStarted) | None)) | Err(_) => connection.release(),
+        }
+
+        fetched.map(|(batches, _)| batches)
     }
 
     #[instrument(skip_all)]
@@ -4202,7 +4247,10 @@ impl Storage for Postgres {
         let base_topic = self.base_topic(topition.topic()).await?;
 
         let permits = self.fetch_read_permits().await?;
-        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
+        let connection = self
+            .abandonable_connection(permits)
+            .queued_for(ReadWait::EngineConnectionPool)
+            .await?;
         let offset_stage = self
             .offset_stage_on(connection.object()?, base_topic, topition.partition())
             .await;
@@ -4427,7 +4475,10 @@ impl Storage for Postgres {
         debug!(cluster = self.cluster, ?isolation_level);
 
         let permits = self.list_offsets_read_permits().await?;
-        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
+        let connection = self
+            .abandonable_connection(permits)
+            .queued_for(ReadWait::EngineConnectionPool)
+            .await?;
         let responses = self
             .list_offsets_on(connection.object()?, isolation_level, offsets)
             .await;
@@ -6921,7 +6972,7 @@ mod tests {
                                 1,
                                 8 * 1024,
                                 IsolationLevel::ReadUncommitted,
-                                Duration::from_secs(5),
+                                Instant::now() + Duration::from_secs(5),
                             )
                             .await
                             .map(drop)
@@ -7093,7 +7144,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await
             .map(drop)
@@ -7329,6 +7380,107 @@ mod tests {
         let tx = c.transaction().await?;
         assert_eq!(1, tx.query_one("SELECT 1", &[]).await?.get::<_, i32>(0));
         tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// A fetch whose deadline passes while its statement waits returns at that deadline with no
+    /// batches. The engine cancels the statement, so the connection goes back to the pool idle, as
+    /// [`SETTLE_QUERY`] shows, while the lock is still held.
+    ///
+    /// The fetch waits for a lock on `header`, so it waits in its header query, inside its
+    /// transaction and after its record query.
+    #[tokio::test]
+    async fn fetch_stopped_at_its_deadline_cancels_its_statement() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let mut locking = monitor.connection().await?;
+
+        // A transaction reads one snapshot of `pg_stat_activity`, so the
+        // test watches the read from outside the locking transaction.
+        let watching = monitor.connection().await?;
+
+        // The test releases the lock before it returns. The timeouts bound
+        // how long the lock holds up other tests when this test stops early.
+        let lock = locking.transaction().await?;
+        lock.batch_execute(concat!(
+            "SET LOCAL lock_timeout = '5s'; ",
+            "SET LOCAL idle_in_transaction_session_timeout = '10s'; ",
+            "LOCK TABLE header IN ACCESS EXCLUSIVE MODE",
+        ))
+        .await?;
+
+        let read_time = Duration::from_millis(500);
+        let started_at = Instant::now();
+
+        let fetched = storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                started_at + read_time,
+            )
+            .await?;
+
+        assert!(fetched.is_empty(), "{fetched:?}");
+
+        // The lock holds for up to 10s, so this bound fails for a fetch that waits for its
+        // statement to end.
+        assert!(
+            started_at.elapsed() < read_time + Duration::from_secs(1),
+            "{:?}",
+            started_at.elapsed()
+        );
+
+        // The loop passes only when the pool's one connection is idle after `SETTLE_QUERY` while
+        // the lock is still held. A connection released with its statement still waiting is back
+        // in the pool while its backend is still active.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        loop {
+            let activity = watching
+                .query_opt(
+                    "SELECT state, query FROM pg_stat_activity WHERE application_name = $1",
+                    &[&application_name],
+                )
+                .await?
+                .map(|row| {
+                    (
+                        row.get::<_, Option<String>>(0),
+                        row.get::<_, Option<String>>(1),
+                    )
+                });
+            let status = storage.pool.status();
+
+            if let Some((Some(state), query)) = &activity
+                && state == "idle"
+                && status.available == 1
+            {
+                assert_eq!(Some(SETTLE_QUERY), query.as_deref());
+                break;
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "{activity:?} while the lock on header is held, pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        lock.rollback().await?;
 
         Ok(())
     }
@@ -10758,7 +10910,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -10917,7 +11069,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -11025,7 +11177,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -11153,7 +11305,7 @@ mod tests {
                 1,
                 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
         };
 
@@ -11217,7 +11369,7 @@ mod tests {
                 1,
                 5 * 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                largest_max_wait,
+                Instant::now() + largest_max_wait,
             ),
         )
         .await
@@ -11609,7 +11761,7 @@ mod tests {
                     1,
                     8 * 1024,
                     IsolationLevel::ReadUncommitted,
-                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(5),
                 )
                 .await?,
         )?;
@@ -11686,7 +11838,7 @@ mod tests {
                     1,
                     8 * 1024,
                     IsolationLevel::ReadUncommitted,
-                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(5),
                 )
                 .await?,
         )?;

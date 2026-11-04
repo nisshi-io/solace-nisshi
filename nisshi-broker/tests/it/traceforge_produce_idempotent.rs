@@ -106,6 +106,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
+use tokio::time::Instant;
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 use url::Url;
 
@@ -294,7 +295,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             0,
             i32::MAX as u32,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(1000),
+            Instant::now() + Duration::from_millis(1000),
         ))
         .expect("fetch");
 
@@ -443,10 +444,10 @@ impl Storage for FaultInjectingProduceStorage {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> StorageResult<Vec<deflated::Batch>> {
         self.inner
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -823,7 +824,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
             0,
             i32::MAX as u32,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(1000),
+            Instant::now() + Duration::from_millis(1000),
         ))
         .expect("fetch");
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
@@ -510,7 +511,7 @@ async fn end_marker(storage: &impl Storage, topition: &Topition) -> Result<Optio
             1,
             50 * 1024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(500),
+            Instant::now() + Duration::from_millis(500),
         )
         .await?;
 

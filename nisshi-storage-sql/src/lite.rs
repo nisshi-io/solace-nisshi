@@ -71,6 +71,7 @@ use nisshi_storage::{
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
+    read_deadline::ReadDeadline,
 };
 use opentelemetry::{
     KeyValue,
@@ -92,7 +93,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
-use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
+use tokio::{fs::rename, sync::Semaphore, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -2085,7 +2086,7 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         let start = SystemTime::now();
         self.inner
@@ -2095,7 +2096,7 @@ impl Storage for Engine {
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                max_wait,
+                deadline,
             )
             .await
             .inspect(|_| {
@@ -3257,17 +3258,9 @@ impl Storage for Delegate {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         let started_at = SystemTime::now();
-
-        let has_deadline_expired = || {
-            started_at
-                .elapsed()
-                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
-                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
-                .unwrap_or_default()
-        };
 
         debug!(
             ?topition,
@@ -3275,13 +3268,25 @@ impl Storage for Delegate {
             min_bytes,
             max_bytes,
             ?isolation_level,
-            ?max_wait
+            ?deadline
         );
 
-        let (base_topic, key_filter): (&str, Option<&str>) =
-            self.topic_with_key(topition.topic()).await?;
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
+        let Ok(topic) = read_deadline
+            .timeout(self.topic_with_key(topition.topic()))
+            .await
+        else {
+            return Ok(vec![]);
+        };
+
+        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
+
+        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
+            return Ok(vec![]);
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
@@ -3299,39 +3304,51 @@ impl Storage for Delegate {
             max_bytes
         );
 
-        let c = self.connection().await?;
-
-        let mut records = if let Some(key) = key_filter {
-            let key_bytes = key.as_bytes().to_vec();
-            c.query(
-                "record_fetch_keyed.sql",
-                (
-                    self.cluster.as_str(),
-                    base_topic,
-                    topition.partition(),
-                    offset,
-                    (max_bytes as i64),
-                    high_watermark,
-                    key_bytes,
-                ),
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            c.query(
-                "record_fetch.sql",
-                (
-                    self.cluster.as_str(),
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    (max_bytes as i64),
-                    high_watermark,
-                ),
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
+        let Ok(c) = read_deadline.timeout(self.connection()).await else {
+            return Ok(vec![]);
         };
+
+        let c = c?;
+
+        let records = async {
+            if let Some(key) = key_filter {
+                let key_bytes = key.as_bytes().to_vec();
+                c.query(
+                    "record_fetch_keyed.sql",
+                    (
+                        self.cluster.as_str(),
+                        base_topic,
+                        topition.partition(),
+                        offset,
+                        (max_bytes as i64),
+                        high_watermark,
+                        key_bytes,
+                    ),
+                )
+                .await
+                .inspect_err(|err| error!(?err))
+            } else {
+                c.query(
+                    "record_fetch.sql",
+                    (
+                        self.cluster.as_str(),
+                        topition.topic(),
+                        topition.partition(),
+                        offset,
+                        (max_bytes as i64),
+                        high_watermark,
+                    ),
+                )
+                .await
+                .inspect_err(|err| error!(?err))
+            }
+        };
+
+        let Ok(records) = read_deadline.timeout(records).await else {
+            return Ok(vec![]);
+        };
+
+        let mut records = records?;
 
         let mut batches = vec![];
 
@@ -3422,8 +3439,16 @@ impl Storage for Delegate {
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
+            // libSQL steps the statement synchronously inside `next`, so the timer of
+            // `read_deadline` can't interrupt a row. The loop checks the deadline after each row.
+            //
+            // A step that waits for a lock blocks for up to the connection's busy timeout, so
+            // the read can overrun its deadline by that much. In WAL mode a read waits for a
+            // lock only rarely, such as while a checkpoint restarts the log. The busy timeout
+            // stays as configured instead of shrinking to the time left, because it applies
+            // to each wait and is shared with every later user of the pooled connection.
             while let Some(row) = records.next().await?
-                && !has_deadline_expired()
+                && read_deadline.continue_reading().is_ok()
             {
                 let attributes = row
                     .get::<Option<i32>>(1)
@@ -6384,12 +6409,206 @@ mod tests {
                 0,
                 1_000_000,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(1),
             )
             .await
             .inspect(|fetched| debug!(?fetched))?;
 
         assert_eq!(1, fetched.len());
+
+        Ok(())
+    }
+
+    /// After its deadline, a fetch returns no batches, and the same fetch before its deadline
+    /// returns the record.
+    #[tokio::test]
+    async fn fetch_after_its_deadline_returns_no_batches() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // The builder resolves the storage path against the current
+        // directory, so the database lives in a temporary directory there.
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let storage = Url::parse(&format!("file:///{}?mode=direct", relative.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic, 0);
+
+        let batch: deflated::Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"value").into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = engine.produce(None, &topition, batch).await?;
+
+        let fetch = |deadline| {
+            engine.fetch(
+                &topition,
+                0,
+                0,
+                1_000_000,
+                IsolationLevel::ReadUncommitted,
+                deadline,
+            )
+        };
+
+        assert!(fetch(Instant::now()).await?.is_empty());
+
+        // The record is there, so the empty fetch above comes from its deadline.
+        assert_eq!(
+            1,
+            fetch(Instant::now() + Duration::from_secs(1)).await?.len()
+        );
+
+        Ok(())
+    }
+
+    /// Returns the number of records in a fetch of `topition` from offset 0 that stops at
+    /// `deadline`.
+    async fn fetched_records(
+        storage: &dyn Storage,
+        topition: &Topition,
+        deadline: Instant,
+    ) -> Result<u32> {
+        storage
+            .fetch(
+                topition,
+                0,
+                0,
+                u32::MAX,
+                IsolationLevel::ReadUncommitted,
+                deadline,
+            )
+            .await
+            .map(|fetched| fetched.iter().map(|batch| batch.record_count).sum())
+    }
+
+    /// A fetch stops at its deadline partway through a partition, and returns the records that it
+    /// read by then.
+    #[tokio::test]
+    async fn fetch_stops_at_its_deadline_partway_through_a_partition() -> Result<()> {
+        // A read of every record runs a header query for each one, so a full read takes long
+        // enough for a deadline to stop it partway.
+        const RECORDS: u32 = 5_000;
+
+        let _guard = init_tracing()?;
+
+        // The builder resolves the storage path against the current
+        // directory, so the database lives in a temporary directory there.
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let storage = Url::parse(&format!("file:///{}?mode=direct", relative.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic, 0);
+
+        let batch: deflated::Batch = (0..RECORDS)
+            .fold(
+                inflated::Batch::builder().last_offset_delta(RECORDS as i32 - 1),
+                |builder, offset_delta| {
+                    builder.record(
+                        Record::builder()
+                            .value(Bytes::from_static(b"value").into())
+                            .offset_delta(offset_delta as i32),
+                    )
+                },
+            )
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = engine.produce(None, &topition, batch).await?;
+
+        // The full read measures how long this machine takes to read the partition, so that the
+        // deadline below falls partway through a read on a fast machine and a slow one alike.
+        let started_at = Instant::now();
+
+        assert_eq!(
+            RECORDS,
+            fetched_records(&*engine, &topition, started_at + Duration::from_secs(60)).await?
+        );
+
+        let full_read = started_at.elapsed();
+
+        let records = fetched_records(&*engine, &topition, Instant::now() + full_read / 10).await?;
+
+        assert!(
+            records < RECORDS,
+            "the deadline didn't stop the fetch: it returned all {records} of {RECORDS} records"
+        );
 
         Ok(())
     }

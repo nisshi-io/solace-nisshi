@@ -96,6 +96,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::time::Instant;
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 use url::Url;
 
@@ -411,7 +412,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
             0,
             i32::MAX as u32,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(1000),
+            Instant::now() + Duration::from_millis(1000),
         ))
         .expect("fetch");
         let fetched_records: usize = fetched
@@ -620,7 +621,7 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
                 0,
                 i32::MAX as u32,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_millis(1000),
+                Instant::now() + Duration::from_millis(1000),
             ))
             .expect("fetch");
 

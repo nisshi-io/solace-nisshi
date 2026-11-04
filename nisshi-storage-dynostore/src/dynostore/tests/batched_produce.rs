@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use bytes::Bytes;
 use nisshi_sans_io::{
     BatchAttribute, Compression, ErrorCode, IsolationLevel, ListOffset,
@@ -106,7 +108,7 @@ async fn batches_that_would_merge_past_the_decoded_limit_are_stored_so_they_deco
                 1,
                 u32::MAX,
                 IsolationLevel::ReadUncommitted,
-                Duration::ZERO,
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 

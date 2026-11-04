@@ -25,6 +25,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -69,6 +70,11 @@ struct Listing {
     /// The store lists objects in key order, except the last two, which it
     /// lists in descending order.
     last_two_swapped: Arc<AtomicBool>,
+    /// Zero lets every read of a batch object finish. Any other value `n` lets the first `n - 1`
+    /// reads finish, and makes every later read wait forever.
+    stall_batch_reads_after: Arc<AtomicUsize>,
+    /// Reads of batch objects, in total.
+    batch_reads: Arc<AtomicUsize>,
 }
 
 impl Listing {
@@ -108,6 +114,13 @@ impl Listing {
 
     fn list_last_two_swapped(&self) {
         self.last_two_swapped.store(true, Ordering::SeqCst);
+    }
+
+    /// Stalls every read of a batch object after the first `batch_count`: each later read waits
+    /// forever.
+    fn stall_batch_reads_after(&self, batch_count: usize) {
+        self.stall_batch_reads_after
+            .store(batch_count + 1, Ordering::SeqCst);
     }
 
     /// Counts, delays and orders the objects of `listing` as this store is
@@ -207,6 +220,15 @@ impl ObjectStore for Listing {
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
+        let stall_after = self.stall_batch_reads_after.load(Ordering::SeqCst);
+
+        if stall_after > 0
+            && location.as_ref().ends_with(".batch")
+            && self.batch_reads.fetch_add(1, Ordering::SeqCst) >= stall_after - 1
+        {
+            std::future::pending::<()>().await;
+        }
+
         self.inner.get_opts(location, options).await
     }
 
@@ -309,13 +331,14 @@ async fn produce(
     Ok(())
 }
 
-/// The base offsets of the batches that a fetch at `offset` returns.
+/// Returns the base offsets of the batches that a fetch at `offset` returns when it may read for
+/// `read_time`.
 async fn fetch_base_offsets(
     storage: &DynoStore,
     topition: &Topition,
     offset: i64,
     max_bytes: u32,
-    max_wait: Duration,
+    read_time: Duration,
 ) -> Result<Vec<i64>> {
     Ok(storage
         .fetch(
@@ -324,7 +347,7 @@ async fn fetch_base_offsets(
             1,
             max_bytes,
             IsolationLevel::ReadUncommitted,
-            max_wait,
+            Instant::now() + read_time,
         )
         .await?
         .iter()
@@ -334,7 +357,7 @@ async fn fetch_base_offsets(
 
 const MAX_BYTES: u32 = 50 * 1024 * 1024;
 
-const MAX_WAIT: Duration = Duration::from_secs(60);
+const READ_TIME: Duration = Duration::from_secs(60);
 
 /// A fetch at a batch's base offset lists from that batch, with a
 /// start-after LIST, instead of from the first batch of the partition.
@@ -346,7 +369,7 @@ async fn head_fetch_lists_after_the_fetch_offset() -> Result<(), Error> {
     produce(&storage, &topition, 20, 1).await?;
     listing.reset_counts();
 
-    let base_offsets = fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, MAX_WAIT).await?;
+    let base_offsets = fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME).await?;
 
     assert_eq!((10..20).collect::<Vec<_>>(), base_offsets);
     assert_eq!(0, listing.full_lists());
@@ -373,7 +396,7 @@ async fn head_fetch_listing_does_not_grow_with_the_partition() -> Result<(), Err
 
         let last = i64::try_from(batches)? - 1;
         let base_offsets =
-            fetch_base_offsets(&storage, &topition, last, MAX_BYTES, MAX_WAIT).await?;
+            fetch_base_offsets(&storage, &topition, last, MAX_BYTES, READ_TIME).await?;
 
         assert_eq!(vec![last], base_offsets);
         listed.push(listing.listed_batches());
@@ -396,7 +419,7 @@ async fn fetch_inside_a_batch_returns_the_batch_whole() -> Result<(), Error> {
 
     assert_eq!(
         vec![10, 20, 30, 40],
-        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, READ_TIME).await?
     );
 
     let (storage, _, topition) = partition("large_batch").await?;
@@ -406,11 +429,11 @@ async fn fetch_inside_a_batch_returns_the_batch_whole() -> Result<(), Error> {
 
     assert_eq!(
         vec![30, 1030],
-        fetch_base_offsets(&storage, &topition, 900, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 900, MAX_BYTES, READ_TIME).await?
     );
     assert_eq!(
         vec![30, 1030],
-        fetch_base_offsets(&storage, &topition, 1029, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 1029, MAX_BYTES, READ_TIME).await?
     );
 
     Ok(())
@@ -428,7 +451,7 @@ async fn fetch_stops_listing_at_max_bytes() -> Result<(), Error> {
 
     assert_eq!(
         vec![0],
-        fetch_base_offsets(&storage, &topition, 0, 1, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 0, 1, READ_TIME).await?
     );
     assert!(
         listing.listed_batches() <= 2,
@@ -439,35 +462,74 @@ async fn fetch_stops_listing_at_max_bytes() -> Result<(), Error> {
     Ok(())
 }
 
-/// A listing slower than the fetch's `max_wait` still answers with the batch
-/// at the fetch offset, instead of answering empty on every retry.
-#[tokio::test]
-async fn slow_listing_still_returns_a_batch() -> Result<(), Error> {
+/// If its listing is slow, a fetch stops at its deadline, and returns the batches that it read by
+/// then, from the batch at the fetch offset.
+#[tokio::test(start_paused = true)]
+async fn slow_listing_returns_the_batches_read_by_the_deadline() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let (storage, listing, topition) = partition("slow_listing_still_returns_a_batch").await?;
-    produce(&storage, &topition, 100, 1).await?;
+    let (storage, listing, topition) =
+        partition("slow_listing_returns_the_batches_read_by_the_deadline").await?;
+    produce(&storage, &topition, 200, 1).await?;
 
-    // Listing the 80 batches below the fetch offset takes 4s, far more than
-    // the fetch's `max_wait`. The fetch must not depend on how fast the test
-    // runs, so it returns the batch at the fetch offset however long its
-    // listing takes.
+    // Listing each batch takes 50ms, so the fetch reads only some of the 120 batches from the
+    // fetch offset by its deadline.
     listing.delay_each_listed_object(Duration::from_millis(50));
 
-    let base_offsets = fetch_base_offsets(
-        &storage,
-        &topition,
-        80,
-        MAX_BYTES,
-        Duration::from_millis(500),
-    )
-    .await?;
+    let base_offsets =
+        fetch_base_offsets(&storage, &topition, 80, MAX_BYTES, Duration::from_secs(1)).await?;
 
     assert_eq!(Some(&80), base_offsets.first(), "{base_offsets:?}");
+    assert!(base_offsets.len() < 120, "{base_offsets:?}");
 
-    // Each of the 20 batches from the fetch offset takes at least 50ms to
-    // list, so the deadline ends the fetch before it reads them all.
-    assert!(base_offsets.len() < 20, "{base_offsets:?}");
+    Ok(())
+}
+
+/// If a fetch's read of a batch object does not finish by its deadline, the fetch answers at that
+/// deadline, with the batches that it finished reading before then.
+#[tokio::test(start_paused = true)]
+async fn stalled_batch_read_answers_at_the_deadline() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("stalled_batch_read_answers_at_the_deadline").await?;
+    produce(&storage, &topition, 10, 1).await?;
+
+    // The fetch reads the batch at offset 0, and its read of the batch at offset 1 never ends.
+    listing.stall_batch_reads_after(1);
+
+    let read_time = Duration::from_secs(1);
+    let started_at = Instant::now();
+
+    let base_offsets = fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, read_time).await?;
+
+    assert_eq!(vec![0], base_offsets);
+    assert_eq!(read_time, started_at.elapsed());
+
+    Ok(())
+}
+
+/// If a fetch's listing does not reach the batch at the fetch offset by its deadline, the fetch
+/// answers empty at that deadline, instead of holding the read until the listing ends.
+#[tokio::test(start_paused = true)]
+async fn slower_listing_than_the_deadline_answers_empty_at_the_deadline() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("slower_listing_than_the_deadline_answers_empty_at_the_deadline").await?;
+    produce(&storage, &topition, 100, 1).await?;
+
+    // Listing one batch takes longer than the read time, so the listing does not reach the batch
+    // at the fetch offset by the deadline.
+    listing.delay_each_listed_object(Duration::from_secs(2));
+
+    let read_time = Duration::from_secs(1);
+    let started_at = Instant::now();
+
+    let base_offsets = fetch_base_offsets(&storage, &topition, 80, MAX_BYTES, read_time).await?;
+
+    assert_eq!(Vec::<i64>::new(), base_offsets);
+    assert_eq!(read_time, started_at.elapsed());
 
     Ok(())
 }
@@ -486,15 +548,15 @@ async fn out_of_order_listing_falls_back_to_a_full_listing() -> Result<(), Error
 
     assert_eq!(
         (5..10).chain([10, 20, 30, 40, 50]).collect::<Vec<_>>(),
-        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, READ_TIME).await?
     );
     assert_eq!(
         vec![20, 30, 40, 50],
-        fetch_base_offsets(&storage, &topition, 25, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 25, MAX_BYTES, READ_TIME).await?
     );
     assert_eq!(
         vec![20],
-        fetch_base_offsets(&storage, &topition, 25, 1, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 25, 1, READ_TIME).await?
     );
 
     Ok(())
@@ -516,7 +578,7 @@ async fn ascending_but_out_of_order_listing_falls_back_to_a_full_listing() -> Re
 
     assert_eq!(
         vec![10],
-        fetch_base_offsets(&storage, &topition, 15, 1, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 15, 1, READ_TIME).await?
     );
 
     Ok(())
@@ -540,7 +602,7 @@ async fn fetch_below_the_first_batch_returns_from_the_first_batch() -> Result<()
 
     assert_eq!(
         vec![1, 2],
-        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
     );
 
     Ok(())
@@ -568,17 +630,17 @@ async fn gap_in_an_in_order_listing_falls_back_to_a_full_listing() -> Result<(),
 
     assert_eq!(
         vec![0, 20, 30],
-        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, READ_TIME).await?
     );
     assert!(listing.full_lists() > 0, "{}", listing.full_lists());
 
     assert_eq!(
         vec![0],
-        fetch_base_offsets(&storage, &topition, 5, 1, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 5, 1, READ_TIME).await?
     );
     assert_eq!(
         vec![20, 30],
-        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, MAX_WAIT).await?
+        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, READ_TIME).await?
     );
 
     Ok(())
@@ -615,7 +677,7 @@ async fn fetch_returns_first_the_batch_that_holds_the_offset() -> Result<(), Err
         for offset in offsets {
             assert_eq!(
                 Some(batch.start),
-                fetch_base_offsets(&storage, &topition, offset, 1, MAX_WAIT)
+                fetch_base_offsets(&storage, &topition, offset, 1, READ_TIME)
                     .await?
                     .first()
                     .copied(),
@@ -663,7 +725,7 @@ async fn failed_listing_answers_kafka_storage_error() -> Result<(), Error> {
                 1,
                 MAX_BYTES,
                 IsolationLevel::ReadUncommitted,
-                MAX_WAIT,
+                Instant::now() + READ_TIME,
             )
             .await,
         Err(Error::Api(ErrorCode::KafkaStorageError))

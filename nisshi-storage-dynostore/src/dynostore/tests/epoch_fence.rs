@@ -21,6 +21,7 @@
 //! [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
 
 use std::{assert_matches, time::Duration};
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -134,7 +135,7 @@ async fn stored_batches(
                 1,
                 u32::MAX,
                 IsolationLevel::ReadUncommitted,
-                Duration::ZERO,
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
