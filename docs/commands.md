@@ -308,15 +308,16 @@ flight, see [Storage](storage.md). An abandoned read is one that its client no
 longer waits for, but that the database is still running, and it counts against
 its shares until the statement ends. The client share is keyed on the user and
 the `client_id` of the request, and the proxy forwards the `client_id`, so one
-proxied client's abandoned reads are limited to its client share, however many
-origin connections they spread over. The connection share bounds no single
+proxied client's abandoned reads are limited to its client share while another
+client waits for the limit, however many origin connections they spread over. The connection share bounds no single
 client behind the proxy, because the proxy takes an origin connection from its
 pool for each request. The proxy does not forward SASL, so the broker sees no
 user, and proxied clients are told apart by `client_id` alone. Clients that
 share a `client_id` share one limit, and a client that changes its `client_id`
 gets a limit of its own.
 
-Behind the proxy, a client at its limit sees reads that miss their deadline:
+Behind the proxy, a client past its share while another client waits for the
+limit sees reads that miss their deadline:
 Fetch responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
 partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
 `stage` set to `queued` and `wait` set to `client_read_limit`. When `wait` is

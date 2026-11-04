@@ -899,16 +899,31 @@ impl<F> ResponseService<F> {
 #[cfg(test)]
 mod tests {
     use nisshi_sans_io::{ApiVersionsResponse, Error as SansIoError};
-    use nisshi_storage::read_share::ClientReadShares;
-    use tokio::time::{Duration, timeout};
+    use nisshi_storage::read_share::{ClientAdmission, ClientReadShares};
+    use tokio::{
+        sync::Semaphore,
+        time::{Duration, timeout},
+    };
 
     use super::*;
 
-    /// Takes the one permit of its client's read share and holds it.
-    #[derive(Clone, Default)]
+    /// Takes the one permit of its client's read share and holds it, with a
+    /// permit of an engine limit that has permits to spare.
+    #[derive(Clone)]
     struct HoldingTheClientShare {
         shares: ClientReadShares,
-        held: Arc<Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>>,
+        limit: Arc<Semaphore>,
+        held: Arc<Mutex<Vec<ClientAdmission>>>,
+    }
+
+    impl Default for HoldingTheClientShare {
+        fn default() -> Self {
+            Self {
+                shares: ClientReadShares::default(),
+                limit: Arc::new(Semaphore::new(10)),
+                held: Arc::default(),
+            }
+        }
     }
 
     impl Service<RequestInput<ApiVersionsRequest>> for HoldingTheClientShare {
@@ -919,15 +934,24 @@ mod tests {
             &self,
             _req: RequestInput<ApiVersionsRequest>,
         ) -> Result<Self::Output, Self::Error> {
-            let permit = timeout(Duration::from_millis(50), self.shares.acquire(1)).await;
+            let admission = timeout(
+                Duration::from_millis(50),
+                self.shares.acquire(1, &self.limit),
+            )
+            .await;
 
-            // A request that waits for its client's share is not the first of
-            // the client, and `None` is a request outside any client.
-            let code = match permit {
+            // A request past its client's share is not the first of the
+            // client, and `None` is a request outside any client.
+            let code = match admission {
                 Err(_) => ErrorCode::RequestTimedOut,
-                Ok(Ok(Some(permit))) => {
-                    self.held.lock().expect("held").push(permit);
-                    ErrorCode::None
+                Ok(Ok(Some(admission))) => {
+                    let code = if admission.is_within_share() {
+                        ErrorCode::None
+                    } else {
+                        ErrorCode::RequestTimedOut
+                    };
+                    self.held.lock().expect("held").push(admission);
+                    code
                 }
                 Ok(_) => ErrorCode::UnknownServerError,
             };
@@ -974,9 +998,9 @@ mod tests {
         // The identity is not left behind for the next request on the task.
         assert!(
             ClientReadShares::default()
-                .acquire(1)
+                .acquire(1, &Arc::new(Semaphore::new(1)))
                 .await
-                .is_ok_and(|permit| permit.is_none())
+                .is_ok_and(|admission| admission.is_none())
         );
 
         Ok(())

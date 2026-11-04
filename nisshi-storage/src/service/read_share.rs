@@ -42,18 +42,32 @@
 //! own while its abandoned reads still hold the engine's permits. So an engine
 //! also keeps a [`ClientReadShares`], which gives each [`ClientIdentity`], the
 //! authenticated principal and the `client_id` of the request, one share of
-//! its own. A read takes a permit from its connection's share, then from its
-//! client's share, then from the engine's limit, so a client never waits on
-//! the engine's limit for more reads than its share.
+//! its own. A read takes a permit from its connection's share, and then
+//! permits from its client's share and the engine's limit, see
+//! [`ClientReadShares::acquire`].
 //!
-//! A client's share is dropped once no read of that client holds a permit. A
-//! client whose abandoned reads still hold permits keeps its share, so
-//! reconnecting does not hand it a fresh one.
+//! The share binds only while the limit is used up and another client waits
+//! for it. A client within its share waits for the limit in its queue, like
+//! any read. A read past its share takes a permit of the limit only if one is
+//! free, so a client that is alone may use the whole limit, and it never
+//! waits in the limit's queue. It waits for a permit of its share instead.
+//! The limit's queue is first in, first out, so a permit that frees while
+//! another client waits goes to that client, and no read past its share takes
+//! it. The reads that the client already runs past its share go on, and
+//! return their permits as they end, so the client falls back to its share
+//! while the other client waits. A client never waits in the limit's queue
+//! with more reads than its share.
+//!
+//! A client's share is dropped once no read of that client holds a permit from
+//! it. A client whose abandoned reads still hold permits keeps its share, so
+//! reconnecting does not hand it a fresh one. A read past the share holds a
+//! permit of the limit only, and an abandoned one counts against the limit
+//! until its statement ends.
 //!
 //! ## What a client sees at the bound
 //!
 //! Nothing but a wait. A read past its client's share waits for a permit in
-//! the broker. The connection stays open, the response carries no error and
+//! the broker while the limit is used up. The connection stays open, the response carries no error and
 //! `throttle_time_ms` stays 0. If the request's deadline passes first, a Fetch
 //! answers the partition with no records, and a ListOffsets answers
 //! `REQUEST_TIMED_OUT` for it, and the `nisshi_storage_read_deadline_exceeded`
@@ -97,8 +111,9 @@
 //! principal, share one client share. That includes every instance of
 //! librdkafka's default `rdkafka`, and every replica of a Java consumer group
 //! without a `client.id`, which sends `consumer-<group.id>-<n>` with `n`
-//! counting from 1 in each JVM. The share is sized to leave a full
-//! connection's share to a newcomer and no more.
+//! counting from 1 in each JVM. They share one client share, which binds only
+//! while another client waits for the limit. The share is sized to leave a
+//! full connection's share to a newcomer and no more.
 //!
 //! The registry holds one entry for each client that has a read in flight or
 //! an abandoned read, and at most its sweep threshold of idle entries. A
@@ -132,7 +147,7 @@ use std::{
 
 use rama::extensions::{Extension, Extensions};
 use tokio::{
-    sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
+    sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore},
     task::LocalKey,
 };
 
@@ -227,28 +242,127 @@ impl Default for Registry {
 ///
 /// Clones count against the same shares.
 #[derive(Clone, Debug, Default)]
-pub struct ClientReadShares(Arc<Mutex<Registry>>);
+pub struct ClientReadShares {
+    registry: Arc<Mutex<Registry>>,
+    released: Arc<Notify>,
+}
+
+/// The permits of a read of one client: one from the engine's limit, and
+/// one from the client's share unless the read is beyond that share, see
+/// [`ClientReadShares::acquire`].
+///
+/// Dropping it returns the permits, and then wakes the reads of every client
+/// that wait for a share, because a permit of the limit may now be free.
+#[derive(Debug)]
+pub struct ClientAdmission {
+    limit: Option<OwnedSemaphorePermit>,
+    share: Option<OwnedSemaphorePermit>,
+    released: Arc<Notify>,
+}
+
+impl ClientAdmission {
+    /// Returns whether the read holds a permit from its client's share. A read
+    /// beyond the share holds only one from the engine's limit.
+    pub fn is_within_share(&self) -> bool {
+        self.share.is_some()
+    }
+}
+
+impl Drop for ClientAdmission {
+    fn drop(&mut self) {
+        // The permit of the limit goes first, so that a read that wakes for it finds it free.
+        drop(self.limit.take());
+        drop(self.share.take());
+        self.released.notify_waiters();
+    }
+}
 
 impl ClientReadShares {
-    /// Waits for a permit from the share of the client in the enclosing
-    /// [`ClientIdentity::scope`], creating the share with `size` permits if
-    /// it has none yet.
+    /// Waits for the permits of a read of the client in the enclosing
+    /// [`ClientIdentity::scope`]: one from the client's share, which has
+    /// `size` permits, and one from `limit`, the engine's limit on reads in
+    /// flight.
+    ///
+    /// A client past its share still takes a permit from `limit` when one is
+    /// free, so a client that is alone may use the whole limit. It never
+    /// queues for a permit of `limit` beyond its share, so it holds no place
+    /// in the queue ahead of another client's read. It waits for a permit of
+    /// its share instead. A permit that frees while another client waits goes
+    /// to the first read in the queue of `limit`, so the share holds a client
+    /// to its size as its reads end once `limit` is used up and another
+    /// client waits for it.
     ///
     /// Returns `None` outside a scope, so a read that no client makes is
-    /// limited only by its engine. A read abandoned during the wait is counted as
-    /// queued for [`ReadWait::ClientReadLimit`].
-    pub async fn acquire(&self, size: usize) -> Result<Option<OwnedSemaphorePermit>, AcquireError> {
+    /// limited only by its engine. A read abandoned during the wait for the share is counted as
+    /// queued for [`ReadWait::ClientReadLimit`], and one abandoned during the wait for `limit` as
+    /// queued for [`ReadWait::EngineReadLimit`].
+    pub async fn acquire(
+        &self,
+        size: usize,
+        limit: &Arc<Semaphore>,
+    ) -> Result<Option<ClientAdmission>, AcquireError> {
         let Ok(identity) = IDENTITY.try_with(Clone::clone) else {
             return Ok(None);
         };
 
-        let permits = self.share(identity, size);
+        let share = self.share(identity, size);
 
-        permits
-            .acquire_owned()
-            .queued_for(ReadWait::ClientReadLimit)
-            .await
-            .map(Some)
+        loop {
+            // The read starts listening before it checks the permits, so that a permit
+            // freed after the checks wakes it. Otherwise it could wait on its share while
+            // a permit of `limit` is free.
+            let released = self.released.notified();
+            tokio::pin!(released);
+            _ = released.as_mut().enable();
+
+            // A closed share has no permits, and waiting for one returns its error.
+            let within_share = share.clone().try_acquire_owned().ok();
+
+            let share_permit = match within_share {
+                Some(permit) => permit,
+                None => {
+                    if let Ok(permit) = limit.clone().try_acquire_owned() {
+                        return Ok(Some(self.admission(permit, None)));
+                    }
+
+                    // A read waits for its share until one of the client's reads ends, or any
+                    // read of the engine does, because a permit of `limit` may then be free.
+                    let waited = async {
+                        tokio::select! {
+                            permit = share.clone().acquire_owned() => Some(permit),
+                            () = &mut released => None,
+                        }
+                    }
+                    .queued_for(ReadWait::ClientReadLimit)
+                    .await;
+
+                    match waited {
+                        Some(permit) => permit?,
+                        None => continue,
+                    }
+                }
+            };
+
+            let limit_permit = limit
+                .clone()
+                .acquire_owned()
+                .queued_for(ReadWait::EngineReadLimit)
+                .await?;
+
+            return Ok(Some(self.admission(limit_permit, Some(share_permit))));
+        }
+    }
+
+    fn admission(
+        &self,
+        limit: OwnedSemaphorePermit,
+        share: Option<OwnedSemaphorePermit>,
+    ) -> ClientAdmission {
+        ClientAdmission {
+            limit: Some(limit),
+            share,
+            released: self.released.clone(),
+        }
     }
 
     /// Returns the permits of `identity`'s share.
@@ -258,7 +372,7 @@ impl ClientReadShares {
     /// that a read waits on, or that an abandoned read still holds a permit
     /// from, is kept.
     fn share(&self, identity: ClientIdentity, size: usize) -> Arc<Semaphore> {
-        let mut registry = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
 
         if registry.shares.len() >= registry.sweep_threshold {
             registry
@@ -277,7 +391,7 @@ impl ClientReadShares {
     /// Returns how many clients have a share.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.0
+        self.registry
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .shares
@@ -512,52 +626,228 @@ mod tests {
         ClientIdentity::new(principal, Some(client_id))
     }
 
+    /// Returns an engine limit with `permits` permits.
+    fn limit(permits: usize) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(permits))
+    }
+
+    /// Takes the permits of a read of `client`, which must not wait.
+    async fn admit(
+        shares: &ClientReadShares,
+        client: &ClientIdentity,
+        size: usize,
+        limit: &Arc<Semaphore>,
+    ) -> ClientAdmission {
+        timeout(
+            Duration::from_millis(200),
+            client.clone().scope(shares.acquire(size, limit)),
+        )
+        .await
+        .expect("the read did not wait")
+        .expect("the limit is open")
+        .expect("the read is in a scope")
+    }
+
+    /// Returns whether a read of `client` waits for its permits.
+    async fn waits(
+        shares: &ClientReadShares,
+        client: &ClientIdentity,
+        size: usize,
+        limit: &Arc<Semaphore>,
+    ) -> bool {
+        timeout(
+            Duration::from_millis(50),
+            client.clone().scope(shares.acquire(size, limit)),
+        )
+        .await
+        .is_err()
+    }
+
     #[tokio::test]
     async fn client_share_outside_a_scope_returns_none() -> Result<(), AcquireError> {
-        assert!(ClientReadShares::default().acquire(1).await?.is_none());
+        assert!(
+            ClientReadShares::default()
+                .acquire(1, &limit(1))
+                .await?
+                .is_none()
+        );
         Ok(())
+    }
+
+    /// A client that nobody else reads for may hold the whole limit, past its
+    /// share.
+    #[tokio::test]
+    async fn a_lone_client_uses_the_whole_limit() {
+        let shares = ClientReadShares::default();
+        let limit = limit(3);
+        let client = identity(None, "alone");
+
+        let held = [
+            admit(&shares, &client, 1, &limit).await,
+            admit(&shares, &client, 1, &limit).await,
+            admit(&shares, &client, 1, &limit).await,
+        ];
+
+        assert_eq!(
+            vec![true, false, false],
+            held.iter()
+                .map(ClientAdmission::is_within_share)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(0, limit.available_permits());
+
+        // The limit is used up, so the fourth read waits for the share.
+        assert!(waits(&shares, &client, 1, &limit).await);
+    }
+
+    /// A client past its share does not queue for the limit. A permit that
+    /// frees while another client waits goes to that client, and the client
+    /// past its share waits for its share, and takes the limit again once
+    /// nobody waits.
+    #[tokio::test]
+    async fn a_client_past_its_share_gives_way_to_a_waiting_client() {
+        let shares = ClientReadShares::default();
+        let limit = limit(2);
+        let greedy = identity(None, "greedy");
+
+        let within = admit(&shares, &greedy, 1, &limit).await;
+        let beyond = admit(&shares, &greedy, 1, &limit).await;
+        assert!(within.is_within_share());
+        assert!(!beyond.is_within_share());
+
+        // The first client's next read waits for its share, not for the limit, and so it holds no
+        // place in the limit's queue ahead of the client that waits next.
+        let next = tokio::spawn({
+            let shares = shares.clone();
+            let limit = limit.clone();
+
+            greedy
+                .clone()
+                .scope(async move { shares.acquire(1, &limit).await })
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!next.is_finished());
+
+        // Another client waits for the limit, which the first has used up.
+        let waiting = tokio::spawn({
+            let shares = shares.clone();
+            let limit = limit.clone();
+
+            identity(None, "polite").scope(async move { shares.acquire(1, &limit).await })
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        // The permit that frees goes to the client that waits.
+        drop(beyond);
+        let polite = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the waiting client got the permit that freed")
+            .expect("the task ran")
+            .expect("the limit is open");
+        assert!(polite.is_some_and(|admission| admission.is_within_share()));
+        assert!(!next.is_finished(), "the greedy client took the permit");
+
+        // Once nobody waits, the greedy client's read takes the permit that frees.
+        drop(within);
+        let next = timeout(Duration::from_secs(1), next)
+            .await
+            .expect("the read took the permit that freed")
+            .expect("the task ran")
+            .expect("the limit is open");
+        assert!(next.is_some());
+    }
+
+    /// A read waiting for its share wakes when a permit of the limit frees, so
+    /// a client past its share that nobody else waits behind keeps the whole
+    /// limit.
+    #[tokio::test]
+    async fn a_read_waiting_for_its_share_takes_a_permit_that_frees() {
+        let shares = ClientReadShares::default();
+        let limit = limit(2);
+        let client = identity(None, "alone");
+
+        let within = admit(&shares, &client, 1, &limit).await;
+        let beyond = admit(&shares, &client, 1, &limit).await;
+
+        let next = tokio::spawn({
+            let shares = shares.clone();
+            let limit = limit.clone();
+
+            client
+                .clone()
+                .scope(async move { shares.acquire(1, &limit).await })
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!next.is_finished());
+
+        // The share is still in use by `within`: only the limit frees.
+        drop(beyond);
+        let next = timeout(Duration::from_secs(1), next)
+            .await
+            .expect("the read woke for the permit of the limit")
+            .expect("the task ran")
+            .expect("the limit is open")
+            .expect("the read is in a scope");
+        assert!(!next.is_within_share());
+        drop(within);
+    }
+
+    /// A read of a client that waits is cancelled without holding a permit, so
+    /// the permits are all back once the holders end.
+    #[tokio::test]
+    async fn cancelled_reads_leave_no_permit_behind() {
+        let shares = ClientReadShares::default();
+        let limit = limit(2);
+        let client = identity(None, "cancelled");
+
+        let held = [
+            admit(&shares, &client, 1, &limit).await,
+            admit(&shares, &client, 1, &limit).await,
+        ];
+
+        for _ in 0..3 {
+            assert!(waits(&shares, &client, 1, &limit).await);
+        }
+        drop(held);
+
+        assert_eq!(2, limit.available_permits());
+        let again = [
+            admit(&shares, &client, 1, &limit).await,
+            admit(&shares, &client, 1, &limit).await,
+        ];
+        assert!(again[0].is_within_share());
     }
 
     /// Reads of one identity count against one share, however many
     /// connections they come from, and another identity has a share of its
     /// own.
     #[tokio::test]
-    async fn an_identity_has_one_share_for_all_its_connections() -> Result<(), AcquireError> {
+    async fn an_identity_has_one_share_for_all_its_connections() {
         let shares = ClientReadShares::default();
+        let limit = limit(10);
         let one = identity(None, "one");
 
-        let held = one.clone().scope(shares.acquire(1)).await?;
-        assert!(held.is_some());
-
+        let first = admit(&shares, &one, 1, &limit).await;
+        let second = admit(&shares, &one, 1, &limit).await;
+        assert!(first.is_within_share());
         assert!(
-            timeout(
-                Duration::from_millis(50),
-                one.clone().scope(shares.acquire(1))
-            )
-            .await
-            .is_err(),
-            "a second connection of the identity took a second permit"
+            !second.is_within_share(),
+            "a second connection of the identity took a second permit of its share"
         );
 
         assert!(
-            identity(None, "two")
-                .scope(shares.acquire(1))
-                .await?
-                .is_some(),
-            "another client waited for the first"
+            admit(&shares, &identity(None, "two"), 1, &limit)
+                .await
+                .is_within_share(),
+            "another client used the share of the first"
         );
         assert!(
-            identity(Some("alice"), "one")
-                .scope(shares.acquire(1))
-                .await?
-                .is_some(),
-            "the same client_id under another principal waited"
+            admit(&shares, &identity(Some("alice"), "one"), 1, &limit)
+                .await
+                .is_within_share(),
+            "the same client_id under another principal used the share of the first"
         );
-
-        drop(held);
-        assert!(one.scope(shares.acquire(1)).await?.is_some());
-
-        Ok(())
     }
 
     /// A read abandoned while it waits for its client's share is a miss
@@ -565,14 +855,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_its_client_share_is_abandoned_as_queued() {
         let shares = ClientReadShares::default();
+        let limit = limit(1);
         let deadline = Instant::now() + Duration::from_secs(1);
 
         let outcome = identity(None, "one")
             .scope(bounded(deadline, async {
-                let held = shares.acquire(1).await;
+                let held = shares.acquire(1, &limit).await;
                 assert!(held.as_ref().is_ok_and(Option::is_some), "{held:?}");
 
-                _ = shares.acquire(1).await;
+                _ = shares.acquire(1, &limit).await;
                 pending::<()>().await
             }))
             .await;
@@ -584,19 +875,16 @@ mod tests {
     /// keeps one whose permit is still held, so reconnecting does not hand
     /// an identity a fresh share.
     #[tokio::test]
-    async fn idle_shares_are_evicted_and_held_ones_are_not() -> Result<(), AcquireError> {
+    async fn idle_shares_are_evicted_and_held_ones_are_not() {
         let shares = ClientReadShares::default();
+        let limit = limit(MINIMUM_SWEEP_THRESHOLD + 2);
         let abandoned = identity(None, "abandoned");
 
-        let held = abandoned.clone().scope(shares.acquire(1)).await?;
-        assert!(held.is_some());
+        let held = admit(&shares, &abandoned, 1, &limit).await;
+        assert!(held.is_within_share());
 
         for n in 0..MINIMUM_SWEEP_THRESHOLD {
-            drop(
-                identity(None, &format!("idle-{n}"))
-                    .scope(shares.acquire(1))
-                    .await?,
-            );
+            drop(admit(&shares, &identity(None, &format!("idle-{n}")), 1, &limit).await);
         }
         assert!(shares.len() <= MINIMUM_SWEEP_THRESHOLD);
 
@@ -607,17 +895,13 @@ mod tests {
             shares.len()
         );
 
+        // A fresh share would give the read a permit of its own.
         assert!(
-            timeout(
-                Duration::from_millis(50),
-                abandoned.scope(shares.acquire(1))
-            )
-            .await
-            .is_err(),
+            !admit(&shares, &abandoned, 1, &limit)
+                .await
+                .is_within_share(),
             "the share of an identity that holds a permit was evicted"
         );
-
-        Ok(())
     }
 
     /// A task sees the identity of the request it answers, so that a log line
