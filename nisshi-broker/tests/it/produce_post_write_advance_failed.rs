@@ -306,30 +306,29 @@ impl Setup {
     /// Produces one idempotent batch that starts at `base_sequence`, and returns the error
     /// code that the partition answers.
     async fn produce(&self, base_sequence: i32) -> Result<ErrorCode> {
-        let response = ProduceService {
-            storage: self.storage.clone(),
-        }
-        .serve(RequestInput {
-            request: ProduceRequest::default().acks(1).topic_data(Some(
-                [TopicProduceData::default()
-                    .name(TOPIC.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(0)
-                            .records(Some(Frame {
-                                batches: vec![batch(
-                                    self.producer_id,
-                                    self.producer_epoch,
-                                    base_sequence,
-                                )?],
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
-            extensions: self.extensions.clone(),
-        })
-        .await?;
+        let response = ProduceService::new(self.storage.clone())
+            .with_validation()
+            .serve(RequestInput {
+                request: ProduceRequest::default().acks(1).topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(TOPIC.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(0)
+                                .records(Some(Frame {
+                                    batches: vec![batch(
+                                        self.producer_id,
+                                        self.producer_epoch,
+                                        base_sequence,
+                                    )?],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+                extensions: self.extensions.clone(),
+            })
+            .await?;
 
         Ok(ErrorCode::try_from(
             response.responses.unwrap_or_default()[0]

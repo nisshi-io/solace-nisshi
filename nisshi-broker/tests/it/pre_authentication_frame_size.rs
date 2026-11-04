@@ -118,6 +118,7 @@ async fn spawn_broker(sasl: bool) -> Result<RunningBroker> {
                 "pre-authentication",
                 coordinator.clone(),
                 storage.clone(),
+                None,
                 TopicCreationConfig::default(),
                 AutoCreateRefusals::default(),
                 sasl_config.clone(),

@@ -109,6 +109,10 @@ use std::{
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 use url::Url;
 
+/// The stack of each thread of the model, in bytes. The default of traceforge is 32 KiB, which the
+/// nested futures of the produce service overflow when `block_on` polls them.
+const STACK_SIZE: usize = 1024 * 1024;
+
 fn batch_data(
     topic: &str,
     index: i32,
@@ -140,177 +144,178 @@ fn batch_data(
 
 #[test]
 fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
-    let stats = verify(Config::builder().build(), || {
-        let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
-        let topic = alphanumeric_string(15);
-        let extensions = Extensions::default();
-        let index = 0;
+    let stats = verify(
+        Config::builder().with_stack_size(STACK_SIZE).build(),
+        || {
+            let storage = future::block_on(memory_storage("spike", 111)).expect("storage");
+            let topic = alphanumeric_string(15);
+            let extensions = Extensions::default();
+            let index = 0;
 
-        let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
-            storage: storage.clone(),
-        });
-        let response = future::block_on(
-            create_topics.serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(topic.clone())
-                            .num_partitions(1)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into())),
-                    ])),
-                extensions: extensions.clone(),
-            }),
-        )
-        .expect("create topic");
+            let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+                storage: storage.clone(),
+            });
+            let response = future::block_on(
+                create_topics.serve(RequestInput {
+                    request: CreateTopicsRequest::default()
+                        .validate_only(Some(false))
+                        .topics(Some(vec![
+                            CreatableTopic::default()
+                                .name(topic.clone())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some([].into())),
+                        ])),
+                    extensions: extensions.clone(),
+                }),
+            )
+            .expect("create topic");
 
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(topics[0].error_code).unwrap()
-        );
+            let topics = response.topics.as_deref().unwrap_or_default();
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(topics[0].error_code).unwrap()
+            );
 
-        let init_producer_id = InitProducerIdService {
-            storage: storage.clone(),
-        };
-        let producer = future::block_on(
-            init_producer_id.serve(RequestInput {
-                request: InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-                extensions: extensions.clone(),
-            }),
-        )
-        .expect("init producer id");
+            let init_producer_id = InitProducerIdService {
+                storage: storage.clone(),
+            };
+            let producer = future::block_on(
+                init_producer_id.serve(RequestInput {
+                    request: InitProducerIdRequest::default()
+                        .transactional_id(None)
+                        .transaction_timeout_ms(0)
+                        .producer_id(Some(-1))
+                        .producer_epoch(Some(-1)),
+                    extensions: extensions.clone(),
+                }),
+            )
+            .expect("init producer id");
 
-        // Pick a delivery order for base_sequence 0, 1, 2 by repeatedly
-        // choosing an index among whoever's left, rather than enumerating
-        // all 6 permutations by hand.
-        let mut remaining: Vec<i32> = (0..3).collect();
-        let mut order = Vec::new();
-        while !remaining.is_empty() {
-            let i = (0..remaining.len()).nondet();
-            order.push(remaining.remove(i));
-        }
+            // Pick a delivery order for base_sequence 0, 1, 2 by repeatedly
+            // choosing an index among whoever's left, rather than enumerating
+            // all 6 permutations by hand.
+            let mut remaining: Vec<i32> = (0..3).collect();
+            let mut order = Vec::new();
+            while !remaining.is_empty() {
+                let i = (0..remaining.len()).nondet();
+                order.push(remaining.remove(i));
+            }
 
-        let produce = ProduceService {
-            storage: storage.clone(),
-        };
+            let produce = ProduceService::new(storage.clone()).with_validation();
 
-        // Oracle: mirrors dynostore's sequence check exactly
-        // but tracked independently here, so it can
-        // be checked against every one of the 48 order/duplicate
-        // combinations rather than only the one fully-in-order case.
-        //
-        // The partition holds no state for the producer until its first batch is
-        // stored, so that batch may start at any sequence, as in Kafka. After it,
-        // a batch is stored only at the next sequence, and one that repeats a
-        // stored batch is answered with that batch's offset.
-        let mut expected_sequence: Option<i32> = None;
-        let mut next_offset: i64 = 0;
-        let mut stored_batches: Vec<(i32, i64)> = Vec::new();
+            // Oracle: mirrors dynostore's sequence check exactly
+            // but tracked independently here, so it can
+            // be checked against every one of the 48 order/duplicate
+            // combinations rather than only the one fully-in-order case.
+            //
+            // The partition holds no state for the producer until its first batch is
+            // stored, so that batch may start at any sequence, as in Kafka. After it,
+            // a batch is stored only at the next sequence, and one that repeats a
+            // stored batch is answered with that batch's offset.
+            let mut expected_sequence: Option<i32> = None;
+            let mut next_offset: i64 = 0;
+            let mut stored_batches: Vec<(i32, i64)> = Vec::new();
 
-        for &base_sequence in &order {
-            let redeliver = bool::nondet();
-            let deliveries = if redeliver { 2 } else { 1 };
+            for &base_sequence in &order {
+                let redeliver = bool::nondet();
+                let deliveries = if redeliver { 2 } else { 1 };
 
-            for _ in 0..deliveries {
-                let response = future::block_on(
-                    produce.serve(RequestInput {
-                        request: ProduceRequest::default()
-                            .transactional_id(None)
-                            .acks(1)
-                            .timeout_ms(0)
-                            .topic_data(batch_data(
-                                &topic,
-                                index,
-                                producer.producer_id,
-                                producer.producer_epoch,
-                                base_sequence,
-                            )),
-                        extensions: extensions.clone(),
-                    }),
-                )
-                .expect("produce");
+                for _ in 0..deliveries {
+                    let response = future::block_on(
+                        produce.serve(RequestInput {
+                            request: ProduceRequest::default()
+                                .transactional_id(None)
+                                .acks(1)
+                                .timeout_ms(0)
+                                .topic_data(batch_data(
+                                    &topic,
+                                    index,
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    base_sequence,
+                                )),
+                            extensions: extensions.clone(),
+                        }),
+                    )
+                    .expect("produce");
 
-                let partition_response = &response.responses.as_ref().unwrap()[0]
-                    .partition_responses
-                    .as_ref()
-                    .unwrap()[0];
-                let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
+                    let partition_response = &response.responses.as_ref().unwrap()[0]
+                        .partition_responses
+                        .as_ref()
+                        .unwrap()[0];
+                    let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
 
-                if let Some(&(_, base_offset)) = stored_batches
-                    .iter()
-                    .find(|(stored_sequence, _)| *stored_sequence == base_sequence)
-                {
-                    assert_eq!(
-                        error_code,
-                        ErrorCode::None,
-                        "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
-                    );
-                    assert_eq!(partition_response.base_offset, base_offset);
-                    cover!("answered_duplicate");
-                } else if expected_sequence.is_none_or(|expected| expected == base_sequence) {
-                    assert_eq!(
-                        error_code,
-                        ErrorCode::None,
-                        "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
-                    );
-                    assert_eq!(partition_response.base_offset, next_offset);
+                    if let Some(&(_, base_offset)) = stored_batches
+                        .iter()
+                        .find(|(stored_sequence, _)| *stored_sequence == base_sequence)
+                    {
+                        assert_eq!(
+                            error_code,
+                            ErrorCode::None,
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
+                        );
+                        assert_eq!(partition_response.base_offset, base_offset);
+                        cover!("answered_duplicate");
+                    } else if expected_sequence.is_none_or(|expected| expected == base_sequence) {
+                        assert_eq!(
+                            error_code,
+                            ErrorCode::None,
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
+                        );
+                        assert_eq!(partition_response.base_offset, next_offset);
 
-                    if expected_sequence.is_none() && base_sequence != 0 {
-                        cover!("accepted_first_at_any_sequence");
+                        if expected_sequence.is_none() && base_sequence != 0 {
+                            cover!("accepted_first_at_any_sequence");
+                        }
+
+                        stored_batches.push((base_sequence, next_offset));
+                        expected_sequence = Some(base_sequence + 1);
+                        next_offset += 1;
+
+                        cover!("accepted_in_order");
+                    } else {
+                        assert_eq!(
+                            error_code,
+                            ErrorCode::OutOfOrderSequenceNumber,
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
+                        );
+                        cover!("rejected_out_of_order");
                     }
-
-                    stored_batches.push((base_sequence, next_offset));
-                    expected_sequence = Some(base_sequence + 1);
-                    next_offset += 1;
-
-                    cover!("accepted_in_order");
-                } else {
-                    assert_eq!(
-                        error_code,
-                        ErrorCode::OutOfOrderSequenceNumber,
-                        "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
-                    );
-                    cover!("rejected_out_of_order");
                 }
             }
-        }
 
-        let accepted_batches = stored_batches.len();
+            let accepted_batches = stored_batches.len();
 
-        // Cross-check against what a fetcher actually sees: a silently
-        // dropped accept or a silently applied reject shows up here as a
-        // record-count mismatch, not just a wrong response code above.
-        let topition = Topition::new(topic.clone(), index);
-        let fetched = future::block_on(storage.fetch(
-            &topition,
-            0,
-            0,
-            i32::MAX as u32,
-            IsolationLevel::ReadUncommitted,
-            Duration::from_millis(1000),
-        ))
-        .expect("fetch");
+            // Cross-check against what a fetcher actually sees: a silently
+            // dropped accept or a silently applied reject shows up here as a
+            // record-count mismatch, not just a wrong response code above.
+            let topition = Topition::new(topic.clone(), index);
+            let fetched = future::block_on(storage.fetch(
+                &topition,
+                0,
+                0,
+                i32::MAX as u32,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(1000),
+            ))
+            .expect("fetch");
 
-        let fetched_records: usize = fetched
-            .iter()
-            .map(|batch| batch.record_count as usize)
-            .sum();
-        assert_eq!(
-            fetched_records, accepted_batches,
-            "fetcher must see exactly the accepted batches, no more, no less"
-        );
+            let fetched_records: usize = fetched
+                .iter()
+                .map(|batch| batch.record_count as usize)
+                .sum();
+            assert_eq!(
+                fetched_records, accepted_batches,
+                "fetcher must see exactly the accepted batches, no more, no less"
+            );
 
-        if order == [0, 1, 2] {
-            cover!("in_order_delivery_explored");
-        }
-    });
+            if order == [0, 1, 2] {
+                cover!("in_order_delivery_explored");
+            }
+        },
+    );
 
     println!(
         "traceforge stats: execs={} blocked={}",
@@ -678,166 +683,167 @@ impl Storage for FaultInjectingProduceStorage {
 
 #[test]
 fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
-    let stats = verify(Config::builder().build(), || {
-        let real_storage = future::block_on(memory_storage("spike", 111)).expect("storage");
-        let topic = alphanumeric_string(15);
-        let extensions = Extensions::default();
-        let index = 0;
+    let stats = verify(
+        Config::builder().with_stack_size(STACK_SIZE).build(),
+        || {
+            let real_storage = future::block_on(memory_storage("spike", 111)).expect("storage");
+            let topic = alphanumeric_string(15);
+            let extensions = Extensions::default();
+            let index = 0;
 
-        _ = future::block_on(
-            real_storage.create_topic(
-                CreatableTopic::default()
-                    .name(topic.clone())
-                    .num_partitions(1)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into())),
-                false,
-            ),
-        )
-        .expect("create topic");
+            _ = future::block_on(
+                real_storage.create_topic(
+                    CreatableTopic::default()
+                        .name(topic.clone())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                ),
+            )
+            .expect("create topic");
 
-        let init_producer_id = InitProducerIdService {
-            storage: real_storage.clone(),
-        };
-        let producer = future::block_on(
-            init_producer_id.serve(RequestInput {
-                request: InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-                extensions: extensions.clone(),
-            }),
-        )
-        .expect("init producer id");
+            let init_producer_id = InitProducerIdService {
+                storage: real_storage.clone(),
+            };
+            let producer = future::block_on(
+                init_producer_id.serve(RequestInput {
+                    request: InitProducerIdRequest::default()
+                        .transactional_id(None)
+                        .transaction_timeout_ms(0)
+                        .producer_id(Some(-1))
+                        .producer_epoch(Some(-1)),
+                    extensions: extensions.clone(),
+                }),
+            )
+            .expect("init producer id");
 
-        let faulty = FaultInjectingProduceStorage::new(real_storage.clone());
-        let produce = ProduceService {
-            storage: faulty.clone(),
-        };
+            let faulty = FaultInjectingProduceStorage::new(real_storage.clone());
+            let produce = ProduceService::new(faulty.clone()).with_validation();
 
-        const MAX_ATTEMPTS: usize = 3;
+            const MAX_ATTEMPTS: usize = 3;
 
-        for base_sequence in 0..3i32 {
-            let mut resolved = false;
-            let mut stored_by_an_ack_lost_attempt = false;
+            for base_sequence in 0..3i32 {
+                let mut resolved = false;
+                let mut stored_by_an_ack_lost_attempt = false;
 
-            for attempt in 0..MAX_ATTEMPTS {
-                let fault = if attempt + 1 == MAX_ATTEMPTS {
-                    // Guarantee termination: after 2 faulted attempts, the
-                    // 3rd is always clean.
-                    ProduceFault::None
-                } else {
-                    match (0..3).nondet() {
-                        0 => ProduceFault::None,
-                        1 => ProduceFault::Dropped,
-                        2 => ProduceFault::AckLost,
-                        _ => unreachable!(),
-                    }
-                };
-                faulty.schedule_produce(fault);
+                for attempt in 0..MAX_ATTEMPTS {
+                    let fault = if attempt + 1 == MAX_ATTEMPTS {
+                        // Guarantee termination: after 2 faulted attempts, the
+                        // 3rd is always clean.
+                        ProduceFault::None
+                    } else {
+                        match (0..3).nondet() {
+                            0 => ProduceFault::None,
+                            1 => ProduceFault::Dropped,
+                            2 => ProduceFault::AckLost,
+                            _ => unreachable!(),
+                        }
+                    };
+                    faulty.schedule_produce(fault);
 
-                let response = future::block_on(
-                    produce.serve(RequestInput {
-                        request: ProduceRequest::default()
-                            .transactional_id(None)
-                            .acks(1)
-                            .timeout_ms(0)
-                            .topic_data(batch_data(
-                                &topic,
-                                index,
-                                producer.producer_id,
-                                producer.producer_epoch,
-                                base_sequence,
-                            )),
-                        extensions: extensions.clone(),
-                    }),
-                )
-                .expect("produce");
+                    let response = future::block_on(
+                        produce.serve(RequestInput {
+                            request: ProduceRequest::default()
+                                .transactional_id(None)
+                                .acks(1)
+                                .timeout_ms(0)
+                                .topic_data(batch_data(
+                                    &topic,
+                                    index,
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    base_sequence,
+                                )),
+                            extensions: extensions.clone(),
+                        }),
+                    )
+                    .expect("produce");
 
-                let partition_response = &response.responses.as_ref().unwrap()[0]
-                    .partition_responses
-                    .as_ref()
-                    .unwrap()[0];
-                let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
+                    let partition_response = &response.responses.as_ref().unwrap()[0]
+                        .partition_responses
+                        .as_ref()
+                        .unwrap()[0];
+                    let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
 
-                match (fault, error_code) {
-                    // Each batch holds one record and is stored in order, so
-                    // it is at the offset of its sequence number. A retry
-                    // after a lost acknowledgement repeats the stored batch,
-                    // and the broker answers it with that batch's offset.
-                    (ProduceFault::None, ErrorCode::None) => {
-                        assert_eq!(partition_response.base_offset, i64::from(base_sequence));
+                    match (fault, error_code) {
+                        // Each batch holds one record and is stored in order, so
+                        // it is at the offset of its sequence number. A retry
+                        // after a lost acknowledgement repeats the stored batch,
+                        // and the broker answers it with that batch's offset.
+                        (ProduceFault::None, ErrorCode::None) => {
+                            assert_eq!(partition_response.base_offset, i64::from(base_sequence));
 
-                        cover!(if stored_by_an_ack_lost_attempt {
-                            "resolved_by_duplicate_detection"
-                        } else {
-                            "resolved_by_direct_accept"
-                        });
-                        resolved = true;
-                    }
+                            cover!(if stored_by_an_ack_lost_attempt {
+                                "resolved_by_duplicate_detection"
+                            } else {
+                                "resolved_by_direct_accept"
+                            });
+                            resolved = true;
+                        }
 
-                    (ProduceFault::None, other) => {
-                        panic!(
-                            "unexpected error on an undisturbed attempt: {other:?} \
+                        (ProduceFault::None, other) => {
+                            panic!(
+                                "unexpected error on an undisturbed attempt: {other:?} \
                              (base_sequence={base_sequence}, attempt={attempt})"
-                        );
+                            );
+                        }
+
+                        (ProduceFault::Dropped, _) | (ProduceFault::AckLost, _) => {
+                            assert_ne!(
+                                error_code,
+                                ErrorCode::None,
+                                "an injected fault must never look like success to the caller"
+                            );
+                            stored_by_an_ack_lost_attempt |= fault == ProduceFault::AckLost;
+
+                            cover!(match fault {
+                                ProduceFault::Dropped => "attempt_dropped",
+                                ProduceFault::AckLost => "attempt_ack_lost",
+                                ProduceFault::None => unreachable!(),
+                            });
+                        }
                     }
 
-                    (ProduceFault::Dropped, _) | (ProduceFault::AckLost, _) => {
-                        assert_ne!(
-                            error_code,
-                            ErrorCode::None,
-                            "an injected fault must never look like success to the caller"
-                        );
-                        stored_by_an_ack_lost_attempt |= fault == ProduceFault::AckLost;
-
-                        cover!(match fault {
-                            ProduceFault::Dropped => "attempt_dropped",
-                            ProduceFault::AckLost => "attempt_ack_lost",
-                            ProduceFault::None => unreachable!(),
-                        });
+                    if resolved {
+                        break;
                     }
                 }
 
-                if resolved {
-                    break;
-                }
+                assert!(
+                    resolved,
+                    "base_sequence={base_sequence} must resolve within {MAX_ATTEMPTS} attempts"
+                );
             }
 
-            assert!(
-                resolved,
-                "base_sequence={base_sequence} must resolve within {MAX_ATTEMPTS} attempts"
+            // Regardless of which attempts were faulted, idempotence must hold:
+            // exactly the 3 distinct batches sent, no more (a hidden ack-lost
+            // write duplicated by a careless retry) and no fewer (a dropped
+            // write never actually retried).
+            let topition = Topition::new(topic.clone(), index);
+            let fetched = future::block_on(real_storage.fetch(
+                &topition,
+                0,
+                0,
+                i32::MAX as u32,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(1000),
+            ))
+            .expect("fetch");
+
+            let fetched_records: usize = fetched
+                .iter()
+                .map(|batch| batch.record_count as usize)
+                .sum();
+            assert_eq!(
+                fetched_records, 3,
+                "exactly the 3 distinct batches must be durably persisted, regardless of faults"
             );
-        }
 
-        // Regardless of which attempts were faulted, idempotence must hold:
-        // exactly the 3 distinct batches sent, no more (a hidden ack-lost
-        // write duplicated by a careless retry) and no fewer (a dropped
-        // write never actually retried).
-        let topition = Topition::new(topic.clone(), index);
-        let fetched = future::block_on(real_storage.fetch(
-            &topition,
-            0,
-            0,
-            i32::MAX as u32,
-            IsolationLevel::ReadUncommitted,
-            Duration::from_millis(1000),
-        ))
-        .expect("fetch");
-
-        let fetched_records: usize = fetched
-            .iter()
-            .map(|batch| batch.record_count as usize)
-            .sum();
-        assert_eq!(
-            fetched_records, 3,
-            "exactly the 3 distinct batches must be durably persisted, regardless of faults"
-        );
-
-        cover!("all_batches_resolved");
-    });
+            cover!("all_batches_resolved");
+        },
+    );
 
     println!(
         "traceforge stats: execs={} blocked={}",

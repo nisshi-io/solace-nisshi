@@ -22,6 +22,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{Body, Frame, Header};
+use nisshi_schema::Registry;
 use nisshi_storage::ArcDynStorage;
 use rustls::ServerConfig;
 use tokio::{
@@ -72,6 +73,20 @@ pub(crate) async fn spawn_broker_with_authentication(
     tls: Option<ServerConfig>,
     authentication: bool,
 ) -> Result<RunningBroker> {
+    spawn(tls, authentication, None).await
+}
+
+/// Like [`spawn_broker`], with `schemas` as the registry that the broker validates produced
+/// records against.
+pub(crate) async fn spawn_broker_with_schemas(schemas: Option<Registry>) -> Result<RunningBroker> {
+    spawn(None, false, schemas).await
+}
+
+async fn spawn(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+    schemas: Option<Registry>,
+) -> Result<RunningBroker> {
     let port = free_port().await?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = Url::parse(&format!("tcp://{addr}"))?;
@@ -91,6 +106,7 @@ pub(crate) async fn spawn_broker_with_authentication(
         .listener(listener)
         .tls_server_config(tls)
         .authentication(authentication)
+        .schema_registry(schemas)
         .silent(true)
         .build()
         .await?;

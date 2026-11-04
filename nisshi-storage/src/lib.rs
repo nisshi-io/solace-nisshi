@@ -230,8 +230,9 @@ pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
-    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
+    AcksZeroLayer, AcksZeroService, AlterUserScramCredentialsService, AutoCreateRefusals,
+    BatchValidationLayer, BatchValidationService, ChannelRequestLayer, ChannelRequestService,
+    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
     DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
@@ -240,10 +241,14 @@ pub use service::{
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
     MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
+    ProduceService, ProduceTopicService, Request, RequestChannelService, RequestLayer,
+    RequestReceiver, RequestSender, RequestService, RequestStorageService, Response,
+    SchemaValidationLayer, SchemaValidationService, StorePartitionService, StoredPartitions,
+    TimestampLayer, TimestampService, TopicConfiguration, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -2045,10 +2050,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Produce a deflated batch to this storage.
     ///
     /// Trusts the batch attributes as given: a batch with the control bit set
-    /// is written as a transaction marker, skipping schema validation and lake
-    /// writes. Only the broker may write control batches, so client Produce
-    /// batches must reach storage through [`ProduceService`], which rejects
-    /// them.
+    /// is written as a transaction marker, skipping lake writes. Only the broker
+    /// may write control batches, so client Produce batches must reach storage
+    /// through [`ProduceService`], which rejects them.
+    ///
+    /// A backend does not validate the records against the topic's schema.
+    /// [`ProduceService`] does that, on the records that it decodes for the
+    /// timestamp check, before it calls this method. A batch that reaches a
+    /// backend any other way is stored without validation.
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.

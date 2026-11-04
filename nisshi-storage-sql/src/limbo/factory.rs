@@ -58,7 +58,6 @@ impl StorageFactory for LimboFactory {
             .node(configuration.node_id)
             .cluster(configuration.cluster)
             .advertised_listener(configuration.advertised_listener)
-            .schemas(configuration.schema_registry)
             .lake(configuration.lake_house)
             .build()
             .await

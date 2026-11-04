@@ -35,6 +35,7 @@ use nisshi_sans_io::{
         inflated,
     },
 };
+use nisshi_schema::Registry;
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, DeleteTopicsService,
     FetchService, FetchValidationLayer, InitProducerIdService, ListOffsetsService, ProduceService,
@@ -169,9 +170,7 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
     let acks = i16::from(Ack::Leader);
     let timeout_ms = 0;
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let response = produce
         .serve(RequestInput {
@@ -256,9 +255,7 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
         storage: storage.clone(),
     };
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let producer = init_producer_id
         .serve(RequestInput {
@@ -459,9 +456,7 @@ async fn non_txn_idempotent_duplicate_sequence(
         storage: storage.clone(),
     };
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let producer = init_producer_id
         .serve(RequestInput {
@@ -580,9 +575,7 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
         storage: storage.clone(),
     };
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -740,9 +733,7 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
         storage: storage.clone(),
     };
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let name = &alphanumeric_string(15)[..];
 
@@ -1002,9 +993,7 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
 
     let index = 0;
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let list_offsets = ListOffsetsService {
         storage: storage.clone(),
@@ -1217,9 +1206,7 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
         storage: storage.clone(),
     });
 
-    let produce = ProduceService {
-        storage: storage.clone(),
-    };
+    let produce = ProduceService::new(storage.clone()).with_validation();
 
     let list_offsets = ListOffsetsService {
         storage: storage.clone(),
@@ -1453,7 +1440,23 @@ pub(crate) async fn produce_batches(
     index: i32,
     batches: Vec<deflated::Batch>,
 ) -> Result<PartitionProduceResponse> {
-    let response = ProduceService { storage }
+    produce_batches_with_schemas(storage, None, topic, index, batches).await
+}
+
+/// [`produce_batches`] for a service that validates each batch against the schema of `topic` in
+/// `schemas`.
+pub(crate) async fn produce_batches_with_schemas(
+    storage: impl Storage + Clone,
+    schemas: Option<Registry>,
+    topic: &str,
+    index: i32,
+    batches: Vec<deflated::Batch>,
+) -> Result<PartitionProduceResponse> {
+    // A caller spawns this future. The compiler cannot prove that the three nested layer futures
+    // are `Send` for every lifetime, so the box ends the nesting.
+    let response = ProduceService::with_schemas(storage, schemas)
+        .with_validation()
+        .boxed()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
                 TopicProduceData::default()

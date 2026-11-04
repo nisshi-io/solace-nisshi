@@ -97,7 +97,13 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-pub use produce::{ProduceService, inflate_produced};
+pub use produce::{
+    AcksZeroLayer, AcksZeroService, BatchValidationLayer, BatchValidationService, PartitionProduce,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
+    ProduceTopicService, SchemaValidationLayer, SchemaValidationService, StorePartitionService,
+    StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
+    ValidatedProduceRequest, ValidatedTopic, inflate_produced,
+};
 use rama::{Layer, Service};
 use tokio::sync::{
     mpsc::{self, error::SendError},

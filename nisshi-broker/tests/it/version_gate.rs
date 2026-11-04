@@ -52,6 +52,7 @@ async fn route_table() -> Result<FrameRouteService<Error>> {
     let builder = storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
+        None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
     )?;
@@ -147,6 +148,7 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
     let with_storage_routes = storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
+        None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
     )?;
