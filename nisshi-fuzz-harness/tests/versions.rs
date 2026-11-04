@@ -36,7 +36,7 @@ use nisshi_sans_io::{
     ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
     ProduceRequest, Request, metadata_request::MetadataRequestTopic,
 };
-use nisshi_service::{CAPPED_API_VERSIONS, routable_range};
+use nisshi_service::{CAPPED_API_VERSIONS, refuse_topic_ids, routable_range};
 use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -144,10 +144,16 @@ fn selector_stays_in_a_capped_range() {
     }
 }
 
-/// Serves `request` with the Metadata service, over an empty in-memory storage.
+/// Serves `request` at `version` the way the broker does: a request that Kafka refuses gets the
+/// refusal, and any other goes to the Metadata service, over an empty in-memory storage.
 async fn serve_metadata(
     request: MetadataRequest,
+    version: i16,
 ) -> Result<nisshi_sans_io::MetadataResponse, nisshi_storage::Error> {
+    if let Some(refusal) = refuse_topic_ids(version, &request) {
+        return Ok(refusal);
+    }
+
     let mut builder = StorageContainer::builder()
         .cluster_id("fuzz")
         .node_id(111)
@@ -196,7 +202,7 @@ async fn metadata_response_encodes_at_every_routed_version() {
         .unwrap_or_else(|error| panic!("{error}"))
         .expect("a named topic encodes at every version");
 
-        let response = serve_metadata(request)
+        let response = serve_metadata(request, version)
             .await
             .unwrap_or_else(|error| panic!("v{version}: {error}"));
 
@@ -222,7 +228,7 @@ async fn assert_answered_as_kafka_rejects(topic: MetadataRequestTopic, version: 
         .unwrap_or_else(|error| panic!("{error}"))
         .expect("the topic encodes from v10");
 
-    let response = serve_metadata(request)
+    let response = serve_metadata(request, version)
         .await
         .unwrap_or_else(|error| panic!("v{version}: {error}"));
 
@@ -239,12 +245,11 @@ async fn assert_answered_as_kafka_rejects(topic: MetadataRequestTopic, version: 
     check_response(response, version).unwrap_or_else(|error| panic!("{error}"));
 }
 
-/// A topic `Name` is nullable from Metadata v10, but a response's topic `Name` only from v12. The
-/// memory engine answers an unnamed topic with an unnamed topic, which v10 and v11 can't encode.
-/// Kafka rejects such a request, and a request with a topic ID next to a name, which Nisshi
-/// accepts by preferring the name.
+/// A topic `Name` is nullable from Metadata v10, but a response's topic `Name` only from v12, so
+/// the memory engine's answer for an unnamed topic can't be encoded at v10 and v11. The broker
+/// refuses such a request before the service sees it, as Kafka does, and `serve_metadata` does the
+/// same. Kafka also refuses a request with a topic ID next to a name.
 #[tokio::test]
-#[ignore = "the Metadata service answers an unnamed topic at v10 and v11 with a response that those versions can't encode"]
 async fn metadata_unnamed_topic_response_encodes_at_v10_and_v11() {
     for version in 10..=11 {
         assert_answered_as_kafka_rejects(

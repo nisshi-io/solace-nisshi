@@ -31,6 +31,7 @@ use std::sync::{Arc, LazyLock};
 use libfuzzer_sys::fuzz_target;
 use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::MetadataRequest;
+use nisshi_service::refuse_topic_ids;
 use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -48,6 +49,13 @@ fuzz_target!(|input: (u16, MetadataRequest)| {
         let Some(request) = check_request(request, version).expect("encode/decode request") else {
             return;
         };
+
+        // The broker routes Metadata through a layer that refuses a v10 or v11 request with a
+        // null topic name or a topic ID, so the service never sees one. Serving it here would
+        // make this target find that gap on every run.
+        if let Some(refusal) = refuse_topic_ids(version, &request) {
+            return check_response(refusal, version).expect("decoded refusal");
+        }
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
