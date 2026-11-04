@@ -20,13 +20,22 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use nisshi_sans_io::{
-    BatchAttribute, Compression, ErrorCode, IsolationLevel, ListOffset,
+    BatchAttribute, Compression, ErrorCode, IsolationLevel, ListOffset, ProduceRequest,
+    ProduceResponse, RequestInput,
     create_topics_request::CreatableTopic,
-    record::{MAX_DECODED_BATCH_BYTES, Record, deflated, inflated},
+    produce_request::{PartitionProduceData, TopicProduceData},
+    record::{
+        MAX_DECODED_BATCH_BYTES, Record,
+        deflated::{self, Frame},
+        inflated,
+    },
     to_system_time,
 };
-use nisshi_storage::{ProduceRequestBatcher, Result, Storage as _, Topition};
+use nisshi_schema::Registry;
+use nisshi_storage::{ProduceRequestBatcher, ProduceService, Result, Storage as _, Topition};
 use object_store::memory::InMemory;
+use rama::{Service as _, extensions::Extensions};
+use url::Url;
 
 use crate::dynostore::DynoStore;
 
@@ -133,6 +142,97 @@ async fn batches_that_would_merge_past_the_decoded_limit_are_stored_so_they_deco
     assert_eq!(1, responses.len());
     assert_eq!(ErrorCode::None, responses[0].1.error_code());
     assert_eq!(Some(1), responses[0].1.offset());
+
+    Ok(())
+}
+
+/// A `ProduceRequest` for partition 0 of `person` with one record, a person of `age`. The person
+/// schema rejects a negative age.
+fn person_request(age: i64) -> Result<RequestInput<ProduceRequest>> {
+    let batch = inflated::Batch::builder()
+        .record(
+            Record::builder()
+                .key(Some(Bytes::from_static(b"\"345-67-6543\"")))
+                .value(Some(Bytes::from(format!(
+                    r#"{{"firstName":"John","lastName":"Doe","age":{age}}}"#
+                )))),
+        )
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    Ok(RequestInput {
+        request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
+            TopicProduceData::default()
+                .name("person".into())
+                .partition_data(Some(vec![
+                    PartitionProduceData::default()
+                        .index(0)
+                        .records(Some(Frame {
+                            batches: vec![batch],
+                        })),
+                ])),
+        ])),
+        extensions: Extensions::default(),
+    })
+}
+
+/// The error code and the base offset of the only partition in `response`.
+fn only_partition(response: ProduceResponse) -> (i16, i64) {
+    let topics = response.responses.unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+
+    (partitions[0].error_code, partitions[0].base_offset)
+}
+
+/// The service validates a batch against the schema before the batcher queues it. A client whose
+/// records break the schema is rejected on its own, and the batcher stores the batch that it
+/// merges with it. If the batcher merged first, the one failed write would fail both clients.
+#[tokio::test]
+async fn a_batch_that_breaks_the_schema_does_not_fail_the_batch_queued_beside_it() -> Result<()> {
+    let storage = DynoStore::new("nisshi", 111, InMemory::new())?;
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name("person".into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let schemas = Registry::builder_try_from_url(&Url::parse("file://../etc/schema")?)
+        .map(|builder| builder.build())?;
+
+    let batcher = ProduceRequestBatcher::new(storage.clone())
+        .with_maximum_delay(Some(Duration::from_millis(100)));
+
+    let produce = ProduceService::new(batcher)
+        .with_schemas(Some(schemas))
+        .with_validation();
+
+    // Both requests join the queue inside one delay, so the batcher would write them as one batch.
+    let (valid, invalid) = tokio::join!(
+        produce.serve(person_request(21)?),
+        produce.serve(person_request(-1)?),
+    );
+
+    assert_eq!((i16::from(ErrorCode::None), 0), only_partition(valid?));
+    assert_eq!(
+        i16::from(ErrorCode::InvalidRecord),
+        only_partition(invalid?).0
+    );
+
+    // The rejected batch took no offset, so the next valid batch follows the first.
+    assert_eq!(
+        (i16::from(ErrorCode::None), 1),
+        only_partition(produce.serve(person_request(22)?).await?)
+    );
 
     Ok(())
 }
