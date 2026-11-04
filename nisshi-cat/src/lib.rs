@@ -141,8 +141,9 @@ impl fmt::Display for Error {
                 offset_delta,
             } => write!(
                 f,
-                "partition {partition} of topic {topic:?} has a record whose offset overflows: \
-                base offset {base_offset} plus offset delta {offset_delta}"
+                "fetching partition {partition} of topic {topic:?} failed: the response has a \
+                record at base offset {base_offset} plus offset delta {offset_delta}, which \
+                overflows an i64"
             ),
             Self::Metadata { topic, error_code } => {
                 write!(f, "looking up topic {topic:?} failed: ")?;
@@ -193,5 +194,25 @@ impl Builder {
 
     pub fn consume() -> consume::PhantomBuilder {
         consume::Builder::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn record_offset_overflow_says_the_response_is_at_fault_and_names_its_record() {
+        assert_eq!(
+            "fetching partition 3 of topic \"taxi\" failed: the response has a record at base \
+            offset 9223372036854775807 plus offset delta 1, which overflows an i64",
+            Error::RecordOffsetOverflow {
+                topic: "taxi".into(),
+                partition: 3,
+                base_offset: i64::MAX,
+                offset_delta: 1,
+            }
+            .to_string()
+        );
     }
 }

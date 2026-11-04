@@ -22,6 +22,7 @@ use nisshi_client::{Client, ConnectionManager};
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, NULL_TOPIC_ID,
     fetch_request::{FetchPartition, FetchRequest, FetchTopic, ReplicaState},
+    fetch_response,
     metadata_request::MetadataRequestTopic,
     record::inflated,
 };
@@ -282,38 +283,28 @@ impl Consume {
                     });
                 }
 
-                if let Some(frame) = partition.records {
-                    debug!(?frame);
+                for batch in readable_batches(
+                    &self.configuration.topic,
+                    partition,
+                    self.configuration.fetch_offset,
+                )? {
+                    let batch = batch?;
 
-                    let frame = inflated::Frame::try_from(frame)?;
-                    for batch in frame.batches {
-                        let Some(batch) = readable(batch, self.configuration.fetch_offset)
-                            .map_err(|overflow| Error::RecordOffsetOverflow {
-                                topic: self.configuration.topic.clone(),
-                                partition: partition.partition_index,
-                                base_offset: overflow.base_offset,
-                                offset_delta: overflow.offset_delta,
-                            })?
-                        else {
-                            continue;
-                        };
+                    debug!(?batch);
 
-                        debug!(?batch);
-
-                        if let Some(ref schema) = schema {
-                            writer
-                                .send(schema.as_json_value(&batch).map(|kv| kv.to_string())?)
-                                .await?;
-                        } else {
-                            writer.send( Value::from(
-                                batch
-                                    .records
-                                    .iter()
-                                    .map(|record| json!({"key": self.maybe_json(record.key.clone()), "value": self.maybe_json(record.value.clone())}))
-                                    .collect::<Vec<_>>(),
-                            )
-                            .to_string()).await?
-                        }
+                    if let Some(ref schema) = schema {
+                        writer
+                            .send(schema.as_json_value(&batch).map(|kv| kv.to_string())?)
+                            .await?;
+                    } else {
+                        writer.send( Value::from(
+                            batch
+                                .records
+                                .iter()
+                                .map(|record| json!({"key": self.maybe_json(record.key.clone()), "value": self.maybe_json(record.value.clone())}))
+                                .collect::<Vec<_>>(),
+                        )
+                        .to_string()).await?
                     }
                 }
             }
@@ -365,6 +356,41 @@ impl Consume {
     fn maybe_json(&self, data: Option<Bytes>) -> Option<Value> {
         data.and_then(|data| serde_json::from_slice::<Value>(&data[..]).ok())
     }
+}
+
+/// The batches of `partition`, a partition of `topic` in the broker's fetch response, that
+/// `cat consume` prints, each with only the records it prints.
+///
+/// The iterator reads a batch when it is asked for it, so the batches before an overflowing one
+/// are still printed, and the overflowing one is an [`Error::RecordOffsetOverflow`] that names
+/// the partition of the response.
+fn readable_batches(
+    topic: &str,
+    partition: fetch_response::PartitionData,
+    fetch_offset: i64,
+) -> Result<impl Iterator<Item = Result<inflated::Batch>>> {
+    let partition_index = partition.partition_index;
+
+    let batches = match partition.records {
+        Some(frame) => {
+            debug!(?frame);
+            inflated::Frame::try_from(frame)?.batches
+        }
+        None => Vec::new(),
+    };
+
+    let topic = topic.to_owned();
+
+    Ok(batches.into_iter().filter_map(move |batch| {
+        readable(batch, fetch_offset)
+            .map_err(|overflow| Error::RecordOffsetOverflow {
+                topic: topic.clone(),
+                partition: partition_index,
+                base_offset: overflow.base_offset,
+                offset_delta: overflow.offset_delta,
+            })
+            .transpose()
+    }))
 }
 
 /// The records of `batch` that `cat consume` prints, or `None` when it has none.
@@ -437,13 +463,15 @@ struct OffsetOverflow {
 
 #[cfg(test)]
 mod tests {
-    use super::{Configuration, Consume, OffsetOverflow, from_offset, readable};
+    use super::{Configuration, Consume, OffsetOverflow, from_offset, readable, readable_batches};
+    use crate::Error;
     use bytes::Bytes;
     use nisshi_sans_io::{
         ApiKey, BatchAttribute, Body, ControlBatch, EndTransactionMarker, FetchRequest, Frame,
-        Header,
-        record::{Record, inflated},
+        Header, fetch_response,
+        record::{Record, deflated, inflated},
     };
+    use std::assert_matches;
     use url::Url;
 
     fn consume(fetch_offset: i64, partition_max_bytes: i32) -> Consume {
@@ -597,6 +625,74 @@ mod tests {
                 .unwrap()
                 .records
                 .len()
+        );
+    }
+
+    /// A partition of the broker's fetch response, with index `partition_index` and `batches`.
+    fn partition_with(
+        partition_index: i32,
+        batches: Vec<inflated::Batch>,
+    ) -> fetch_response::PartitionData {
+        fetch_response::PartitionData::default()
+            .partition_index(partition_index)
+            .records(Some(
+                deflated::Frame::try_from(inflated::Frame { batches }).unwrap(),
+            ))
+    }
+
+    #[test]
+    fn overflowing_offset_names_the_topic_and_the_partition_of_the_response() {
+        let Err(error) =
+            readable_batches("taxi", partition_with(5, vec![batch_at(i64::MAX, &[1])]), 0)
+                .unwrap()
+                .next()
+                .unwrap()
+        else {
+            panic!("an overflowing offset was returned as a record")
+        };
+
+        assert_matches!(
+            error,
+            Error::RecordOffsetOverflow {
+                ref topic,
+                partition: 5,
+                base_offset: i64::MAX,
+                offset_delta: 1,
+            } if topic == "taxi"
+        );
+    }
+
+    #[test]
+    fn batches_before_an_overflowing_one_are_still_returned() {
+        let mut batches = readable_batches(
+            "taxi",
+            partition_with(0, vec![batch(10, &["a"]), batch_at(i64::MAX, &[1])]),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Some(vec![Bytes::from("a")]),
+            values(Some(batches.next().unwrap().unwrap()))
+        );
+        assert_matches!(
+            batches.next(),
+            Some(Err(Error::RecordOffsetOverflow { .. }))
+        );
+        assert_matches!(batches.next(), None);
+    }
+
+    #[test]
+    fn partition_without_records_has_no_batches() {
+        assert_eq!(
+            0,
+            readable_batches(
+                "taxi",
+                fetch_response::PartitionData::default().partition_index(0),
+                0
+            )
+            .unwrap()
+            .count()
         );
     }
 
