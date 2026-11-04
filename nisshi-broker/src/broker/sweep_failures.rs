@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What the broker reports when a storage sweep fails.
+//! What the broker reports when a storage sweep fails, panics or runs over its deadline.
 //!
 //! A sweep that fails leaves its work undone until the broker runs it again on its next tick, so a
 //! persistent fault fails every tick. The log carries the first failure and then at most one line
@@ -24,15 +24,33 @@
 //! failures were left out of the log since its last line, the recovery line carries the latest of
 //! them and what the sweep stops, so the newest error text in the log is not older than the last
 //! failure.
+//!
+//! A sweep that panics counts as a failure, with the outcome `panic`, and is logged at error
+//! through the same limit. Tokio catches the panic in the sweep's task, which would otherwise end
+//! unreported at `debug`, and the next tick starts a new sweep.
+//!
+//! A sweep that is still running when its next tick is due is over its deadline, which is its own
+//! interval (`maintenance_interval` and `transaction_maintenance_interval` of the storage URL).
+//! The broker skips that tick and calls [`SweepFailures::overdue`] instead, which logs at warn
+//! through the same limit, so a sweep that never finishes keeps being reported every
+//! [`REPEAT_INTERVAL`]. The broker never aborts a running sweep on a tick, because a sweep stopped part-way through
+//! a compaction could leave its work half done. The gauge `nisshi_storage_maintenance_sweeps_overdue`
+//! is 1 while the sweep is over its deadline, and 0 once it finishes, however it finishes. A
+//! sweep that logged an overdue line logs a line when it finishes.
 
 use std::{
     fmt::Display,
+    panic::AssertUnwindSafe,
     sync::{LazyLock, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
-use opentelemetry::{KeyValue, metrics::Counter};
-use tracing::warn;
+use futures::FutureExt as _;
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, UpDownCounter},
+};
+use tracing::{error, warn};
 
 use crate::METER;
 
@@ -49,8 +67,40 @@ static SWEEPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// 1 while a sweep is running past the tick that was due to start its next run.
+static OVERDUE: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("nisshi_storage_maintenance_sweeps_overdue")
+        .with_description("storage maintenance sweeps still running when their next tick is due")
+        .build()
+});
+
+/// How a sweep ended.
+enum Outcome {
+    Ok,
+    Error(String),
+    Panic(String),
+}
+
+impl Outcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error(_) => "error",
+            Self::Panic(_) => "panic",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
+    /// When the broker first found the running sweep past its next tick. `None` when the sweep is
+    /// not overdue.
+    overdue_since: Option<Instant>,
+
+    /// Whether a line reported the current overdue sweep.
+    overdue_logged: bool,
+
     /// Failed sweeps since the last recovery line. A success that comes before a line is due does
     /// not end the run, so this count can include sweeps that succeeded in between.
     failed_sweeps: u64,
@@ -81,6 +131,7 @@ pub(crate) struct SweepFailures {
 
     engine: String,
     counter: Counter<u64>,
+    overdue: UpDownCounter<i64>,
     state: Mutex<State>,
 }
 
@@ -109,12 +160,73 @@ impl SweepFailures {
             stopped,
             engine: engine.into(),
             counter: SWEEPS.clone(),
+            overdue: OVERDUE.clone(),
             state: Mutex::new(State::default()),
         }
     }
 
+    /// Runs `sweep` and records how it ends, including a panic, which would otherwise unwind
+    /// into the broker's task set and end unreported at `debug`.
+    ///
+    /// The panic is caught in the same task, not in a task of its own, so that aborting the
+    /// broker's task set still aborts the sweep.
+    pub(crate) async fn run<E, F>(&self, sweep: F)
+    where
+        E: Display,
+        F: Future<Output = Result<(), E>>,
+    {
+        match AssertUnwindSafe(sweep).catch_unwind().await {
+            Ok(outcome) => self.record(outcome, Instant::now()),
+            Err(payload) => {
+                self.finish(Outcome::Panic(panic_message(&*payload)), Instant::now());
+            }
+        }
+    }
+
+    /// Reports that the sweep is still running at `now`, when its next tick is due.
+    pub(crate) fn overdue(&self, now: Instant) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let since = *state.overdue_since.get_or_insert_with(|| {
+            self.overdue.add(1, &self.attributes());
+            now
+        });
+
+        if !state.log_is_due(now) {
+            return;
+        }
+
+        warn!(
+            sweep = self.sweep,
+            engine = %self.engine,
+            overdue_for_secs = now.saturating_duration_since(since).as_secs(),
+            stopped = self.stopped,
+            "storage maintenance sweep is still running when its next run is due"
+        );
+
+        state.overdue_logged = true;
+        state.last_logged = Some(now);
+    }
+
+    fn attributes(&self) -> [KeyValue; 2] {
+        [
+            KeyValue::new("sweep", self.sweep),
+            KeyValue::new("engine", self.engine.clone()),
+        ]
+    }
+
     /// Records the outcome of a sweep that ran at `now`.
     pub(crate) fn record<E: Display>(&self, outcome: Result<(), E>, now: Instant) {
+        self.finish(
+            match outcome {
+                Ok(()) => Outcome::Ok,
+                Err(error) => Outcome::Error(error.to_string()),
+            },
+            now,
+        );
+    }
+
+    fn finish(&self, outcome: Outcome, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 
         self.counter.add(
@@ -122,12 +234,48 @@ impl SweepFailures {
             &[
                 KeyValue::new("sweep", self.sweep),
                 KeyValue::new("engine", self.engine.clone()),
-                KeyValue::new("outcome", if outcome.is_ok() { "ok" } else { "error" }),
+                KeyValue::new("outcome", outcome.label()),
             ],
         );
 
+        if let Some(since) = state.overdue_since.take() {
+            self.overdue.add(-1, &self.attributes());
+
+            if std::mem::take(&mut state.overdue_logged) {
+                // The line carries the error, because the failure line of this sweep can be held
+                // back by the limit that the overdue line has just used up.
+                let (error, panic) = match &outcome {
+                    Outcome::Ok => (None, None),
+                    Outcome::Error(error) => (Some(error.as_str()), None),
+                    Outcome::Panic(message) => (None, Some(message.as_str())),
+                };
+
+                if panic.is_some() {
+                    error!(
+                        sweep = self.sweep,
+                        engine = %self.engine,
+                        overdue_for_secs = now.saturating_duration_since(since).as_secs(),
+                        outcome = outcome.label(),
+                        panic,
+                        "storage maintenance sweep that was over its deadline panicked"
+                    );
+                } else {
+                    warn!(
+                        sweep = self.sweep,
+                        engine = %self.engine,
+                        overdue_for_secs = now.saturating_duration_since(since).as_secs(),
+                        outcome = outcome.label(),
+                        error,
+                        "storage maintenance sweep that was over its deadline has finished"
+                    );
+                }
+            }
+        }
+
+        let panicked = matches!(outcome, Outcome::Panic(_));
+
         match outcome {
-            Ok(()) => {
+            Outcome::Ok => {
                 // The recovery line counts against the same limit as the failure lines, because a
                 // sweep that alternates between failing and succeeding would otherwise log two
                 // lines per cycle. The run of failures stays open until the line is written, so
@@ -159,24 +307,36 @@ impl SweepFailures {
                 state.last_logged = Some(now);
             }
 
-            Err(error) => {
+            Outcome::Error(error) | Outcome::Panic(error) => {
                 state.failed_sweeps += 1;
                 state.unlogged += 1;
 
                 if !state.log_is_due(now) {
-                    state.unlogged_error = Some(error.to_string());
+                    state.unlogged_error = Some(error);
                     return;
                 }
 
-                warn!(
-                    sweep = self.sweep,
-                    engine = %self.engine,
-                    failed_sweeps = state.failed_sweeps,
-                    failures_since_last_log = state.unlogged,
-                    stopped = self.stopped,
-                    %error,
-                    "storage maintenance sweep failed"
-                );
+                if panicked {
+                    error!(
+                        sweep = self.sweep,
+                        engine = %self.engine,
+                        failed_sweeps = state.failed_sweeps,
+                        failures_since_last_log = state.unlogged,
+                        stopped = self.stopped,
+                        panic = %error,
+                        "storage maintenance sweep panicked"
+                    );
+                } else {
+                    warn!(
+                        sweep = self.sweep,
+                        engine = %self.engine,
+                        failed_sweeps = state.failed_sweeps,
+                        failures_since_last_log = state.unlogged,
+                        stopped = self.stopped,
+                        %error,
+                        "storage maintenance sweep failed"
+                    );
+                }
 
                 state.unlogged = 0;
                 state.unlogged_error = None;
@@ -184,6 +344,14 @@ impl SweepFailures {
             }
         }
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 #[cfg(test)]
@@ -254,10 +422,7 @@ mod tests {
         let logs = captured(|| failures.record(Err("connection refused"), Instant::now()));
 
         assert!(logs.contains("WARN"), "{logs}");
-        assert!(
-            logs.contains("sweep=\"maintain\"") || logs.contains("sweep=maintain"),
-            "{logs}"
-        );
+        assert!(logs.contains("sweep=\"maintain\""), "{logs}");
         assert!(logs.contains("engine=postgres"), "{logs}");
         assert!(logs.contains("connection refused"), "{logs}");
     }
@@ -514,5 +679,207 @@ mod tests {
 
         assert_eq!(30, swept(&exporter, "error"));
         assert_eq!(1, swept(&exporter, "ok"));
+    }
+
+    /// A `SweepFailures` whose counters export to `exporter`.
+    fn measured(
+        sweep: fn(String) -> SweepFailures,
+        engine: &str,
+    ) -> (SweepFailures, InMemoryMetricExporter, SdkMeterProvider) {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+
+        let mut failures = sweep(engine.to_owned());
+        let meter = provider.meter("test");
+        failures.counter = meter
+            .u64_counter("nisshi_storage_maintenance_sweeps")
+            .build();
+        failures.overdue = meter
+            .i64_up_down_counter("nisshi_storage_maintenance_sweeps_overdue")
+            .build();
+
+        (failures, exporter, provider)
+    }
+
+    /// The latest value of the overdue gauge, summed over its series.
+    fn overdue_now(exporter: &InMemoryMetricExporter, provider: &SdkMeterProvider) -> i64 {
+        provider.force_flush().expect("flush");
+        exporter.reset();
+        provider.force_flush().expect("flush");
+
+        exporter
+            .get_finished_metrics()
+            .expect("finished metrics")
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == "nisshi_storage_maintenance_sweeps_overdue")
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::I64(MetricData::Sum(sum)) => {
+                    Some(sum.data_points().map(SumDataPoint::value).sum::<i64>())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sweep_is_logged_at_error_with_its_engine_and_counted() {
+        let (failures, exporter, provider) =
+            measured(SweepFailures::maintain_transactions, "postgres");
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        failures
+            .run(async { panic!("lock poisoned") as Result<(), &'static str> })
+            .await;
+
+        // A second panic inside the interval is counted and not logged again.
+        failures
+            .run(async { panic!("lock poisoned") as Result<(), &'static str> })
+            .await;
+
+        let logs = capture.text();
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("sweep=\"maintain_transactions\""), "{logs}");
+        assert!(logs.contains("engine=postgres"), "{logs}");
+        assert!(logs.contains("lock poisoned"), "{logs}");
+
+        provider.force_flush().expect("flush");
+        assert_eq!(2, swept(&exporter, "panic"));
+        assert_eq!(0, swept(&exporter, "ok"));
+    }
+
+    #[tokio::test]
+    async fn an_overdue_sweep_that_panics_logs_the_panic_at_error_on_its_finish_line() {
+        let failures = SweepFailures::maintain_transactions("postgres");
+        let start = Instant::now();
+
+        _ = captured(|| failures.overdue(start));
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        failures
+            .run(async { panic!("index out of range") as Result<(), &'static str> })
+            .await;
+
+        let logs = capture.text();
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("ERROR"), "{logs}");
+        assert!(logs.contains("index out of range"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_panic_joins_the_run_of_failures() {
+        let failures = SweepFailures::maintain("memory");
+
+        failures
+            .run(async { panic!("boom") as Result<(), &'static str> })
+            .await;
+
+        let state = failures.state.lock().unwrap();
+        assert_eq!(1, state.failed_sweeps);
+    }
+
+    #[test]
+    fn a_sweep_over_its_deadline_is_reported_at_warn_and_again_only_once_per_interval() {
+        let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
+        let start = Instant::now();
+
+        let logs = captured(|| {
+            failures.overdue(start);
+            failures.overdue(start + Duration::from_secs(10));
+        });
+
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("sweep=\"maintain\""), "{logs}");
+        assert!(logs.contains("engine=sqlite"), "{logs}");
+        assert!(logs.contains("retention, compaction"), "{logs}");
+        assert_eq!(1, overdue_now(&exporter, &provider));
+
+        // A sweep that never finishes keeps being reported.
+        let logs = captured(|| failures.overdue(start + REPEAT_INTERVAL));
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("overdue_for_secs=300"), "{logs}");
+    }
+
+    #[test]
+    fn the_report_clears_when_the_overdue_sweep_finishes() {
+        let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
+        let start = Instant::now();
+
+        _ = captured(|| failures.overdue(start));
+        assert_eq!(1, overdue_now(&exporter, &provider));
+
+        let logs = captured(|| {
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(20));
+        });
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("has finished"), "{logs}");
+        assert!(logs.contains("outcome=\"ok\""), "{logs}");
+        assert_eq!(0, overdue_now(&exporter, &provider));
+
+        // Nothing is left to clear.
+        let logs = captured(|| {
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(40));
+        });
+        assert!(logs.is_empty(), "{logs}");
+        assert_eq!(0, overdue_now(&exporter, &provider));
+    }
+
+    #[test]
+    fn an_overdue_sweep_that_fails_clears_the_report_and_logs_the_failure() {
+        let (failures, exporter, provider) =
+            measured(SweepFailures::maintain_transactions, "postgres");
+        let start = Instant::now();
+
+        _ = captured(|| failures.overdue(start));
+
+        // The finish comes inside the interval, so the failure line is held back and the finish
+        // line has to carry the error.
+        let logs = captured(|| {
+            failures.record(Err("connection reset"), start + Duration::from_secs(10));
+        });
+
+        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert!(logs.contains("has finished"), "{logs}");
+        assert!(logs.contains("connection reset"), "{logs}");
+        assert_eq!(0, overdue_now(&exporter, &provider));
+    }
+
+    #[test]
+    fn a_finish_line_follows_only_an_overdue_line_that_was_written() {
+        let failures = SweepFailures::maintain("memory");
+        let start = Instant::now();
+
+        // The failure line uses the interval, so the overdue line is held back.
+        let logs = captured(|| {
+            failures.record(Err("boom"), start);
+            failures.overdue(start + Duration::from_secs(10));
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(20));
+        });
+
+        assert!(!logs.contains("has finished"), "{logs}");
     }
 }
