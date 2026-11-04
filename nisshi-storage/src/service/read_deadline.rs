@@ -79,6 +79,9 @@ pub enum ReadWait {
     ExclusiveEngineAccess,
     /// A permit from the client connection's limit on reads in flight.
     ConnectionReadLimit,
+    /// A permit from the read share of the client that made the request, over all its
+    /// connections.
+    ClientReadLimit,
     /// A permit from the storage engine's limit on reads in flight.
     EngineReadLimit,
     /// A connection from the storage engine's pool of database connections.
@@ -93,6 +96,7 @@ impl ReadWait {
         match self {
             Self::ExclusiveEngineAccess => "exclusive_engine_access",
             Self::ConnectionReadLimit => "connection_read_limit",
+            Self::ClientReadLimit => "client_read_limit",
             Self::EngineReadLimit => "engine_read_limit",
             Self::EngineConnectionPool => "engine_connection_pool",
             Self::EngineWriteLimit => "engine_write_limit",
@@ -645,6 +649,12 @@ mod tests {
                 .await
         );
         assert_eq!(
+            Err(Missed::Queued(ReadWait::ClientReadLimit)),
+            fetch_deadline(in_a_second())
+                .timeout(pending::<()>().queued_for(ReadWait::ClientReadLimit))
+                .await
+        );
+        assert_eq!(
             Err(Missed::Queued(ReadWait::EngineConnectionPool)),
             fetch_deadline(in_a_second())
                 .timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
@@ -656,10 +666,11 @@ mod tests {
         let fetch = StorageOperation::Fetch.as_str();
 
         assert_eq!(
-            3,
+            4,
             exceeded(&exporter, &[("operation", fetch), ("stage", "queued")])
         );
         assert_eq!(1, exceeded(&exporter, &[("wait", "connection_read_limit")]));
+        assert_eq!(1, exceeded(&exporter, &[("wait", "client_read_limit")]));
         assert_eq!(
             2,
             exceeded(&exporter, &[("wait", "engine_connection_pool")])

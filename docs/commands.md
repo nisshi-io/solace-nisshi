@@ -303,22 +303,24 @@ reach the proxy listener gets the proxy's access to the origin.
 
 The proxy is for development and demos, not for production, and that includes
 a proxy in front of a broker on PostgreSQL. A Postgres broker limits each
-connection to its share of the Fetch and ListOffsets reads in flight. An
-abandoned read is one that its client no longer waits for, but that the
-database is still running, and it counts against its connection's share until
-the statement ends. So one connection's abandoned reads are limited to its
-share. The proxy takes an origin connection from its pool for each request,
-so behind it the share bounds no single client: one client's abandoned reads
-can spread over many origin connections and take up to the broker's whole
-limit, and other clients' reads then wait. Nisshi does not isolate proxied
-clients from each other here.
+connection, and each client, to its share of the Fetch and ListOffsets reads in
+flight, see [Storage](storage.md). An abandoned read is one that its client no
+longer waits for, but that the database is still running, and it counts against
+its shares until the statement ends. The client share is keyed on the user and
+the `client_id` of the request, and the proxy forwards the `client_id`, so one
+proxied client's abandoned reads are limited to its client share, however many
+origin connections they spread over. The connection share bounds no single
+client behind the proxy, because the proxy takes an origin connection from its
+pool for each request. The proxy does not forward SASL, so the broker sees no
+user, and proxied clients are told apart by `client_id` alone. Clients that
+share a `client_id` share one limit, and a client that changes its `client_id`
+is not limited.
 
-Behind the proxy, this shows as reads that miss their deadline: Fetch
-responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
+Behind the proxy, a client at its limit sees reads that miss their deadline:
+Fetch responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
 partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
-`stage` set to `queued` and `wait` set to `engine_read_limit`. A larger
-`pool_max_size` does not fix this, because one client can still take the whole
-limit.
+`stage` set to `queued` and `wait` set to `client_read_limit`. A larger
+`pool_max_size` does not fix this, but a larger `client_read_share` can.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not

@@ -115,6 +115,18 @@ impl AuthenticationExtension {
             .unwrap_or_default()
     }
 
+    /// The name that the connection authenticated as, or `None` while it has
+    /// not authenticated.
+    pub fn principal(&self) -> Option<String> {
+        self.stage
+            .lock()
+            .ok()
+            .and_then(|guard| match guard.as_ref() {
+                Some(Stage::Finished(Some(success))) => Some(success.auth_id().to_owned()),
+                _ => None,
+            })
+    }
+
     /// Build a fresh `Stage::Server` from the stored config. Used by
     /// the SASL handshake handler to support re-authentication
     /// (KIP-368): a client periodically issues a new SaslHandshake on
@@ -161,6 +173,13 @@ impl fmt::Display for AuthError {
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Success {
     auth_id: String,
+}
+
+impl Success {
+    /// The name that the client authenticated as.
+    pub fn auth_id(&self) -> &str {
+        &self.auth_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
