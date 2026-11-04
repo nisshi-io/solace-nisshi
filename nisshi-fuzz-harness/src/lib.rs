@@ -187,26 +187,26 @@ where
 }
 
 /// [`check_response`] for a response that a caller holds as a [`Body`], as it comes out of a
-/// route: `api_key` is the API of the request that it answers.
-pub fn check_response_body(body: Body, api_key: i16, api_version: i16) -> Result<(), Error> {
+/// route: `api` is the API of the request that it answers.
+pub fn check_response_body(body: Body, api: i16, api_version: i16) -> Result<(), Error> {
     let encode = |body| {
         Frame::response(
             Header::Response { correlation_id: 0 },
             body,
-            api_key,
+            api,
             api_version,
         )
     };
 
-    let once = encode(body).map_err(|error| at_version(error, api_key, api_version))?;
-    let body = Frame::response_from_bytes(once.clone(), api_key, api_version)
-        .map_err(|error| at_version(error, api_key, api_version))?
+    let once = encode(body).map_err(|error| at_version(error, api, api_version))?;
+    let body = Frame::response_from_bytes(once.clone(), api, api_version)
+        .map_err(|error| at_version(error, api, api_version))?
         .body;
-    let twice = encode(body).map_err(|error| at_version(error, api_key, api_version))?;
+    let twice = encode(body).map_err(|error| at_version(error, api, api_version))?;
 
     assert_eq!(
         once, twice,
-        "api key {api_key} v{api_version}: re-encoding the decoded response changed its bytes",
+        "api key {api} v{api_version}: re-encoding the decoded response changed its bytes",
     );
 
     Ok(())
