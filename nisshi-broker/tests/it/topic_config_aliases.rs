@@ -44,6 +44,7 @@ use crate::common::{
     self, StorageType, alphanumeric_string, lite_storage, memory_storage, postgres_storage,
     register_broker, slate_storage,
 };
+use crate::produce::produce_batches_with_schemas;
 
 const DEPRECATION: &str = "deprecated topic configuration key";
 
@@ -141,30 +142,30 @@ async fn person_storage(
     cluster: Uuid,
     node: i32,
 ) -> Result<ArcDynStorage> {
-    let schemas = Url::parse("file://../etc/schema")
+    common::storage_container(
+        storage_type,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        Some(person_schemas()?),
+    )
+    .await
+}
+
+/// The registry that holds the `person` schema.
+fn person_schemas() -> Result<Registry> {
+    Url::parse("file://../etc/schema")
         .map_err(Error::from)
         .and_then(|url| {
             Registry::builder_try_from_url(&url)
                 .map(|builder| builder.build())
                 .map_err(Into::into)
         })
-        .map(Some)?;
-
-    common::storage_container(
-        storage_type,
-        cluster,
-        node,
-        Url::parse("tcp://127.0.0.1/")?,
-        schemas,
-    )
-    .await
 }
 
-/// Produces a person with a negative age, which the person schema rejects.
-async fn produce_invalid_person(
-    storage: &impl Storage,
-    topic: &str,
-) -> nisshi_storage::Result<i64> {
+/// Produces a person with a negative age, which the person schema rejects, and returns the error
+/// code that the partition answers with.
+async fn produce_invalid_person(storage: &ArcDynStorage, topic: &str) -> Result<ErrorCode> {
     let batch = inflated::Batch::builder()
         .record(
             Record::builder()
@@ -178,9 +179,16 @@ async fn produce_invalid_person(
         .build()
         .and_then(TryInto::try_into)?;
 
-    storage
-        .produce(None, &Topition::new(topic.to_owned(), 0), batch)
-        .await
+    let response = produce_batches_with_schemas(
+        storage.clone(),
+        Some(person_schemas()?),
+        topic,
+        0,
+        vec![batch],
+    )
+    .await?;
+
+    ErrorCode::try_from(response.error_code).map_err(Into::into)
 }
 
 /// Creates the `person` topic with `configs`, produces an invalid person to it twice, and returns
@@ -197,14 +205,14 @@ async fn accepts_invalid_person(
 
     create_topic(&storage, "person", configs).await?;
 
-    let first = produce_invalid_person(&storage, "person").await;
-    let second = produce_invalid_person(&storage, "person").await;
-    assert_eq!(first.is_ok(), second.is_ok());
+    let first = produce_invalid_person(&storage, "person").await?;
+    let second = produce_invalid_person(&storage, "person").await?;
+    assert_eq!(first, second);
 
     match first {
-        Ok(_) => Ok(true),
-        Err(nisshi_storage::Error::Api(ErrorCode::InvalidRecord)) => Ok(false),
-        Err(err) => Err(err.into()),
+        ErrorCode::None => Ok(true),
+        ErrorCode::InvalidRecord => Ok(false),
+        error_code => Err(Error::Api(error_code)),
     }
 }
 

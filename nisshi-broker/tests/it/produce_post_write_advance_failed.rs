@@ -274,27 +274,29 @@ async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
 
     object_store.fail_next_advance();
 
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .with_validation()
-    .serve(RequestInput {
-        request: ProduceRequest::default().acks(1).topic_data(Some(
-            [TopicProduceData::default()
-                .name(TOPIC.into())
-                .partition_data(Some(
-                    [PartitionProduceData::default()
-                        .index(0)
-                        .records(Some(Frame {
-                            batches: vec![batch(producer.producer_id, producer.producer_epoch, 0)?],
-                        }))]
-                    .into(),
-                ))]
-            .into(),
-        )),
-        extensions: extensions.clone(),
-    })
-    .await?;
+    let response = ProduceService::new(storage.clone())
+        .with_validation()
+        .serve(RequestInput {
+            request: ProduceRequest::default().acks(1).topic_data(Some(
+                [TopicProduceData::default()
+                    .name(TOPIC.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(0)
+                            .records(Some(Frame {
+                                batches: vec![batch(
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    0,
+                                )?],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: extensions.clone(),
+        })
+        .await?;
 
     let error_code = ErrorCode::try_from(
         response.responses.unwrap_or_default()[0]

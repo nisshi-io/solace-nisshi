@@ -1004,31 +1004,6 @@ impl Delegate {
 
         debug!(after_attributes = elapsed_millis(start));
 
-        if !attributes.control
-            && let Some(ref schemas) = self.schemas
-            && self
-                .describe_config(topic, ConfigResource::Topic, None)
-                .await
-                .map(|resources| {
-                    resources
-                        .configs
-                        .as_ref()
-                        .and_then(|configs| {
-                            topic_config::lookup(
-                                configs.iter().inspect(|config| debug!(?config)).filter_map(
-                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
-                                ),
-                                topic_config::SCHEMA_VALIDATION,
-                            )
-                            .and_then(|value| bool::from_str(value).ok())
-                        })
-                        .unwrap_or(true)
-                })
-                .inspect(|schema_validation| debug!(schema_validation))?
-        {
-            schemas.validate(topition.topic(), &inflated).await?;
-        }
-
         debug!(after_validation = elapsed_millis(start));
 
         let last_offset_delta = i64::from(inflated.last_offset_delta);

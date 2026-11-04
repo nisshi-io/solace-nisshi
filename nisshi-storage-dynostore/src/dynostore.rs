@@ -2954,9 +2954,9 @@ impl Storage for DynoStore {
             self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
                 .await?;
 
-            // Decode and validate before the high watermark moves, so that a
-            // batch rejected here leaves no state behind.
-            let inflated = if let Some(ref registry) = self.schemas {
+            // Decode before the high watermark moves, so that a batch that does
+            // not decode leaves no state behind.
+            let inflated = if self.schemas.is_some() {
                 let batch_attribute = BatchAttribute::try_from(deflated.attributes)
                     .inspect(|batch_attribute| debug!(?batch_attribute))
                     .inspect_err(|err| debug!(?err))?;
@@ -2971,12 +2971,6 @@ impl Storage for DynoStore {
                     .await
                     .inspect(|inflated| debug!(?inflated))
                     .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
-                        .inspect_err(|err| debug!(?err))?;
 
                     Some(inflated)
                 }
@@ -3075,32 +3069,19 @@ impl Storage for DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            // Decode and validate before the producer's sequence or the high
-            // watermark moves, so that a batch rejected here leaves no state
+            // Decode before the producer's sequence or the high watermark
+            // moves, so that a batch that does not decode leaves no state
             // behind. A producer can reuse a rejected batch's sequence for its
             // next batch. If the stored sequence had moved, that batch would
             // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
             // although nothing was stored.
-            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
-            {
-                let inflated = {
-                    let deflated = deflated.clone();
-                    offload(move || inflate_produced(&deflated))
-                }
-                .await
-                .inspect_err(|err| debug!(?err))?;
+            let inflated = if !attributes.control && self.lake.is_some() {
+                let deflated = deflated.clone();
 
-                if let Some(ref registry) = self.schemas {
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
-
-                // Only the lake reads the decoded batch after this point.
-                // Dropping it here, rather than at the end of the function,
-                // frees its memory before the object store writes.
-                self.lake.is_some().then_some(inflated)
+                offload(move || inflate_produced(&deflated))
+                    .await
+                    .inspect_err(|err| debug!(?err))
+                    .map(Some)?
             } else {
                 None
             };

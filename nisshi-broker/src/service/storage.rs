@@ -21,6 +21,7 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
+use nisshi_schema::Registry;
 use nisshi_service::{
     FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, TransactionAbortableDowngradeLayer,
 };
@@ -41,6 +42,7 @@ use crate::Error;
 pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
@@ -67,7 +69,6 @@ where
         init_producer_id,
         list_offsets,
         list_partition_reassignments,
-        produce,
         end_txn,
         txn_offset_commit,
     ]
@@ -75,6 +76,7 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+    .and_then(|builder| produce(builder, storage.clone(), schemas))
     .and_then(|builder| {
         metadata(
             builder,
@@ -471,6 +473,7 @@ where
 pub fn produce<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    schemas: Option<Registry>,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage,
@@ -478,7 +481,9 @@ where
     builder
         .with_capped_route_layer::<ProduceRequest, _, _>(
             TransactionAbortableDowngradeLayer,
-            ProduceService { storage }.with_validation(),
+            ProduceService::new(storage)
+                .with_schemas(schemas)
+                .with_validation(),
         )
         .map_err(Into::into)
 }

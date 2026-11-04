@@ -275,6 +275,7 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
 
@@ -318,6 +319,7 @@ where
             advertised_listener,
             storage,
             groups,
+            schemas: None,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
 
@@ -640,6 +642,7 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
+                        self.schemas.clone(),
                         self.topic_creation,
                         self.auto_create_refusals.clone(),
                         self.sasl_config.clone()
@@ -1112,6 +1115,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            schemas: self.schema_registry,
             topic_creation: self.topic_creation,
             auto_create_refusals: AutoCreateRefusals::default(),
             sasl_config,

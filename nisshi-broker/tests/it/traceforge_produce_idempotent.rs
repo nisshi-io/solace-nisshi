@@ -196,10 +196,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             order.push(remaining.remove(i));
         }
 
-        let produce = ProduceService {
-            storage: storage.clone(),
-        }
-        .with_validation();
+        let produce = ProduceService::new(storage.clone()).with_validation();
 
         // Oracle: mirrors dynostore's sequence check exactly
         // but tracked independently here, so it can
@@ -702,10 +699,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
         .expect("init producer id");
 
         let faulty = FaultInjectingProduceStorage::new(real_storage.clone());
-        let produce = ProduceService {
-            storage: faulty.clone(),
-        }
-        .with_validation();
+        let produce = ProduceService::new(faulty.clone()).with_validation();
 
         const MAX_ATTEMPTS: usize = 3;
 

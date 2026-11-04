@@ -280,10 +280,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
         )
         .expect("init producer id");
 
-        let produce = ProduceService {
-            storage: storage.clone(),
-        }
-        .with_validation();
+        let produce = ProduceService::new(storage.clone()).with_validation();
 
         // A client believes a batch is durably stored once it sees either
         // a direct success or a `DuplicateSequenceNumber` on retry (proof,

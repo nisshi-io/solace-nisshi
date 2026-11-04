@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use nisshi_schema::Registry;
 use nisshi_service::{
     BytesFrameLayer, BytesFrameService, DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE,
     FrameRouteBuilder, FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext,
@@ -38,6 +39,7 @@ type TcpRouteFrame =
 pub fn routes<C, S>(
     coordinator: C,
     storage: S,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
@@ -48,6 +50,7 @@ where
     storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
+        schemas,
         topic_creation,
         auto_create_refusals,
     )
@@ -63,6 +66,7 @@ pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
     storage: S,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
     sasl_config: Option<Arc<SASLConfig>>,
@@ -71,24 +75,28 @@ where
     S: Storage + Clone,
     C: Coordinator,
 {
-    routes(coordinator, storage, topic_creation, auto_create_refusals)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|route| {
-            let pre_authentication_maximum_frame_size = sasl_config
-                .is_some()
-                .then_some(DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE);
+    routes(
+        coordinator,
+        storage,
+        schemas,
+        topic_creation,
+        auto_create_refusals,
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|route| {
+        let pre_authentication_maximum_frame_size = sasl_config
+            .is_some()
+            .then_some(DEFAULT_PRE_AUTHENTICATION_MAXIMUM_FRAME_SIZE);
 
-            (
-                TcpContextLayer::new(
-                    TcpContext::default()
-                        .cluster_id(Some(cluster_id.into()))
-                        .pre_authentication_maximum_frame_size(
-                            pre_authentication_maximum_frame_size,
-                        ),
-                ),
-                TcpBytesLayer,
-                BytesFrameLayer::default().with_sasl_config(sasl_config),
-            )
-                .into_layer(route)
-        })
+        (
+            TcpContextLayer::new(
+                TcpContext::default()
+                    .cluster_id(Some(cluster_id.into()))
+                    .pre_authentication_maximum_frame_size(pre_authentication_maximum_frame_size),
+            ),
+            TcpBytesLayer,
+            BytesFrameLayer::default().with_sasl_config(sasl_config),
+        )
+            .into_layer(route)
+    })
 }

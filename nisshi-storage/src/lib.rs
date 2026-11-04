@@ -1869,10 +1869,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Produce a deflated batch to this storage.
     ///
     /// Trusts the batch attributes as given: a batch with the control bit set
-    /// is written as a transaction marker, skipping schema validation and lake
-    /// writes. Only the broker may write control batches, so client Produce
-    /// batches must reach storage through [`ProduceService`], which rejects
-    /// them.
+    /// is written as a transaction marker, skipping lake writes. Only the broker
+    /// may write control batches, so client Produce batches must reach storage
+    /// through [`ProduceService`], which rejects them.
+    ///
+    /// A backend does not validate the records against the topic's schema.
+    /// [`ProduceService`] does that, on the records that it decodes for the
+    /// timestamp check, before it calls this method. A batch that reaches a
+    /// backend any other way is stored without validation.
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.

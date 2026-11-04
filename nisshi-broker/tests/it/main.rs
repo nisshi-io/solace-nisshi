@@ -85,6 +85,7 @@ pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
 #[cfg(feature = "postgres")]
 pub mod produce_row_locks;
+pub mod produce_schema_validation;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;

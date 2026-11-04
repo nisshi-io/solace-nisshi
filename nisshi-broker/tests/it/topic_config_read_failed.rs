@@ -195,7 +195,7 @@ async fn produce(storage: ArcDynStorage) -> Result<ErrorCode> {
         .build()
         .and_then(deflated::Batch::try_from)?;
 
-    let response = ProduceService { storage }
+    let response = ProduceService::new(storage)
         .with_validation()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(1).topic_data(Some(

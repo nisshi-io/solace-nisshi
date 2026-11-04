@@ -130,7 +130,7 @@ async fn produce(
     topic: &str,
     batch: deflated::Batch,
 ) -> Result<PartitionProduceResponse> {
-    let response = ProduceService { storage }
+    let response = ProduceService::new(storage)
         .with_validation()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(-1).topic_data(Some(vec![

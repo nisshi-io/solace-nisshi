@@ -18,14 +18,16 @@ mod rejection;
 mod request_validation;
 mod response;
 mod timestamps;
+mod topic_configuration;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nisshi_sans_io::{
-    ApiKey, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
+    ApiKey, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::inflated,
 };
+use nisshi_schema::Registry;
 use rama::{Layer as _, Service};
 use tracing::{debug, error, instrument, warn};
 
@@ -39,8 +41,9 @@ use self::{
     rejection::storage_error_code,
     request_validation::{ValidatedPartition, ValidatedTopic},
     timestamps::{NO_TIMESTAMP, validate_timestamps_offloaded},
+    topic_configuration::TopicConfiguration,
 };
-use crate::{Error, Result, Storage, Topition, message_timestamp_type};
+use crate::{Error, Result, Storage, Topition};
 
 /// Inflate a batch that a client sent in a Produce request, mapping a
 /// decode failure to `INVALID_RECORD`.
@@ -149,10 +152,7 @@ where
 /// assert_eq!(1, topics.len());
 /// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
 ///
-/// let produce = ProduceService {
-///     storage: storage.clone(),
-/// }
-/// .with_validation();
+/// let produce = ProduceService::new(storage.clone()).with_validation();
 ///
 /// let partition = 0;
 ///
@@ -199,7 +199,8 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct ProduceService<G> {
-    pub storage: G,
+    storage: G,
+    schemas: Option<Registry>,
 }
 
 impl<G> ApiKey for ProduceService<G> {
@@ -210,6 +211,22 @@ impl<G> ProduceService<G>
 where
     G: Storage,
 {
+    /// Returns a service that stores batches in `storage`, and does not validate them against a
+    /// schema.
+    pub fn new(storage: G) -> Self {
+        Self {
+            storage,
+            schemas: None,
+        }
+    }
+
+    /// Returns this service with `schemas`: the registry that holds the schema of each topic. A
+    /// batch for a topic that has a schema must match it before the service stores the batch,
+    /// unless the topic's `schema.validation` is `false`.
+    pub fn with_schemas(self, schemas: Option<Registry>) -> Self {
+        Self { schemas, ..self }
+    }
+
     /// Returns this service behind the layers that give it a [`ValidatedProduceRequest`] and that
     /// close the connection of a failed `acks=0` request: [`AcksZeroLayer`] around
     /// [`ProduceRequestValidationLayer`].
@@ -224,7 +241,7 @@ where
         &self,
         transaction_id: Option<&str>,
         name: &str,
-        timestamp_type: TimestampType,
+        configuration: &TopicConfiguration,
         partition: ValidatedPartition,
     ) -> PartitionProduceResponse {
         let ValidatedPartition { index, batch } = partition;
@@ -234,22 +251,50 @@ where
             Err(rejection) => return rejection.into_response(index),
         };
 
+        let timestamp_type = configuration.timestamp_type;
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
-        let batch = match validate_timestamps_offloaded(batch, timestamp_type, now).await {
-            Ok((validated, None)) => validated,
-            Ok((validated, Some(rejection))) => {
-                rejection.log(name, index, &validated);
-                return rejection.into_response(index);
-            }
-            Err(err) => {
-                error!(?err);
-                return response::partition_error(index, ErrorCode::UnknownServerError);
-            }
-        };
+        let (batch, inflated) =
+            match validate_timestamps_offloaded(batch, timestamp_type, now).await {
+                Ok((validated, Ok(inflated))) => (validated, inflated),
+                Ok((validated, Err(rejection))) => {
+                    rejection.log(name, index, &validated);
+                    return rejection.into_response(index);
+                }
+                Err(err) => {
+                    error!(?err);
+                    return response::partition_error(index, ErrorCode::UnknownServerError);
+                }
+            };
+
+        let producer_id = batch.producer_id;
+        let producer_epoch = batch.producer_epoch;
+        let base_sequence = batch.base_sequence;
+
+        // The batch is validated here, on the records that the timestamp step decoded, and before
+        // storage moves the high watermark, so that a batch rejected here leaves no state behind.
+        // Storage does not validate the schema, because it would decode the batch a second time.
+        if let Some(schemas) = &self.schemas
+            && configuration.schema_validation()
+            && let Err(error) = schemas
+                .validate(name, &inflated)
+                .await
+                .inspect(|validation| debug!(?validation))
+                .inspect_err(|err| debug!(?err))
+        {
+            return produce_failure(
+                name,
+                index,
+                producer_id,
+                producer_epoch,
+                base_sequence,
+                error.into(),
+            );
+        }
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
         let log_append_time_ms = match timestamp_type {
@@ -258,9 +303,6 @@ where
         };
 
         let tp = Topition::new(name, index);
-        let producer_id = batch.producer_id;
-        let producer_epoch = batch.producer_epoch;
-        let base_sequence = batch.base_sequence;
 
         match self.storage.produce(transaction_id, &tp, batch).await {
             Ok(base_offset) => PartitionProduceResponse::default()
@@ -273,80 +315,15 @@ where
                 .error_message(None)
                 .current_leader(None),
 
-            Err(error) => {
-                let error_code = storage_error_code(&error);
-
-                // Logged once, here, with the partition: a rejection
-                // the client caused is a warning, an internal failure
-                // is an error.
-                if error_code == ErrorCode::UnknownServerError {
-                    error!(
-                        topic = name,
-                        partition = index,
-                        producer_id,
-                        producer_epoch,
-                        base_sequence,
-                        ?error,
-                        "produce failed"
-                    );
-                } else if let Error::MessageTooLarge { size, limit } = error {
-                    warn!(
-                        topic = name,
-                        partition = index,
-                        producer_id,
-                        size,
-                        limit,
-                        "rejecting produce batch larger than max.message.bytes"
-                    );
-                } else {
-                    warn!(
-                        topic = name,
-                        partition = index,
-                        producer_id,
-                        producer_epoch,
-                        base_sequence,
-                        ?error_code,
-                        %error,
-                        "rejecting produce batch"
-                    );
-                }
-
-                let response = response::partition_error(index, error_code);
-
-                // Kafka sends the same message, so that the producer's `RecordTooLargeException`
-                // names both sizes.
-                if let Error::MessageTooLarge { size, limit, .. } = error {
-                    response.error_message(Some(format!(
-                        "The record batch size in the append to {name}-{} is {size} bytes \
-                         which exceeds the maximum configured value of {limit}.",
-                        index
-                    )))
-                } else {
-                    response
-                }
-            }
-        }
-    }
-
-    /// Returns the `message.timestamp.type` of the topic `name`, as
-    /// [`message_timestamp_type::described`] reads it from the topic's configs.
-    ///
-    /// The lookup and `storage.produce()` run in separate transactions. If the topic's
-    /// `message.timestamp.type` changes between them, the batch keeps the type that this function
-    /// read. The batch stores its type in its attributes, so a consumer still reads its timestamps
-    /// correctly. Kafka also applies a config change asynchronously, and an append that is in
-    /// progress can use the old type.
-    async fn timestamp_type(&self, name: &str) -> Result<TimestampType> {
-        let described = self
-            .storage
-            .describe_config(
+            Err(error) => produce_failure(
                 name,
-                ConfigResource::Topic,
-                Some(&[message_timestamp_type::KEY.to_owned()]),
-            )
-            .await?;
-
-        message_timestamp_type::described(name, described)
+                index,
+                producer_id,
+                producer_epoch,
+                base_sequence,
+                error,
+            ),
+        }
     }
 
     #[instrument(skip_all)]
@@ -357,11 +334,11 @@ where
     ) -> TopicProduceResponse {
         let mut partitions = Vec::with_capacity(topic.partitions.len());
 
-        match self.timestamp_type(&topic.name).await {
-            Ok(timestamp_type) => {
+        match TopicConfiguration::read(&self.storage, &topic.name).await {
+            Ok(configuration) => {
                 for partition in topic.partitions {
                     partitions.push(
-                        self.partition(transaction_id, &topic.name, timestamp_type, partition)
+                        self.partition(transaction_id, &topic.name, &configuration, partition)
                             .await,
                     )
                 }
@@ -371,7 +348,7 @@ where
                 error!(
                     topic = topic.name,
                     ?error,
-                    "message.timestamp.type lookup failed"
+                    "topic configuration read failed"
                 );
 
                 let error_code = storage_error_code(&error);
@@ -388,6 +365,65 @@ where
         TopicProduceResponse::default()
             .name(topic.name)
             .partition_responses(Some(partitions))
+    }
+}
+
+/// Returns the response for a batch that `storage.produce()` or the schema validation failed with
+/// `error`, and logs the failure once, with the partition: a rejection that the client caused is
+/// a warning, and an internal failure is an error.
+fn produce_failure(
+    name: &str,
+    index: i32,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    error: Error,
+) -> PartitionProduceResponse {
+    let error_code = storage_error_code(&error);
+
+    if error_code == ErrorCode::UnknownServerError {
+        error!(
+            topic = name,
+            partition = index,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            ?error,
+            "produce failed"
+        );
+    } else if let Error::MessageTooLarge { size, limit } = error {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id,
+            size,
+            limit,
+            "rejecting produce batch larger than max.message.bytes"
+        );
+    } else {
+        warn!(
+            topic = name,
+            partition = index,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            ?error_code,
+            %error,
+            "rejecting produce batch"
+        );
+    }
+
+    let response = response::partition_error(index, error_code);
+
+    // Kafka sends the same message, so that the producer's `RecordTooLargeException` names both
+    // sizes.
+    if let Error::MessageTooLarge { size, limit, .. } = error {
+        response.error_message(Some(format!(
+            "The record batch size in the append to {name}-{index} is {size} bytes which exceeds \
+             the maximum configured value of {limit}."
+        )))
+    } else {
+        response
     }
 }
 

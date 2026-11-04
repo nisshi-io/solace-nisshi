@@ -222,26 +222,30 @@ fn producer_log_append_time(
 /// The function decodes the batch for both types, so a batch that does not decode is rejected on
 /// every topic, with the error code that [`undecodable_batch`] gives it.
 ///
-/// Returns `Ok(Some(_))` for a batch that the client must not store, and `Err` for a broker-side
-/// failure.
+/// Returns the decoded batch, so that the caller does not decode it again, or the [`Rejection`]
+/// for a batch that the client must not store. The timestamp rewrite changes only the header of
+/// `batch`, so the decoded records are those of the rewritten batch. Returns `Err` for a
+/// broker-side failure.
 fn validate_timestamps(
     batch: &mut deflated::Batch,
     timestamp_type: TimestampType,
     now: i64,
-) -> Result<Option<Rejection>> {
+) -> Result<Result<inflated::Batch, Rejection>> {
     let inflated = match inflate_produced(&*batch) {
         Ok(inflated) => inflated,
-        Err(error) => return Ok(Some(undecodable_batch(&error))),
+        Err(error) => return Ok(Err(undecodable_batch(&error))),
     };
 
     if let Some(rejection) = producer_log_append_time(batch, timestamp_type) {
-        return Ok(Some(rejection));
+        return Ok(Err(rejection));
     }
 
-    match timestamp_type {
-        TimestampType::CreateTime => rewrite_create_time(batch, &inflated, now),
-        TimestampType::LogAppendTime => stamp_log_append_time(batch, now),
-    }
+    let rejection = match timestamp_type {
+        TimestampType::CreateTime => rewrite_create_time(batch, &inflated, now)?,
+        TimestampType::LogAppendTime => stamp_log_append_time(batch, now)?,
+    };
+
+    Ok(rejection.map_or(Ok(inflated), Err))
 }
 
 /// Runs [`validate_timestamps`] on Tokio's blocking thread pool, because it decodes the batch, and
@@ -250,13 +254,13 @@ pub(super) async fn validate_timestamps_offloaded(
     batch: deflated::Batch,
     timestamp_type: TimestampType,
     now: i64,
-) -> Result<(deflated::Batch, Option<Rejection>)> {
+) -> Result<(deflated::Batch, Result<inflated::Batch, Rejection>)> {
     // The batch moves into the closure and back out, because `offload` needs a `'static` closure. A
     // clone would only add a handle to the same record bytes, so moving the batch keeps one owner.
     offload(move || {
         let mut batch = batch;
-        let rejection = validate_timestamps(&mut batch, timestamp_type, now)?;
-        Ok((batch, rejection))
+        let outcome = validate_timestamps(&mut batch, timestamp_type, now)?;
+        Ok((batch, outcome))
     })
     .await
 }
@@ -272,6 +276,15 @@ mod validate_timestamps_tests {
     use super::*;
 
     const FIXED_NOW: i64 = 1_800_000_000_000;
+
+    /// [`super::validate_timestamps`], reduced to the rejection that most tests look at.
+    fn validate_timestamps(
+        batch: &mut deflated::Batch,
+        timestamp_type: TimestampType,
+        now: i64,
+    ) -> Result<Option<Rejection>> {
+        super::validate_timestamps(batch, timestamp_type, now).map(Result::err)
+    }
 
     fn batch(base_timestamp: i64, max_timestamp: i64, deltas: &[i64]) -> Result<deflated::Batch> {
         let builder = deltas.iter().enumerate().try_fold(
@@ -672,9 +685,9 @@ mod validate_timestamps_tests {
             "the batch was decoded on the runtime thread"
         );
 
-        let (batch, rejection) = rewrite.await??;
+        let (batch, outcome) = rewrite.await??;
 
-        assert_eq!(None, rejection);
+        assert_eq!(None, outcome.err());
         assert_eq!(FIXED_NOW + i64::try_from(RECORDS)? - 1, batch.max_timestamp);
         assert_eq!(batch.computed_crc(), batch.crc);
 

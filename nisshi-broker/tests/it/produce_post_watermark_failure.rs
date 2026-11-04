@@ -200,27 +200,25 @@ async fn produce(
         .build()
         .and_then(deflated::Batch::try_from)?;
 
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .with_validation()
-    .serve(RequestInput {
-        request: ProduceRequest::default().acks(1).topic_data(Some(
-            [TopicProduceData::default()
-                .name(TOPIC.into())
-                .partition_data(Some(
-                    [PartitionProduceData::default()
-                        .index(PARTITION)
-                        .records(Some(Frame {
-                            batches: vec![batch],
-                        }))]
-                    .into(),
-                ))]
-            .into(),
-        )),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = ProduceService::new(storage.clone())
+        .with_validation()
+        .serve(RequestInput {
+            request: ProduceRequest::default().acks(1).topic_data(Some(
+                [TopicProduceData::default()
+                    .name(TOPIC.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(PARTITION)
+                            .records(Some(Frame {
+                                batches: vec![batch],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let topics = response.responses.unwrap_or_default();
     assert_eq!(1, topics.len());
