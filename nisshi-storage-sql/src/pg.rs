@@ -683,12 +683,18 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
     name
 }
 
+/// The message of a [`Error::SchemaStepFailed`] whose SQLSTATE is in class `22`, data exception.
+const DATA_EXCEPTION_MESSAGE: &str =
+    "a value in the table is not valid for what the step does with it";
+
 /// Returns the error for a schema upgrade step from `from_version` to `to_version` that failed
 /// with `error`.
 ///
 /// A database error becomes [`Error::SchemaStepFailed`], which leaves out the `DETAIL` of the
-/// server's error, because a failed constraint repeats the failing row there. A `statement_timeout`
-/// keeps the conversion of [`Error::from`], which carries no `DETAIL`.
+/// server's error, because a failed constraint repeats the failing row there. The server's message
+/// of a class `22` error, such as `invalid input syntax for type integer: "..."`, quotes the value
+/// that failed, so [`DATA_EXCEPTION_MESSAGE`] replaces it. A `statement_timeout` keeps the
+/// conversion of [`Error::from`], which carries no `DETAIL`.
 fn schema_step_failure(from_version: i32, to_version: i32, error: tokio_postgres::Error) -> Error {
     let error = Error::from(error);
     let Error::TokioPostgres(error) = &error else {
@@ -702,7 +708,11 @@ fn schema_step_failure(from_version: i32, to_version: i32, error: tokio_postgres
         from_version,
         to_version,
         code: db_error.code().code().into(),
-        message: db_error.message().into(),
+        message: if db_error.code().code().starts_with("22") {
+            DATA_EXCEPTION_MESSAGE.into()
+        } else {
+            db_error.message().into()
+        },
         table: db_error.table().map(Into::into),
         constraint: db_error.constraint().map(Into::into),
     }
@@ -13944,6 +13954,50 @@ mod tests {
                     }) if **code == *SqlState::UNIQUE_VIOLATION.code()
                         && &**table == "step_rows"
                         && &**constraint == "step_rows_value"
+                );
+                assert!(!format!("{outcome:?}").contains("payload-in-a-row"));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails on a value that does not fit its type, SQLSTATE class `22`, must not
+    /// report the value, which the server quotes in its message.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_failure_does_not_quote_a_value_that_does_not_fit() -> Result<()>
+    {
+        const CASTS_TO_INTEGER: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "alter table step_rows alter column value type integer using value::integer",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_failure_does_not_quote_a_value_that_does_not_fit",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                database
+                    .execute(
+                        "create table step_rows (value text); \
+                         insert into step_rows values ('payload-in-a-row')",
+                    )
+                    .await?;
+
+                let outcome = storage.ensure_schema_of(&CASTS_TO_INTEGER, SCHEMA).await;
+
+                assert_matches!(
+                    &outcome,
+                    Err(Error::SchemaStepFailed { from_version: 1, to_version: 2, code, message, .. })
+                        if **code == *SqlState::INVALID_TEXT_REPRESENTATION.code()
+                            && &**message == DATA_EXCEPTION_MESSAGE
                 );
                 assert!(!format!("{outcome:?}").contains("payload-in-a-row"));
                 Ok(())

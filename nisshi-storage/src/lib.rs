@@ -356,8 +356,10 @@ pub enum Error {
     ///
     /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
     /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
-    /// or `header` holds message payloads. The fields are boxed strings, so that this variant
-    /// does not make [`Error`] larger.
+    /// or `header` holds message payloads. The `message` of a SQLSTATE in class `22`, data
+    /// exception, is a fixed phrase instead of the server's, because that message quotes the value
+    /// that failed. The fields are boxed strings, so that this variant does not make [`Error`]
+    /// larger.
     SchemaStepFailed {
         from_version: i32,
         to_version: i32,
