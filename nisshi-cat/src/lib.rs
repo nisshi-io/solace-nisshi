@@ -51,6 +51,16 @@ pub enum Error {
         error_code: i16,
     },
 
+    /// A record in the broker's answer to a fetch of `partition` of `topic` has an offset that
+    /// doesn't fit in an `i64`: its batch's `base_offset` plus its `offset_delta` overflows. No
+    /// partition has such an offset, so the response is corrupt.
+    RecordOffsetOverflow {
+        topic: String,
+        partition: i32,
+        base_offset: i64,
+        offset_delta: i32,
+    },
+
     Client(#[from] nisshi_client::Error),
     InvalidJson {
         location: Location,
@@ -124,6 +134,17 @@ impl fmt::Display for Error {
                 )?;
                 write_error_code(f, *error_code)
             }
+            Self::RecordOffsetOverflow {
+                topic,
+                partition,
+                base_offset,
+                offset_delta,
+            } => write!(
+                f,
+                "fetching partition {partition} of topic {topic:?} failed: the response has a \
+                record at base offset {base_offset} plus offset delta {offset_delta}, which \
+                overflows an i64"
+            ),
             Self::Metadata { topic, error_code } => {
                 write!(f, "looking up topic {topic:?} failed: ")?;
                 write_error_code(f, *error_code)
@@ -173,5 +194,25 @@ impl Builder {
 
     pub fn consume() -> consume::PhantomBuilder {
         consume::Builder::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn record_offset_overflow_says_the_response_is_at_fault_and_names_its_record() {
+        assert_eq!(
+            "fetching partition 3 of topic \"taxi\" failed: the response has a record at base \
+            offset 9223372036854775807 plus offset delta 1, which overflows an i64",
+            Error::RecordOffsetOverflow {
+                topic: "taxi".into(),
+                partition: 3,
+                base_offset: i64::MAX,
+                offset_delta: 1,
+            }
+            .to_string()
+        );
     }
 }
