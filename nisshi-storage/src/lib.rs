@@ -231,11 +231,11 @@ pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, Top
 pub use service::{
     AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
     ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
-    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FetchValidationLayer, FetchValidationService, FindCoordinatorService,
+    CreateTopicsValidationLayer, CreateTopicsValidationService, DELETE_RECORDS_CONCURRENCY,
+    DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency, DeleteRecordsService,
+    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
+    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
     MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
@@ -2035,6 +2035,21 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>>;
 
+    /// Returns how many [`Storage::delete_records`] calls the
+    /// [`DeleteRecordsService`] may run at once, for one request and across
+    /// all requests.
+    ///
+    /// The service makes one call for each partition of a request. The default
+    /// is [`DELETE_RECORDS_CONCURRENCY`] calls for a request and no limit across
+    /// requests. A storage that runs its writes one at a time answers
+    /// [`DeleteRecordsConcurrency::serial`], so that a second call never waits
+    /// behind the first after the deadline check. A storage that wraps another
+    /// answers what the storage it wraps answers, unless the wrapper changes
+    /// how the calls run.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::default()
+    }
+
     /// Delete a topic from this storage.
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode>;
 
@@ -2355,6 +2370,10 @@ where
         self.as_ref().delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2638,6 +2657,10 @@ where
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         self.as_ref().delete_records(topics).await
+    }
+
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {

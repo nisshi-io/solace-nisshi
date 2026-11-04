@@ -38,10 +38,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, service::deadline,
+    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version, service::deadline,
 };
 
 static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -133,6 +134,12 @@ where
             )
         })?;
         self.storage.delete_records(topics).await
+    }
+
+    /// The proxy holds one permit for each call, so a second call waits for
+    /// the first, whatever the storage behind it allows.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {

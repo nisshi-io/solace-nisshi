@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::slice;
+use std::{slice, sync::Arc};
 
 use futures::{StreamExt as _, stream};
 
@@ -22,24 +22,83 @@ use nisshi_sans_io::{
     delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
 };
 use rama::Service;
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, StorageOperation, Topition,
     service::{
-        deadline::{DELETE_RECORDS_DEADLINE, started_before},
+        deadline::{DELETE_RECORDS_DEADLINE, Missed, queued, started_before, within},
         storage_error_code,
     },
 };
 
-/// How many partitions of one DeleteRecords request are in storage at once.
+/// How many partitions of one DeleteRecords request are in storage at once on
+/// a storage engine that does not set its own limit, see
+/// [`Storage::delete_records_concurrency`].
 ///
 /// The value is the one of `LIST_OFFSETS_CONCURRENCY`.
-/// A request takes up to this many connections of an engine's pool, and an
-/// engine that serialises its writes (libSQL by default) gains nothing from
-/// it, but loses nothing either.
-const DELETE_RECORDS_CONCURRENCY: usize = 4;
+pub const DELETE_RECORDS_CONCURRENCY: usize = 4;
+
+/// How many `delete_records` calls one request makes at once, and the limit on
+/// those calls across every request, that a [`Storage`] answers with.
+///
+/// The [`DeleteRecordsService`] makes one call for each partition of a request.
+/// A storage engine that runs its writes one after another gains nothing from
+/// a second call, and a call that waits behind the first starts after the
+/// deadline has passed. A pooled engine gains from concurrent calls, but each
+/// call holds a connection, so the calls of all requests together need a limit
+/// of their own.
+#[derive(Clone, Debug)]
+pub struct DeleteRecordsConcurrency {
+    per_request: usize,
+    shared: Option<Arc<Semaphore>>,
+}
+
+impl DeleteRecordsConcurrency {
+    /// Returns the concurrency of an engine that runs one call at a time.
+    pub fn serial() -> Self {
+        Self {
+            per_request: 1,
+            shared: None,
+        }
+    }
+
+    /// Returns the concurrency of an engine that runs up to `per_request`
+    /// calls of a request at once, and the calls of all requests together
+    /// only while they hold a permit of `permits`.
+    ///
+    /// A call that waits for a permit past the request's deadline is not
+    /// started, and its partition answers `REQUEST_TIMED_OUT`.
+    pub fn shared(per_request: usize, permits: Arc<Semaphore>) -> Self {
+        Self {
+            per_request: per_request.max(1),
+            shared: Some(permits),
+        }
+    }
+
+    /// Returns how many calls of one request run at once.
+    pub fn per_request(&self) -> usize {
+        self.per_request
+    }
+
+    /// Returns the permits that the calls of all requests share, if the
+    /// engine limits them.
+    pub fn permits(&self) -> Option<&Arc<Semaphore>> {
+        self.shared.as_ref()
+    }
+}
+
+impl Default for DeleteRecordsConcurrency {
+    /// Returns [`DELETE_RECORDS_CONCURRENCY`] calls for a request, and no
+    /// limit across requests.
+    fn default() -> Self {
+        Self {
+            per_request: DELETE_RECORDS_CONCURRENCY,
+            shared: None,
+        }
+    }
+}
 
 /// How many failed partitions one log line names.
 const PARTITION_SAMPLE: usize = 8;
@@ -58,9 +117,47 @@ impl<G> DeleteRecordsService<G>
 where
     G: Storage,
 {
-    /// Deletes the records of each partition with its own storage call, up to
-    /// [`DELETE_RECORDS_CONCURRENCY`] at a time, so that a storage error
-    /// answers in the partition that it belongs to (see
+    /// Makes one storage call for `request`, and answers [`Missed`] when the
+    /// deadline passes before the call starts.
+    ///
+    /// The wait for a permit that the engine shares across requests ends at
+    /// the deadline, because a call that has not started can be dropped. A
+    /// call that has started runs to its end, see [`started_before`].
+    async fn call(
+        storage: &G,
+        deadline: Instant,
+        permits: Option<Arc<Semaphore>>,
+        request: &DeleteRecordsTopic,
+    ) -> Result<Result<Vec<DeleteRecordsTopicResult>>, Missed> {
+        let _permit = match permits {
+            Some(permits) => {
+                match within(
+                    StorageOperation::DeleteRecords,
+                    deadline,
+                    queued(permits.acquire_owned()),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(closed)) => return Ok(Err(closed.into())),
+                    Err(missed) => return Err(missed),
+                }
+            }
+
+            None => None,
+        };
+
+        started_before(
+            StorageOperation::DeleteRecords,
+            deadline,
+            storage.delete_records(slice::from_ref(request)),
+        )
+        .await
+    }
+
+    /// Deletes the records of each partition with its own storage call, as
+    /// many at a time as [`Storage::delete_records_concurrency`] allows, so
+    /// that a storage error answers in the partition that it belongs to (see
     /// [`storage_error_code`]) and the other partitions still answer. Kafka
     /// also answers each partition's failure in that partition
     /// ([ReplicaManager.scala#L1122-L1146]).
@@ -77,11 +174,16 @@ where
     /// ([DeleteRecordsHandler.java#L147-L165]), so a request with more
     /// partitions than one round serves still completes.
     ///
+    /// A call that waits for a permit that the engine shares across requests
+    /// is not started when the deadline passes during the wait. An engine that
+    /// runs its writes one at a time answers a concurrency of 1, so a call
+    /// never waits behind another call of its request after the deadline check.
+    ///
     /// A call that has started runs to its end, so the request takes longer
-    /// than the deadline by at most the longest call of the last calls to
-    /// start. The service does not drop a started call, because a write that
-    /// its caller drops can leave its storage engine's connection busy for
-    /// the next caller. For that reason the loop below reads the stream to
+    /// than the deadline by at most the longest call among those that started
+    /// before it. The service does not drop a started call, because a write
+    /// that its caller drops can leave its storage engine's connection busy
+    /// for the next caller. For that reason the loop below reads the stream to
     /// its end and never breaks out of it.
     ///
     /// [ReplicaManager.scala#L1122-L1146]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1122-L1146
@@ -89,6 +191,7 @@ where
     async fn delete_records(&self, topics: &[DeleteRecordsTopic]) -> Vec<DeleteRecordsTopicResult> {
         let started_at = Instant::now();
         let deadline = started_at + DELETE_RECORDS_DEADLINE;
+        let concurrency = self.storage.delete_records_concurrency();
 
         // The calls are built up front (but not started) rather than in a
         // `StreamExt::map` closure, whose lifetimes keep `serve` from being
@@ -104,25 +207,22 @@ where
                     },
                 )
             })
-            .map(
-                |(topic_index, partition_index, topic, partition)| async move {
+            .map(|(topic_index, partition_index, topic, partition)| {
+                let permits = concurrency.permits().map(Arc::clone);
+
+                async move {
                     let request = DeleteRecordsTopic::default()
                         .name(topic.name.clone())
                         .partitions(Some(vec![partition.clone()]));
 
-                    let answer = started_before(
-                        StorageOperation::DeleteRecords,
-                        deadline,
-                        self.storage.delete_records(slice::from_ref(&request)),
-                    )
-                    .await;
+                    let answer = Self::call(&self.storage, deadline, permits, &request).await;
 
                     (topic_index, partition_index, topic, partition, answer)
-                },
-            )
+                }
+            })
             .collect::<Vec<_>>();
 
-        let mut answers = stream::iter(calls).buffer_unordered(DELETE_RECORDS_CONCURRENCY);
+        let mut answers = stream::iter(calls).buffer_unordered(concurrency.per_request());
 
         // One slot for each partition of the request, so that the response
         // keeps the order of the request whatever order the calls end in.
@@ -262,14 +362,16 @@ mod tests {
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use rama::{Service as _, extensions::Extensions};
+    use tokio::sync::Semaphore;
     use url::Url;
     use uuid::Uuid;
 
-    use super::{DELETE_RECORDS_CONCURRENCY, DeleteRecordsService};
+    use super::{DELETE_RECORDS_CONCURRENCY, DeleteRecordsConcurrency, DeleteRecordsService};
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-        GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-        OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        GroupDetail, LatencyIntroducingStorage, ListOffsetResponse, MetadataResponse,
+        NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceRequestBatcher,
+        ProducerIdResponse, Result, ScramCredential, SemaphoreProxy, Storage, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
         Version, service::deadline::DELETE_RECORDS_DEADLINE,
     };
@@ -302,6 +404,8 @@ mod tests {
         /// The delay of a partition's call, for a partition that does not
         /// take `delay`.
         partition_delays: BTreeMap<(String, i32), Duration>,
+        /// How many calls the engine runs at once, which the service reads.
+        concurrency: DeleteRecordsConcurrency,
         /// Calls in storage now, the most at once, and those that ran to
         /// their end.
         running: Arc<AtomicUsize>,
@@ -319,6 +423,7 @@ mod tests {
                 calls: Arc::default(),
                 delay: Duration::ZERO,
                 partition_delays: BTreeMap::new(),
+                concurrency: DeleteRecordsConcurrency::default(),
                 running: Arc::default(),
                 most_running: Arc::default(),
                 completed: Arc::default(),
@@ -329,6 +434,15 @@ mod tests {
         /// to answer, as a degraded engine does.
         fn with_delay(self, delay: Duration) -> Self {
             Self { delay, ..self }
+        }
+
+        /// Returns a stub that answers `concurrency`, as an engine with its own
+        /// limits does.
+        fn with_concurrency(self, concurrency: DeleteRecordsConcurrency) -> Self {
+            Self {
+                concurrency,
+                ..self
+            }
         }
 
         /// Returns a stub whose call for each listed partition takes its
@@ -461,6 +575,10 @@ mod tests {
 
         async fn create_topic(&self, _topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
             unimplemented!()
+        }
+
+        fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+            self.concurrency.clone()
         }
 
         async fn delete_records(
@@ -961,6 +1079,204 @@ mod tests {
         assert_eq!(12, stub.completed.load(Ordering::SeqCst));
 
         Ok(())
+    }
+
+    /// An engine that runs one call at a time starts no second call of a
+    /// request before the first ends, so the deadline check comes after the
+    /// wait. Each call takes 2s and the deadline is 5s: the calls start at 0s,
+    /// 2s and 4s, and the 4th would start at 6s, so it and the 5th answer
+    /// `REQUEST_TIMED_OUT`. With the default concurrency of four, all five
+    /// calls start at 0s, before the deadline, and none times out.
+    #[tokio::test(start_paused = true)]
+    async fn serial_engine_starts_no_second_call_before_the_first_ends() -> Result<()> {
+        let partitions = (0..5).collect::<Vec<_>>();
+        let stub = Stub::new(
+            &partitions
+                .iter()
+                .map(|partition| ("a", *partition, Answer::Cut(1)))
+                .collect::<Vec<_>>(),
+        )
+        .with_delay(Duration::from_secs(2))
+        .with_concurrency(DeleteRecordsConcurrency::serial());
+
+        let started_at = tokio::time::Instant::now();
+
+        let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
+
+        assert_eq!(
+            vec![
+                (0, ErrorCode::None, 1),
+                (1, ErrorCode::None, 1),
+                (2, ErrorCode::None, 1),
+                (
+                    3,
+                    ErrorCode::RequestTimedOut,
+                    DELETE_RECORDS_INVALID_LOW_WATERMARK
+                ),
+                (
+                    4,
+                    ErrorCode::RequestTimedOut,
+                    DELETE_RECORDS_INVALID_LOW_WATERMARK
+                ),
+            ],
+            answers[0].1.clone().expect("partitions")
+        );
+
+        assert_eq!(1, stub.most_running.load(Ordering::SeqCst));
+        assert_eq!(3, stub.calls().len());
+        assert_eq!(Duration::from_secs(6), started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// The calls of two requests together hold at most the engine's permits.
+    /// The engine has 2 permits and each request makes up to 4 calls at once,
+    /// each call takes 1s, and the 8 calls finish at 4s, within the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn calls_of_two_requests_share_the_engine_permits() -> Result<()> {
+        let partitions = (0..4).collect::<Vec<_>>();
+        let answers = ["a", "b"]
+            .iter()
+            .flat_map(|name| {
+                partitions
+                    .iter()
+                    .map(move |partition| (*name, *partition, Answer::Cut(1)))
+            })
+            .collect::<Vec<_>>();
+
+        let stub = Stub::new(&answers)
+            .with_delay(Duration::from_secs(1))
+            .with_concurrency(DeleteRecordsConcurrency::shared(
+                DELETE_RECORDS_CONCURRENCY,
+                Arc::new(Semaphore::new(2)),
+            ));
+
+        let started_at = tokio::time::Instant::now();
+
+        let (first, second) = tokio::join!(
+            delete_records(&stub, vec![topic("a", Some(&partitions))]),
+            delete_records(&stub, vec![topic("b", Some(&partitions))]),
+        );
+
+        for answered in [first?, second?] {
+            assert_eq!(
+                partitions
+                    .iter()
+                    .map(|partition| (*partition, ErrorCode::None, 1))
+                    .collect::<Vec<_>>(),
+                answered[0].1.clone().expect("partitions")
+            );
+        }
+
+        assert_eq!(2, stub.most_running.load(Ordering::SeqCst));
+        assert_eq!(8, stub.completed.load(Ordering::SeqCst));
+        assert_eq!(Duration::from_secs(4), started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// A call that is still waiting for an engine permit at the deadline is
+    /// not started, and its partition answers `REQUEST_TIMED_OUT`. The engine
+    /// has one permit and each call takes 3s: the first call runs from 0s to
+    /// 3s, the second from 3s to 6s, and the third and fourth are waiting at
+    /// the deadline of 5s. With no permit limit, all four calls start at 0s.
+    #[tokio::test(start_paused = true)]
+    async fn call_waiting_for_an_engine_permit_at_the_deadline_is_not_started() -> Result<()> {
+        let partitions = (0..4).collect::<Vec<_>>();
+        let stub = Stub::new(
+            &partitions
+                .iter()
+                .map(|partition| ("a", *partition, Answer::Cut(1)))
+                .collect::<Vec<_>>(),
+        )
+        .with_delay(Duration::from_secs(3))
+        .with_concurrency(DeleteRecordsConcurrency::shared(
+            DELETE_RECORDS_CONCURRENCY,
+            Arc::new(Semaphore::new(1)),
+        ));
+
+        let started_at = tokio::time::Instant::now();
+
+        let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
+
+        assert_eq!(
+            vec![
+                (0, ErrorCode::None, 1),
+                (1, ErrorCode::None, 1),
+                (
+                    2,
+                    ErrorCode::RequestTimedOut,
+                    DELETE_RECORDS_INVALID_LOW_WATERMARK
+                ),
+                (
+                    3,
+                    ErrorCode::RequestTimedOut,
+                    DELETE_RECORDS_INVALID_LOW_WATERMARK
+                ),
+            ],
+            answers[0].1.clone().expect("partitions")
+        );
+
+        // the second call started before the deadline and ran 1s past it
+        assert_eq!(Duration::from_secs(6), started_at.elapsed());
+        assert_eq!(2, stub.calls().len());
+        assert_eq!(2, stub.completed.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// A storage that holds another storage answers the concurrency of the one
+    /// that it holds, whether it is a pointer, a latency wrapper or the batcher
+    /// of produce requests. A serial engine answers 1 where the default is 4.
+    #[test]
+    fn wrappers_forward_the_engines_concurrency() {
+        let stub = Stub::new(&[]).with_concurrency(DeleteRecordsConcurrency::serial());
+
+        assert_eq!(1, stub.delete_records_concurrency().per_request());
+        assert_eq!(
+            1,
+            Arc::new(stub.clone())
+                .delete_records_concurrency()
+                .per_request()
+        );
+        assert_eq!(
+            1,
+            Box::new(stub.clone())
+                .delete_records_concurrency()
+                .per_request()
+        );
+
+        let dynamic: Arc<dyn Storage> = Arc::new(Box::new(stub.clone()));
+        assert_eq!(1, dynamic.delete_records_concurrency().per_request());
+
+        assert_eq!(
+            1,
+            LatencyIntroducingStorage::new(stub.clone())
+                .delete_records_concurrency()
+                .per_request()
+        );
+        assert_eq!(
+            1,
+            ProduceRequestBatcher::new(stub)
+                .delete_records_concurrency()
+                .per_request()
+        );
+    }
+
+    /// A proxy that holds one permit for each call answers a serial
+    /// concurrency, whatever the storage behind it answers.
+    #[test]
+    fn semaphore_proxy_answers_serial_whatever_the_engine_allows() {
+        let stub = Stub::new(&[]);
+
+        assert_eq!(
+            DELETE_RECORDS_CONCURRENCY,
+            stub.delete_records_concurrency().per_request()
+        );
+
+        let proxy = SemaphoreProxy::new(stub);
+        assert_eq!(1, proxy.delete_records_concurrency().per_request());
+        assert!(proxy.delete_records_concurrency().permits().is_none());
     }
 
     /// A topic without partitions answers an empty partition list, as the

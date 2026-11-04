@@ -50,10 +50,15 @@ pub(crate) const LIST_OFFSETS_READ_DEADLINE: Duration = Duration::from_secs(5);
 /// request.
 ///
 /// A partition whose call has not started at this deadline answers
-/// `REQUEST_TIMED_OUT` with a low watermark of -1. A call that has started
-/// runs to its end, so the request takes longer than the deadline by at most
-/// one partition's call. A retry is safe, because a cut at or below the log
-/// start changes nothing.
+/// `REQUEST_TIMED_OUT` with a low watermark of -1. That includes a call that
+/// is still waiting for a permit that its storage engine shares across
+/// requests, see [`DeleteRecordsConcurrency`](crate::DeleteRecordsConcurrency).
+/// A call that has started runs to its end, so the request takes longer than
+/// the deadline by at most the longest call among those that started before
+/// it. A storage engine that runs its writes one at a time lets one call of a
+/// request run at a time, so no call waits behind another after the deadline
+/// check. A retry is safe, because a cut at or below the log start changes
+/// nothing.
 ///
 /// The bound is this constant, not the request's `timeout_ms`. Kafka cuts
 /// the logs first and then waits at most `timeout_ms` for its replicas to

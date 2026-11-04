@@ -66,11 +66,12 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
+    LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
     deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
     parse_storage_option, producer_claim,
@@ -137,6 +138,13 @@ pub struct Postgres {
     /// How many of `fetch_reads` one connection may hold, see
     /// [`ReadLimits::fetch_per_connection`].
     fetch_reads_per_connection: usize,
+    /// Permits for the DeleteRecords calls in flight across every request,
+    /// see [`delete_records_limit`].
+    delete_records_writes: Arc<Semaphore>,
+    /// How many DeleteRecords calls one request makes at once, at most
+    /// `delete_records_writes`, see
+    /// [`Storage::delete_records_concurrency`].
+    delete_records_per_request: usize,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -212,6 +220,8 @@ impl<C, N, L, P> Builder<C, N, L, P> {
 
 impl Builder<String, i32, Url, Pool> {
     pub fn build(self) -> Postgres {
+        let delete_records_limit = delete_records_limit(self.pool.status().max_size);
+
         Postgres {
             cluster: self.cluster,
             node: self.node,
@@ -222,6 +232,8 @@ impl Builder<String, i32, Url, Pool> {
             fetch_reads: Arc::new(Semaphore::new(self.read_limits.fetch)),
             list_offsets_reads_per_connection: self.read_limits.list_offsets_per_connection(),
             fetch_reads_per_connection: self.read_limits.fetch_per_connection(),
+            delete_records_writes: Arc::new(Semaphore::new(delete_records_limit)),
+            delete_records_per_request: DELETE_RECORDS_CONCURRENCY.min(delete_records_limit),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -310,6 +322,21 @@ impl ReadLimits {
     fn fetch_per_connection(self) -> usize {
         FETCH_READS_PER_CONNECTION.min(self.fetch)
     }
+}
+
+/// How many DeleteRecords calls this engine has in flight at once, across every
+/// request, for a pool of `max_size` connections: a quarter of the pool, and at
+/// least one.
+///
+/// Each call holds a pooled connection for its watermark transaction and its
+/// record `DELETE`, which only the statement timeout bounds. Without this
+/// limit, requests that each make [`DELETE_RECORDS_CONCURRENCY`] calls take the
+/// whole pool with a few requests, and produce and offset commits then wait for
+/// a connection. Kafka Streams sends such requests from every stream thread at
+/// each purge interval. The calls of a request wait for a permit, and a call
+/// still waiting at the request's deadline is not started.
+fn delete_records_limit(max_size: usize) -> usize {
+    (max_size / 4).max(1)
 }
 
 impl Default for ReadLimits {
@@ -3901,6 +3928,13 @@ impl Storage for Postgres {
         Ok(topic_uuid)
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::shared(
+            self.delete_records_per_request,
+            Arc::clone(&self.delete_records_writes),
+        )
+    }
+
     #[instrument(skip_all)]
     async fn delete_records(
         &self,
@@ -5867,6 +5901,68 @@ mod tests {
             .expect_err("an option that tokio-postgres does not read must be rejected");
 
         assert!(error.to_string().contains("vacuum_into"), "{error}");
+    }
+
+    /// DeleteRecords calls across every request take a quarter of the pool,
+    /// and at least one connection, and one request makes at most
+    /// [`DELETE_RECORDS_CONCURRENCY`] of them at once. The pool of 16 leaves 12
+    /// connections to other work, which four requests that each made four calls
+    /// would take.
+    #[test]
+    fn delete_records_calls_take_a_quarter_of_the_pool() -> Result<()> {
+        for (pool_max_size, limit, per_request) in [(16, 4, 4), (32, 8, 4), (8, 2, 2), (2, 1, 1)] {
+            let storage =
+                Postgres::builder(&format!("{}?pool_max_size={pool_max_size}", *CONNECTION))?
+                    .cluster("sized")
+                    .node(0)
+                    .build();
+
+            let concurrency = storage.delete_records_concurrency();
+
+            assert_eq!(per_request, concurrency.per_request(), "{pool_max_size}");
+            assert_eq!(
+                limit,
+                concurrency
+                    .permits()
+                    .map(|permits| permits.available_permits())
+                    .expect("permits shared across requests"),
+                "{pool_max_size}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Two requests, which ask the same engine, get the same permits, so the
+    /// calls of both together stay within the limit. A clone of the engine, as
+    /// each client connection has, shares them too.
+    #[test]
+    fn delete_records_permits_are_shared_across_requests() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster("shared")
+            .node(0)
+            .build();
+
+        let first = storage.delete_records_concurrency();
+        let second = storage.clone().delete_records_concurrency();
+
+        let (first, second) = (
+            first.permits().expect("permits"),
+            second.permits().expect("permits"),
+        );
+
+        assert!(Arc::ptr_eq(first, second));
+
+        // the calls of one request take permits that another request then lacks
+        let taken = (0..first.available_permits())
+            .map(|_| Arc::clone(first).try_acquire_owned())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Message(error.to_string()))?;
+
+        assert_eq!(0, second.available_permits());
+        assert_eq!(taken.len(), 4);
+
+        Ok(())
     }
 
     /// Without `pool_max_size`, the pool opens at most 16 connections, and
