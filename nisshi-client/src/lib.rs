@@ -1130,6 +1130,9 @@ impl BytesConnectionService {
 
         let start = SystemTime::now();
 
+        // tokio-rustls's `poll_write` returns once rustls holds the bytes, and its
+        // `poll_read` never sends them, so only a flush puts the tail of a large
+        // request on the socket. A bare TCP stream flushes as a no-op.
         async {
             stream.write_all(&frame[..]).await?;
             stream.flush().await
