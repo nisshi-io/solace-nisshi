@@ -32,11 +32,13 @@
 //! A sweep that is still running when its next tick is due is over its deadline, which is its own
 //! interval (`maintenance_interval` and `transaction_maintenance_interval` of the storage URL).
 //! The broker skips that tick and calls [`SweepFailures::overdue`] instead, which logs at warn
-//! through the same limit, so a sweep that never finishes keeps being reported every
-//! [`REPEAT_INTERVAL`]. The broker never aborts a running sweep on a tick, because a sweep stopped part-way through
-//! a compaction could leave its work half done. The gauge `nisshi_storage_maintenance_sweeps_overdue`
-//! is 1 while the sweep is over its deadline, and 0 once it finishes, however it finishes. A
-//! sweep that logged an overdue line logs a line when it finishes.
+//! under a limit of its own, one line per [`REPEAT_INTERVAL`], so that a sweep that never finishes
+//! keeps being reported, and neither the overdue lines nor the failure and recovery lines hold the
+//! other back. The broker never aborts a running sweep on a tick, because a sweep stopped
+//! part-way through a compaction could leave its work half done. The gauge
+//! `nisshi_storage_maintenance_sweeps_overdue` is 1 while the sweep is over its deadline, and 0
+//! once it finishes, however it finishes, and whether or not the limit held an overdue line back.
+//! A sweep that logged an overdue line logs a line when it finishes.
 
 use std::{
     fmt::Display,
@@ -94,12 +96,22 @@ impl Outcome {
 
 #[derive(Debug, Default)]
 struct State {
+    /// Whether a sweep has started and not yet finished. A tick that finds the sweep's task
+    /// unfinished can come after the sweep recorded its outcome and before its task ended, and
+    /// this flag, which `finish` clears under the same lock that `overdue` reads it under, stops
+    /// that tick from reporting a sweep that is over.
+    in_flight: bool,
+
     /// When the broker first found the running sweep past its next tick. `None` when the sweep is
     /// not overdue.
     overdue_since: Option<Instant>,
 
     /// Whether a line reported the current overdue sweep.
     overdue_logged: bool,
+
+    /// When the last overdue line was written. Overdue lines have their own limit, so that a
+    /// failure or recovery line cannot hold one back and an overdue line cannot hold those back.
+    last_overdue_logged: Option<Instant>,
 
     /// Failed sweeps since the last recovery line. A success that comes before a line is due does
     /// not end the run, so this count can include sweeps that succeeded in between.
@@ -117,6 +129,11 @@ struct State {
 impl State {
     fn log_is_due(&self, now: Instant) -> bool {
         self.last_logged
+            .is_none_or(|logged| now.saturating_duration_since(logged) >= REPEAT_INTERVAL)
+    }
+
+    fn overdue_log_is_due(&self, now: Instant) -> bool {
+        self.last_overdue_logged
             .is_none_or(|logged| now.saturating_duration_since(logged) >= REPEAT_INTERVAL)
     }
 }
@@ -175,6 +192,8 @@ impl SweepFailures {
         E: Display,
         F: Future<Output = Result<(), E>>,
     {
+        self.begin();
+
         match AssertUnwindSafe(sweep).catch_unwind().await {
             Ok(outcome) => self.record(outcome, Instant::now()),
             Err(payload) => {
@@ -183,16 +202,29 @@ impl SweepFailures {
         }
     }
 
-    /// Reports that the sweep is still running at `now`, when its next tick is due.
+    /// Marks a sweep as running, so that [`SweepFailures::overdue`] can report it.
+    fn begin(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_flight = true;
+    }
+
+    /// Reports that the sweep is still running at `now`, when its next tick is due. A sweep that
+    /// has already recorded its outcome is not reported, whatever its task is still doing.
     pub(crate) fn overdue(&self, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if !state.in_flight {
+            return;
+        }
 
         let since = *state.overdue_since.get_or_insert_with(|| {
             self.overdue.add(1, &self.attributes());
             now
         });
 
-        if !state.log_is_due(now) {
+        if !state.overdue_log_is_due(now) {
             return;
         }
 
@@ -205,7 +237,7 @@ impl SweepFailures {
         );
 
         state.overdue_logged = true;
-        state.last_logged = Some(now);
+        state.last_overdue_logged = Some(now);
     }
 
     fn attributes(&self) -> [KeyValue; 2] {
@@ -229,6 +261,8 @@ impl SweepFailures {
     fn finish(&self, outcome: Outcome, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
 
+        state.in_flight = false;
+
         self.counter.add(
             1,
             &[
@@ -243,7 +277,7 @@ impl SweepFailures {
 
             if std::mem::take(&mut state.overdue_logged) {
                 // The line carries the error, because the failure line of this sweep can be held
-                // back by the limit that the overdue line has just used up.
+                // back by the limit of an earlier failure line.
                 let (error, panic) = match &outcome {
                     Outcome::Ok => (None, None),
                     Outcome::Error(error) => (Some(error.as_str()), None),
@@ -342,6 +376,25 @@ impl SweepFailures {
                 state.unlogged_error = None;
                 state.last_logged = Some(now);
             }
+        }
+    }
+}
+
+impl Drop for SweepFailures {
+    /// Takes back the overdue report of a sweep that never finished, because the broker aborted
+    /// its task at shutdown. The gauge is process-wide, so the report would otherwise stay at 1
+    /// for the next broker in the process.
+    fn drop(&mut self) {
+        let overdue = self
+            .state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .overdue_since
+            .take()
+            .is_some();
+
+        if overdue {
+            self.overdue.add(-1, &self.attributes());
         }
     }
 }
@@ -767,6 +820,7 @@ mod tests {
         let failures = SweepFailures::maintain_transactions("postgres");
         let start = Instant::now();
 
+        failures.begin();
         _ = captured(|| failures.overdue(start));
 
         let capture = Capture::default();
@@ -783,10 +837,24 @@ mod tests {
             .run(async { panic!("index out of range") as Result<(), &'static str> })
             .await;
 
+        // The overdue line did not use the failure limit, so the panic is logged on its own line
+        // as well as on the finish line.
         let logs = capture.text();
-        assert_eq!(1, logs.lines().count(), "{logs}");
-        assert!(logs.contains("ERROR"), "{logs}");
-        assert!(logs.contains("index out of range"), "{logs}");
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(2, lines.len(), "{logs}");
+        assert!(
+            lines[0].contains("was over its deadline panicked"),
+            "{logs}"
+        );
+        assert!(
+            lines[1].contains("storage maintenance sweep panicked"),
+            "{logs}"
+        );
+
+        for line in lines {
+            assert!(line.contains("ERROR"), "{line}");
+            assert!(line.contains("index out of range"), "{line}");
+        }
     }
 
     #[tokio::test]
@@ -805,6 +873,8 @@ mod tests {
     fn a_sweep_over_its_deadline_is_reported_at_warn_and_again_only_once_per_interval() {
         let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
         let start = Instant::now();
+
+        failures.begin();
 
         let logs = captured(|| {
             failures.overdue(start);
@@ -829,6 +899,7 @@ mod tests {
         let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
         let start = Instant::now();
 
+        failures.begin();
         _ = captured(|| failures.overdue(start));
         assert_eq!(1, overdue_now(&exporter, &provider));
 
@@ -854,32 +925,146 @@ mod tests {
             measured(SweepFailures::maintain_transactions, "postgres");
         let start = Instant::now();
 
+        failures.begin();
         _ = captured(|| failures.overdue(start));
 
-        // The finish comes inside the interval, so the failure line is held back and the finish
-        // line has to carry the error.
+        // The overdue line did not use the failure limit, so the failure line is written as well
+        // as the finish line, and both carry the error.
         let logs = captured(|| {
             failures.record(Err("connection reset"), start + Duration::from_secs(10));
         });
 
-        assert_eq!(1, logs.lines().count(), "{logs}");
+        assert_eq!(2, logs.lines().count(), "{logs}");
         assert!(logs.contains("has finished"), "{logs}");
-        assert!(logs.contains("connection reset"), "{logs}");
+        assert!(logs.contains("storage maintenance sweep failed"), "{logs}");
+        assert_eq!(2, logs.matches("connection reset").count(), "{logs}");
         assert_eq!(0, overdue_now(&exporter, &provider));
     }
 
     #[test]
     fn a_finish_line_follows_only_an_overdue_line_that_was_written() {
+        let (failures, exporter, provider) = measured(SweepFailures::maintain, "memory");
+        let start = Instant::now();
+
+        // The first overdue sweep is reported, and the second is inside the overdue limit, so
+        // its line is held back.
+        failures.begin();
+        let logs = captured(|| {
+            failures.overdue(start);
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(20));
+        });
+        assert_eq!(1, logs.matches("has finished").count(), "{logs}");
+
+        failures.begin();
+        let logs = captured(|| failures.overdue(start + Duration::from_secs(60)));
+        assert!(logs.is_empty(), "{logs}");
+
+        // The held line leaves the gauge at 1, because the gauge does not follow the log limit.
+        assert_eq!(1, overdue_now(&exporter, &provider));
+
+        let logs = captured(|| {
+            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(80));
+        });
+
+        assert!(logs.is_empty(), "{logs}");
+        assert_eq!(0, overdue_now(&exporter, &provider));
+    }
+
+    #[test]
+    fn a_tick_after_the_sweep_recorded_its_outcome_does_not_report_it() {
+        let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
+        let start = Instant::now();
+
+        failures.begin();
+        failures.record(Ok::<(), &str>(()), start);
+
+        // The sweep's task has not ended yet, so the broker's tick still finds it unfinished.
+        let logs = captured(|| failures.overdue(start + Duration::from_secs(10)));
+
+        assert!(logs.is_empty(), "{logs}");
+        assert_eq!(0, overdue_now(&exporter, &provider));
+
+        // The next sweep is not reported as late either.
+        failures.begin();
+        let logs =
+            captured(|| failures.record(Ok::<(), &str>(()), start + Duration::from_secs(20)));
+
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    #[test]
+    fn a_sweep_that_hangs_right_after_a_failure_is_reported() {
+        let failures = SweepFailures::maintain_transactions("postgres");
+        let start = Instant::now();
+
+        let logs = captured(|| {
+            failures.record(Err("pool timed out"), start);
+            failures.begin();
+            failures.overdue(start + Duration::from_secs(20));
+        });
+
+        let lines: Vec<_> = logs.lines().collect();
+        assert_eq!(2, lines.len(), "{logs}");
+        assert!(
+            lines[0].contains("storage maintenance sweep failed"),
+            "{logs}"
+        );
+        assert!(lines[1].contains("still running"), "{logs}");
+    }
+
+    #[test]
+    fn a_slow_sweep_that_recovered_still_logs_its_recovery() {
+        let failures = SweepFailures::maintain("postgres");
+        let start = Instant::now();
+
+        _ = captured(|| failures.record(Err("boom"), start));
+
+        // The sweep runs a little over its interval, so each tick that finds it running is an
+        // overdue tick. The overdue line at 300 seconds must not use up the recovery's limit.
+        failures.begin();
+
+        let logs = captured(|| {
+            failures.overdue(start + REPEAT_INTERVAL);
+            failures.record(
+                Ok::<(), &str>(()),
+                start + REPEAT_INTERVAL + Duration::from_secs(5),
+            );
+        });
+
+        assert!(logs.contains("succeeded again"), "{logs}");
+        assert!(logs.contains("has finished"), "{logs}");
+    }
+
+    #[test]
+    fn overdue_lines_are_limited_to_one_per_interval_whatever_else_is_logged() {
         let failures = SweepFailures::maintain("memory");
         let start = Instant::now();
 
-        // The failure line uses the interval, so the overdue line is held back.
+        failures.begin();
+
         let logs = captured(|| {
-            failures.record(Err("boom"), start);
-            failures.overdue(start + Duration::from_secs(10));
-            failures.record(Ok::<(), &str>(()), start + Duration::from_secs(20));
+            failures.overdue(start);
+            failures.record(Err("boom"), start + Duration::from_secs(10));
+            failures.begin();
+            failures.overdue(start + Duration::from_secs(20));
         });
 
-        assert!(!logs.contains("has finished"), "{logs}");
+        // The overdue line at 0, the finish line and the failure line at 10 seconds, and nothing
+        // for the overdue tick at 20 seconds, which is inside the overdue limit.
+        assert_eq!(3, logs.lines().count(), "{logs}");
+        assert_eq!(1, logs.matches("still running").count(), "{logs}");
+    }
+
+    #[test]
+    fn a_sweep_that_never_finishes_takes_back_its_report_when_the_broker_is_dropped() {
+        let (failures, exporter, provider) = measured(SweepFailures::maintain, "sqlite");
+
+        failures.begin();
+        _ = captured(|| failures.overdue(Instant::now()));
+        assert_eq!(1, overdue_now(&exporter, &provider));
+
+        drop(failures);
+
+        assert_eq!(0, overdue_now(&exporter, &provider));
     }
 }
