@@ -4319,8 +4319,6 @@ mod tests {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
-    use nisshi_storage::SemaphoreProxy;
-
     use super::*;
 
     #[test]
@@ -5227,24 +5225,48 @@ mod tests {
         Ok(())
     }
 
-    /// Calls that write at the same time through the proxy that the factory puts in front
-    /// of the engine all succeed. A call that finds another call's write lock held waits
-    /// for the proxy's permit and does not fail with `Busy`. The engine alone fails them.
-    ///
-    /// `#[ignore]`d like every other engine-level test here: turso/limbo
-    /// cannot yet run the full produce flow in CI. Run manually against
-    /// turso with `cargo nextest run --features turso -- --ignored`.
-    #[ignore]
+    /// The storage that the factory builds runs one write at a time, so calls that write at
+    /// the same time, as the DeleteRecords service makes one call for each partition, all
+    /// succeed. Turso fails a write that finds another connection's write lock held with
+    /// `Busy`, so this fails if the factory does not put a proxy in front of the engine. It
+    /// runs in CI: a database file in a temporary directory needs no service.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_delete_records_calls_wait_for_the_write_lock() -> Result<()> {
+    async fn factory_storage_runs_concurrent_delete_records_calls_one_at_a_time() -> Result<()> {
         use std::sync::Arc as Shared;
 
         use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+        use nisshi_storage::{StorageFactory as _, StorageFactoryConfiguration};
         use tokio::{sync::Barrier, task::JoinSet};
+        use tokio_util::sync::CancellationToken;
 
         let _guard = init_tracing()?;
         let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = SemaphoreProxy::new(registered_engine(&temp_dir).await?);
+
+        let node = 12321;
+        let cluster = "nisshi";
+
+        let engine = factory::LimboFactory
+            .build(StorageFactoryConfiguration {
+                node_id: node,
+                cluster: cluster.to_owned(),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: storage_url(&temp_dir)?,
+                schema_registry: None,
+                lake_house: None,
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        assert_eq!(1, engine.delete_records_concurrency().per_request());
 
         let partitions = 4;
 

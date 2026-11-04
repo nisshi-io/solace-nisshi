@@ -1182,6 +1182,7 @@ mod tests {
     /// the deadline of 5s. With no permit limit, all four calls start at 0s.
     #[tokio::test(start_paused = true)]
     async fn call_waiting_for_an_engine_permit_at_the_deadline_is_not_started() -> Result<()> {
+        let permits = Arc::new(Semaphore::new(1));
         let partitions = (0..4).collect::<Vec<_>>();
         let stub = Stub::new(
             &partitions
@@ -1192,12 +1193,15 @@ mod tests {
         .with_delay(Duration::from_secs(3))
         .with_concurrency(DeleteRecordsConcurrency::shared(
             DELETE_RECORDS_CONCURRENCY,
-            Arc::new(Semaphore::new(1)),
+            Arc::clone(&permits),
         ));
 
         let started_at = tokio::time::Instant::now();
 
         let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
+
+        // the two calls that gave up their wait took no permit with them
+        assert_eq!(1, permits.available_permits());
 
         assert_eq!(
             vec![
