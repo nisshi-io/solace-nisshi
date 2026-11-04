@@ -5231,6 +5231,81 @@ mod tests {
         Ok(())
     }
 
+    /// Calls that write at the same time, as the DeleteRecords service makes one call for
+    /// each partition of a request, all succeed. Without the connection's busy timeout, a
+    /// call that finds another call's write lock held fails with `Busy`.
+    ///
+    /// `#[ignore]`d like every other engine-level test here: turso/limbo
+    /// cannot yet run the full produce flow in CI. Run manually against
+    /// turso with `cargo nextest run --features turso -- --ignored`.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_delete_records_calls_wait_for_the_write_lock() -> Result<()> {
+        use std::sync::Arc as Shared;
+
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+        use tokio::{sync::Barrier, task::JoinSet};
+
+        let _guard = init_tracing()?;
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = registered_engine(&temp_dir).await?;
+
+        let partitions = 4;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(partitions)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // A call holds the write lock for a short time, so one round of calls can miss
+        // each other. Many rounds, each started together, make them meet.
+        for _ in 0..50 {
+            let start = Shared::new(Barrier::new(usize::try_from(partitions)?));
+            let mut calls = JoinSet::new();
+
+            for partition in 0..partitions {
+                let engine = engine.clone();
+                let start = Shared::clone(&start);
+
+                _ = calls.spawn(async move {
+                    _ = start.wait().await;
+
+                    engine
+                        .delete_records(&[DeleteRecordsTopic::default()
+                            .name("t".into())
+                            .partitions(Some(vec![
+                                DeleteRecordsPartition::default()
+                                    .partition_index(partition)
+                                    .offset(-1),
+                            ]))])
+                        .await
+                });
+            }
+
+            while let Some(call) = calls.join_next().await {
+                let topics = call??;
+
+                assert_eq!(
+                    vec![ErrorCode::None],
+                    topics
+                        .iter()
+                        .flat_map(|topic| topic.partitions.iter().flatten())
+                        .map(|partition| ErrorCode::try_from(partition.error_code))
+                        .collect::<Result<Vec<_>, _>>()?
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns the URL of `nisshi.db` in `temp_dir`. `build()` opens the URL path relative to
     /// the current directory, so `temp_dir` must be in it.
     fn storage_url(temp_dir: &TempDir) -> Result<Url> {

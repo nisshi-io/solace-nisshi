@@ -299,6 +299,9 @@ mod tests {
         answers: BTreeMap<(String, i32), Answer>,
         calls: Arc<Mutex<Vec<Call>>>,
         delay: Duration,
+        /// The delay of a partition's call, for a partition that does not
+        /// take `delay`.
+        partition_delays: BTreeMap<(String, i32), Duration>,
         /// Calls in storage now, the most at once, and those that ran to
         /// their end.
         running: Arc<AtomicUsize>,
@@ -315,6 +318,7 @@ mod tests {
                     .collect(),
                 calls: Arc::default(),
                 delay: Duration::ZERO,
+                partition_delays: BTreeMap::new(),
                 running: Arc::default(),
                 most_running: Arc::default(),
                 completed: Arc::default(),
@@ -325,6 +329,39 @@ mod tests {
         /// to answer, as a degraded engine does.
         fn with_delay(self, delay: Duration) -> Self {
             Self { delay, ..self }
+        }
+
+        /// Returns a stub whose call for each listed partition takes its
+        /// own delay, so that calls that start together end in an order of
+        /// the test's choosing.
+        fn with_partition_delays(self, delays: &[(&str, i32, Duration)]) -> Self {
+            Self {
+                partition_delays: delays
+                    .iter()
+                    .map(|(topic, partition, delay)| (((*topic).to_owned(), *partition), *delay))
+                    .collect(),
+                ..self
+            }
+        }
+
+        /// Returns how long the call for `topics` takes: the delay of its
+        /// first partition when it has its own, and `delay` otherwise.
+        fn delay_of(&self, topics: &[DeleteRecordsTopic]) -> Duration {
+            topics
+                .first()
+                .and_then(|topic| {
+                    topic
+                        .partitions
+                        .iter()
+                        .flatten()
+                        .next()
+                        .and_then(|partition| {
+                            self.partition_delays
+                                .get(&(topic.name.clone(), partition.partition_index))
+                        })
+                })
+                .copied()
+                .unwrap_or(self.delay)
         }
 
         /// The topics and partitions of each `delete_records` call.
@@ -434,7 +471,7 @@ mod tests {
 
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             _ = self.most_running.fetch_max(running, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            tokio::time::sleep(self.delay_of(topics)).await;
             _ = self.running.fetch_sub(1, Ordering::SeqCst);
             _ = self.completed.fetch_add(1, Ordering::SeqCst);
 
@@ -787,7 +824,6 @@ mod tests {
 
         let started_at = tokio::time::Instant::now();
 
-        // in the order of the request, whatever order the calls end in
         assert_eq!(
             vec![(
                 String::from("a"),
@@ -803,6 +839,49 @@ mod tests {
 
         assert_eq!(Duration::from_secs(4), started_at.elapsed());
         assert_eq!(8, stub.calls().len());
+
+        Ok(())
+    }
+
+    /// The response lists the topics and partitions in the order of the
+    /// request, and each partition answers its own cut, whatever order the
+    /// calls end in.
+    ///
+    /// The four calls start together and end in the reverse of the request
+    /// order within each topic, and the second topic's first call ends before
+    /// the first topic's.
+    #[tokio::test(start_paused = true)]
+    async fn response_keeps_the_request_order_when_calls_end_out_of_order() -> Result<()> {
+        let stub = Stub::new(&[
+            ("a", 0, Answer::Cut(10)),
+            ("a", 1, Answer::Cut(11)),
+            ("b", 0, Answer::Cut(20)),
+            ("b", 1, Answer::Cut(21)),
+        ])
+        .with_partition_delays(&[
+            ("a", 0, Duration::from_secs(4)),
+            ("a", 1, Duration::from_secs(1)),
+            ("b", 0, Duration::from_secs(3)),
+            ("b", 1, Duration::from_secs(2)),
+        ]);
+
+        assert_eq!(
+            vec![
+                (
+                    String::from("a"),
+                    Some(vec![(0, ErrorCode::None, 10), (1, ErrorCode::None, 11)])
+                ),
+                (
+                    String::from("b"),
+                    Some(vec![(0, ErrorCode::None, 20), (1, ErrorCode::None, 21)])
+                ),
+            ],
+            delete_records(
+                &stub,
+                vec![topic("a", Some(&[0, 1])), topic("b", Some(&[0, 1]))]
+            )
+            .await?
+        );
 
         Ok(())
     }
