@@ -22,8 +22,24 @@
 // failure, so the crate may call `expect`.
 #![allow(clippy::expect_used)]
 
-use nisshi_sans_io::{ApiKey, Error, Frame, Header, MetadataRequest, Request, Response};
+use nisshi_sans_io::{ApiKey, Body, Error, Frame, Header, MetadataRequest, Request, Response};
 use nisshi_service::routable_range;
+
+/// `len` bytes of a xorshift64 stream: the same bytes on every run for a `seed`, so that a test
+/// that builds arbitrary values from them fails the same way each time.
+#[must_use]
+pub fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[0]
+        })
+        .collect()
+}
 
 /// Maps a fuzzed `selector` onto one of the versions of `T`'s API that a client can reach, so that
 /// every target reaches every version, not only the latest.
@@ -129,6 +145,37 @@ where
     })
 }
 
+/// The request that a client could send as `body` at `api_version`: `body` encoded and decoded
+/// again, for a caller that serves requests and so needs one that has an encoding at that version.
+///
+/// A fuzzed request is an arbitrary in-memory value, so it may leave a field unset that is
+/// mandatory at `api_version` and nullable only at a later one. No client could send that at this
+/// version, and the encoder refuses it with [`Error::MandatoryFieldUnset`], so the answer is
+/// `None`, whatever the field. [`check_request`] is stricter, and names the fields that it allows.
+pub fn request_at_version(
+    body: Body,
+    api_key: i16,
+    api_version: i16,
+) -> Result<Option<Body>, Error> {
+    let header = Header::Request {
+        api_key,
+        api_version,
+        correlation_id: 0,
+        client_id: Some("fuzzer".into()),
+    };
+
+    match Frame::request(header, body) {
+        Err(Error::MandatoryFieldUnset { .. }) => Ok(None),
+        encoded => {
+            let encoded = encoded.map_err(|error| at_version(error, api_key, api_version))?;
+
+            Frame::request_from_bytes(encoded)
+                .map(|frame| Some(frame.body))
+                .map_err(|error| at_version(error, api_key, api_version))
+        }
+    }
+}
+
 /// The response counterpart of [`check_request`], with one difference: a response comes out of a
 /// service, not out of a fuzzer, so [`Error::MandatoryFieldUnset`] is an error here. It is a
 /// service that answers a client at `api_version` with a field that version requires left unset.
@@ -136,26 +183,30 @@ pub fn check_response<T>(response: T, api_version: i16) -> Result<(), Error>
 where
     T: Response,
 {
+    check_response_body(response.into(), T::KEY, api_version)
+}
+
+/// [`check_response`] for a response that a caller holds as a [`Body`], as it comes out of a
+/// route: `api_key` is the API of the request that it answers.
+pub fn check_response_body(body: Body, api_key: i16, api_version: i16) -> Result<(), Error> {
     let encode = |body| {
         Frame::response(
             Header::Response { correlation_id: 0 },
             body,
-            T::KEY,
+            api_key,
             api_version,
         )
     };
 
-    let once = encode(response.into()).map_err(|error| at_version(error, T::KEY, api_version))?;
-    let body = Frame::response_from_bytes(once.clone(), T::KEY, api_version)
-        .map_err(|error| at_version(error, T::KEY, api_version))?
+    let once = encode(body).map_err(|error| at_version(error, api_key, api_version))?;
+    let body = Frame::response_from_bytes(once.clone(), api_key, api_version)
+        .map_err(|error| at_version(error, api_key, api_version))?
         .body;
-    let twice = encode(body).map_err(|error| at_version(error, T::KEY, api_version))?;
+    let twice = encode(body).map_err(|error| at_version(error, api_key, api_version))?;
 
     assert_eq!(
-        once,
-        twice,
-        "api key {} v{api_version}: re-encoding the decoded response changed its bytes",
-        T::KEY,
+        once, twice,
+        "api key {api_key} v{api_version}: re-encoding the decoded response changed its bytes",
     );
 
     Ok(())

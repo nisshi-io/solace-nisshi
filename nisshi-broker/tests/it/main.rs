@@ -89,6 +89,7 @@ pub mod produce_post_write_advance_failed;
 pub mod produce_row_locks;
 pub mod rebalance_timing;
 pub mod replication_factor;
+pub mod response_encoding;
 pub mod retention_bytes;
 pub mod retention_ms;
 #[cfg(feature = "libsql")]

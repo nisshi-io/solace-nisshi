@@ -25,7 +25,7 @@ use std::{
 };
 
 use arbitrary::{Arbitrary, Unstructured};
-use nisshi_fuzz_harness::{api_version, check_request, check_response};
+use nisshi_fuzz_harness::{api_version, check_request, check_response, pseudo_random_bytes};
 use nisshi_sans_io::{
     AddPartitionsToTxnRequest, AlterUserScramCredentialsRequest, ApiKey,
     ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest,
@@ -41,20 +41,6 @@ use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, Topi
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use url::Url;
-
-/// A xorshift64 stream: the same bytes on every run, so a failure reproduces.
-fn bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[0]
-        })
-        .collect()
-}
 
 /// Checks `T` at every version a client can reach, with `inputs` arbitrary requests each.
 ///
@@ -85,7 +71,7 @@ where
             let mut compared = Vec::new();
 
             for seed in 0..inputs {
-                let data = bytes(seed, 4096);
+                let data = pseudo_random_bytes(seed, 4096);
 
                 let Ok(request) = T::arbitrary(&mut Unstructured::new(&data)) else {
                     continue;
