@@ -19,8 +19,8 @@ use std::{
 
 use async_trait::async_trait;
 use nisshi_storage::{
-    ArcDynStorage, Result, StorageCapabilities, StorageFactory, StorageFactoryConfiguration,
-    reject_unrecognized_options,
+    ArcDynStorage, Result, SemaphoreProxy, StorageCapabilities, StorageFactory,
+    StorageFactoryConfiguration, reject_unrecognized_options,
 };
 use regex::Regex;
 
@@ -62,6 +62,10 @@ impl StorageFactory for LimboFactory {
             .lake(configuration.lake_house)
             .build()
             .await
+            // A Turso connection has no busy handler, and one that finds the
+            // write lock held fails at once with `Busy`. The proxy lets one
+            // call at a time reach the engine, as it does for libSQL.
+            .map(SemaphoreProxy::new)
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)
     }

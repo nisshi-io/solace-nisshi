@@ -65,12 +65,13 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    DeleteRecordsConcurrency, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -93,9 +94,6 @@ macro_rules! include_sql {
         remove_comments(include_str!($e))
     };
 }
-
-/// How long a Turso connection waits for another connection's write lock.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
@@ -275,20 +273,8 @@ impl Engine {
     }
 
     async fn connection(&self) -> Result<Connection> {
-        let connection = {
-            let db = self.db.lock()?;
-            db.connect()?
-        };
-
-        // A connection has no busy handler until one is set, and a second
-        // writer then fails at once with `Busy` instead of waiting for the
-        // first. The DeleteRecords service runs one call per partition at the
-        // same time, each with its own write transaction, and the same
-        // happens to concurrent writes of different requests. The value is
-        // libSQL's default.
-        connection.busy_timeout(BUSY_TIMEOUT)?;
-
-        Ok(connection)
+        let db = self.db.lock()?;
+        db.connect().map_err(Into::into)
     }
 
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
@@ -1413,6 +1399,14 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
 
 #[async_trait]
 impl Storage for Engine {
+    /// A Turso connection has no busy handler, so a write that finds another
+    /// connection's write lock held fails at once with `Busy`. The factory puts a
+    /// `nisshi_storage::SemaphoreProxy` in front of the engine, which runs one write at a time,
+    /// so a second call at once gains nothing.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(?broker_registration);
 
@@ -4325,6 +4319,8 @@ mod tests {
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
+    use nisshi_storage::SemaphoreProxy;
+
     use super::*;
 
     #[test]
@@ -5231,9 +5227,9 @@ mod tests {
         Ok(())
     }
 
-    /// Calls that write at the same time, as the DeleteRecords service makes one call for
-    /// each partition of a request, all succeed. Without the connection's busy timeout, a
-    /// call that finds another call's write lock held fails with `Busy`.
+    /// Calls that write at the same time through the proxy that the factory puts in front
+    /// of the engine all succeed. A call that finds another call's write lock held waits
+    /// for the proxy's permit and does not fail with `Busy`. The engine alone fails them.
     ///
     /// `#[ignore]`d like every other engine-level test here: turso/limbo
     /// cannot yet run the full produce flow in CI. Run manually against
@@ -5248,7 +5244,7 @@ mod tests {
 
         let _guard = init_tracing()?;
         let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = registered_engine(&temp_dir).await?;
+        let engine = SemaphoreProxy::new(registered_engine(&temp_dir).await?);
 
         let partitions = 4;
 
