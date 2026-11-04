@@ -346,6 +346,37 @@ mod tests {
         is_sync::<AuthenticationExtension>();
     }
 
+    /// Returns an extension whose stage is `stage`, on a configuration that no
+    /// test exchange uses.
+    fn extension_at(stage: Stage) -> AuthenticationExtension {
+        let config = SASLConfig::with_credentials(None, "unused".into(), "unused".into())
+            .expect("a client configuration with credentials is valid");
+        let extension = AuthenticationExtension::server(config);
+        *extension
+            .stage
+            .lock()
+            .expect("no other thread holds the lock") = Some(stage);
+        extension
+    }
+
+    /// A connection has a principal only after it authenticated.
+    #[test]
+    fn principal_is_none_until_authentication_succeeds() {
+        let config = SASLConfig::with_credentials(None, "unused".into(), "unused".into())
+            .expect("a client configuration with credentials is valid");
+
+        // Before any exchange, and after one that finished without a success, as SCRAM
+        // does for a bad proof.
+        assert_eq!(None, AuthenticationExtension::server(config).principal());
+        assert_eq!(None, extension_at(Stage::Finished(None)).principal());
+
+        let authenticated = extension_at(Stage::Finished(Some(Success {
+            auth_id: "alice".to_owned(),
+        })));
+        assert_eq!(Some("alice".to_owned()), authenticated.principal());
+        assert!(authenticated.is_authenticated());
+    }
+
     /// The broker enables exactly the SCRAM mechanisms that it can look up a
     /// credential for.
     #[test]

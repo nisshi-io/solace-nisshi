@@ -6515,6 +6515,28 @@ mod tests {
         Ok(())
     }
 
+    /// `client_read_share` in the storage URL reaches the storage's client
+    /// shares. Without the option, a client holds 6 of 8 Fetch reads and 4 of 8
+    /// ListOffsets reads.
+    #[test]
+    fn client_read_share_sets_the_client_shares_of_the_storage() -> Result<()> {
+        for (percent, fetch, list_offsets) in [(50, 4, 4), (100, 8, 8)] {
+            let storage =
+                Postgres::builder(&format!("{}?client_read_share={percent}", *CONNECTION))?
+                    .cluster("shared")
+                    .node(0)
+                    .build();
+
+            assert_eq!(fetch, storage.fetch_reads_per_client, "{percent}%");
+            assert_eq!(
+                list_offsets, storage.list_offsets_reads_per_client,
+                "{percent}%"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Each connection's share of each kind of read is at least one read and
     /// at most the engine's limit, whatever `pool_max_size` is. A pool too
     /// small for the usual share gives each connection the whole limit, and
@@ -7186,6 +7208,84 @@ mod tests {
         )
         .await
         .map_err(|_| Error::Message("the connection's share did not come back".into()))??;
+
+        Ok(())
+    }
+
+    /// A client's abandoned Fetch reads keep their permits from its client
+    /// share, as well as from `ReadLimits::fetch`, until their statements end,
+    /// so a new connection of the same client waits meanwhile, and another
+    /// client's read goes ahead. This is the reconnect that the client share
+    /// exists for.
+    #[tokio::test]
+    async fn abandoned_fetch_reads_count_against_their_client() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!("skipping abandoned_fetch_reads_count_against_their_client: {err:?}");
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let marker = alphanumeric_string(15);
+        let client = ClientIdentity::new(Some("alice"), Some("reconnecting"));
+        let share = ReadLimits::default().fetch_per_client();
+
+        // Each read comes from a new connection, so that no connection's share
+        // is used up, only the client's.
+        for _ in 0..share {
+            let permits = client
+                .clone()
+                .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+
+        assert_eq!(
+            i64::try_from(share)?,
+            backends_running(&monitor, &marker).await?
+        );
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                client
+                    .clone()
+                    .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+            )
+            .await
+            .is_err(),
+            "the client read beyond its share while its abandoned reads ran"
+        );
+
+        let other_client = timeout(
+            Duration::from_millis(200),
+            ClientIdentity::new(Some("bob"), Some("polite"))
+                .scope(FetchReadShare::default().scope(storage.fetch_read_permits())),
+        )
+        .await
+        .map_err(|_| Error::Message("another client's read waited".into()))??;
+        drop(other_client);
+
+        assert_eq!(share, cancel_backends(&monitor, &marker).await?);
+
+        wait_until(&storage, |storage| {
+            storage.fetch_reads.available_permits() == ReadLimits::default().fetch
+        })
+        .await;
+
+        _ = timeout(
+            Duration::from_secs(1),
+            client.scope(FetchReadShare::default().scope(storage.fetch_read_permits())),
+        )
+        .await
+        .map_err(|_| Error::Message("the client's share did not come back".into()))??;
 
         Ok(())
     }

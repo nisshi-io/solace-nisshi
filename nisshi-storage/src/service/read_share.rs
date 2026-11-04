@@ -87,12 +87,18 @@
 //! connections of every client behind one NAT or proxy.
 //!
 //! `client_id` is chosen by the client and is not authenticated, in Kafka
-//! as here, so with authentication off a client that changes its `client_id`
-//! for each connection avoids its share, as it avoided the connection share by
-//! opening more connections. With authentication on, the principal is part of
-//! the key. Clients that share a default `client_id`, such as librdkafka's
-//! `rdkafka`, share one client share when authentication is off, so the share
-//! is sized to leave a full connection's share to a newcomer and no more.
+//! as here. The key is the principal and the `client_id` together, so a client
+//! that changes its `client_id` for each connection avoids its share, with or
+//! without authentication, as it avoided the connection share by opening more
+//! connections. A user that logs in does not get a share over all its
+//! `client_id`s. The share protects other clients from one that abandons
+//! reads, and does not stop a user that changes its `client_id` on purpose.
+//! Clients that send the same `client_id` and the same principal, or no
+//! principal, share one client share. That includes every instance of
+//! librdkafka's default `rdkafka`, and every replica of a Java consumer group
+//! without a `client.id`, which sends `consumer-<group.id>-<n>` with `n`
+//! counting from 1 in each JVM. The share is sized to leave a full
+//! connection's share to a newcomer and no more.
 //!
 //! The registry holds one entry for each client that has a read in flight or
 //! an abandoned read, and at most its sweep threshold of idle entries. A
@@ -166,6 +172,25 @@ impl ClientIdentity {
             principal: principal.map(bounded),
             client_id: client_id.map(bounded),
         }
+    }
+
+    /// Returns the identity of the request that the task is answering, or
+    /// `None` outside a [`ClientIdentity::scope`].
+    pub fn current() -> Option<Self> {
+        IDENTITY.try_with(Clone::clone).ok()
+    }
+
+    /// Returns the request's `client_id`, cut to [`ClientIdentity::MAX_LEN`] bytes.
+    ///
+    /// Log it, and do not use it as a metric label: a client chooses it, so
+    /// its values have no bound.
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    /// Returns the authenticated principal, cut to [`ClientIdentity::MAX_LEN`] bytes.
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
     }
 
     /// Runs `reads` with this as the identity that
@@ -595,20 +620,42 @@ mod tests {
         Ok(())
     }
 
+    /// A task sees the identity of the request it answers, so that a log line
+    /// can name the client at its share.
+    #[tokio::test]
+    async fn current_identity_is_the_one_in_scope() {
+        assert_eq!(None, ClientIdentity::current());
+
+        let identity = ClientIdentity::new(Some("alice"), Some("reporting"));
+        let seen = identity
+            .clone()
+            .scope(async { ClientIdentity::current() })
+            .await;
+
+        assert_eq!(Some(identity), seen);
+        assert_eq!(
+            (Some("reporting"), Some("alice")),
+            seen.as_ref()
+                .map(|seen| (seen.client_id(), seen.principal()))
+                .unwrap_or_default()
+        );
+    }
+
     #[test]
     fn a_long_client_id_is_cut_on_a_character_boundary() {
-        let long = "é".repeat(ClientIdentity::MAX_LEN);
+        // The prefix puts each "é" at an odd byte, so byte `MAX_LEN` is inside a
+        // character, and the cut has to fall back to the byte before it.
+        let long = format!("a{}", "é".repeat(ClientIdentity::MAX_LEN));
         let identity = ClientIdentity::new(Some(&long), Some(&long));
 
-        assert!(
-            identity
-                .client_id
-                .is_some_and(|id| id.len() <= ClientIdentity::MAX_LEN)
+        assert_eq!(
+            Some(ClientIdentity::MAX_LEN - 1),
+            identity.client_id().map(str::len)
         );
-        assert!(
-            identity
-                .principal
-                .is_some_and(|id| id.len() <= ClientIdentity::MAX_LEN)
+        assert_eq!(
+            Some(ClientIdentity::MAX_LEN - 1),
+            identity.principal().map(str::len)
         );
+        assert!(long.starts_with(identity.client_id().unwrap_or_default()));
     }
 }

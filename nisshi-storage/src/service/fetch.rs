@@ -29,8 +29,8 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
     service::{
-        read_deadline::{Missed, ReadDeadline},
-        read_share::FetchReadShare,
+        read_deadline::{Missed, ReadDeadline, ReadWait},
+        read_share::{ClientIdentity, FetchReadShare},
     },
 };
 use validation::ValidatedFetchRequest;
@@ -116,6 +116,23 @@ fn missed(
                 stage,
                 elapsed = ?started_at.elapsed(),
                 "fetch read not started"
+            )
+        }
+        // A client share names the client in the log, not in the metric, because a client
+        // chooses its `client_id`. It tells a client that abandons reads from a consumer group
+        // whose instances share one `client_id`, and those need different fixes.
+        Missed::Queued(ReadWait::ClientReadLimit) => {
+            let client = ClientIdentity::current();
+            warn!(
+                ?tp,
+                %operation,
+                offset,
+                stage,
+                wait,
+                elapsed = ?started_at.elapsed(),
+                client_id = ?client.as_ref().and_then(ClientIdentity::client_id),
+                principal = ?client.as_ref().and_then(ClientIdentity::principal),
+                "fetch read deadline exceeded"
             )
         }
         Missed::Queued(_) | Missed::Reading => {
@@ -1158,9 +1175,10 @@ mod tests {
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
         ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version, read_share::FetchReadShare,
+        Version,
+        read_share::{ClientIdentity, FetchReadShare},
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -2609,6 +2627,67 @@ mod tests {
                 .collect(),
             elapsed,
         ))
+    }
+
+    /// The log lines written at `warn` or above.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns what `missed` logs at `warn` or above for a read of a request from `identity`.
+    async fn warning_for(identity: ClientIdentity, stage: Missed) -> String {
+        let log = WarnLog::default();
+        let writer = log.clone();
+
+        identity
+            .scope(async {
+                tracing::subscriber::with_default(
+                    tracing_subscriber::fmt()
+                        .with_max_level(tracing::Level::WARN)
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone())
+                        .finish(),
+                    || {
+                        super::missed(
+                            &Topition::new("orders", 0),
+                            StorageOperation::Fetch,
+                            0,
+                            stage,
+                            Instant::now(),
+                        );
+                    },
+                );
+            })
+            .await;
+
+        String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8")
+    }
+
+    /// A read that missed its deadline waiting for its client's share names the client in the
+    /// log, and not in the metric, so that an operator can tell a client that abandons reads from
+    /// a consumer group that shares one `client_id`. A miss at another stage does not blame the
+    /// client.
+    #[tokio::test]
+    async fn a_miss_at_the_client_share_names_the_client() {
+        let identity = ClientIdentity::new(Some("alice"), Some("reporting"));
+
+        let log = warning_for(identity.clone(), Missed::QueuedForClientShare).await;
+        assert!(log.contains("reporting"), "{log:?}");
+        assert!(log.contains("alice"), "{log:?}");
+
+        let log = warning_for(identity, Missed::QueuedForConnectionShare).await;
+        assert!(!log.contains("reporting"), "{log:?}");
+        assert!(log.contains("fetch read deadline exceeded"), "{log:?}");
     }
 
     /// A Fetch's reads take their permits from the read share of the request's connection. A

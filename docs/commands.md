@@ -314,13 +314,16 @@ client behind the proxy, because the proxy takes an origin connection from its
 pool for each request. The proxy does not forward SASL, so the broker sees no
 user, and proxied clients are told apart by `client_id` alone. Clients that
 share a `client_id` share one limit, and a client that changes its `client_id`
-is not limited.
+gets a limit of its own.
 
 Behind the proxy, a client at its limit sees reads that miss their deadline:
 Fetch responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
 partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
-`stage` set to `queued` and `wait` set to `client_read_limit`. A larger
-`pool_max_size` does not fix this, but a larger `client_read_share` can.
+`stage` set to `queued` and `wait` set to `client_read_limit`. When `wait` is
+`engine_read_limit`, a larger `pool_max_size` helps. When `wait` is
+`client_read_limit`, give each instance its own `client.id` or set a larger
+`client_read_share`. A larger `pool_max_size` raises the client share too, but it
+does not stop a client that keeps abandoning reads.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
