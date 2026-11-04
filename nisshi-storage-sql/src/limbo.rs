@@ -65,12 +65,13 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    DeleteRecordsConcurrency, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1398,6 +1399,14 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
 
 #[async_trait]
 impl Storage for Engine {
+    /// A Turso connection has no busy handler, so a write that finds another
+    /// connection's write lock held fails at once with `Busy`. The factory puts a
+    /// `nisshi_storage::SemaphoreProxy` in front of the engine, which runs one write at a time,
+    /// so a second call at once gains nothing.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(?broker_registration);
 
@@ -5212,6 +5221,105 @@ mod tests {
             ErrorCode::try_from(known_partitions[0].error_code)?
         );
         assert_eq!(1, known_partitions[0].low_watermark);
+
+        Ok(())
+    }
+
+    /// The storage that the factory builds runs one write at a time, so calls that write at
+    /// the same time, as the DeleteRecords service makes one call for each partition, all
+    /// succeed. Turso fails a write that finds another connection's write lock held with
+    /// `Busy`, so this fails if the factory does not put a proxy in front of the engine. It
+    /// runs in CI: a database file in a temporary directory needs no service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn factory_storage_runs_concurrent_delete_records_calls_one_at_a_time() -> Result<()> {
+        use std::sync::Arc as Shared;
+
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+        use nisshi_storage::{StorageFactory as _, StorageFactoryConfiguration};
+        use tokio::{sync::Barrier, task::JoinSet};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = init_tracing()?;
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+
+        let node = 12321;
+        let cluster = "nisshi";
+
+        let engine = factory::LimboFactory
+            .build(StorageFactoryConfiguration {
+                node_id: node,
+                cluster: cluster.to_owned(),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: storage_url(&temp_dir)?,
+                schema_registry: None,
+                lake_house: None,
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        assert_eq!(1, engine.delete_records_concurrency().per_request());
+
+        let partitions = 4;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(partitions)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // A call holds the write lock for a short time, so one round of calls can miss
+        // each other. Many rounds, each started together, make them meet.
+        for _ in 0..50 {
+            let start = Shared::new(Barrier::new(usize::try_from(partitions)?));
+            let mut calls = JoinSet::new();
+
+            for partition in 0..partitions {
+                let engine = engine.clone();
+                let start = Shared::clone(&start);
+
+                _ = calls.spawn(async move {
+                    _ = start.wait().await;
+
+                    engine
+                        .delete_records(&[DeleteRecordsTopic::default()
+                            .name("t".into())
+                            .partitions(Some(vec![
+                                DeleteRecordsPartition::default()
+                                    .partition_index(partition)
+                                    .offset(-1),
+                            ]))])
+                        .await
+                });
+            }
+
+            while let Some(call) = calls.join_next().await {
+                let topics = call??;
+
+                assert_eq!(
+                    vec![ErrorCode::None],
+                    topics
+                        .iter()
+                        .flat_map(|topic| topic.partitions.iter().flatten())
+                        .map(|partition| ErrorCode::try_from(partition.error_code))
+                        .collect::<Result<Vec<_>, _>>()?
+                );
+            }
+        }
 
         Ok(())
     }

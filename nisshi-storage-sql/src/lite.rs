@@ -62,12 +62,12 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
-    ProducerIdResponse, RequestChannelService, RequestStorageService, Result, ScramCredential,
-    SemaphoreProxy, StartupFailure, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, bounded_channel, check_claim,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService, RequestStorageService,
+    Result, ScramCredential, SemaphoreProxy, StartupFailure, Storage, StorageOperation,
+    StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
@@ -2012,6 +2012,10 @@ impl Storage for Engine {
             })
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.inner.delete_records_concurrency()
+    }
+
     #[instrument(skip_all)]
     async fn delete_records(
         &self,
@@ -2969,6 +2973,14 @@ impl Storage for Delegate {
                 &[StorageOperation::CreateTopic.attribute()],
             )
         })
+    }
+
+    /// SQLite has one writer. A call that finds the write lock held waits in the
+    /// connection's busy handler, after the service's deadline check, so a
+    /// second call at once gains nothing. This applies in direct mode too, where
+    /// no proxy or channel serialises the calls.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
     }
 
     async fn delete_records(

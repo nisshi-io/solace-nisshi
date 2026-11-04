@@ -369,6 +369,27 @@ impl Service<Request> for InFlightService {
     }
 }
 
+/// The supervisor loop serves one request at a time, so a client of the channel answers a
+/// serial DeleteRecords concurrency, without a request over the channel: the service asks
+/// before its deadline check, when a request could wait behind the others.
+#[tokio::test]
+async fn channel_client_answers_a_serial_delete_records_concurrency() -> Result<(), TestError> {
+    let _guard = init_tracing()?;
+
+    let (sender, receiver) = bounded_channel(1);
+
+    // nothing serves the channel, so a request over it would never answer
+    let client = RequestChannelService::new(sender);
+    let concurrency = client.delete_records_concurrency();
+
+    assert_eq!(1, concurrency.per_request());
+    assert!(concurrency.permits().is_none());
+
+    drop(receiver);
+
+    Ok(())
+}
+
 /// mpsc mode's single-writer discipline depends on the supervisor loop serving one
 /// request at a time. Concurrent requests through a channel with room for all of them
 /// must still never overlap inside storage.

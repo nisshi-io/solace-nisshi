@@ -48,11 +48,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, inflate_produced,
-    offload,
+    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version, inflate_produced, offload,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -523,6 +523,10 @@ where
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
         self.storage.delete_records(topics).await
+    }
+
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.storage.delete_records_concurrency()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {

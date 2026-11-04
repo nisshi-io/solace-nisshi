@@ -38,10 +38,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 #[derive(Clone, Debug)]
@@ -122,6 +123,10 @@ where
         self.introduce_latency().await?;
 
         self.storage.delete_records(topics).await
+    }
+
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.storage.delete_records_concurrency()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {

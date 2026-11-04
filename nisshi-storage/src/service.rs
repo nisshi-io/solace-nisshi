@@ -61,7 +61,9 @@ pub use create_topics::{
 };
 pub use delete_acls::DeleteAclsService;
 pub use delete_groups::DeleteGroupsService;
-pub use delete_records::DeleteRecordsService;
+pub use delete_records::{
+    DELETE_RECORDS_CONCURRENCY, DeleteRecordsConcurrency, DeleteRecordsService,
+};
 pub use delete_topics::DeleteTopicsService;
 pub use describe_acls::DescribeAclsService;
 pub use describe_cluster::DescribeClusterService;
@@ -583,6 +585,14 @@ impl Storage for RequestChannelService {
             Request::DeleteRecords(Vec::from(topics)),
             DeleteRecords
         )
+    }
+
+    /// The server of a channel serves one request after another, see
+    /// [`ChannelRequestService`], so a second call waits for the first.
+    /// This answers without a request over the channel, which a call could
+    /// not make before the deadline check.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
     }
 
     #[instrument(skip_all)]
