@@ -115,6 +115,7 @@ async fn produce(
     let response = ProduceService {
         storage: storage.clone(),
     }
+    .with_validation()
     .serve(RequestInput {
         request: ProduceRequest::default().acks(acks).topic_data(Some(
             [TopicProduceData::default()

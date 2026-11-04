@@ -103,6 +103,7 @@ async fn produce(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let response = ProduceService { storage }
+        .with_validation()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
                 TopicProduceData::default()

@@ -412,7 +412,8 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -663,7 +664,8 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency_reads_every_batch() -> Result<
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -811,7 +813,8 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency_reads_every_batch() -> Result<
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -955,7 +958,8 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -1096,7 +1100,8 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -1238,7 +1243,8 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),
@@ -1396,7 +1402,8 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() ->
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let fetch = FetchValidationLayer::new().layer(FetchService {
         storage: storage.clone(),

@@ -238,6 +238,7 @@ async fn produce(
         .and_then(deflated::Batch::try_from)?;
 
     let response = ProduceService { storage }
+        .with_validation()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(1).topic_data(Some(
                 [TopicProduceData::default()

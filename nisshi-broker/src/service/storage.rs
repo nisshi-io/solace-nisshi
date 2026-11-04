@@ -478,7 +478,7 @@ where
     builder
         .with_capped_route_layer::<ProduceRequest, _, _>(
             TransactionAbortableDowngradeLayer,
-            ProduceService { storage },
+            ProduceService { storage }.with_validation(),
         )
         .map_err(Into::into)
 }

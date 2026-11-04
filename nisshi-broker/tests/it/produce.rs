@@ -171,7 +171,8 @@ async fn non_txn_idempotent_unknown_producer_id(storage: impl Storage + Clone) -
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let response = produce
         .serve(RequestInput {
@@ -258,7 +259,8 @@ async fn non_txn_idempotent(storage: impl Storage + Clone) -> Result<()> {
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let producer = init_producer_id
         .serve(RequestInput {
@@ -461,7 +463,8 @@ async fn non_txn_idempotent_duplicate_sequence(
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let producer = init_producer_id
         .serve(RequestInput {
@@ -582,7 +585,8 @@ async fn non_txn_idempotent_sequence_out_of_order(storage: impl Storage + Clone)
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let topic = &alphanumeric_string(15)[..];
 
@@ -742,7 +746,8 @@ async fn list_offsets(storage: impl Storage + Clone) -> Result<()> {
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let name = &alphanumeric_string(15)[..];
 
@@ -1004,7 +1009,8 @@ async fn produce_rejects_last_offset_delta_mismatch(storage: impl Storage + Clon
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let list_offsets = ListOffsetsService {
         storage: storage.clone(),
@@ -1219,7 +1225,8 @@ async fn produce_rejects_control_batch(storage: impl Storage + Clone) -> Result<
 
     let produce = ProduceService {
         storage: storage.clone(),
-    };
+    }
+    .with_validation();
 
     let list_offsets = ListOffsetsService {
         storage: storage.clone(),
@@ -1453,7 +1460,11 @@ pub(crate) async fn produce_batches(
     index: i32,
     batches: Vec<deflated::Batch>,
 ) -> Result<PartitionProduceResponse> {
+    // A caller spawns this future. The compiler cannot prove that the three nested layer futures
+    // are `Send` for every lifetime, so the box ends the nesting.
     let response = ProduceService { storage }
+        .with_validation()
+        .boxed()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
                 TopicProduceData::default()

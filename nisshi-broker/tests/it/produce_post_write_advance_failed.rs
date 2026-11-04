@@ -277,6 +277,7 @@ async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
     let response = ProduceService {
         storage: storage.clone(),
     }
+    .with_validation()
     .serve(RequestInput {
         request: ProduceRequest::default().acks(1).topic_data(Some(
             [TopicProduceData::default()

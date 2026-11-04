@@ -82,7 +82,7 @@ fuzz_target!(|request: ProduceRequest| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = ProduceService { storage };
+        let service = ProduceService { storage }.with_validation();
 
         match service.serve(request).await {
             // The service returns this error so that the broker closes the connection of an

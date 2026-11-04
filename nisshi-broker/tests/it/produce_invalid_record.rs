@@ -130,6 +130,7 @@ async fn produce_records(
     let response = ProduceService {
         storage: storage.clone(),
     }
+    .with_validation()
     .serve(RequestInput {
         request: ProduceRequest::default()
             .acks(i16::from(Ack::Leader))

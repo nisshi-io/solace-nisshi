@@ -229,20 +229,22 @@ pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
-    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
-    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    AcksZeroLayer, AcksZeroService, AlterUserScramCredentialsService, AutoCreateRefusals,
+    ChannelRequestLayer, ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService,
+    CreateTopicsService, CreateTopicsValidationLayer, CreateTopicsValidationService,
+    DeleteAclsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
+    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService, Request,
     RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
     RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response,
+    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
+    ValidatedProduceRequest, bounded_channel, describe_groups_response, inflate_produced,
+    list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]

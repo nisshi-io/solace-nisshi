@@ -14,8 +14,14 @@
 
 use std::borrow::Cow;
 
-use nisshi_sans_io::{ErrorCode, produce_response::BatchIndexAndErrorMessage};
+use nisshi_sans_io::{
+    ErrorCode,
+    produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse},
+    record::deflated,
+};
+use tracing::warn;
 
+use super::response;
 use crate::Error;
 
 /// A batch that the broker rejects before it writes anything, with what the
@@ -34,6 +40,35 @@ impl Rejection {
             message: message.into(),
             record_error: None,
         }
+    }
+
+    /// Logs the rejection of `batch`, sent for `partition` of `topic`, once at warn.
+    pub(super) fn log(&self, topic: &str, partition: i32, batch: &deflated::Batch) {
+        warn!(
+            topic,
+            partition,
+            producer_id = batch.producer_id,
+            attributes = batch.attributes,
+            record_count = batch.record_count,
+            last_offset_delta = batch.last_offset_delta,
+            base_timestamp = batch.base_timestamp,
+            max_timestamp = batch.max_timestamp,
+            error_code = ?self.error_code,
+            reason = %self.message,
+            record_error = self
+                .record_error
+                .as_ref()
+                .and_then(|record_error| record_error.batch_index_error_message.as_deref()),
+            "rejecting produce batch",
+        );
+    }
+
+    /// Returns the response that tells the client why the batch for the partition at `index`
+    /// was rejected.
+    pub(super) fn into_response(self, index: i32) -> PartitionProduceResponse {
+        response::partition_error(index, self.error_code)
+            .error_message(Some(self.message.into_owned()))
+            .record_errors(Some(self.record_error.into_iter().collect()))
     }
 }
 

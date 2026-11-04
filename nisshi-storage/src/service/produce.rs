@@ -12,45 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod acks_zero;
 mod batch_validation;
 mod rejection;
+mod request_validation;
+mod response;
 mod timestamps;
 
-use std::{
-    sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nisshi_sans_io::{
-    Ack, ApiKey, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    SuppressResponseExtension, TimestampType,
-    produce_request::{PartitionProduceData, TopicProduceData},
+    ApiKey, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
-    record::{deflated, inflated},
+    record::inflated,
 };
-use opentelemetry::{KeyValue, metrics::Counter};
-use rama::Service;
+use rama::{Layer as _, Service};
 use tracing::{debug, error, instrument, warn};
 
+pub use self::{
+    acks_zero::{AcksZeroLayer, AcksZeroService},
+    request_validation::{
+        ProduceRequestValidationLayer, ProduceRequestValidationService, ValidatedProduceRequest,
+    },
+};
 use self::{
-    batch_validation::rejection,
-    rejection::{Rejection, storage_error_code},
+    rejection::storage_error_code,
+    request_validation::{ValidatedPartition, ValidatedTopic},
     timestamps::{NO_TIMESTAMP, validate_timestamps_offloaded},
 };
-use crate::{Error, METER, Result, Storage, Topition, message_timestamp_type};
-
-/// Counts the connections closed by a failed `acks=0` Produce, by the error
-/// code of the first failing partition.
-///
-/// The failed request does not reach the request and error counts, because
-/// it ends the connection before a response is encoded. A producer that
-/// keeps failing shows here as a reconnect loop.
-static ACKS_ZERO_PRODUCE_FAILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_produce_acks_zero_failed")
-        .with_description("Connections closed by a failed acks=0 Produce")
-        .build()
-});
+use crate::{Error, Result, Storage, Topition, message_timestamp_type};
 
 /// Inflate a batch that a client sent in a Produce request, mapping a
 /// decode failure to `INVALID_RECORD`.
@@ -103,30 +93,10 @@ where
     })
 }
 
-/// The first partition in `responses` carrying a non-[`ErrorCode::None`]
-/// error code, for the message an `acks=0` closed connection logs: the
-/// client gets no response at all, so an operator needs to know which
-/// partition actually failed.
-fn first_error(responses: &[TopicProduceResponse]) -> Option<(String, i32, ErrorCode)> {
-    responses.iter().find_map(|topic| {
-        topic
-            .partition_responses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|partition| partition.error_code != i16::from(ErrorCode::None))
-            .map(|partition| {
-                (
-                    topic.name.clone(),
-                    partition.index,
-                    ErrorCode::try_from(partition.error_code)
-                        .unwrap_or(ErrorCode::UnknownServerError),
-                )
-            })
-    })
-}
-
-/// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
+/// A [`Service`] using its [`Storage`] taking [`ValidatedProduceRequest`] returning
+/// [`ProduceResponse`].
+///
+/// Call [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
 /// ```no_run
 /// use bytes::Bytes;
 /// use rama::{Layer as _, Service as _};
@@ -181,7 +151,8 @@ fn first_error(responses: &[TopicProduceResponse]) -> Option<(String, i32, Error
 ///
 /// let produce = ProduceService {
 ///     storage: storage.clone(),
-/// };
+/// }
+/// .with_validation();
 ///
 /// let partition = 0;
 ///
@@ -239,60 +210,13 @@ impl<G> ProduceService<G>
 where
     G: Storage,
 {
-    fn error(&self, index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
-        PartitionProduceResponse::default()
-            .index(index)
-            .error_code(error_code.into())
-            .base_offset(-1)
-            .log_append_time_ms(Some(-1))
-            .log_start_offset(Some(0))
-            .record_errors(Some([].into()))
-            .error_message(None)
-            .current_leader(None)
-    }
-
-    /// Returns the response for `topic` that answers each of its partitions with `error_code`.
-    fn topic_error(&self, topic: TopicProduceData, error_code: ErrorCode) -> TopicProduceResponse {
-        let partitions = topic
-            .partition_data
-            .unwrap_or_default()
-            .iter()
-            .map(|partition| self.error(partition.index, error_code))
-            .collect();
-
-        TopicProduceResponse::default()
-            .name(topic.name)
-            .partition_responses(Some(partitions))
-    }
-
-    fn reject(
-        &self,
-        name: &str,
-        index: i32,
-        batch: &deflated::Batch,
-        rejection: Rejection,
-    ) -> PartitionProduceResponse {
-        warn!(
-            topic = name,
-            partition = index,
-            producer_id = batch.producer_id,
-            attributes = batch.attributes,
-            record_count = batch.record_count,
-            last_offset_delta = batch.last_offset_delta,
-            base_timestamp = batch.base_timestamp,
-            max_timestamp = batch.max_timestamp,
-            error_code = ?rejection.error_code,
-            reason = %rejection.message,
-            record_error = rejection
-                .record_error
-                .as_ref()
-                .and_then(|record_error| record_error.batch_index_error_message.as_deref()),
-            "rejecting produce batch",
-        );
-
-        self.error(index, rejection.error_code)
-            .error_message(Some(rejection.message.into_owned()))
-            .record_errors(Some(rejection.record_error.into_iter().collect()))
+    /// Returns this service behind the layers that give it a [`ValidatedProduceRequest`] and that
+    /// close the connection of a failed `acks=0` request: [`AcksZeroLayer`] around
+    /// [`ProduceRequestValidationLayer`].
+    pub fn with_validation(
+        self,
+    ) -> AcksZeroService<ProduceRequestValidationService<ProduceService<G>>> {
+        AcksZeroLayer::new().layer(ProduceRequestValidationLayer::new().layer(self))
     }
 
     #[instrument(skip_all)]
@@ -301,59 +225,31 @@ where
         transaction_id: Option<&str>,
         name: &str,
         timestamp_type: TimestampType,
-        partition: PartitionProduceData,
+        partition: ValidatedPartition,
     ) -> PartitionProduceResponse {
-        // The decoder turns a zero-length records field into `None`, so it
-        // counts as zero batches.
-        let batches = partition
-            .records
-            .map(|records| records.batches)
-            .unwrap_or_default();
+        let ValidatedPartition { index, batch } = partition;
 
-        // Kafka allows exactly one batch per partition from Produce v3, the
-        // first version that carries record batches, which is the only format
-        // this broker decodes. Kafka checks the count before it validates any
-        // batch, so this check runs before `rejection`. See
-        // [ProduceRequest.java#L225-L246].
-        //
-        // [ProduceRequest.java#L225-L246]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
-        let batch_count = batches.len();
-        let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
-            const REASON: &str =
-                "a produce request must contain exactly one record batch per partition";
-
-            warn!(
-                topic = name,
-                partition = partition.index,
-                batch_count,
-                reason = REASON,
-                "rejecting produce request",
-            );
-
-            return self
-                .error(partition.index, ErrorCode::InvalidRecord)
-                .error_message(Some(REASON.into()));
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(rejection) => return rejection.into_response(index),
         };
-
-        if let Some(rejection) = rejection(&batch) {
-            return self.reject(name, partition.index, &batch, rejection.into());
-        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
-        match validate_timestamps_offloaded(batch, timestamp_type, now).await {
-            Ok((validated, None)) => batch = validated,
+        let batch = match validate_timestamps_offloaded(batch, timestamp_type, now).await {
+            Ok((validated, None)) => validated,
             Ok((validated, Some(rejection))) => {
-                return self.reject(name, partition.index, &validated, rejection);
+                rejection.log(name, index, &validated);
+                return rejection.into_response(index);
             }
             Err(err) => {
                 error!(?err);
-                return self.error(partition.index, ErrorCode::UnknownServerError);
+                return response::partition_error(index, ErrorCode::UnknownServerError);
             }
-        }
+        };
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
         let log_append_time_ms = match timestamp_type {
@@ -361,14 +257,14 @@ where
             TimestampType::LogAppendTime => now,
         };
 
-        let tp = Topition::new(name, partition.index);
+        let tp = Topition::new(name, index);
         let producer_id = batch.producer_id;
         let producer_epoch = batch.producer_epoch;
         let base_sequence = batch.base_sequence;
 
         match self.storage.produce(transaction_id, &tp, batch).await {
             Ok(base_offset) => PartitionProduceResponse::default()
-                .index(partition.index)
+                .index(index)
                 .error_code(ErrorCode::None.into())
                 .base_offset(base_offset)
                 .log_append_time_ms(Some(log_append_time_ms))
@@ -386,7 +282,7 @@ where
                 if error_code == ErrorCode::UnknownServerError {
                     error!(
                         topic = name,
-                        partition = partition.index,
+                        partition = index,
                         producer_id,
                         producer_epoch,
                         base_sequence,
@@ -396,7 +292,7 @@ where
                 } else if let Error::MessageTooLarge { size, limit } = error {
                     warn!(
                         topic = name,
-                        partition = partition.index,
+                        partition = index,
                         producer_id,
                         size,
                         limit,
@@ -405,7 +301,7 @@ where
                 } else {
                     warn!(
                         topic = name,
-                        partition = partition.index,
+                        partition = index,
                         producer_id,
                         producer_epoch,
                         base_sequence,
@@ -415,7 +311,7 @@ where
                     );
                 }
 
-                let response = self.error(partition.index, error_code);
+                let response = response::partition_error(index, error_code);
 
                 // Kafka sends the same message, so that the producer's `RecordTooLargeException`
                 // names both sizes.
@@ -423,7 +319,7 @@ where
                     response.error_message(Some(format!(
                         "The record batch size in the append to {name}-{} is {size} bytes \
                          which exceeds the maximum configured value of {limit}.",
-                        partition.index
+                        index
                     )))
                 } else {
                     response
@@ -457,14 +353,13 @@ where
     async fn topic(
         &self,
         transaction_id: Option<&str>,
-        topic: TopicProduceData,
+        topic: ValidatedTopic,
     ) -> TopicProduceResponse {
-        let partition_data = topic.partition_data.unwrap_or_default();
-        let mut partitions = Vec::with_capacity(partition_data.len());
+        let mut partitions = Vec::with_capacity(topic.partitions.len());
 
         match self.timestamp_type(&topic.name).await {
             Ok(timestamp_type) => {
-                for partition in partition_data {
+                for partition in topic.partitions {
                     partitions.push(
                         self.partition(transaction_id, &topic.name, timestamp_type, partition)
                             .await,
@@ -482,9 +377,10 @@ where
                 let error_code = storage_error_code(&error);
 
                 partitions.extend(
-                    partition_data
+                    topic
+                        .partitions
                         .iter()
-                        .map(|partition| self.error(partition.index, error_code)),
+                        .map(|partition| response::partition_error(partition.index, error_code)),
                 );
             }
         }
@@ -495,79 +391,22 @@ where
     }
 }
 
-impl<G, I> Service<I> for ProduceService<G>
+impl<G> Service<ValidatedProduceRequest> for ProduceService<G>
 where
     G: Storage,
-    I: Into<RequestInput<ProduceRequest>> + Send + 'static,
 {
     type Output = ProduceResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
-    async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
+    #[instrument(skip(self, request))]
+    async fn serve(&self, request: ValidatedProduceRequest) -> Result<Self::Output, Self::Error> {
+        let mut responses = Vec::with_capacity(request.topics.len());
 
-        let topics = input.request.topic_data.unwrap_or_default();
-        let mut responses = Vec::with_capacity(topics.len());
-
-        // Kafka refuses a Produce whose `acks` is not -1, 0 or 1 before it appends anything, and
-        // answers every partition `INVALID_REQUIRED_ACKS` ([`ReplicaManager.appendRecords`]).
-        //
-        // Kafka first answers an unknown partition `UNKNOWN_TOPIC_OR_PARTITION`, and a partition
-        // without exactly one batch `INVALID_RECORD`. We answer every partition
-        // `INVALID_REQUIRED_ACKS` instead, because we find an unknown partition only inside
-        // `storage.produce`, and this check must run before any storage call. Each such partition
-        // still fails, only with another error code.
-        //
-        // [`ReplicaManager.appendRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L762-L765
-        if Ack::try_from(input.request.acks).is_err() {
-            warn!(
-                acks = input.request.acks,
-                topics = topics.len(),
-                "rejecting produce request: acks must be -1, 0 or 1"
-            );
-
-            responses.extend(
-                topics
-                    .into_iter()
-                    .map(|topic| self.topic_error(topic, ErrorCode::InvalidRequiredAcks)),
-            );
-        } else {
-            for topic in topics {
-                responses.push(
-                    self.topic(input.request.transactional_id.as_deref(), topic)
-                        .await,
-                )
-            }
+        for topic in request.topics {
+            responses.push(self.topic(request.transactional_id.as_deref(), topic).await)
         }
 
-        // Kafka's `KafkaApis.handleProduceRequest` closes the connection for an
-        // `acks=0` request whenever any partition in the assembled response map
-        // carries an error, not only a storage failure: `unauthorizedTopicResponses`,
-        // `nonExistingTopicResponses` and `invalidRequestResponses` are merged into
-        // that map before the check runs. The client reads no response under
-        // `acks=0` regardless, so closing on any error (rather than silently
-        // dropping the batch) matches that behaviour and gives a real Kafka
-        // producer a retriable `NetworkException` instead of nothing at all.
-        if input.request.acks == i16::from(Ack::None) {
-            if let Some((topic, partition, error_code)) = first_error(&responses) {
-                ACKS_ZERO_PRODUCE_FAILED
-                    .add(1, &[KeyValue::new("error_code", format!("{error_code:?}"))]);
-
-                return Err(Error::AcksZeroProduceFailed {
-                    topic,
-                    partition,
-                    error_code,
-                });
-            }
-
-            SuppressResponseExtension::mark(&input.extensions);
-        }
-
-        Ok(ProduceResponse::default()
-            .responses(Some(responses))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None))
+        Ok(response::produce_response(responses))
     }
 }
 
