@@ -7105,15 +7105,12 @@ mod tests {
     #[tokio::test]
     async fn fetches_beyond_the_limit_all_finish() -> Result<()> {
         let cluster = alphanumeric_string(15);
-        let storage = Postgres::builder(&CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping fetches_beyond_the_limit_all_finish: {err:?}");
+        let Some(storage) =
+            storage_with_schema("fetches_beyond_the_limit_all_finish", &CONNECTION, &cluster)
+                .await?
+        else {
             return Ok(());
-        }
+        };
 
         let topition = topic_with_one_record(&storage, &cluster).await?;
 
@@ -7235,7 +7232,7 @@ mod tests {
 
     /// Returns storage on a pool of one connection that connects with a
     /// unique `application_name`, a monitor on a pool of its own, and that
-    /// name, or `None` when no server answers.
+    /// name, or `None` when no server answers. The schema is in place.
     async fn storage_on_one_connection(
         cluster: &str,
     ) -> Result<Option<(Postgres, Postgres, String)>> {
@@ -7250,18 +7247,14 @@ mod tests {
         .build();
         storage.pool.resize(1);
 
-        let monitor = Postgres::builder(&CONNECTION)?
-            .cluster(cluster)
-            .node(0)
-            .build();
-
-        match monitor.connection().await {
-            Ok(_) => Ok(Some((storage, monitor, application_name))),
-            Err(err) => {
-                eprintln!("skipping: {err:?}");
-                Ok(None)
-            }
-        }
+        // The tests of this module share one database, and a test that
+        // starts before another one has created the schema fails without
+        // this.
+        Ok(
+            storage_with_schema("storage_on_one_connection", &CONNECTION, cluster)
+                .await?
+                .map(|monitor| (storage, monitor, application_name)),
+        )
     }
 
     /// A fetch dropped while its statement waits has that statement
@@ -11067,15 +11060,11 @@ mod tests {
     async fn storage_with_empty_topic() -> Result<Option<(Postgres, Topition)>> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(&CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping: {err:?}");
+        let Some(storage) =
+            storage_with_schema("storage_with_empty_topic", &CONNECTION, &cluster).await?
+        else {
             return Ok(None);
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
