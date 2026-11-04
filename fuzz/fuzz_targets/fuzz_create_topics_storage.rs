@@ -25,8 +25,8 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::CreateTopicsRequest;
 use nisshi_storage::{CreateTopicsService, CreateTopicsValidationLayer, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
@@ -40,12 +40,15 @@ static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("toki
 // rejects out of range values, explicit counts beside manual assignments (`INVALID_REQUEST`), (`INVALID_PARTITIONS`, `INVALID_REPLICATION_FACTOR`) and a request
 // totalling more than 10,000 partitions (`POLICY_VIOLATION`) before storage is consulted, so
 // an arbitrary `i32::MAX` cannot reach `create_topic`. Fuzzing the raw values checks that guard.
-fuzz_target!(|request: CreateTopicsRequest| {
-    RUNTIME.block_on(async {
-        check_request(request.clone()).expect("encode/decode request");
+fuzz_target!(|input: (u16, CreateTopicsRequest)| {
+    let (selector, request) = input;
+    let version = api_version::<CreateTopicsRequest>(selector);
 
+    RUNTIME.block_on(async {
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let request = normalize_request(request).expect("normalized request");
+        let Some(request) = check_request(request, version).expect("encode/decode request") else {
+            return;
+        };
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
@@ -65,7 +68,7 @@ fuzz_target!(|request: CreateTopicsRequest| {
         service
             .serve(request)
             .await
-            .and_then(|response| check_response(response).map_err(Into::into))
+            .and_then(|response| check_response(response, version).map_err(Into::into))
             .expect("served and decoded")
     });
 });

@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 bytes.workspace = true
 libfuzzer-sys.workspace = true
+nisshi-fuzz-harness.workspace = true
 nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
 nisshi-service.workspace = true
 nisshi-storage-dynostore.workspace = true

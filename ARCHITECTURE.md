@@ -64,6 +64,7 @@ writes it to the socket.
 | | `nisshi-perf` | Performance producer and consumer |
 | | `nisshi-otel` | OpenTelemetry setup shared by the commands |
 | Tests | `nisshi-smoke-test` | Runs the Apache Kafka command line tools against a broker |
+| | `nisshi-fuzz-harness` | The checks that the fuzz targets and their tests share |
 | | `fuzz` | cargo-fuzz targets for the codec and the storage handlers |
 
 ## Wire protocol

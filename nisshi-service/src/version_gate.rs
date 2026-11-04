@@ -61,18 +61,26 @@ pub fn capped_range(api_key: i16) -> Option<RangeInclusive<i16>> {
         .map(|(_, range)| range.clone())
 }
 
+/// Returns the versions of `api_key` that a client can reach, or `None` for an `api_key` this
+/// build has no protocol metadata for.
+///
+/// This is the range in [`CAPPED_API_VERSIONS`] for a capped API, because [`VersionGateLayer`]
+/// rejects every other version before a handler sees the request, and the protocol's own range
+/// for every other API.
+#[must_use]
+pub fn routable_range(api_key: i16) -> Option<RangeInclusive<i16>> {
+    capped_range(api_key).or_else(|| protocol_range(api_key))
+}
+
 /// Returns the highest version an internal caller may send for `api_key` without an
 /// `ApiVersions` negotiation, or `None` for an `api_key` this build has no protocol metadata
 /// for.
 ///
-/// An internal caller that builds a request directly has no negotiated version to use. The
-/// protocol maximum of a capped API is a version that [`VersionGateLayer`] rejects, so this
-/// returns the cap's maximum for such an API, and the protocol maximum for every other API.
+/// An internal caller that builds a request directly has no negotiated version to use, so this
+/// is the highest version in [`routable_range`].
 #[must_use]
 pub fn routable_max_version(api_key: i16) -> Option<i16> {
-    capped_range(api_key)
-        .map(|range| *range.end())
-        .or_else(|| protocol_range(api_key).map(|range| *range.end()))
+    routable_range(api_key).map(|range| *range.end())
 }
 
 fn protocol_range(api_key: i16) -> Option<RangeInclusive<i16>> {
@@ -262,6 +270,19 @@ mod tests {
                 ..
             } if api_key == MetadataRequest::KEY
         ));
+    }
+
+    #[test]
+    fn routable_range_is_the_cap_for_a_capped_api() {
+        assert_eq!(Some(0..=6), routable_range(ListOffsetsRequest::KEY));
+    }
+
+    #[test]
+    fn routable_range_is_the_protocol_range_for_an_uncapped_api() {
+        assert_eq!(
+            protocol_range(MetadataRequest::KEY),
+            routable_range(MetadataRequest::KEY)
+        );
     }
 
     #[test]
