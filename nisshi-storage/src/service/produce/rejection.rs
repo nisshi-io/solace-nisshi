@@ -83,14 +83,24 @@ impl From<(ErrorCode, &'static str)> for Rejection {
 /// A batch over the decoded-size limit is reported as `MESSAGE_TOO_LARGE`:
 /// Kafka's code for "this batch is too large for the broker", which a
 /// producer can recover from on its own (the Java producer splits a batch of
-/// more than one record and retries). `UNKNOWN_SERVER_ERROR` is reserved for
-/// failures the client did not cause.
+/// more than one record and retries). Any other error answers
+/// [`Error::error_code`] with `KAFKA_STORAGE_ERROR`, the code Kafka answers
+/// when appending to its log fails with a storage exception ([`ReplicaManager.scala`]), which Kafka
+/// producers retry: a backend that is briefly unavailable doesn't fail the
+/// producer. `UNKNOWN_SERVER_ERROR` is reserved for failures that a retry
+/// can't fix, which the client did not cause either.
+///
+/// A retry after `KAFKA_STORAGE_ERROR` assumes that the batch was not stored.
+/// The object store backend writes the batch before it advances the producer's
+/// sequence, so a failure of the advance can leave the batch stored, and the
+/// retry stores it again. See `DynoStore::advance_idempotent_sequence`.
+///
+/// [`ReplicaManager.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1425-L1436
 pub(super) fn storage_error_code(error: &Error) -> ErrorCode {
     match error {
-        Error::Api(error_code) => *error_code,
         Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_))
         | Error::MessageTooLarge { .. } => ErrorCode::MessageTooLarge,
-        _ => ErrorCode::UnknownServerError,
+        error => error.error_code(ErrorCode::KafkaStorageError),
     }
 }
 
@@ -144,10 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn other_storage_errors_are_unknown_server_error() {
+    fn permanent_storage_errors_are_unknown_server_error() {
         assert_eq!(
             ErrorCode::UnknownServerError,
             storage_error_code(&Error::SansIo(nisshi_sans_io::Error::Overflow))
+        );
+    }
+
+    /// A backend failure may clear, so the producer retries it.
+    #[test]
+    fn transient_storage_errors_are_kafka_storage_error() {
+        assert_eq!(
+            ErrorCode::KafkaStorageError,
+            storage_error_code(&Error::from(std::io::Error::other("connection reset")))
         );
     }
 }

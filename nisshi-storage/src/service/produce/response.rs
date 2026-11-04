@@ -70,7 +70,10 @@ pub(super) fn produce_failure(
 ) -> PartitionProduceResponse {
     let error_code = storage_error_code(&error);
 
-    if error_code == ErrorCode::UnknownServerError {
+    if matches!(
+        error_code,
+        ErrorCode::UnknownServerError | ErrorCode::KafkaStorageError
+    ) {
         error!(
             topic = name,
             partition = index,

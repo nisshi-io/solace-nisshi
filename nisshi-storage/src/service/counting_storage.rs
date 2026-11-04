@@ -51,8 +51,10 @@ pub(crate) enum Listing {
     /// Lists the topics that exist.
     #[default]
     Topics,
-    /// Fails with an error.
+    /// Fails with an error that a retry can't fix.
     Error,
+    /// Fails with an error that a retry may fix, such as a lost connection.
+    TransientError,
     /// One topic without a name, with an error code: the PostgreSQL engine answers a failed
     /// listing query this way.
     NamelessTopic,
@@ -66,6 +68,8 @@ pub(crate) struct CountingStorage {
     created: Arc<Mutex<Vec<String>>>,
     listings: Arc<Mutex<usize>>,
     lookups: Arc<Mutex<usize>>,
+    init_producer_error: Option<Error>,
+    create_topic_failure: Option<(String, Error)>,
 }
 
 impl CountingStorage {
@@ -76,6 +80,23 @@ impl CountingStorage {
             topics: Arc::new(Mutex::new(
                 names.iter().map(|name| (*name).to_owned()).collect(),
             )),
+            ..Self::default()
+        }
+    }
+
+    /// A storage whose `init_producer` fails with `error`.
+    pub(crate) fn failing_init_producer(error: Error) -> Self {
+        Self {
+            init_producer_error: Some(error),
+            ..Self::default()
+        }
+    }
+
+    /// A storage whose `create_topic` of the topic `name` fails with `error`. A create of any
+    /// other topic succeeds.
+    pub(crate) fn failing_create_topic(name: &str, error: Error) -> Self {
+        Self {
+            create_topic_failure: Some((name.to_owned(), error)),
             ..Self::default()
         }
     }
@@ -110,6 +131,8 @@ impl CountingStorage {
                 .collect()),
 
             Listing::Error => Err(Error::Message("listing failed".into())),
+
+            Listing::TransientError => Err(Error::from(std::io::Error::other("listing failed"))),
 
             Listing::NamelessTopic => Ok(vec![
                 MetadataResponseTopic::default()
@@ -185,6 +208,12 @@ impl Storage for CountingStorage {
     }
 
     async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+        if let Some((name, error)) = &self.create_topic_failure
+            && *name == topic.name
+        {
+            return Err(error.clone());
+        }
+
         _ = self.topics.lock()?.insert(topic.name.clone());
         self.created.lock()?.push(topic.name);
         Ok(Uuid::new_v4())
@@ -324,7 +353,10 @@ impl Storage for CountingStorage {
         _producer_id: Option<i64>,
         _producer_epoch: Option<i16>,
     ) -> Result<ProducerIdResponse> {
-        unimplemented!()
+        Err(self
+            .init_producer_error
+            .clone()
+            .expect("a storage built with `failing_init_producer`"))
     }
 
     async fn txn_add_offsets(

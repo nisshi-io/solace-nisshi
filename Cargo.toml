@@ -27,7 +27,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.8.1"
+version = "0.8.2"
 license = "Apache-2.0"
 homepage = "https://nisshi.io"
 repository = "https://github.com/nisshi-io/solace-nisshi"
@@ -125,26 +125,26 @@ libfuzzer-sys = "0.4"
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.5.0"
-nisshi = { version = "0.8.1", path = "nisshi", default-features = false }
-nisshi-auth = { version = "0.8.1", path = "nisshi-auth", default-features = false }
-nisshi-broker = { version = "0.8.1", path = "nisshi-broker", default-features = false }
-nisshi-cat = { version = "0.8.1", path = "nisshi-cat", default-features = false }
-nisshi-cli = { version = "0.8.1", path = "nisshi-cli", default-features = false }
-nisshi-client = { version = "0.8.1", path = "nisshi-client", default-features = false }
-nisshi-generator = { version = "0.8.1", path = "nisshi-generator", default-features = false }
-nisshi-model = { version = "0.8.1", path = "nisshi-model", default-features = false }
-nisshi-otel = { version = "0.8.1", path = "nisshi-otel", default-features = false }
-nisshi-perf = { version = "0.8.1", path = "nisshi-perf", default-features = false }
-nisshi-proxy = { version = "0.8.1", path = "nisshi-proxy", default-features = false }
-nisshi-sans-io = { version = "0.8.1", path = "nisshi-sans-io", default-features = false }
-nisshi-schema = { version = "0.8.1", path = "nisshi-schema", default-features = false }
-nisshi-service = { version = "0.8.1", path = "nisshi-service", default-features = false }
-nisshi-storage = { version = "0.8.1", path = "nisshi-storage", default-features = false }
-nisshi-storage-dynostore = { version = "0.8.1", path = "nisshi-storage-dynostore", default-features = false }
-nisshi-storage-null = { version = "0.8.1", path = "nisshi-storage-null", default-features = false }
-nisshi-storage-slatedb = { version = "0.8.1", path = "nisshi-storage-slatedb", default-features = false }
-nisshi-storage-sql = { version = "0.8.1", path = "nisshi-storage-sql", default-features = false }
-nisshi-topic = { version = "0.8.1", path = "nisshi-topic", default-features = false }
+nisshi = { version = "0.8.2", path = "nisshi", default-features = false }
+nisshi-auth = { version = "0.8.2", path = "nisshi-auth", default-features = false }
+nisshi-broker = { version = "0.8.2", path = "nisshi-broker", default-features = false }
+nisshi-cat = { version = "0.8.2", path = "nisshi-cat", default-features = false }
+nisshi-cli = { version = "0.8.2", path = "nisshi-cli", default-features = false }
+nisshi-client = { version = "0.8.2", path = "nisshi-client", default-features = false }
+nisshi-generator = { version = "0.8.2", path = "nisshi-generator", default-features = false }
+nisshi-model = { version = "0.8.2", path = "nisshi-model", default-features = false }
+nisshi-otel = { version = "0.8.2", path = "nisshi-otel", default-features = false }
+nisshi-perf = { version = "0.8.2", path = "nisshi-perf", default-features = false }
+nisshi-proxy = { version = "0.8.2", path = "nisshi-proxy", default-features = false }
+nisshi-sans-io = { version = "0.8.2", path = "nisshi-sans-io", default-features = false }
+nisshi-schema = { version = "0.8.2", path = "nisshi-schema", default-features = false }
+nisshi-service = { version = "0.8.2", path = "nisshi-service", default-features = false }
+nisshi-storage = { version = "0.8.2", path = "nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { version = "0.8.2", path = "nisshi-storage-dynostore", default-features = false }
+nisshi-storage-null = { version = "0.8.2", path = "nisshi-storage-null", default-features = false }
+nisshi-storage-slatedb = { version = "0.8.2", path = "nisshi-storage-slatedb", default-features = false }
+nisshi-storage-sql = { version = "0.8.2", path = "nisshi-storage-sql", default-features = false }
+nisshi-topic = { version = "0.8.2", path = "nisshi-topic", default-features = false }
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }

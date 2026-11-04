@@ -128,6 +128,24 @@ impl ProducedBatches {
     }
 }
 
+/// Returns the sequence after a batch: the batch's first sequence plus its record count, which
+/// wraps to 0 past `i32::MAX` as Kafka's [`DefaultRecordBatch.incrementSequence`] does.
+///
+/// `base_sequence` and `last_offset_delta` are not negative.
+///
+/// [`DefaultRecordBatch.incrementSequence`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L556-L560
+pub(super) fn next_sequence(base_sequence: i32, last_offset_delta: i32) -> i32 {
+    increment_sequence(increment_sequence(base_sequence, last_offset_delta), 1)
+}
+
+fn increment_sequence(sequence: i32, increment: i32) -> i32 {
+    if sequence > i32::MAX - increment {
+        increment - (i32::MAX - sequence) - 1
+    } else {
+        sequence + increment
+    }
+}
+
 /// Checks an idempotent batch's sequence against the partition's next sequence and its
 /// remembered batches, as Kafka's `ProducerAppendInfo.checkSequence` and
 /// `ProducerStateEntry.findDuplicateBatch` do.
@@ -181,6 +199,15 @@ mod tests {
         }
 
         batches
+    }
+
+    #[test]
+    fn sequence_after_a_batch_wraps_to_0_past_the_largest_sequence() {
+        assert_eq!(8, next_sequence(5, 2));
+        assert_eq!(i32::MAX, next_sequence(i32::MAX - 1, 0));
+        assert_eq!(0, next_sequence(i32::MAX, 0));
+        assert_eq!(0, next_sequence(i32::MAX - 1, 1));
+        assert_eq!(2, next_sequence(i32::MAX - 3, 5));
     }
 
     #[test]

@@ -16,7 +16,9 @@
 //! only then advances the producer's sequence in `meta.json`. If that advance
 //! fails the batch is stored while the client is told it failed, so
 //! `nisshi_produce_post_write_advance_failed` counts every such failure, with
-//! the `reason` it failed for.
+//! the `reason` it failed for. The client's retry of the same sequence would
+//! store the batch a second time, so the answer is a code that it does not
+//! retry. A record write that fails after it completed gets the same answer.
 //!
 //! The metric is read from a process-wide meter provider, which has to be
 //! installed before the first instrument is created. nextest runs each test in
@@ -75,6 +77,7 @@ struct FailAdvanceStore {
     inner: InMemory,
     armed: AtomicBool,
     fail_meta: AtomicBool,
+    fail_record_after_storing: AtomicBool,
 }
 
 impl FailAdvanceStore {
@@ -83,12 +86,19 @@ impl FailAdvanceStore {
             inner: InMemory::new(),
             armed: AtomicBool::new(false),
             fail_meta: AtomicBool::new(false),
+            fail_record_after_storing: AtomicBool::new(false),
         }
     }
 
     /// Fail the `meta.json` write that comes after the next record write.
     fn fail_next_advance(&self) {
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Store the next record write and then answer it with an error, as an object store does
+    /// when a write that it completed times out before it answers.
+    fn fail_next_record_write_after_storing(&self) {
+        self.fail_record_after_storing.store(true, Ordering::SeqCst);
     }
 
     /// How many record batches are in the log.
@@ -127,6 +137,16 @@ impl ObjectStore for FailAdvanceStore {
         }
 
         let result = self.inner.put_opts(location, payload, opts).await;
+
+        if location.as_ref().contains("/records/")
+            && result.is_ok()
+            && self.fail_record_after_storing.swap(false, Ordering::SeqCst)
+        {
+            return Err(object_store::Error::Generic {
+                store: "FailAdvanceStore",
+                source: "injected fault: record write timed out after it completed".into(),
+            });
+        }
 
         if location.as_ref().contains("/records/")
             && result.is_ok()
@@ -215,6 +235,111 @@ fn counted(exporter: &InMemoryMetricExporter) -> Vec<(BTreeMap<String, String>, 
         .collect()
 }
 
+/// An object store engine on a [`FailAdvanceStore`], with a topic of one partition and an
+/// idempotent producer.
+struct Setup {
+    storage: ArcDynStorage,
+    object_store: Arc<FailAdvanceStore>,
+    extensions: Extensions,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl Setup {
+    async fn new() -> Result<Self> {
+        let object_store = Arc::new(FailAdvanceStore::new());
+        let storage: ArcDynStorage = Arc::new(Box::new(
+            DynoStore::new(CLUSTER, 111, object_store.clone())?
+                .advertised_listener(Url::parse("tcp://127.0.0.1/")?)
+                .schemas(None)
+                .lake(None),
+        ));
+
+        let extensions = Extensions::default();
+
+        let created = CreateTopicsValidationLayer::new()
+            .layer(CreateTopicsService {
+                storage: storage.clone(),
+            })
+            .serve(RequestInput {
+                request: CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(TOPIC.into())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+                extensions: extensions.clone(),
+            })
+            .await?;
+
+        let topics = created.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+        let producer = InitProducerIdService {
+            storage: storage.clone(),
+        }
+        .serve(RequestInput {
+            request: InitProducerIdRequest::default()
+                .transactional_id(None)
+                .transaction_timeout_ms(0)
+                .producer_id(Some(-1))
+                .producer_epoch(Some(-1)),
+            extensions: extensions.clone(),
+        })
+        .await?;
+
+        Ok(Self {
+            storage,
+            object_store,
+            extensions,
+            producer_id: producer.producer_id,
+            producer_epoch: producer.producer_epoch,
+        })
+    }
+
+    /// Produces one idempotent batch that starts at `base_sequence`, and returns the error
+    /// code that the partition answers.
+    async fn produce(&self, base_sequence: i32) -> Result<ErrorCode> {
+        let response = ProduceService::new(self.storage.clone())
+            .with_validation()
+            .serve(RequestInput {
+                request: ProduceRequest::default().acks(1).topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(TOPIC.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(0)
+                                .records(Some(Frame {
+                                    batches: vec![batch(
+                                        self.producer_id,
+                                        self.producer_epoch,
+                                        base_sequence,
+                                    )?],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+                extensions: self.extensions.clone(),
+            })
+            .await?;
+
+        Ok(ErrorCode::try_from(
+            response.responses.unwrap_or_default()[0]
+                .partition_responses
+                .clone()
+                .unwrap_or_default()[0]
+                .error_code,
+        )?)
+    }
+}
+
 #[tokio::test]
 async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
     let _guard = init_tracing()?;
@@ -225,92 +350,15 @@ async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
         .build();
     global::set_meter_provider(provider.clone());
 
-    let object_store = Arc::new(FailAdvanceStore::new());
-    let storage: ArcDynStorage = Arc::new(Box::new(
-        DynoStore::new(CLUSTER, 111, object_store.clone())?
-            .advertised_listener(Url::parse("tcp://127.0.0.1/")?)
-            .schemas(None)
-            .lake(None),
-    ));
+    let setup = Setup::new().await?;
+    setup.object_store.fail_next_advance();
 
-    let extensions = Extensions::default();
-
-    let created = CreateTopicsValidationLayer::new()
-        .layer(CreateTopicsService {
-            storage: storage.clone(),
-        })
-        .serve(RequestInput {
-            request: CreateTopicsRequest::default()
-                .validate_only(Some(false))
-                .topics(Some(
-                    [CreatableTopic::default()
-                        .name(TOPIC.into())
-                        .num_partitions(1)
-                        .replication_factor(1)
-                        .assignments(Some([].into()))
-                        .configs(Some([].into()))]
-                    .into(),
-                )),
-            extensions: extensions.clone(),
-        })
-        .await?;
-
-    let topics = created.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    let producer = InitProducerIdService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: InitProducerIdRequest::default()
-            .transactional_id(None)
-            .transaction_timeout_ms(0)
-            .producer_id(Some(-1))
-            .producer_epoch(Some(-1)),
-        extensions: extensions.clone(),
-    })
-    .await?;
-
-    object_store.fail_next_advance();
-
-    let response = ProduceService::new(storage.clone())
-        .with_validation()
-        .serve(RequestInput {
-            request: ProduceRequest::default().acks(1).topic_data(Some(
-                [TopicProduceData::default()
-                    .name(TOPIC.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(0)
-                            .records(Some(Frame {
-                                batches: vec![batch(
-                                    producer.producer_id,
-                                    producer.producer_epoch,
-                                    0,
-                                )?],
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
-            extensions: extensions.clone(),
-        })
-        .await?;
-
-    let error_code = ErrorCode::try_from(
-        response.responses.unwrap_or_default()[0]
-            .partition_responses
-            .clone()
-            .unwrap_or_default()[0]
-            .error_code,
-    )?;
-
-    // The client is told the batch failed ...
-    assert_ne!(ErrorCode::None, error_code);
+    // The client is told the batch failed with a code that it does not retry, because a retry
+    // of the same sequence would store the batch a second time ...
+    assert_eq!(ErrorCode::UnknownServerError, setup.produce(0).await?);
 
     // ... while it is in the log.
-    assert_eq!(1, object_store.records().await.expect("records"));
+    assert_eq!(1, setup.object_store.records().await.expect("records"));
 
     provider.force_flush().expect("flush");
 
@@ -326,6 +374,24 @@ async fn failed_sequence_advance_is_counted_with_its_reason() -> Result<()> {
         )],
         counted(&exporter)
     );
+
+    Ok(())
+}
+
+/// A record write of an idempotent batch that fails with an error that a retry may fix can have
+/// completed, so the answer is a code that the client does not retry.
+#[tokio::test]
+async fn record_write_that_may_have_completed_is_not_retried_for_an_idempotent_batch() -> Result<()>
+{
+    let _guard = init_tracing()?;
+
+    let setup = Setup::new().await?;
+    setup.object_store.fail_next_record_write_after_storing();
+
+    assert_eq!(ErrorCode::UnknownServerError, setup.produce(0).await?);
+
+    // The write completed, which is why a retry would store the batch twice.
+    assert_eq!(1, setup.object_store.records().await.expect("records"));
 
     Ok(())
 }

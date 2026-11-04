@@ -3605,7 +3605,7 @@ impl Storage for Engine {
                                 error!(?err, cluster = self.cluster, transaction_id, producer)
                             }) {
                                 Ok(()) => ErrorCode::ConcurrentTransactions,
-                                Err(_) => ErrorCode::UnknownServerError,
+                                Err(err) => return Err(Error::from(err)),
                             };
 
                             return Ok(ProducerIdResponse::failed(error));
@@ -3779,7 +3779,7 @@ impl Storage for Engine {
                     )
                 }) {
                     Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
+                    Err(err) => return Err(Error::from(err)),
                 };
 
                 Ok(ProducerIdResponse {
@@ -3855,7 +3855,7 @@ impl Storage for Engine {
                             .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
                         {
                             Ok(()) => ErrorCode::None,
-                            Err(_) => ErrorCode::UnknownServerError,
+                            Err(err) => return Err(Error::from(err)),
                         };
 
                         Ok(ProducerIdResponse {

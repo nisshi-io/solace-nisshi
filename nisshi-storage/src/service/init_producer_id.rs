@@ -16,7 +16,7 @@ use nisshi_sans_io::{
     ApiKey, ErrorCode, InitProducerIdRequest, InitProducerIdResponse, RequestInput,
 };
 use rama::Service;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::{Error, ProducerIdResponse, Result, Storage, producer_claim};
 
@@ -129,14 +129,35 @@ where
                     // as -1, the default Kafka gives those fields.
                     let (producer_id, producer_epoch) = claim.unwrap_or((-1, -1));
 
-                    self.storage
+                    // A failed storage answers a code instead of failing the request, which
+                    // closes the connection. A transient failure answers
+                    // `COORDINATOR_LOAD_IN_PROGRESS`, the code that Kafka answers while it
+                    // can't hand out a producer ID yet ([ProducerIdManager.scala#L191]), which
+                    // Java and librdkafka producers retry. `COORDINATOR_NOT_AVAILABLE` would
+                    // not do: for a producer with no transactional ID, the Java client answers
+                    // it with a coordinator lookup that has no key, and then stops
+                    // ([TransactionManager.java#L1320-L1322]).
+                    //
+                    // [ProducerIdManager.scala#L191]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/ProducerIdManager.scala#L191
+                    // [TransactionManager.java#L1320-L1322]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/producer/internals/TransactionManager.java#L1320-L1322
+                    match self
+                        .storage
                         .init_producer(
                             None,
                             input.request.transaction_timeout_ms,
                             Some(producer_id),
                             Some(producer_epoch),
                         )
-                        .await?
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            error!(?error, "init producer id failed");
+                            ProducerIdResponse::failed(
+                                error.error_code(ErrorCode::CoordinatorLoadInProgress),
+                            )
+                        }
+                    }
                 }
 
                 Err(error) => ProducerIdResponse::failed(error),
@@ -160,5 +181,66 @@ where
             .error_code(response.error.into())
             .producer_id(response.id)
             .producer_epoch(response.epoch))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nisshi_sans_io::InitProducerIdRequest;
+
+    use crate::service::counting_storage::CountingStorage;
+
+    use super::*;
+
+    async fn answer(error: Error) -> Result<InitProducerIdResponse> {
+        InitProducerIdService {
+            storage: CountingStorage::failing_init_producer(error),
+        }
+        .serve(
+            InitProducerIdRequest::default()
+                .producer_id(Some(-1))
+                .producer_epoch(Some(-1)),
+        )
+        .await
+    }
+
+    async fn code_of(error: Error) -> Result<ErrorCode> {
+        let response = answer(error).await?;
+
+        assert_eq!((-1, -1), (response.producer_id, response.producer_epoch));
+
+        Ok(ErrorCode::try_from(response.error_code)?)
+    }
+
+    /// Java and librdkafka producers retry `COORDINATOR_LOAD_IN_PROGRESS`. A producer with no
+    /// transactional ID stops on `COORDINATOR_NOT_AVAILABLE`, so it must not answer that.
+    #[tokio::test]
+    async fn transient_storage_error_answers_coordinator_load_in_progress() -> Result<()> {
+        assert_eq!(
+            ErrorCode::CoordinatorLoadInProgress,
+            code_of(Error::from(std::io::Error::other("connection reset"))).await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_storage_error_answers_unknown_server_error() -> Result<()> {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            code_of(Error::Message("no producer ID".into())).await?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_error_with_a_code_keeps_that_code() -> Result<()> {
+        assert_eq!(
+            ErrorCode::ProducerFenced,
+            code_of(Error::Api(ErrorCode::ProducerFenced)).await?
+        );
+
+        Ok(())
     }
 }

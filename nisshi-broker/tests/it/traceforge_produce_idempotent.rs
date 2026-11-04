@@ -37,9 +37,10 @@
 //! whether it is also immediately redelivered as a duplicate (`2^3 = 8`),
 //! modeling a producer retry or network-level reordering/resend. That's
 //! `48` combinations, matched against an oracle that mirrors dynostore's
-//! exact sequence-check logic (`expected < base_sequence` -> out of order,
-//! `expected > base_sequence` -> a repeat of a stored batch, answered with its
-//! offset, else accept) tracked
+//! exact sequence-check logic (the first stored batch may start at any
+//! sequence, as in Kafka, and after it only `base_sequence + 1` is accepted;
+//! a repeat of a stored batch is answered with its offset; any other sequence
+//! is out of order) tracked
 //! independently in the test - not just special-cased for the one in-order
 //! delivery - and finally cross-checked against what a real `Storage::fetch`
 //! actually returns, so a silently dropped accept or a silently applied
@@ -208,9 +209,14 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             // but tracked independently here, so it can
             // be checked against every one of the 48 order/duplicate
             // combinations rather than only the one fully-in-order case.
-            let mut expected_sequence: i32 = 0;
+            //
+            // The partition holds no state for the producer until its first batch is
+            // stored, so that batch may start at any sequence, as in Kafka. After it,
+            // a batch is stored only at the next sequence, and one that repeats a
+            // stored batch is answered with that batch's offset.
+            let mut expected_sequence: Option<i32> = None;
             let mut next_offset: i64 = 0;
-            let mut accepted_batches: usize = 0;
+            let mut stored_batches: Vec<(i32, i64)> = Vec::new();
 
             for &base_sequence in &order {
                 let redeliver = bool::nondet();
@@ -241,40 +247,46 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
                         .unwrap()[0];
                     let error_code = ErrorCode::try_from(partition_response.error_code).unwrap();
 
-                    if expected_sequence < base_sequence {
-                        assert_eq!(
-                            error_code,
-                            ErrorCode::OutOfOrderSequenceNumber,
-                            "base_sequence={base_sequence} expected_sequence={expected_sequence}"
-                        );
-                        cover!("rejected_out_of_order");
-                    } else if expected_sequence > base_sequence {
-                        // Each batch holds one record and was accepted in
-                        // order, so the batch at this sequence is stored at the
-                        // offset of the same number.
+                    if let Some(&(_, base_offset)) = stored_batches
+                        .iter()
+                        .find(|(stored_sequence, _)| *stored_sequence == base_sequence)
+                    {
                         assert_eq!(
                             error_code,
                             ErrorCode::None,
-                            "base_sequence={base_sequence} expected_sequence={expected_sequence}"
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
                         );
-                        assert_eq!(partition_response.base_offset, i64::from(base_sequence));
+                        assert_eq!(partition_response.base_offset, base_offset);
                         cover!("answered_duplicate");
-                    } else {
+                    } else if expected_sequence.is_none_or(|expected| expected == base_sequence) {
                         assert_eq!(
                             error_code,
                             ErrorCode::None,
-                            "base_sequence={base_sequence} expected_sequence={expected_sequence}"
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
                         );
                         assert_eq!(partition_response.base_offset, next_offset);
 
-                        expected_sequence += 1;
+                        if expected_sequence.is_none() && base_sequence != 0 {
+                            cover!("accepted_first_at_any_sequence");
+                        }
+
+                        stored_batches.push((base_sequence, next_offset));
+                        expected_sequence = Some(base_sequence + 1);
                         next_offset += 1;
-                        accepted_batches += 1;
 
                         cover!("accepted_in_order");
+                    } else {
+                        assert_eq!(
+                            error_code,
+                            ErrorCode::OutOfOrderSequenceNumber,
+                            "base_sequence={base_sequence} expected_sequence={expected_sequence:?}"
+                        );
+                        cover!("rejected_out_of_order");
                     }
                 }
             }
+
+            let accepted_batches = stored_batches.len();
 
             // Cross-check against what a fetcher actually sees: a silently
             // dropped accept or a silently applied reject shows up here as a

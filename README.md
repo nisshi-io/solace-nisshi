@@ -57,7 +57,34 @@ Other ways to run Nisshi, both described in [Install and run Nisshi](docs/instal
 - Docker Compose — if you have Docker installed. See [Running with Docker Compose](docs/install.md#running-with-docker-compose).
 - cargo — if you have Rust installed, or there is no prebuilt binary for your platform, such as Windows or an Intel Mac. See [Installing with crates.io](docs/install.md#installing-with-cratesio).
 
-To see Nisshi write topics to a data lake, try the examples for [pyiceberg](https://github.com/nisshi-io/example-pyiceberg), [Apache Spark](https://github.com/nisshi-io/example-spark), or [Delta Lake](https://github.com/nisshi-io/example-delta-lake).
+### Examples
+
+Each example is a repository of its own.
+
+Kafka clients:
+
+- [example-kafka-python](https://github.com/nisshi-io/example-kafka-python) — send and receive messages with kafka-python
+- [example-aiokafka](https://github.com/nisshi-io/example-aiokafka) — a consumer group with the asyncio Python client: start several consumers and watch the partitions rebalance
+- [example-kafkajs](https://github.com/nisshi-io/example-kafkajs) — send messages with KafkaJS
+- [example-franz](https://github.com/nisshi-io/example-franz) — send and receive messages with franz-go, on four storage setups
+- [example-java](https://github.com/nisshi-io/example-java) — the Apache Kafka® command-line tools, run as a test suite against Nisshi
+
+Data lakes, from topics that have a schema:
+
+- [example-pyiceberg](https://github.com/nisshi-io/example-pyiceberg) — Apache Iceberg tables, read with pyiceberg
+- [example-spark](https://github.com/nisshi-io/example-spark) — Apache Iceberg tables, queried with Apache Spark
+- [example-delta-lake](https://github.com/nisshi-io/example-delta-lake) — Delta Lake tables, queried with DuckDB
+- [example-parquet](https://github.com/nisshi-io/example-parquet) — Apache Parquet files on local disk
+- [example-rustfs](https://github.com/nisshi-io/example-rustfs) — Apache Parquet files on RustFS, an S3-compatible store
+
+Integrations:
+
+- [example-pg-tx-outbox](https://github.com/nisshi-io/example-pg-tx-outbox) — check an order, update the database and produce a Kafka message in one PostgreSQL transaction, which works because Nisshi keeps its messages in the same database
+- [example-mirror-maker](https://github.com/nisshi-io/example-mirror-maker) — Kafka Mirror Maker copying a topic from one Nisshi cluster to another
+- [example-kafka-proxy](https://github.com/nisshi-io/example-kafka-proxy) — the Nisshi proxy in front of an Apache Kafka® broker
+- [example-xtdb](https://github.com/nisshi-io/example-xtdb) — XTDB with its transaction log in a Nisshi topic
+- [example-vehicle-telemetry](https://github.com/nisshi-io/example-vehicle-telemetry) — a simulated fleet of vehicles sending GPS updates, with a Grafana dashboard
+- [example-knative](https://github.com/nisshi-io/example-knative) — Knative Eventing on Kubernetes, with Nisshi as its Kafka broker
 
 ## Commands
 

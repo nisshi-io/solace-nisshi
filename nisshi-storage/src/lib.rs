@@ -221,7 +221,8 @@ pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
 pub use producer::{
-    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+    FirstSequence, OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted,
+    producer_claim,
 };
 pub use proxy::SemaphoreProxy;
 pub use service::deadline;
@@ -239,15 +240,15 @@ pub use service::{
     FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, PartitionProduce,
-    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
-    ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
-    RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
-    SchemaValidationService, StorePartitionService, StoredPartitions, TimestampLayer,
-    TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    ValidatedProduceRequest, ValidatedTopic, bounded_channel, describe_groups_response,
-    inflate_produced, list_groups_response,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
+    PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
+    ProduceService, ProduceTopicService, Request, RequestChannelService, RequestLayer,
+    RequestReceiver, RequestSender, RequestService, RequestStorageService, Response,
+    SchemaValidationLayer, SchemaValidationService, StorePartitionService, StoredPartitions,
+    TimestampLayer, TimestampService, TopicConfiguration, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -485,20 +486,197 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
-    /// reports when storage fails with this error.
+    /// Returns whether a retry of the failed operation may succeed.
     ///
-    /// A storage error that carries a code keeps that code. Any other storage error is treated as
-    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
-    /// [retry].
+    /// A failure of the storage backend, such as an object store, PostgreSQL, the connection
+    /// pool, libSQL, Turso or I/O, may clear on its own, so it is transient. Everything else is
+    /// permanent: a value that can't be decoded, a request that the storage rejects, or a broken
+    /// invariant fails the same way on every retry.
     ///
-    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
-    pub fn group_request_error_code(&self) -> ErrorCode {
+    /// Two backend errors are permanent because a retry can't fix them. An object store error
+    /// that names a missing object, a rejected credential or an unsupported operation, and a
+    /// PostgreSQL error whose SQLSTATE names a request that the server never accepts: an
+    /// unsupported feature, a cardinality violation, a data exception, an integrity constraint
+    /// violation, a missing database or schema, a syntax error or access rule violation, a
+    /// program limit exceeded, an internal error (classes 0A, 21, 22, 23, 3D, 3F, 42, 54 and
+    /// XX), or a statement in a failed transaction (25P02). Every other SQLSTATE is transient.
+    ///
+    /// [`Error::Acquire`], [`Error::UnableToSend`], [`Error::OneshotRecv`] and an
+    /// [`Error::Join`] of a cancelled task are transient. A semaphore, a channel to the storage
+    /// service or an offloaded task ends when the broker shuts down, and a retry reaches the
+    /// broker that replaces it. An [`Error::Join`] of a panicked task is permanent, because the
+    /// same input panics the task again.
+    ///
+    /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
+    /// batch took its offset, so a retry can store the batch twice.
+    ///
+    /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
+    /// [`Error::error_code`] keeps.
+    ///
+    /// The match lists every variant, so that a new variant does not compile until its author
+    /// decides whether a retry may succeed.
+    pub fn is_transient(&self) -> bool {
         match self {
-            Self::Api(error_code) => *error_code,
-            _ => ErrorCode::CoordinatorNotAvailable,
+            Self::Acquire(_) | Self::Io(_) | Self::UnableToSend | Self::OneshotRecv => true,
+
+            Self::Join(error) => error.is_cancelled(),
+
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::ObjectStore(error) => !matches!(
+                error.as_ref(),
+                object_store::Error::NotFound { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+                    | object_store::Error::InvalidPath { .. }
+                    | object_store::Error::NotSupported { .. }
+                    | object_store::Error::NotImplemented { .. }
+                    | object_store::Error::UnknownConfigurationKey { .. }
+            ),
+
+            // A credential provider that returned nothing may recover. A misconfigured one
+            // fails at startup, before any client request.
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::NoCredentials(_) => true,
+
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            Self::Pool(_) => true,
+
+            #[cfg(feature = "postgres")]
+            Self::TokioPostgres(error) => match error.as_db_error() {
+                Some(db_error) => is_transient_sqlstate(db_error.code()),
+
+                // Without a SQLSTATE the error is the client's. A closed connection and an I/O
+                // error clear on a retry. A value that doesn't convert to its Rust type, a
+                // query that found no row, and a protocol mismatch do not.
+                None => {
+                    error.is_closed()
+                        || error::Error::source(error.as_ref())
+                            .is_some_and(|source| source.is::<io::Error>())
+                }
+            },
+
+            #[cfg(feature = "libsql")]
+            Self::LibSql(_) => true,
+
+            #[cfg(feature = "turso")]
+            Self::Turso(_) => true,
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(_) => true,
+
+            Self::Api(_)
+            | Self::AuthenticationUnsupported { .. }
+            | Self::UserCredentialsUnsupported { .. }
+            | Self::AcksZeroProduceFailed { .. }
+            | Self::ChronoParse(_)
+            | Self::Decode(_)
+            | Self::Boxed(_)
+            | Self::FeatureNotEnabled { .. }
+            | Self::Glob(_)
+            | Self::NoEngineForScheme { .. }
+            | Self::IncompatibleSchema { .. }
+            | Self::OutdatedSchema { .. }
+            | Self::InsufficientCapacity(_)
+            | Self::LessThanBaseOffset { .. }
+            | Self::LessThanLastOffset { .. }
+            | Self::LessThanMaxTime { .. }
+            | Self::LessThanMinTime { .. }
+            | Self::MessageTooLarge { .. }
+            | Self::Message(_)
+            | Self::NoSuchEntry { .. }
+            | Self::NoSuchOffset(_)
+            | Self::OsString(_)
+            | Self::StartupFailed { .. }
+            | Self::ParseFilter(_)
+            | Self::Pattern(_)
+            | Self::ParseInt(_)
+            | Self::PhantomCached()
+            | Self::Poison
+            | Self::ProgressStyleTemplate(_)
+            | Self::Regex(_)
+            | Self::SansIo(_)
+            | Self::Schema(_)
+            | Self::Rustls(_)
+            | Self::SegmentEmpty(_)
+            | Self::SegmentMissing { .. }
+            | Self::SerdeJson(_)
+            | Self::SystemTime(_)
+            | Self::TryFromInt(_)
+            | Self::TryFromSlice(_)
+            | Self::TryGet(_)
+            | Self::UnexpectedBody(_)
+            | Self::UnexpectedServiceResponse(_)
+            | Self::UnknownCacheKey(_)
+            | Self::InvalidStorageOptionValue { .. }
+            | Self::UnrecognizedStorageOption { .. }
+            | Self::UnsupportedTxnAddPartitionsVersion
+            | Self::UnexpectedAddPartitionsToTxnRequest(_)
+            | Self::Url(_)
+            | Self::UnknownTxnState(_)
+            | Self::Uuid(_) => false,
+
+            #[cfg(any(feature = "postgres", feature = "libsql"))]
+            Self::DeadPoolBuild(_) => false,
+
+            #[cfg(feature = "slatedb")]
+            Self::Postcard(_) => false,
+
+            #[cfg(feature = "turso")]
+            Self::UnexpectedValue(_) => false,
+
+            #[cfg(feature = "libsql")]
+            Self::UnexpectedLibSqlValue(_) => false,
         }
     }
+
+    /// Returns the error code that a request reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. A transient error, see
+    /// [`Error::is_transient`], answers `retriable`: the code that Kafka clients retry for the
+    /// API that is answering. Any other error is permanent and answers `UNKNOWN_SERVER_ERROR`,
+    /// which clients report at once, because a retry can't fix it. Kafka's group coordinator
+    /// answers the same way: its [`handleOperationException`] maps a timeout or an unavailable
+    /// log to a retriable code and every other exception to `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// Each API passes the retriable code that its Kafka clients handle:
+    /// `COORDINATOR_NOT_AVAILABLE` for the group APIs, `KAFKA_STORAGE_ERROR` for Produce, and so
+    /// on. This method is the only place that picks between the retriable code and
+    /// `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1170
+    pub fn error_code(&self, retriable: ErrorCode) -> ErrorCode {
+        match self {
+            Self::Api(error_code) => *error_code,
+            error if error.is_transient() => retriable,
+            _ => ErrorCode::UnknownServerError,
+        }
+    }
+}
+
+/// Returns whether a PostgreSQL error with `sqlstate` may clear on a retry.
+///
+/// The SQLSTATE classes for an unsupported feature (0A), a cardinality violation (21), a data
+/// exception (22), an integrity constraint violation (23), a missing database or schema (3D and
+/// 3F), a syntax error or access rule violation (42), a program limit exceeded (54) and an
+/// internal error (XX) name a request that the server never accepts. So does
+/// `in_failed_sql_transaction` (25P02), which a code bug causes. All of them are permanent.
+/// Class 0A is safe to call permanent because Nisshi runs only at the `READ COMMITTED` level
+/// and takes no runtime lock above `ROW EXCLUSIVE` on PostgreSQL, so a hot standby answers
+/// `read_only_sql_transaction` (25006) and not `feature_not_supported` (0A000). A request-time
+/// `pg_advisory_xact_lock` or a `SERIALIZABLE` transaction would change that. Every other state
+/// is transient. A state that nobody listed, such as
+/// `read_only_sql_transaction` (25006) on a pooled connection to a primary that a failover
+/// has demoted, or `lock_not_available` (55P03), then answers the retriable code and not a
+/// fatal one.
+#[cfg(feature = "postgres")]
+fn is_transient_sqlstate(sqlstate: &tokio_postgres::error::SqlState) -> bool {
+    let permanent_class = matches!(
+        sqlstate.code().get(..2),
+        Some("0A" | "21" | "22" | "23" | "3D" | "3F" | "42" | "54" | "XX")
+    );
+
+    !permanent_class && *sqlstate != tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
 }
 
 impl Display for Error {
@@ -3344,16 +3522,114 @@ mod tests {
     fn storage_error_with_a_code_keeps_that_code() {
         assert_eq!(
             ErrorCode::UnknownServerError,
-            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+            Error::Api(ErrorCode::UnknownServerError)
+                .error_code(ErrorCode::CoordinatorNotAvailable)
         );
     }
 
     #[test]
-    fn other_storage_error_answers_coordinator_not_available() {
+    fn transient_storage_error_answers_the_retriable_code() {
+        let error = Error::Io(Arc::new(io::Error::other("connection reset")));
+
+        assert!(error.is_transient());
         assert_eq!(
             ErrorCode::CoordinatorNotAvailable,
-            Error::Message("connection refused".into()).group_request_error_code()
+            error.error_code(ErrorCode::CoordinatorNotAvailable)
         );
+    }
+
+    #[test]
+    fn permanent_storage_error_answers_unknown_server_error() {
+        for error in [
+            Error::Message("connection refused".into()),
+            Error::Poison,
+            Error::Decode(Bytes::new()),
+        ] {
+            assert!(!error.is_transient(), "{error:?}");
+            assert_eq!(
+                ErrorCode::UnknownServerError,
+                error.error_code(ErrorCode::CoordinatorNotAvailable),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_closed_semaphore_or_channel_or_a_cancelled_task_is_transient() {
+        let semaphore = tokio::sync::Semaphore::new(0);
+        semaphore.close();
+        let acquire = semaphore.acquire().await.expect_err("closed semaphore");
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.expect_err("aborted task");
+
+        for error in [
+            Error::from(acquire),
+            Error::UnableToSend,
+            Error::OneshotRecv,
+            Error::Join(Arc::new(cancelled)),
+        ] {
+            assert!(error.is_transient(), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_panicked_task_is_permanent() {
+        let panicked = tokio::spawn(async { panic!("injected panic") })
+            .await
+            .expect_err("panicked task");
+
+        assert!(!Error::Join(Arc::new(panicked)).is_transient());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_sqlstate_is_transient_unless_its_class_names_a_request_the_server_never_accepts() {
+        use tokio_postgres::error::SqlState;
+
+        // A failover and a busy server produce these states, and they clear on their own.
+        for sqlstate in [
+            SqlState::CONNECTION_FAILURE,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::READ_ONLY_SQL_TRANSACTION,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::ADMIN_SHUTDOWN,
+        ] {
+            assert!(is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
+        }
+
+        for sqlstate in [
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::SYNTAX_ERROR,
+            SqlState::INTERNAL_ERROR,
+            SqlState::PROGRAM_LIMIT_EXCEEDED,
+            SqlState::FEATURE_NOT_SUPPORTED,
+            SqlState::CARDINALITY_VIOLATION,
+            SqlState::INVALID_CATALOG_NAME,
+            SqlState::INVALID_SCHEMA_NAME,
+            SqlState::IN_FAILED_SQL_TRANSACTION,
+        ] {
+            assert!(!is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
+        }
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn object_store_error_is_transient_unless_a_retry_cannot_fix_it() {
+        let generic = object_store::Error::Generic {
+            store: "S3",
+            source: "timed out".into(),
+        };
+
+        let not_found = object_store::Error::NotFound {
+            path: "a".into(),
+            source: "missing".into(),
+        };
+
+        assert!(Error::from(generic).is_transient());
+        assert!(!Error::from(not_found).is_transient());
     }
 
     #[test]

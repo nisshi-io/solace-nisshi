@@ -224,7 +224,7 @@ where
                             resource_name = resource.resource_name,
                             ?error
                         );
-                        error_response(&resource, ErrorCode::UnknownServerError)
+                        error_response(&resource, error.error_code(ErrorCode::RequestTimedOut))
                     }
                 },
             };
@@ -271,7 +271,7 @@ where
                     resource_name = resource.resource_name,
                     ?error
                 );
-                ErrorCode::UnknownServerError
+                error.error_code(ErrorCode::RequestTimedOut)
             }
         };
 

@@ -4618,15 +4618,19 @@ impl Storage for Delegate {
                 // The engine answers a group whose read fails with an error code, as Apache Kafka's
                 // [`GroupCoordinatorService`] does, instead of failing the request, because the
                 // broker closes the client's connection on a failed request and sends no response.
-                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`.
+                // Kafka clients retry `COORDINATOR_NOT_AVAILABLE`, so a transient error answers
+                // it, and any other error answers `UNKNOWN_SERVER_ERROR`.
                 //
                 // [`GroupCoordinatorService`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1184
-                let Ok(c) = &c else {
-                    results.push(NamedGroupDetail::error_code(
-                        group_id.into(),
-                        ErrorCode::CoordinatorNotAvailable,
-                    ));
-                    continue;
+                let c = match &c {
+                    Ok(c) => c,
+                    Err(err) => {
+                        results.push(NamedGroupDetail::error_code(
+                            group_id.into(),
+                            err.error_code(ErrorCode::CoordinatorNotAvailable),
+                        ));
+                        continue;
+                    }
                 };
 
                 match c
@@ -4661,9 +4665,9 @@ impl Storage for Delegate {
                         ErrorCode::GroupIdNotFound,
                     )),
 
-                    Err(_) => results.push(NamedGroupDetail::error_code(
+                    Err(err) => results.push(NamedGroupDetail::error_code(
                         group_id.into(),
-                        ErrorCode::CoordinatorNotAvailable,
+                        Error::from(err).error_code(ErrorCode::CoordinatorNotAvailable),
                     )),
                 }
             }
@@ -4961,7 +4965,7 @@ impl Storage for Delegate {
                                 error!(?err, cluster = self.cluster, transaction_id, producer)
                             }) {
                                 Ok(()) => ErrorCode::ConcurrentTransactions,
-                                Err(_) => ErrorCode::UnknownServerError,
+                                Err(err) => return Err(err),
                             };
 
                             return Ok(ProducerIdResponse::failed(error)).inspect(|_| {
@@ -5113,7 +5117,7 @@ impl Storage for Delegate {
                     )
                 }) {
                     Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
+                    Err(err) => return Err(err),
                 };
 
                 Ok(ProducerIdResponse {
@@ -5162,7 +5166,7 @@ impl Storage for Delegate {
                             .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
                         {
                             Ok(()) => ErrorCode::None,
-                            Err(_) => ErrorCode::UnknownServerError,
+                            Err(err) => return Err(err),
                         };
 
                         Ok(ProducerIdResponse {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, DescribeGroupsRequest, DescribeGroupsResponse, RequestInput,
+    ApiKey, DescribeGroupsRequest, DescribeGroupsResponse, ErrorCode, RequestInput,
     describe_groups_response::DescribedGroup,
 };
 use rama::Service;
@@ -111,7 +111,10 @@ pub fn describe_groups_response(
             .unwrap_or_default()
             .iter()
             .map(|group_id| {
-                NamedGroupDetail::error_code(group_id.clone(), err.group_request_error_code())
+                NamedGroupDetail::error_code(
+                    group_id.clone(),
+                    err.error_code(ErrorCode::CoordinatorNotAvailable),
+                )
             })
             .collect()
     });
@@ -133,8 +136,6 @@ pub fn describe_groups_response(
 
 #[cfg(test)]
 mod tests {
-    use nisshi_sans_io::ErrorCode;
-
     use super::*;
 
     #[test]
@@ -142,7 +143,7 @@ mod tests {
         let group_ids = ["a".to_owned(), "b".to_owned()];
 
         let response = describe_groups_response(
-            Err(Error::Message("connection refused".into())),
+            Err(Error::from(std::io::Error::other("connection refused"))),
             Some(&group_ids),
             false,
         );
@@ -194,6 +195,27 @@ mod tests {
                 groups[0].authorized_operations
             );
         }
+
+        Ok(())
+    }
+
+    /// A storage error that a retry can't fix answers `UNKNOWN_SERVER_ERROR`, which clients
+    /// report at once instead of retrying until their API timeout.
+    #[test]
+    fn permanent_storage_error_answers_each_group_with_unknown_server_error() -> Result<()> {
+        let group_ids = ["a".to_owned()];
+
+        let response = describe_groups_response(
+            Err(Error::Message("cannot parse".into())),
+            Some(&group_ids),
+            false,
+        );
+
+        let groups = response.groups.unwrap_or_default();
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(groups[0].error_code)?
+        );
 
         Ok(())
     }
