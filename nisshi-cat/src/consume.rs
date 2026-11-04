@@ -286,11 +286,18 @@ impl Consume {
                     debug!(?frame);
 
                     let frame = inflated::Frame::try_from(frame)?;
-                    for batch in frame
-                        .batches
-                        .into_iter()
-                        .filter_map(|batch| readable(batch, self.configuration.fetch_offset))
-                    {
+                    for batch in frame.batches {
+                        let Some(batch) = readable(batch, self.configuration.fetch_offset)
+                            .map_err(|overflow| Error::RecordOffsetOverflow {
+                                topic: self.configuration.topic.clone(),
+                                partition: partition.partition_index,
+                                base_offset: overflow.base_offset,
+                                offset_delta: overflow.offset_delta,
+                            })?
+                        else {
+                            continue;
+                        };
+
                         debug!(?batch);
 
                         if let Some(ref schema) = schema {
@@ -367,12 +374,15 @@ impl Consume {
 /// skipped as [`from_offset`] does.
 ///
 /// [`CompletedFetch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L232-L238
-fn readable(batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch> {
+fn readable(
+    batch: inflated::Batch,
+    fetch_offset: i64,
+) -> Result<Option<inflated::Batch>, OffsetOverflow> {
     if batch.is_control() {
         // A fetch that returns only a marker prints nothing and exits 0, like a partition with
         // nothing to read, so this line is the only trace of it.
         debug!(base_offset = batch.base_offset, "skipped a control batch");
-        None
+        Ok(None)
     } else {
         from_offset(batch, fetch_offset)
     }
@@ -384,19 +394,50 @@ fn readable(batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch
 /// consumer skips the records before it, as [`CompletedFetch`] does, and so does `cat consume`.
 ///
 /// [`CompletedFetch`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/CompletedFetch.java#L227-L228
-fn from_offset(mut batch: inflated::Batch, fetch_offset: i64) -> Option<inflated::Batch> {
+///
+/// A record whose offset overflows an `i64` is an error, not a record before `fetch_offset`: no
+/// partition has such an offset, so the response is corrupt, and dropping the record would hide
+/// that. Kafka's consumer is looser: it adds the two unchecked in Java, as
+/// [`DefaultRecord.readFrom`] does, and wraps. `cat consume` reads once and already exits
+/// non-zero on other broker errors, so it is stricter.
+///
+/// [`DefaultRecord.readFrom`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecord.java#L319
+fn from_offset(
+    mut batch: inflated::Batch,
+    fetch_offset: i64,
+) -> Result<Option<inflated::Batch>, OffsetOverflow> {
     let base_offset = batch.base_offset;
 
+    if let Some(overflow) = batch.records.iter().find_map(|record| {
+        base_offset
+            .checked_add(i64::from(record.offset_delta))
+            .is_none()
+            .then_some(OffsetOverflow {
+                base_offset,
+                offset_delta: record.offset_delta,
+            })
+    }) {
+        return Err(overflow);
+    }
+
+    // Every sum fits, as checked above.
     batch
         .records
         .retain(|record| base_offset + i64::from(record.offset_delta) >= fetch_offset);
 
-    (!batch.records.is_empty()).then_some(batch)
+    Ok((!batch.records.is_empty()).then_some(batch))
+}
+
+/// A record's offset, its batch's base offset plus its offset delta, that overflows an `i64`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OffsetOverflow {
+    base_offset: i64,
+    offset_delta: i32,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Configuration, Consume, from_offset, readable};
+    use super::{Configuration, Consume, OffsetOverflow, from_offset, readable};
     use bytes::Bytes;
     use nisshi_sans_io::{
         ApiKey, BatchAttribute, Body, ControlBatch, EndTransactionMarker, FetchRequest, Frame,
@@ -487,7 +528,7 @@ mod tests {
     fn records_before_the_fetch_offset_are_skipped() {
         assert_eq!(
             Some(vec![Bytes::from("c"), Bytes::from("d")]),
-            values(from_offset(batch(10, &["a", "b", "c", "d"]), 12))
+            values(from_offset(batch(10, &["a", "b", "c", "d"]), 12).unwrap())
         );
     }
 
@@ -495,18 +536,79 @@ mod tests {
     fn batch_at_or_after_the_fetch_offset_is_kept_whole() {
         assert_eq!(
             Some(vec![Bytes::from("a"), Bytes::from("b")]),
-            values(from_offset(batch(10, &["a", "b"]), 10))
+            values(from_offset(batch(10, &["a", "b"]), 10).unwrap())
         );
 
         assert_eq!(
             Some(vec![Bytes::from("a")]),
-            values(from_offset(batch(10, &["a"]), 0))
+            values(from_offset(batch(10, &["a"]), 0).unwrap())
         );
     }
 
     #[test]
     fn batch_before_the_fetch_offset_is_dropped() {
-        assert_eq!(None, values(from_offset(batch(10, &["a", "b"]), 12)));
+        assert_eq!(
+            None,
+            values(from_offset(batch(10, &["a", "b"]), 12).unwrap())
+        );
+    }
+
+    /// A batch at `base_offset` with one record at each of `offset_deltas`.
+    fn batch_at(base_offset: i64, offset_deltas: &[i32]) -> inflated::Batch {
+        offset_deltas
+            .iter()
+            .fold(
+                inflated::Batch::builder().base_offset(base_offset),
+                |batch, offset_delta| batch.record(Record::builder().offset_delta(*offset_delta)),
+            )
+            .last_offset_delta(offset_deltas.iter().copied().max().unwrap_or(0))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn offset_past_i64_max_is_an_error() {
+        assert_eq!(
+            Err(OffsetOverflow {
+                base_offset: i64::MAX,
+                offset_delta: 1
+            }),
+            from_offset(batch_at(i64::MAX, &[0, 1]), 0)
+        );
+    }
+
+    #[test]
+    fn offset_before_i64_min_is_an_error() {
+        assert_eq!(
+            Err(OffsetOverflow {
+                base_offset: i64::MIN,
+                offset_delta: -1
+            }),
+            from_offset(batch_at(i64::MIN, &[-1]), 0)
+        );
+    }
+
+    #[test]
+    fn offset_at_i64_max_is_kept() {
+        assert_eq!(
+            1,
+            from_offset(batch_at(i64::MAX, &[0]), i64::MAX)
+                .unwrap()
+                .unwrap()
+                .records
+                .len()
+        );
+    }
+
+    #[test]
+    fn readable_reports_an_overflowing_offset() {
+        assert_eq!(
+            Err(OffsetOverflow {
+                base_offset: i64::MAX,
+                offset_delta: 1
+            }),
+            readable(batch_at(i64::MAX, &[1]), 0)
+        );
     }
 
     /// The batch that the broker's storage writes when it ends a transaction.
@@ -535,7 +637,7 @@ mod tests {
         let marker = commit_marker(10);
 
         assert!(marker.is_control());
-        assert_eq!(None, values(readable(marker, 0)));
+        assert_eq!(None, values(readable(marker, 0).unwrap()));
     }
 
     #[test]
@@ -547,6 +649,9 @@ mod tests {
             .unwrap();
 
         assert!(!data.is_control());
-        assert_eq!(Some(vec![Bytes::from("a")]), values(readable(data, 0)));
+        assert_eq!(
+            Some(vec![Bytes::from("a")]),
+            values(readable(data, 0).unwrap())
+        );
     }
 }

@@ -51,6 +51,16 @@ pub enum Error {
         error_code: i16,
     },
 
+    /// A record in the broker's answer to a fetch of `partition` of `topic` has an offset that
+    /// doesn't fit in an `i64`: its batch's `base_offset` plus its `offset_delta` overflows. No
+    /// partition has such an offset, so the response is corrupt.
+    RecordOffsetOverflow {
+        topic: String,
+        partition: i32,
+        base_offset: i64,
+        offset_delta: i32,
+    },
+
     Client(#[from] nisshi_client::Error),
     InvalidJson {
         location: Location,
@@ -124,6 +134,16 @@ impl fmt::Display for Error {
                 )?;
                 write_error_code(f, *error_code)
             }
+            Self::RecordOffsetOverflow {
+                topic,
+                partition,
+                base_offset,
+                offset_delta,
+            } => write!(
+                f,
+                "partition {partition} of topic {topic:?} has a record whose offset overflows: \
+                base offset {base_offset} plus offset delta {offset_delta}"
+            ),
             Self::Metadata { topic, error_code } => {
                 write!(f, "looking up topic {topic:?} failed: ")?;
                 write_error_code(f, *error_code)

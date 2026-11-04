@@ -452,7 +452,9 @@ impl Display for Produced {
                 f,
                 "Produced {count} messages to {topic} partition {partition}, offsets \
                 {base_offset} to {}.",
-                base_offset + i64::from(count - 1)
+                // The broker supplies `base_offset`, and `fmt` can't fail, so a base offset
+                // too close to `i64::MAX` prints `i64::MAX` instead of overflowing.
+                base_offset.saturating_add(i64::from(count - 1))
             ),
         }
     }
@@ -843,6 +845,17 @@ mod tests {
         assert_eq!(
             "Produced 4 messages to taxi partition 0, offsets 0 to 3.",
             produced(0, 4)
+        );
+    }
+
+    #[test]
+    fn produced_range_past_i64_max_stops_at_it() {
+        assert_eq!(
+            format!(
+                "Produced 3 messages to taxi partition 0, offsets {0} to {0}.",
+                i64::MAX
+            ),
+            produced(i64::MAX, 3)
         );
     }
 
