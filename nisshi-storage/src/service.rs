@@ -99,7 +99,7 @@ use opentelemetry::{
 };
 pub use produce::{
     AcksZeroLayer, AcksZeroService, ProduceRequestValidationLayer, ProduceRequestValidationService,
-    ProduceService, ValidatedProduceRequest, inflate_produced,
+    ProduceService, ProduceTopicService, ValidatedProduceRequest, ValidatedTopic, inflate_produced,
 };
 use rama::{Layer, Service};
 use tokio::sync::{

@@ -18,32 +18,28 @@ mod rejection;
 mod request_validation;
 mod response;
 mod timestamps;
+mod topic;
 mod topic_configuration;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::convert::Infallible;
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
-    produce_response::{PartitionProduceResponse, TopicProduceResponse},
+    ApiKey, ErrorCode, ProduceRequest, ProduceResponse, produce_response::TopicProduceResponse,
     record::inflated,
 };
 use nisshi_schema::Registry;
 use rama::{Layer as _, Service};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, instrument};
 
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
     request_validation::{
         ProduceRequestValidationLayer, ProduceRequestValidationService, ValidatedProduceRequest,
+        ValidatedTopic,
     },
+    topic::ProduceTopicService,
 };
-use self::{
-    rejection::storage_error_code,
-    request_validation::{ValidatedPartition, ValidatedTopic},
-    timestamps::{NO_TIMESTAMP, validate_timestamps_offloaded},
-    topic_configuration::TopicConfiguration,
-};
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Result, Storage};
 
 /// Inflate a batch that a client sent in a Produce request, mapping a
 /// decode failure to `INVALID_RECORD`.
@@ -96,10 +92,11 @@ where
     })
 }
 
-/// A [`Service`] using its [`Storage`] taking [`ValidatedProduceRequest`] returning
-/// [`ProduceResponse`].
+/// A [`Service`] taking [`ValidatedProduceRequest`] returning [`ProduceResponse`], that serves each
+/// topic of the request, in order, with `topics`.
 ///
-/// Call [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
+/// [`ProduceService::new`] gives it a [`ProduceTopicService`] that uses a [`Storage`]. Call
+/// [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
 /// ```no_run
 /// use bytes::Bytes;
 /// use rama::{Layer as _, Service as _};
@@ -198,16 +195,15 @@ where
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct ProduceService<G> {
-    storage: G,
-    schemas: Option<Registry>,
+pub struct ProduceService<S> {
+    topics: S,
 }
 
-impl<G> ApiKey for ProduceService<G> {
+impl<S> ApiKey for ProduceService<S> {
     const KEY: i16 = ProduceRequest::KEY;
 }
 
-impl<G> ProduceService<G>
+impl<G> ProduceService<ProduceTopicService<G>>
 where
     G: Storage,
 {
@@ -215,8 +211,7 @@ where
     /// schema.
     pub fn new(storage: G) -> Self {
         Self {
-            storage,
-            schemas: None,
+            topics: ProduceTopicService::new(storage),
         }
     }
 
@@ -224,212 +219,29 @@ where
     /// batch for a topic that has a schema must match it before the service stores the batch,
     /// unless the topic's `schema.validation` is `false`.
     pub fn with_schemas(self, schemas: Option<Registry>) -> Self {
-        Self { schemas, ..self }
+        Self {
+            topics: self.topics.with_schemas(schemas),
+        }
     }
+}
 
+impl<S> ProduceService<S>
+where
+    S: Service<ValidatedTopic, Output = TopicProduceResponse, Error = Infallible>,
+{
     /// Returns this service behind the layers that give it a [`ValidatedProduceRequest`] and that
     /// close the connection of a failed `acks=0` request: [`AcksZeroLayer`] around
     /// [`ProduceRequestValidationLayer`].
     pub fn with_validation(
         self,
-    ) -> AcksZeroService<ProduceRequestValidationService<ProduceService<G>>> {
+    ) -> AcksZeroService<ProduceRequestValidationService<ProduceService<S>>> {
         AcksZeroLayer::new().layer(ProduceRequestValidationLayer::new().layer(self))
     }
-
-    #[instrument(skip_all)]
-    async fn partition(
-        &self,
-        transaction_id: Option<&str>,
-        name: &str,
-        configuration: &TopicConfiguration,
-        partition: ValidatedPartition,
-    ) -> PartitionProduceResponse {
-        let ValidatedPartition { index, batch } = partition;
-
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(rejection) => return rejection.into_response(index),
-        };
-
-        let timestamp_type = configuration.timestamp_type;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or_default();
-
-        let (batch, inflated) =
-            match validate_timestamps_offloaded(batch, timestamp_type, now).await {
-                Ok((validated, Ok(inflated))) => (validated, inflated),
-                Ok((validated, Err(rejection))) => {
-                    rejection.log(name, index, &validated);
-                    return rejection.into_response(index);
-                }
-                Err(err) => {
-                    error!(?err);
-                    return response::partition_error(index, ErrorCode::UnknownServerError);
-                }
-            };
-
-        let producer_id = batch.producer_id;
-        let producer_epoch = batch.producer_epoch;
-        let base_sequence = batch.base_sequence;
-
-        // The batch is validated here, on the records that the timestamp step decoded, and before
-        // storage moves the high watermark, so that a batch rejected here leaves no state behind.
-        // Storage does not validate the schema, because it would decode the batch a second time.
-        if let Some(schemas) = &self.schemas
-            && configuration.schema_validation()
-            && let Err(error) = schemas
-                .validate(name, &inflated)
-                .await
-                .inspect(|validation| debug!(?validation))
-                .inspect_err(|err| debug!(?err))
-        {
-            return produce_failure(
-                name,
-                index,
-                producer_id,
-                producer_epoch,
-                base_sequence,
-                error.into(),
-            );
-        }
-
-        // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
-        let log_append_time_ms = match timestamp_type {
-            TimestampType::CreateTime => NO_TIMESTAMP,
-            TimestampType::LogAppendTime => now,
-        };
-
-        let tp = Topition::new(name, index);
-
-        match self.storage.produce(transaction_id, &tp, batch).await {
-            Ok(base_offset) => PartitionProduceResponse::default()
-                .index(index)
-                .error_code(ErrorCode::None.into())
-                .base_offset(base_offset)
-                .log_append_time_ms(Some(log_append_time_ms))
-                .log_start_offset(Some(0))
-                .record_errors(Some([].into()))
-                .error_message(None)
-                .current_leader(None),
-
-            Err(error) => produce_failure(
-                name,
-                index,
-                producer_id,
-                producer_epoch,
-                base_sequence,
-                error,
-            ),
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn topic(
-        &self,
-        transaction_id: Option<&str>,
-        topic: ValidatedTopic,
-    ) -> TopicProduceResponse {
-        let mut partitions = Vec::with_capacity(topic.partitions.len());
-
-        match TopicConfiguration::read(&self.storage, &topic.name).await {
-            Ok(configuration) => {
-                for partition in topic.partitions {
-                    partitions.push(
-                        self.partition(transaction_id, &topic.name, &configuration, partition)
-                            .await,
-                    )
-                }
-            }
-
-            Err(error) => {
-                error!(
-                    topic = topic.name,
-                    ?error,
-                    "topic configuration read failed"
-                );
-
-                let error_code = storage_error_code(&error);
-
-                partitions.extend(
-                    topic
-                        .partitions
-                        .iter()
-                        .map(|partition| response::partition_error(partition.index, error_code)),
-                );
-            }
-        }
-
-        TopicProduceResponse::default()
-            .name(topic.name)
-            .partition_responses(Some(partitions))
-    }
 }
 
-/// Returns the response for a batch that `storage.produce()` or the schema validation failed with
-/// `error`, and logs the failure once, with the partition: a rejection that the client caused is
-/// a warning, and an internal failure is an error.
-fn produce_failure(
-    name: &str,
-    index: i32,
-    producer_id: i64,
-    producer_epoch: i16,
-    base_sequence: i32,
-    error: Error,
-) -> PartitionProduceResponse {
-    let error_code = storage_error_code(&error);
-
-    if error_code == ErrorCode::UnknownServerError {
-        error!(
-            topic = name,
-            partition = index,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            ?error,
-            "produce failed"
-        );
-    } else if let Error::MessageTooLarge { size, limit } = error {
-        warn!(
-            topic = name,
-            partition = index,
-            producer_id,
-            size,
-            limit,
-            "rejecting produce batch larger than max.message.bytes"
-        );
-    } else {
-        warn!(
-            topic = name,
-            partition = index,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            ?error_code,
-            %error,
-            "rejecting produce batch"
-        );
-    }
-
-    let response = response::partition_error(index, error_code);
-
-    // Kafka sends the same message, so that the producer's `RecordTooLargeException` names both
-    // sizes.
-    if let Error::MessageTooLarge { size, limit, .. } = error {
-        response.error_message(Some(format!(
-            "The record batch size in the append to {name}-{index} is {size} bytes which exceeds \
-             the maximum configured value of {limit}."
-        )))
-    } else {
-        response
-    }
-}
-
-impl<G> Service<ValidatedProduceRequest> for ProduceService<G>
+impl<S> Service<ValidatedProduceRequest> for ProduceService<S>
 where
-    G: Storage,
+    S: Service<ValidatedTopic, Output = TopicProduceResponse, Error = Infallible>,
 {
     type Output = ProduceResponse;
     type Error = Error;
@@ -439,7 +251,8 @@ where
         let mut responses = Vec::with_capacity(request.topics.len());
 
         for topic in request.topics {
-            responses.push(self.topic(request.transactional_id.as_deref(), topic).await)
+            let Ok(response) = self.topics.serve(topic).await;
+            responses.push(response);
         }
 
         Ok(response::produce_response(responses))
@@ -491,5 +304,167 @@ mod inflate_produced_tests {
             let error = result.expect_err("a batch without record data must not decode");
             assert_eq!(ErrorCode::InvalidRecord, storage_error_code(&error));
         }
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use std::sync::{Arc, Mutex};
+
+    use nisshi_sans_io::{
+        RequestInput,
+        produce_request::{PartitionProduceData, TopicProduceData},
+    };
+    use rama::extensions::Extensions;
+
+    use super::*;
+
+    /// A topic that [`RecordingTopics`] served.
+    #[derive(Clone, Debug, PartialEq)]
+    struct ServedTopic {
+        name: String,
+        transaction_id: Option<String>,
+    }
+
+    impl ServedTopic {
+        fn new(name: &str, transaction_id: Option<&str>) -> Self {
+            Self {
+                name: name.to_owned(),
+                transaction_id: transaction_id.map(Into::into),
+            }
+        }
+    }
+
+    /// A topic service that records each topic that it serves, and answers the topic with its name
+    /// and no partitions.
+    #[derive(Clone, Debug, Default)]
+    struct RecordingTopics {
+        served: Arc<Mutex<Vec<ServedTopic>>>,
+    }
+
+    impl RecordingTopics {
+        fn served(&self) -> Vec<ServedTopic> {
+            self.served
+                .lock()
+                .expect("a test thread panicked while it held the lock")
+                .clone()
+        }
+    }
+
+    impl Service<ValidatedTopic> for RecordingTopics {
+        type Output = TopicProduceResponse;
+        type Error = Infallible;
+
+        async fn serve(&self, topic: ValidatedTopic) -> Result<Self::Output, Self::Error> {
+            self.served
+                .lock()
+                .expect("a test thread panicked while it held the lock")
+                .push(ServedTopic {
+                    name: topic.name.clone(),
+                    transaction_id: topic.transaction_id,
+                });
+
+            Ok(TopicProduceResponse::default().name(topic.name))
+        }
+    }
+
+    /// Serves a request for each of `topics` with `topics_service`, through the layer that builds
+    /// each [`ValidatedTopic`] from the request.
+    async fn serve(
+        topics_service: &RecordingTopics,
+        transactional_id: Option<&str>,
+        topics: &[&str],
+    ) -> Result<Vec<String>> {
+        let topic_data = topics
+            .iter()
+            .map(|name| {
+                TopicProduceData::default()
+                    .name((*name).into())
+                    .partition_data(Some(vec![PartitionProduceData::default().index(0)]))
+            })
+            .collect();
+
+        let response = ProduceRequestValidationLayer::new()
+            .layer(ProduceService {
+                topics: topics_service.clone(),
+            })
+            .serve(RequestInput {
+                request: ProduceRequest::default()
+                    .acks(-1)
+                    .transactional_id(transactional_id.map(Into::into))
+                    .topic_data(Some(topic_data)),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        Ok(response
+            .responses
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic| topic.name)
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn topics_are_served_and_answered_in_the_order_of_the_request() -> Result<()> {
+        let topics_service = RecordingTopics::default();
+
+        let answered = serve(&topics_service, None, &["c", "a", "b"]).await?;
+
+        assert_eq!(["c", "a", "b"], answered.as_slice());
+        assert_eq!(
+            ["c", "a", "b"],
+            topics_service
+                .served()
+                .iter()
+                .map(|served| served.name.as_str())
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn each_topic_is_served_in_the_transaction_of_the_request() -> Result<()> {
+        let topics_service = RecordingTopics::default();
+
+        _ = serve(&topics_service, Some("transaction"), &["a", "b"]).await?;
+
+        assert_eq!(
+            [
+                ServedTopic::new("a", Some("transaction")),
+                ServedTopic::new("b", Some("transaction")),
+            ],
+            topics_service.served().as_slice()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_outside_a_transaction_serves_each_topic_without_one() -> Result<()> {
+        let topics_service = RecordingTopics::default();
+
+        _ = serve(&topics_service, None, &["a"]).await?;
+
+        assert_eq!(
+            [ServedTopic::new("a", None)],
+            topics_service.served().as_slice()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_without_topics_serves_no_topic() -> Result<()> {
+        let topics_service = RecordingTopics::default();
+
+        let answered = serve(&topics_service, None, &[]).await?;
+
+        assert!(answered.is_empty());
+        assert!(topics_service.served().is_empty());
+
+        Ok(())
     }
 }

@@ -280,7 +280,11 @@ fn record_write_failure_never_causes_silent_data_loss() {
         )
         .expect("init producer id");
 
-        let produce = ProduceService::new(storage.clone()).with_validation();
+        // `block_on` keeps the future of each produce on the stack of the model's thread, and that
+        // stack overflows for the unboxed service. The box keeps the future on the heap.
+        let produce = ProduceService::new(storage.clone())
+            .with_validation()
+            .boxed();
 
         // A client believes a batch is durably stored once it sees either
         // a direct success or a `DuplicateSequenceNumber` on retry (proof,

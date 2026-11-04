@@ -32,13 +32,17 @@ use crate::{Error, Result};
 /// never parses those fields itself.
 #[derive(Clone, Debug)]
 pub struct ValidatedProduceRequest {
-    pub(super) transactional_id: Option<String>,
     pub(super) topics: Vec<ValidatedTopic>,
 }
 
+/// A topic of a [`ProduceRequest`], with the transaction that the request writes it in, if any.
+///
+/// [`ProduceTopicService`](super::ProduceTopicService) takes this, so that it needs nothing else
+/// from the request.
 #[derive(Clone, Debug)]
-pub(super) struct ValidatedTopic {
+pub struct ValidatedTopic {
     pub(super) name: String,
+    pub(super) transaction_id: Option<String>,
     pub(super) partitions: Vec<ValidatedPartition>,
 }
 
@@ -102,7 +106,7 @@ impl ValidatedPartition {
 }
 
 impl ValidatedTopic {
-    fn new(topic: TopicProduceData) -> Self {
+    fn new(topic: TopicProduceData, transaction_id: Option<String>) -> Self {
         let partitions = topic
             .partition_data
             .unwrap_or_default()
@@ -112,6 +116,7 @@ impl ValidatedTopic {
 
         Self {
             name: topic.name,
+            transaction_id,
             partitions,
         }
     }
@@ -190,8 +195,10 @@ where
 
         self.inner
             .serve(ValidatedProduceRequest {
-                transactional_id: request.transactional_id,
-                topics: topics.into_iter().map(ValidatedTopic::new).collect(),
+                topics: topics
+                    .into_iter()
+                    .map(|topic| ValidatedTopic::new(topic, request.transactional_id.clone()))
+                    .collect(),
             })
             .await
     }

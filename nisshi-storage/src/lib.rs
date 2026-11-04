@@ -239,12 +239,12 @@ pub use service::{
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
     MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService,
-    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    ValidatedProduceRequest, bounded_channel, describe_groups_response, inflate_produced,
-    list_groups_response,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
+    ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
+    RequestSender, RequestService, RequestStorageService, Response, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
