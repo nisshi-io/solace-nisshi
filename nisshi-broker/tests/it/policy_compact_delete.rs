@@ -458,6 +458,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -783,6 +785,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -931,6 +935,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -1090,6 +1096,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -1406,6 +1414,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -1554,6 +1564,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -1713,6 +1725,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -2034,6 +2048,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -2182,6 +2198,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -2507,6 +2525,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -2655,6 +2675,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
@@ -2806,6 +2828,8 @@ where
                         .topic_id(Some(topic_id))
                         .partitions(Some(vec![
                             FetchPartition::default()
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .partition(partition)
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),

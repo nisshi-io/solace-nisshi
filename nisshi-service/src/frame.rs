@@ -31,7 +31,7 @@ use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
+use crate::{API_ERRORS, API_REQUESTS, PeerAddressExtension, ProgressBarExtension};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -433,6 +433,13 @@ where
             _ = extensions.insert(authentication);
         }
 
+        // A response that fails to encode closes the connection, so the error log names who
+        // the connection belongs to.
+        let client_id = req.client_id()?.map(str::to_owned);
+        let client_host = extensions
+            .get_ref::<PeerAddressExtension>()
+            .map(PeerAddressExtension::client_host);
+
         let Frame { body, .. } = {
             self.inner
                 .serve(FrameInput {
@@ -531,7 +538,14 @@ where
                 API_REQUESTS.add(1, &attributes);
             })
             .inspect_err(|err| {
-                error!(api_key, api_version, ?err);
+                error!(
+                    api_key,
+                    api_version,
+                    correlation_id,
+                    ?client_id,
+                    ?client_host,
+                    ?err
+                );
                 API_ERRORS.add(1, &attributes);
             })
             .map_err(Into::into)

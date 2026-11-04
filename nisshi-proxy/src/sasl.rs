@@ -95,8 +95,8 @@ impl Service<RequestInput<SaslAuthenticateRequest>> for SaslAuthenticateRejectSe
         Ok(SaslAuthenticateResponse::default()
             .error_code(ErrorCode::IllegalSaslState.into())
             .error_message(Some(REJECT_MESSAGE.into()))
-            // Version 1 and later carry this field, and the encoder writes nothing for
-            // `None`, so the client reads a truncated response without it.
+            // Version 1 and later carry this field, and the encoder refuses a `None`
+            // for it (`MandatoryFieldUnset`), so the response would never be sent.
             .session_lifetime_ms(Some(0)))
     }
 }

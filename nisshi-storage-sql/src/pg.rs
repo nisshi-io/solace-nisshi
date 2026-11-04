@@ -1145,7 +1145,7 @@ fn dynamic_topic_config(name: String, value: Option<String>) -> DescribeConfigsR
         .name(name)
         .value(Some(value.unwrap_or_default()))
         .read_only(false)
-        .is_default(None)
+        .is_default(Some(false))
         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
         .is_sensitive(false)
         .synonyms(Some([].into()))

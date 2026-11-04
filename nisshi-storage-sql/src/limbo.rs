@@ -2882,7 +2882,7 @@ impl Storage for Engine {
                         .name(name)
                         .value(value)
                         .read_only(false)
-                        .is_default(None)
+                        .is_default(Some(false))
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))

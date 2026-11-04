@@ -270,7 +270,7 @@ impl Consume {
 
         let topic_id = topic
             .and_then(|topic| topic.topic_id)
-            // The encoder leaves out a `None` topic ID, which moves the fields after it, so a
+            // The encoder refuses a `None` topic ID (`MandatoryFieldUnset`), so a
             // topic missing from the metadata is asked for by the null ID instead.
             .unwrap_or(NULL_TOPIC_ID);
 
@@ -347,7 +347,7 @@ impl Consume {
                     .topic_id(Some(topic_id))
                     .partitions(Some(vec![
                         // Every field that the request's version has is set: the encoder
-                        // leaves out a field that is `None`, which moves the fields after it.
+                        // refuses a field that is `None` (`MandatoryFieldUnset`).
                         // `cat consume` tracks no leader epoch and is not a follower, so it
                         // sends -1 for both epochs and the log start offset. Kafka's consumer
                         // sends -1 for an epoch it doesn't know ([`FetchRequest.build`]) and

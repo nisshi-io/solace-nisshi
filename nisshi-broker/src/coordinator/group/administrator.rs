@@ -1862,8 +1862,8 @@ fn join_error(member_id: &str, error_code: ErrorCode) -> Reply {
             .error_code(error_code.into())
             .generation_id(-1)
             .protocol_type(None)
-            // ProtocolName is non-nullable before version 7, so encoding None would omit the
-            // length prefix and truncate the frame.
+            // ProtocolName is non-nullable before version 7, so encoding None
+            // fails with `MandatoryFieldUnset`.
             .protocol_name(Some("".into()))
             .leader("".into())
             .skip_assignment(Some(false))

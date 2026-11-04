@@ -508,6 +508,24 @@ impl Serializer for &mut Encoder {
             } else {
                 self.serialize_i32(0)
             }
+        } else if self.is_valid() && self.meta.field.is_some_and(|field| field.tag.is_none()) {
+            // A scalar, string or struct that exists at this version, is not
+            // nullable and is not a tagged field has no encoding for `None`.
+            // Skipping it, as this branch used to, drops its bytes and shifts
+            // every field after it: the receiver reads garbage with no error
+            // here. Kafka's generated `write` also refuses a null in a
+            // non-nullable string, bytes or struct field rather than writing
+            // a default (`MessageDataGenerator`, "non-nullable field ... was
+            // serialized as null"), and its primitives are never null because
+            // each starts at its descriptor default. Rust has no such default
+            // here, and one guessed for the caller may be wrong, so fail.
+            // Tagged fields are encoded elsewhere and never reach this
+            // serializer; the `tag` check is a guard.
+            Err(Error::MandatoryFieldUnset {
+                field: self.field_name(),
+                // `is_valid` above is true only when the encoder knows the version.
+                api_version: self.api_version.unwrap_or_default(),
+            })
         } else {
             Ok(())
         }
