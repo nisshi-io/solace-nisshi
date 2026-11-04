@@ -310,11 +310,13 @@ pub enum TlsRejection {
     /// example, `UnknownCA` means that the broker does not trust the authority that signed it.
     ClientCertificate(String),
 
-    /// The broker found nothing to agree on with the client, and the alert's name says which:
-    /// `HandshakeFailure` is no shared cipher suite, and also what a Java broker negotiating
-    /// TLS 1.2 sends to a client that gave no certificate when it requires one (a TLS 1.3
-    /// broker sends `CertificateRequired`). `ProtocolVersion` and `InsufficientSecurity` mean no
-    /// shared version or cipher suite.
+    /// The broker sent the `HandshakeFailure` alert: it shares no cipher suite with the client,
+    /// or it negotiates TLS 1.2, requires a client certificate and got none, as a Java broker
+    /// does. A TLS 1.3 broker sends `CertificateRequired` for a missing certificate.
+    HandshakeFailure,
+
+    /// The broker shares no TLS version or cipher suite with the client, and the alert's name
+    /// says which: `ProtocolVersion` or `InsufficientSecurity`.
     Negotiation(String),
 
     /// Any other alert, by name.
@@ -339,9 +341,11 @@ impl TlsRejection {
             | AlertDescription::UnknownCA
             | AlertDescription::AccessDenied => Self::ClientCertificate(format!("{alert:?}")),
 
-            AlertDescription::HandshakeFailure
-            | AlertDescription::ProtocolVersion
-            | AlertDescription::InsufficientSecurity => Self::Negotiation(format!("{alert:?}")),
+            AlertDescription::HandshakeFailure => Self::HandshakeFailure,
+
+            AlertDescription::ProtocolVersion | AlertDescription::InsufficientSecurity => {
+                Self::Negotiation(format!("{alert:?}"))
+            }
 
             _ => Self::Other(format!("{alert:?}")),
         })
@@ -881,9 +885,19 @@ mod tests {
     /// A Java broker sends `HandshakeFailure` on TLS 1.2 when it requires a client certificate
     /// and gets none, and when it shares no cipher suite with the client.
     #[test]
-    fn handshake_failure_alert_during_the_handshake_is_a_negotiation_rejection() {
+    fn handshake_failure_alert_during_the_handshake_is_a_handshake_failure_rejection() {
+        let error = handshake_failure(alert_during_handshake(AlertDescription::HandshakeFailure));
+
+        assert_eq!(
+            Some(&TlsRejection::HandshakeFailure),
+            error.tls_rejection(),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn version_or_cipher_alert_during_the_handshake_is_a_negotiation_rejection() {
         for alert in [
-            AlertDescription::HandshakeFailure,
             AlertDescription::ProtocolVersion,
             AlertDescription::InsufficientSecurity,
         ] {
