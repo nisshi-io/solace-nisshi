@@ -326,7 +326,9 @@ partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
 whether or not another client waited. Give each instance its own `client.id`,
 set a larger `client_read_share`, or raise `pool_max_size`, which raises the
 limit and the share with it. A larger pool does not stop a client that keeps
-abandoning reads, which can fill any limit while it is alone.
+abandoning reads, which can fill any limit while it is alone. With
+`client_read_share=100`, `wait` is `client_read_limit` only when one client holds every
+permit of the limit.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not

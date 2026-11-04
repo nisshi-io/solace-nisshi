@@ -80,7 +80,9 @@
 //!
 //! Nothing but a wait. A read of a client that already holds its share waits
 //! for a permit in the broker while the limit is used up, and `limit` is
-//! `client` in the metric below, whether or not another client waits. The
+//! `client` in the metric below, whether or not another client waits. With
+//! the share set to the whole limit, a read waits with `limit` set to `client`
+//! only when its client holds every permit of the limit. The
 //! connection stays open, the response carries no error and
 //! `throttle_time_ms` stays 0. If the request's deadline passes first, a Fetch
 //! answers the partition with no records, and a ListOffsets answers
@@ -157,7 +159,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering, fence},
     },
 };
 
@@ -294,6 +296,13 @@ struct PastShare<'a>(&'a Waiters);
 impl<'a> PastShare<'a> {
     fn new(waiters: &'a Waiters) -> Self {
         _ = waiters.past_share.fetch_add(1, Ordering::SeqCst);
+
+        // The read's count must be visible before its last look for a permit, and a release
+        // must put its permit back before it reads the count. Each side writes one variable
+        // and reads the other, so a read that the count misses sees the permit. Atomics that
+        // use SeqCst do not promise that across two variables to the language, only the
+        // hardware here does, so the fence states it.
+        fence(Ordering::SeqCst);
         Self(waiters)
     }
 }
@@ -331,18 +340,24 @@ impl ClientAdmission {
 
 impl Drop for ClientAdmission {
     fn drop(&mut self) {
-        // A permit that a read in the limit's queue takes never counts as available, so the
-        // permit has reached the limit only if the count rose. The waiters then have a permit
-        // to take, and one of them can use it.
-        let available = self.engine.available_permits();
         drop(self.limit.take());
-        let reached_the_limit = self.engine.available_permits() > available;
-
         drop(self.share.take());
 
-        // The count is read after the permit went back. A read adds itself to the count before
-        // its last look for a permit, so a read that this misses finds the permit itself.
-        if reached_the_limit && self.waiters.past_share.load(Ordering::SeqCst) > 0 {
+        // The permit went back first. If the limit has a permit now, no read is queued for it:
+        // a permit that frees while reads queue goes to the first of them, and does not count
+        // as available. A read that waits for its share can take it, so one is woken. Asking
+        // only for the count after the release means that a read which took the permit
+        // meanwhile, or another release, cannot make this one miss its wake-up.
+        //
+        // A read of a client within its share that is cancelled after the limit gave it a
+        // permit, and before it polled, returns the permit through tokio's `Acquire::drop`,
+        // and not through here, so it wakes nobody. The read that waits stays parked until the
+        // next release, while a permit is free.
+        //
+        // See `PastShare::new` for the fence.
+        fence(Ordering::SeqCst);
+        if self.engine.available_permits() > 0 && self.waiters.past_share.load(Ordering::SeqCst) > 0
+        {
             self.waiters.released.notify_one();
         }
     }
@@ -1034,6 +1049,85 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(2, waiting.iter().filter(|read| read.is_finished()).count());
 
+        for read in waiting {
+            read.abort();
+        }
+    }
+
+    /// Starts `count` reads of `client`, which wait because the limit is used up
+    /// and the client holds its share.
+    fn spawn_waiting(
+        shares: &ClientReadShares,
+        client: &ClientIdentity,
+        limit: &Arc<Semaphore>,
+        count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<ClientAdmission, AcquireError>>> {
+        (0..count)
+            .map(|_| {
+                let shares = shares.clone();
+                let limit = limit.clone();
+
+                tokio::spawn(
+                    client
+                        .clone()
+                        .scope(async move { shares.acquire(1, &limit).await }),
+                )
+            })
+            .collect()
+    }
+
+    /// A read that a release woke takes the permit, and the next release wakes
+    /// the next read: the count that a release looks at is the one after it,
+    /// so the read that took the permit does not hide the second release.
+    #[tokio::test]
+    async fn each_release_wakes_the_next_read_that_waits_for_its_share() {
+        let shares = ClientReadShares::default();
+        let limit = limit(3);
+        let client = identity(None, "queued");
+
+        let within = admit(&shares, &client, 1, &limit).await;
+        let first = admit(&shares, &client, 1, &limit).await;
+        let second = admit(&shares, &client, 1, &limit).await;
+
+        let waiting = spawn_waiting(&shares, &client, &limit, 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(waiting.iter().all(|read| !read.is_finished()));
+
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(1, waiting.iter().filter(|read| read.is_finished()).count());
+
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(2, waiting.iter().filter(|read| read.is_finished()).count());
+
+        drop(within);
+        for read in waiting {
+            read.abort();
+        }
+    }
+
+    /// Two releases in a row, before either woken read runs, wake two reads:
+    /// the second finds a permit in the count that the first already counted.
+    #[tokio::test]
+    async fn two_releases_in_a_row_wake_two_reads() {
+        let shares = ClientReadShares::default();
+        let limit = limit(3);
+        let client = identity(None, "queued");
+
+        let within = admit(&shares, &client, 1, &limit).await;
+        let first = admit(&shares, &client, 1, &limit).await;
+        let second = admit(&shares, &client, 1, &limit).await;
+
+        let waiting = spawn_waiting(&shares, &client, &limit, 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        drop(first);
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(2, waiting.iter().filter(|read| read.is_finished()).count());
+
+        drop(within);
         for read in waiting {
             read.abort();
         }
