@@ -1129,23 +1129,25 @@ impl BytesConnectionService {
 
         let start = SystemTime::now();
 
-        stream
-            .write_all(&frame[..])
-            .await
-            .inspect(|_| {
-                TCP_SEND_DURATION.record(
-                    start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes,
-                );
+        async {
+            stream.write_all(&frame[..]).await?;
+            stream.flush().await
+        }
+        .await
+        .inspect(|_| {
+            TCP_SEND_DURATION.record(
+                start
+                    .elapsed()
+                    .map_or(0, |duration| duration.as_millis() as u64),
+                attributes,
+            );
 
-                TCP_BYTES_SENT.add(frame.len() as u64, attributes);
-            })
-            .inspect_err(|_| {
-                TCP_SEND_ERRORS.add(1, attributes);
-            })
-            .map_err(Into::into)
+            TCP_BYTES_SENT.add(frame.len() as u64, attributes);
+        })
+        .inspect_err(|_| {
+            TCP_SEND_ERRORS.add(1, attributes);
+        })
+        .map_err(Into::into)
     }
 
     pub(crate) async fn read(
