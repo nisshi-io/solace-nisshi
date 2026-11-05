@@ -202,7 +202,7 @@ $ nisshi topic create taxi --output json
 produce does not end them with 4. A refused login or TLS connection still does. `nisshi perf
 consume` is not implemented and ends with 1.
 
-Releases before this one exited with 1 when the broker refused a request. A script that tests
+Releases up to 0.8.2 exited with 1 when the broker refused a request. A script that tests
 for `1` should test for non-zero, or for `4`.
 
 ```shell

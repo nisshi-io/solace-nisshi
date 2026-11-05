@@ -359,7 +359,7 @@ fn a_wrong_password_is_reported_as_a_refused_login() {
         &[("SASL_PASSWORD", "wrong")],
     );
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert!(
         stderr(&output)
             .lines()
@@ -379,7 +379,7 @@ fn the_password_comes_from_one_place() {
         &[("SASL_PASSWORD", PASSWORD)],
     );
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(2), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).contains("Both --sasl-password-file and the SASL_PASSWORD"),
         "{output:?}"
@@ -393,7 +393,7 @@ fn the_password_comes_from_one_place() {
         "",
     );
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(2), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).contains("--sasl-username needs a password"),
         "{output:?}"
@@ -425,7 +425,7 @@ fn a_tool_that_does_not_trust_the_broker_certificate_is_told_how_to_trust_it() {
     // The system's CA certificates don't include the test certificate.
     let output = broker.run(&["topic", "list", "--tls"], "");
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).lines().any(|line| {
             line.starts_with("error: The TLS handshake with the broker failed: ")
@@ -450,7 +450,7 @@ fn a_certificate_for_another_name_is_refused_unless_the_name_check_is_off() {
         "",
     );
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).contains("not valid for name \"other.example\""),
         "{output:?}"
@@ -477,7 +477,7 @@ fn tls_against_a_plaintext_listener_says_so() {
 
     let output = broker.run(&["topic", "list", "--tls"], "");
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).starts_with("error: The TLS handshake with the broker failed: "),
         "{output:?}"
@@ -499,6 +499,6 @@ fn a_login_to_a_listener_without_sasl_says_so() {
         &[("SASL_PASSWORD", PASSWORD)],
     );
 
-    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert!(stderr(&output).contains("does not use SASL"), "{output:?}");
 }
