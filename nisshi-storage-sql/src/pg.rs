@@ -229,6 +229,8 @@ pub struct PoolParts {
     pool_max_size: usize,
     /// Whether the storage URL, in its query or in `options`, sets `application_name`.
     named_by_operator: bool,
+    /// The machine's name, which [`application_name`] puts in the name of each connection.
+    host: Option<String>,
     /// The pool with the plain [`APPLICATION_NAME_PREFIX`] as its name, built where the storage
     /// URL is parsed, so that an unusable setting fails there.
     pool: Pool,
@@ -240,6 +242,7 @@ impl Debug for PoolParts {
             .field("config", &self.config)
             .field("pool_max_size", &self.pool_max_size)
             .field("named_by_operator", &self.named_by_operator)
+            .field("host", &self.host)
             .finish_non_exhaustive()
     }
 }
@@ -263,7 +266,7 @@ impl PoolParts {
             .build()
     }
 
-    /// The pool for the broker `node` of `cluster`: its connections are named by
+    /// The pool for the broker of `cluster`: its connections are named by
     /// [`application_name`] unless the operator named them.
     fn pool_of(&self, cluster: &str, node: i32) -> Pool {
         if self.named_by_operator {
@@ -271,7 +274,7 @@ impl PoolParts {
         }
 
         let mut config = self.config.clone();
-        _ = config.application_name(application_name(cluster, node));
+        _ = config.application_name(application_name(self.host.as_deref(), cluster, node));
 
         // The only way that opening a pool fails is a timeout without a runtime, and `open` sets
         // both. The pool that `from_str` built with the same settings stands in, so that this
@@ -280,6 +283,16 @@ impl PoolParts {
             error!(?err, "opening the pool with the broker's name failed");
             self.pool.clone()
         })
+    }
+}
+
+impl<C, N, L> Builder<C, N, L, PoolParts> {
+    /// Names the connections of the pool `nisshi-<host>-<cluster>`, with `host` instead of the
+    /// name of the machine that this process runs on. A storage URL that sets
+    /// `application_name` still wins.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.pool.host = Some(host.into());
+        self
     }
 }
 
@@ -509,38 +522,58 @@ const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The start of the `application_name` of the broker's connections when the storage URL sets
 /// none, so that `application_name LIKE 'nisshi%'` finds every Nisshi connection in
-/// `pg_stat_activity`. [`application_name`] adds the node and the cluster.
+/// `pg_stat_activity`. [`application_name`] adds the host and the cluster.
 const APPLICATION_NAME_PREFIX: &str = "nisshi";
 
 /// The longest `application_name` that the server keeps. It cuts a longer name to
 /// `NAMEDATALEN - 1`, which is 63 bytes, without an error.
 const APPLICATION_NAME_MAX_LEN: usize = 63;
 
-/// The `application_name` of the broker's connections when the storage URL sets none:
-/// `nisshi-<node>-<cluster>`. A row in `pg_stat_activity` then names the broker's node and
-/// the cluster, which tells apart the clusters that share a database even where a pooler or
-/// proxy hides `client_addr`. Every broker has the same node today, so two brokers of one
-/// cluster get one name, and an operator who needs more sets `application_name` in the URL.
-///
-/// A character of the cluster that is not an ASCII letter, digit, `.`, `_` or `-` becomes `_`,
-/// because the server replaces a byte outside printable ASCII with `?` and a name with a space
-/// or a quote is hard to filter on. The node comes first and the cluster is cut at
-/// [`APPLICATION_NAME_MAX_LEN`], so the cut never removes the node.
-fn application_name(cluster: &str, node: i32) -> String {
-    let mut name = format!("{APPLICATION_NAME_PREFIX}-{node}-");
+/// The name of the machine that this process runs on, from the `HOSTNAME` environment variable
+/// or, where that is not set, from `/etc/hostname`. On Kubernetes it is the name of the pod, and
+/// in a container the container's id or its `--hostname`. `None` when neither gives a name.
+fn local_host_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+}
 
-    name.extend(
-        cluster
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(APPLICATION_NAME_MAX_LEN.saturating_sub(name.len())),
-    );
+/// Keeps the ASCII letters, digits, `.`, `_` and `-` of `text` and replaces every other
+/// character with `_`, because the server replaces a byte outside printable ASCII with `?` and a
+/// name with a space or a quote is hard to filter on.
+fn sanitised(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            c
+        } else {
+            '_'
+        }
+    })
+}
+
+/// The `application_name` of the broker's connections when the storage URL sets none:
+/// `nisshi-<host>-<cluster>`, or `nisshi-<node>-<cluster>` where the host is not known. A row in
+/// `pg_stat_activity` then names the machine of the broker, which on Kubernetes is its pod, and
+/// the cluster, also where a pooler or proxy hides `client_addr`.
+///
+/// Both parts go through [`sanitised`]. The host comes before the cluster and the name is cut at
+/// [`APPLICATION_NAME_MAX_LEN`], so the cut removes the end of the cluster first, and the end of
+/// the host only when the host alone is longer than the limit allows.
+fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
+    let mut name = match host {
+        Some(host) if !host.is_empty() => format!("{APPLICATION_NAME_PREFIX}-"),
+        _ => format!("{APPLICATION_NAME_PREFIX}-{node}"),
+    };
+
+    if let Some(host) = host.filter(|host| !host.is_empty()) {
+        name.extend(sanitised(host));
+    }
+
+    name.push('-');
+    name.extend(sanitised(cluster));
+    name.truncate(APPLICATION_NAME_MAX_LEN);
 
     name
 }
@@ -746,6 +779,7 @@ where
                 tls,
                 pool_max_size,
                 named_by_operator,
+                host: local_host_name(),
                 pool,
             },
             read_limits,
@@ -5981,40 +6015,51 @@ mod tests {
         );
     }
 
-    /// The name has the node first and the cluster after it.
+    /// The machine's name has no surrounding white space and is not empty,
+    /// or is not known.
     #[test]
-    fn application_name_names_the_node_then_the_cluster() {
+    fn local_host_name_is_trimmed_or_unknown() {
+        assert!(local_host_name().is_none_or(|host| !host.is_empty() && host == host.trim()));
+    }
+
+    /// The name has the host first and the cluster after it, and the node
+    /// only where the host is not known.
+    #[test]
+    fn application_name_names_the_host_then_the_cluster() {
         assert_eq!(
-            "nisshi-111-cluster.a_b-c",
-            application_name("cluster.a_b-c", 111)
+            "nisshi-pod-0.ns-cluster.a_b-c",
+            application_name(Some("pod-0.ns"), "cluster.a_b-c", 111)
         );
-        assert_eq!("nisshi--1-c", application_name("c", -1));
+        assert_eq!("nisshi-111-c", application_name(None, "c", 111));
+        assert_eq!("nisshi-111-c", application_name(Some(""), "c", 111));
     }
 
     /// A character that the server would turn into `?`, or that a filter would
-    /// have to quote, becomes `_`.
+    /// have to quote, becomes `_`, in the host and in the cluster.
     #[test]
     fn application_name_replaces_characters_a_filter_cannot_use() {
         assert_eq!(
-            "nisshi-1-a_b_c_d_e_",
-            application_name("a b'c\"d\u{e9}e\n", 1)
+            "nisshi-h_t-a_b_c_d_e_",
+            application_name(Some("h t"), "a b'c\"d\u{e9}e\n", 1)
         );
     }
 
-    /// The server keeps 63 bytes of a name. A cluster that is longer is cut,
-    /// and the node, which comes first, stays.
+    /// The server keeps 63 bytes of a name. The cluster is cut first, so the
+    /// host stays whole, and the host is cut only where it alone is too long.
     #[test]
-    fn application_name_is_cut_at_the_servers_limit_and_keeps_the_node() {
-        let name = application_name(&"c".repeat(200), i32::MAX);
+    fn application_name_is_cut_at_the_servers_limit_and_keeps_the_host() {
+        let host = "h".repeat(40);
+        let name = application_name(Some(&host), &"c".repeat(200), 1);
 
         assert_eq!(APPLICATION_NAME_MAX_LEN, name.len());
-        assert!(
-            name.starts_with(&format!("nisshi-{}-c", i32::MAX)),
-            "{name}"
-        );
+        assert!(name.starts_with(&format!("nisshi-{host}-c")), "{name}");
 
-        let exact = application_name(&"c".repeat(APPLICATION_NAME_MAX_LEN), 1);
+        let exact = application_name(Some("h"), &"c".repeat(APPLICATION_NAME_MAX_LEN), 1);
         assert_eq!(APPLICATION_NAME_MAX_LEN, exact.len());
+
+        let long_host = application_name(Some(&"h".repeat(200)), "cluster", 1);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, long_host.len());
+        assert!(long_host.starts_with("nisshi-hhh"), "{long_host}");
     }
 
     /// Reads the `application_name` that the server shows for the connection of
@@ -6032,7 +6077,7 @@ mod tests {
             .map_err(Into::into)
     }
 
-    /// Every connection of the pool is named in `pg_stat_activity` by its node
+    /// Every connection of the pool is named in `pg_stat_activity` by its host
     /// and cluster, and a name that the operator sets, in the URL or in
     /// `options`, wins.
     #[tokio::test]
@@ -6050,10 +6095,9 @@ mod tests {
         }
 
         let cluster = alphanumeric_string(15);
-        let node = rng().random_range(0..i32::MAX);
 
         let cases = [
-            ("", format!("nisshi-{node}-{cluster}")),
+            ("", format!("nisshi-pod-0-{cluster}")),
             ("?application_name=from_url", "from_url".to_owned()),
             (
                 "?options=-c%20application_name%3Dfrom_options",
@@ -6067,8 +6111,9 @@ mod tests {
 
         for (query, expected) in cases {
             let storage = Postgres::builder(&format!("{}{query}", *CONNECTION))?
+                .host("pod-0")
                 .cluster(cluster.clone())
-                .node(node)
+                .node(111)
                 .build();
 
             assert_eq!(expected, connection_name(&storage).await?, "for {query:?}");
@@ -6077,27 +6122,35 @@ mod tests {
         Ok(())
     }
 
-    /// Brokers of one database that differ in node or in cluster show
+    /// Brokers of one database that differ in host or in cluster show
     /// different names, and the name stays within what the server keeps, so
-    /// the server shows exactly the name that was set.
+    /// the server shows exactly the name that was set. A broker whose host is
+    /// not known shows its node.
     #[tokio::test]
     async fn brokers_are_told_apart_in_pg_stat_activity() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let brokers = [
-            (cluster.clone(), 1),
-            (cluster.clone(), 2),
-            (alphanumeric_string(15), 1),
-            ("c".repeat(200), i32::MAX),
+            (Some("pod-0"), cluster.clone()),
+            (Some("pod-1"), cluster.clone()),
+            (Some("pod-0"), alphanumeric_string(15)),
+            (Some("pod-0"), "c".repeat(200)),
+            (None, cluster.clone()),
         ];
 
         let mut names = Vec::new();
 
-        for (cluster, node) in brokers {
-            let storage = Postgres::builder(&CONNECTION)?
-                .cluster(cluster)
-                .node(node)
-                .build();
+        for (host, cluster) in brokers {
+            let mut builder = Postgres::builder(&CONNECTION)?;
+
+            if let Some(host) = host {
+                builder = builder.host(host);
+            } else {
+                // The machine that runs the test may have a host name, so leave it unknown.
+                builder.pool.host = None;
+            }
+
+            let storage = builder.cluster(cluster).node(111).build();
 
             let name = match connection_name(&storage).await {
                 Ok(name) => name,
@@ -6114,9 +6167,10 @@ mod tests {
 
         let distinct = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(names.len(), distinct.len(), "{names:?}");
-        assert_eq!(format!("nisshi-1-{cluster}"), names[0]);
-        assert_eq!(format!("nisshi-2-{cluster}"), names[1]);
+        assert_eq!(format!("nisshi-pod-0-{cluster}"), names[0]);
+        assert_eq!(format!("nisshi-pod-1-{cluster}"), names[1]);
         assert_eq!(APPLICATION_NAME_MAX_LEN, names[3].len());
+        assert_eq!(format!("nisshi-111-{cluster}"), names[4]);
 
         Ok(())
     }
