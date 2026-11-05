@@ -18,18 +18,24 @@
 //! A response that leaves a field unset that the client's version requires has no encoding, and
 //! the encoder refuses it with `MandatoryFieldUnset` (SOL-157119). The broker then has nothing to
 //! send, so the connection closes where Kafka would have answered. Each handler fills in the fields
-//! of the version it serves, so a handler can miss one at one version and nowhere else. This test
-//! serves requests at every one of those versions, so that the next miss fails here and not on a
-//! client.
+//! of the version it serves, so a handler can miss one at one version and nowhere else. These tests
+//! serve requests at every one of those versions, and check the response of each that is answered.
 //!
 //! The routes come from [`nisshi_broker::service::routes`], the list that the broker serves, and
 //! the versions from [`routable_range`], the range that the broker routes, so a
 //! service that is added to the broker is covered with no change here.
 //!
-//! The requests are arbitrary ones against empty storage, so most of them end in an error response,
-//! and a field that only a success path fills is checked only where a request happens to succeed.
-//! What the test guarantees is one answered request at every version of every route. A route that
-//! needs connection state, the SASL ones, is served with none, so only its refusal is checked.
+//! What the first test reaches is the first check of each handler. Its requests are arbitrary ones
+//! against empty storage, with random names, IDs and timeouts, so nearly all of them end in the
+//! error response of that check, and the builders that fill in a topic, a partition or a group
+//! member are almost never reached. The test guarantees one answered request at every version of
+//! every route, and that answer is often the cheapest error. A route that needs connection state,
+//! the SASL ones, is served with none, so only its refusal is checked.
+//!
+//! The second test serves requests that are valid for seeded storage, so that they get past that
+//! first check. It covers `DescribeConfigs`, whose result is built for each topic config, and
+//! `JoinGroup`, whose error response has fields of its own. Another API is covered past its first
+//! check only when `known_good` has a request for it.
 //!
 //! The test lives in this crate, which is not published, because it needs the harness and the
 //! broker together, and a test of the broker's own crate that imports the harness would not compile
@@ -47,6 +53,7 @@ use std::{
 };
 
 use arbitrary::{Arbitrary as _, Unstructured};
+use bytes::Bytes;
 use nisshi_broker::{
     NODE_ID,
     coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
@@ -55,13 +62,23 @@ use nisshi_broker::{
 use nisshi_fuzz_harness::{
     RequestAtVersion, check_response_body, pseudo_random_bytes, request_at_version,
 };
-use nisshi_sans_io::{ApiKey as _, Body, EndTxnRequest, Error, Frame, Header};
-use nisshi_service::routable_range;
-use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, StorageContainer, TopicCreationConfig};
+use nisshi_sans_io::{
+    ApiKey as _, Body, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse,
+    EndTxnRequest, Error, ErrorCode, Frame, Header, JoinGroupRequest, JoinGroupResponse,
+    create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    describe_configs_request::DescribeConfigsResource,
+    join_group_request::JoinGroupRequestProtocol,
+};
+use nisshi_service::{FrameRouteService, routable_range};
+use nisshi_storage::{
+    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
+    TopicCreationConfig,
+};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use tokio::time::timeout;
 use url::Url;
+use uuid::Uuid;
 
 /// The requests of each API that are served at each of its versions. The harness's own tests use
 /// 200 for each version of one API, and this serves every API, so it is smaller.
@@ -185,11 +202,9 @@ async fn memory_storage() -> ArcDynStorage {
         .expect("in-memory storage always builds")
 }
 
-#[tokio::test(start_paused = true)]
-async fn every_routed_response_encodes_at_every_routed_version() {
-    let storage = memory_storage().await;
-
-    let route = routes(
+/// The routes that the broker serves over `storage`.
+fn broker_route(storage: ArcDynStorage) -> FrameRouteService<nisshi_broker::Error> {
+    routes(
         Controller::new(storage.clone(), GroupCoordinatorConfig::default()),
         storage,
         TopicCreationConfig::default(),
@@ -197,7 +212,12 @@ async fn every_routed_response_encodes_at_every_routed_version() {
     )
     .expect("the broker's routes build")
     .build()
-    .expect("the broker's routes build");
+    .expect("the broker's routes build")
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_routed_response_encodes_at_every_routed_version() {
+    let route = broker_route(memory_storage().await);
 
     let api_keys: Vec<i16> = route.api_keys().collect();
     let requests = requests(&api_keys);
@@ -326,6 +346,167 @@ fn a_response_that_leaves_a_required_field_unset_fails_the_check() {
         ),
         Err(Error::Message(message)) if message.contains("protocol_name")
     );
+}
+
+/// The topic that the known-good requests name.
+const KNOWN_TOPIC: &str = "known-good-topic";
+
+/// The config that the topic sets, so that a `DescribeConfigs` answer lists one.
+const KNOWN_CONFIG: (&str, &str) = ("cleanup.policy", "compact");
+
+/// A request that is valid for the storage that [`seed`] built, and the check that its answer is
+/// the one that reaches the part of the handler that the request is for.
+struct KnownGood {
+    api_key: i16,
+    request: Body,
+    reached: fn(&Body) -> bool,
+}
+
+/// Registers the broker and creates [`KNOWN_TOPIC`] with [`KNOWN_CONFIG`], so that the requests
+/// of [`known_good`] get past the first validation check of their handlers.
+async fn seed(storage: &ArcDynStorage) {
+    storage
+        .register_broker(BrokerRegistrationRequest {
+            broker_id: NODE_ID,
+            cluster_id: "response-encoding".into(),
+            incarnation_id: Uuid::now_v7(),
+            rack: None,
+        })
+        .await
+        .expect("the in-memory storage registers the broker");
+
+    let _topic_id = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(KNOWN_TOPIC.into())
+                .num_partitions(1)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some(
+                    [CreatableTopicConfig::default()
+                        .name(KNOWN_CONFIG.0.into())
+                        .value(Some(KNOWN_CONFIG.1.into()))]
+                    .into(),
+                )),
+            false,
+        )
+        .await
+        .expect("the in-memory storage creates the topic");
+}
+
+/// Requests that get past the first check of their handlers, for the answers that arbitrary
+/// requests rarely produce: the arbitrary ones carry random names, IDs and timeouts, so they stop at
+/// the first check.
+///
+/// - `DescribeConfigs` for [`KNOWN_TOPIC`] is answered with one result for each config that the
+///   topic sets, which is built per topic and per config. A mandatory field that this builder
+///   leaves unset, such as `is_default` at v0, is found only by a request that gets this far.
+/// - `JoinGroup` with a valid session timeout, protocol type and protocols, as a member that the
+///   group does not know, is answered by the coordinator's error response, which has fields of its
+///   own to fill in, such as `protocol_name` below v7.
+fn known_good() -> Vec<KnownGood> {
+    vec![
+        KnownGood {
+            api_key: DescribeConfigsRequest::KEY,
+            request: DescribeConfigsRequest::default()
+                .resources(Some(
+                    [DescribeConfigsResource::default()
+                        .resource_type(ConfigResource::Topic.into())
+                        .resource_name(KNOWN_TOPIC.into())
+                        .configuration_keys(None)]
+                    .into(),
+                ))
+                .include_synonyms(Some(true))
+                .include_documentation(Some(true))
+                .into(),
+            reached: |answer| {
+                DescribeConfigsResponse::try_from(answer.clone()).is_ok_and(|response| {
+                    response
+                        .results
+                        .iter()
+                        .flatten()
+                        .flat_map(|result| result.configs.iter().flatten())
+                        .any(|config| config.name == KNOWN_CONFIG.0)
+                })
+            },
+        },
+        KnownGood {
+            api_key: JoinGroupRequest::KEY,
+            request: JoinGroupRequest::default()
+                .group_id("known-good-group".into())
+                .session_timeout_ms(10_000)
+                .rebalance_timeout_ms(Some(10_000))
+                .member_id("a-member-that-did-not-join".into())
+                .group_instance_id(None)
+                .protocol_type("consumer".into())
+                .protocols(Some(
+                    [JoinGroupRequestProtocol::default()
+                        .name("range".into())
+                        .metadata(Bytes::from_static(b"\0\x01\0\0\0\0\0\0\0\0"))]
+                    .into(),
+                ))
+                .reason(None)
+                .into(),
+            reached: |answer| {
+                JoinGroupResponse::try_from(answer.clone()).is_ok_and(|response| {
+                    response.error_code == i16::from(ErrorCode::UnknownMemberId)
+                })
+            },
+        },
+    ]
+}
+
+/// Arbitrary requests rarely get past the first check of their handlers, so the response builders
+/// behind it are checked by requests that are valid, at every version.
+#[tokio::test(start_paused = true)]
+async fn known_good_requests_reach_the_builders_behind_the_first_check() {
+    let storage = memory_storage().await;
+    seed(&storage).await;
+    let route = broker_route(storage);
+
+    for known in known_good() {
+        let api_key = known.api_key;
+
+        for api_version in routable_range(api_key).expect("a routed API has protocol metadata") {
+            let body = match request_at_version(known.request.clone(), api_key, api_version) {
+                Ok(RequestAtVersion::Encoded(body)) => body,
+                other => panic!(
+                    "api key {api_key} v{api_version}: the known-good request has no encoding here: {other:?}"
+                ),
+            };
+
+            let answer = timeout(
+                ANSWER_WITHIN,
+                route.serve(Frame {
+                    size: 0,
+                    header: Header::Request {
+                        api_key,
+                        api_version,
+                        correlation_id: 1,
+                        client_id: Some("response-encoding".into()),
+                    },
+                    body,
+                }),
+            )
+            .await
+            .unwrap_or_else(|_elapsed| panic!("api key {api_key} v{api_version}: no answer"))
+            .unwrap_or_else(|error| {
+                panic!("api key {api_key} v{api_version}: the route failed: {error:?}")
+            });
+
+            assert!(
+                (known.reached)(&answer.body),
+                "api key {api_key} v{api_version}: the answer is not the one that the request is for: {:?}",
+                answer.body
+            );
+
+            assert_matches!(
+                check_response_body(answer.body, api_key, api_version),
+                Ok(()),
+                "api key {api_key} v{api_version}"
+            );
+        }
+    }
 }
 
 /// A panic with a literal message has a `&str` payload, and any panic must keep its message.

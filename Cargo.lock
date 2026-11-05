@@ -6049,6 +6049,7 @@ name = "nisshi-fuzz-harness"
 version = "0.8.2"
 dependencies = [
  "arbitrary",
+ "bytes",
  "nisshi-broker",
  "nisshi-sans-io",
  "nisshi-service",
@@ -6057,6 +6058,7 @@ dependencies = [
  "rama",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]
