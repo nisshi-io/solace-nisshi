@@ -647,8 +647,12 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
 
 /// How long checking an idle pooled connection with [`RECYCLE_QUERY`] may take. A connection
 /// whose peer vanished without a reset passes the pool's `is_closed` check, and without a bound
-/// the query would wait for TCP to give up. On a timeout the pool drops the connection and
-/// opens a new one.
+/// the query would wait for TCP to give up. On a timeout the pool drops that connection and tries
+/// the next idle one, which gets its own timeout, so the pool opens a new connection only when no
+/// idle one is left. A checkout can take up to this timeout for each idle connection, plus
+/// [`DEFAULT_POOL_CREATE_TIMEOUT`], and `connection()` puts no other bound around the checkout.
+/// The deadpool-postgres warning for a failed check sits inside the future that the timeout drops,
+/// so a timed-out check is not logged.
 const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run on each idle pooled connection before the pool hands it out. It fails when the session
@@ -663,7 +667,11 @@ const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// privilege on a procedural language: a role without `USAGE` on plpgsql would otherwise
 /// fail every check and open a connection for every checkout. The message is concatenated
 /// with a stable function so the planner doesn't fold the cast into an error for every
-/// session. The pool logs the message when it drops the connection.
+/// session.
+///
+/// deadpool-postgres logs a failed check at `warn`, with the target `deadpool.postgres`, as
+/// `Connection could not be recycled: {error}`, and tokio-postgres displays a server error as
+/// only `db error`. The broker log therefore does not carry the message above. The server log does.
 ///
 /// A new connection isn't checked, so one opened to a server that is still read-only is
 /// dropped at its next checkout. Add `target_session_attrs=read-write` to the storage URL to
