@@ -5939,7 +5939,18 @@ fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
             "timestamp {timestamp} is before the earliest that PostgreSQL stores"
         )))
     } else {
-        Ok(SystemTime::UNIX_EPOCH - Duration::from_millis(timestamp.unsigned_abs()))
+        // `SystemTime - Duration` panics on overflow, and on Windows a `SystemTime` cannot be
+        // earlier than 1601, so a timestamp between `MIN_SQL_TIMESTAMP_MS` and that year must
+        // be an error there. Kafka 3.9.1 accepts such a timestamp on a CreateTime topic with
+        // the default `message.timestamp.before.max.ms`; this broker answers
+        // UNKNOWN_SERVER_ERROR for it, a deliberate difference on Windows only.
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_millis(timestamp.unsigned_abs()))
+            .ok_or_else(|| {
+                Error::Message(format!(
+                    "timestamp {timestamp} is before the earliest that this broker stores"
+                ))
+            })
     }
 }
 
