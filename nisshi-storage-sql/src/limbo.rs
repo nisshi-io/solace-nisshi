@@ -1784,14 +1784,25 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
         // The batch is inflated before the transaction starts, so the wait
         // for a decode permit and the decode do not hold a connection or the
         // database write lock.
         let inflated = inflate(deflated.clone())
             .await
             .inspect_err(|err| debug!(?err))?;
+
+        self.produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
         let mut connection = self.connection().await?;
         let tx = connection

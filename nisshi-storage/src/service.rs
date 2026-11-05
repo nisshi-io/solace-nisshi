@@ -37,6 +37,8 @@ mod list_offsets;
 mod list_partition_reassignments;
 mod metadata;
 mod produce;
+#[cfg(test)]
+mod produce_inflated_forwarding;
 pub mod read_deadline;
 pub mod read_share;
 mod txn;
@@ -86,13 +88,17 @@ pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::{AutoCreateRefusals, MetadataService};
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::{
@@ -121,7 +127,7 @@ use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, produce_path,
     service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
 };
 
@@ -140,6 +146,8 @@ pub enum Request {
         transaction_id: Option<String>,
         topition: Topition,
         batch: deflated::Batch,
+        /// `batch` decoded, when the caller has done that: see [`Storage::produce_inflated`].
+        inflated: Option<inflated::Batch>,
     },
     Fetch {
         topition: Topition,
@@ -456,9 +464,6 @@ impl RequestChannelService {
 
     /// Sends `input` on the channel once the channel has room for it.
     async fn send(&self, input: Request) -> Result<SentRequest, ServiceError> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let (started_tx, started_rx) = oneshot::channel();
-
         let start = Instant::now();
 
         let operation = input.operation();
@@ -468,33 +473,47 @@ impl RequestChannelService {
         STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
         debug!(%operation, capacity);
 
-        self.tx
+        let permit = self
+            .tx
             .reserve()
             .queued_for(ReadWait::ExclusiveEngineAccess)
             .await
-            .map(|permit| {
-                permit.send(ChannelRequest {
-                    request: input,
-                    response: resp_tx,
-                    started: started_tx,
-                })
-            })
-            .inspect(|_| {
-                let permit_elapsed = start.elapsed().as_millis() as u64;
-                STORAGE_CHANNEL_PERMIT_DURATION.record(permit_elapsed, &attributes);
-                debug!(%operation, permit_elapsed);
-            })
             .inspect_err(|err| {
                 error!(%operation, ?err);
                 STORAGE_CHANNEL_ERROR.add(1, &attributes);
             })?;
 
-        Ok(SentRequest {
+        Ok(Self::send_reserved(permit, input, start))
+    }
+
+    /// Sends `input` through `permit`, which reserved a slot in the channel at `start`.
+    fn send_reserved(
+        permit: mpsc::Permit<'_, ChannelRequest>,
+        input: Request,
+        start: Instant,
+    ) -> SentRequest {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+
+        let operation = input.operation();
+        let attributes = [operation.attribute()];
+
+        permit.send(ChannelRequest {
+            request: input,
+            response: resp_tx,
+            started: started_tx,
+        });
+
+        let permit_elapsed = start.elapsed().as_millis() as u64;
+        STORAGE_CHANNEL_PERMIT_DURATION.record(permit_elapsed, &attributes);
+        debug!(%operation, permit_elapsed);
+
+        SentRequest {
             response: resp_rx,
             started: started_rx,
             start,
             operation,
-        })
+        }
     }
 }
 
@@ -678,9 +697,56 @@ impl Storage for RequestChannelService {
                 transaction_id,
                 topition,
                 batch,
+                inflated: None,
             },
             Produce
         )
+    }
+
+    #[instrument(skip_all)]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        // A produce that waits for a slot holds only its compressed bytes, so the number of decoded
+        // batches the channel holds is the number of slots, not the number of waiting produces.
+        // The produce then reaches the storage without the decoded batch, which decodes it again.
+        let start = Instant::now();
+
+        let capacity = self.tx.capacity();
+        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[StorageOperation::Produce.attribute()]);
+        debug!(operation = %StorageOperation::Produce, capacity);
+
+        let Ok(permit) = self.tx.try_reserve() else {
+            drop(inflated);
+            produce_path::fallback();
+
+            return self.produce(transaction_id, topition, deflated).await;
+        };
+
+        produce_path::direct();
+
+        let request = Request::Produce {
+            transaction_id: transaction_id.map(|s| s.to_string()),
+            topition: topition.to_owned(),
+            batch: deflated,
+            inflated: Some(inflated),
+        };
+
+        Self::send_reserved(permit, request, start)
+            .response()
+            .await
+            .and_then(|response| {
+                if let Response::Produce(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -1342,11 +1408,19 @@ where
                 transaction_id,
                 topition,
                 batch,
-            } => Ok(Response::Produce(
-                self.storage
-                    .produce(transaction_id.as_deref(), &topition, batch)
-                    .await,
-            )),
+                inflated,
+            } => Ok(Response::Produce(match inflated {
+                Some(inflated) => {
+                    self.storage
+                        .produce_inflated(transaction_id.as_deref(), &topition, batch, inflated)
+                        .await
+                }
+                None => {
+                    self.storage
+                        .produce(transaction_id.as_deref(), &topition, batch)
+                        .await
+                }
+            })),
             Request::Fetch {
                 topition,
                 offset,
@@ -1576,6 +1650,7 @@ mod tests {
                     transaction_id: None,
                     topition: topition.clone(),
                     batch: deflated::Batch::default(),
+                    inflated: None,
                 },
                 "produce",
             ),

@@ -2079,6 +2079,26 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
+        self.inner
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+            .inspect(|_| {
+                ENGINE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[KeyValue::new("operation", "produce")],
+                )
+            })
+    }
+
+    #[instrument(skip_all)]
     async fn fetch(
         &self,
         topition: &Topition,
@@ -3203,8 +3223,9 @@ impl Storage for Delegate {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-
+        // This runs while the delegate serves the request, so the wait for a decode permit holds
+        // the engine's single permit. `produce_inflated` skips this decode.
+        //
         // The batch is inflated before the transaction starts, so the wait
         // for a decode permit and the decode do not hold a connection or the
         // database write lock.
@@ -3212,7 +3233,18 @@ impl Storage for Delegate {
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        debug!(after_inflate = elapsed_millis(start));
+        self.produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
 
         let pc = self.connection().await?;
 
@@ -6612,6 +6644,104 @@ mod tests {
         assert!(
             records > 0,
             "the fetch kept none of the records that it read before its deadline"
+        );
+
+        Ok(())
+    }
+
+    /// `produce_inflated` stores the batch that the caller decoded and does not decode the bytes
+    /// again, also through the channel to the engine's single writer.
+    ///
+    /// The test sends record bytes that do not decode, next to the batch that does. `produce`
+    /// decodes them and fails. `produce_inflated` stores the decoded records, so it never reads
+    /// the bytes.
+    #[tokio::test]
+    async fn produce_inflated_does_not_decode_again() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?).inspect(|temporary| debug!(?temporary))?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(env::current_dir()?)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let storage = Url::parse(&format!("file:///{}?mode=mpsc", relative.display()))?;
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(storage)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let inflated = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"decoded once").into()))
+            .build()?;
+        let mut undecodable: deflated::Batch = inflated.clone().try_into()?;
+        undecodable.record_data = Bytes::from_static(b"\xff\xff\xff");
+
+        let topition = Topition::new(topic, 0);
+
+        assert_matches!(
+            engine.produce(None, &topition, undecodable.clone()).await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        assert_eq!(
+            0,
+            engine
+                .produce_inflated(None, &topition, undecodable, inflated)
+                .await?
+        );
+
+        let fetched = engine
+            .fetch(
+                &topition,
+                0,
+                0,
+                1_000_000,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+        let records: Vec<_> = fetched
+            .into_iter()
+            .map(inflated::Batch::try_from)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flat_map(|batch| batch.records)
+            .collect();
+
+        assert_eq!(1, records.len());
+        assert_eq!(
+            Some(Bytes::from_static(b"decoded once")),
+            records[0].value.clone()
         );
 
         Ok(())

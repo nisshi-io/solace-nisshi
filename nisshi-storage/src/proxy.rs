@@ -22,13 +22,17 @@ use std::{
 use async_trait::async_trait;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::metrics::Histogram;
@@ -42,7 +46,7 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    UpdateError, Version, produce_path,
     service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
 };
 
@@ -181,6 +185,36 @@ where
         })?;
         self.storage
             .produce(transaction_id, topition, deflated)
+            .await
+    }
+
+    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        // A produce that waits for the permit holds only its compressed bytes, so the one decoded
+        // batch that the proxy holds is the batch of the produce that has the permit. The produce
+        // then reaches the storage without the decoded batch, which decodes it again.
+        let start = SystemTime::now();
+        let Ok(_permit) = self.semaphore.try_acquire() else {
+            drop(inflated);
+            produce_path::fallback();
+
+            return self.produce(transaction_id, topition, deflated).await;
+        };
+
+        produce_path::direct();
+        SEMAPHORE_ACQUIRE_DURATION.record(
+            elapsed_millis(start),
+            &[StorageOperation::Produce.attribute()],
+        );
+
+        self.storage
+            .produce_inflated(transaction_id, topition, deflated, inflated)
             .await
     }
 
@@ -618,14 +652,133 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nisshi_sans_io::IsolationLevel;
-    use tokio::time::{Duration, Instant, advance};
+    use std::sync::atomic::Ordering;
+
+    use nisshi_sans_io::{IsolationLevel, record::deflated};
+    use tokio::{
+        task::yield_now,
+        time::{Duration, Instant, advance},
+    };
 
     use super::SemaphoreProxy;
     use crate::{
         Result, Storage, Topition,
+        decoded_batch_probe::probe,
         service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };
+
+    /// A produce that gets the permit at once passes its decoded batch on.
+    #[tokio::test]
+    async fn an_uncontended_produce_keeps_the_decoded_batch() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
+
+        let (inflated, _dropped) = probe();
+        let tp = Topition::new("abc", 0);
+
+        let produce = proxy.produce_inflated(None, &tp, deflated::Batch::default(), inflated);
+
+        let answer = async {
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = rx.recv().await.expect("a produce request");
+
+            let Request::Produce { inflated, .. } = request else {
+                panic!("{request:?}");
+            };
+
+            reply
+                .send(Ok(Response::Produce(Ok(0))))
+                .expect("the producer");
+
+            inflated.is_some()
+        };
+
+        let (offset, kept) = tokio::join!(produce, answer);
+
+        assert_eq!(0, offset?);
+        assert!(kept, "the proxy dropped the decoded batch");
+
+        Ok(())
+    }
+
+    /// A produce that waits for the permit holds only its compressed bytes, so a queue of waiting
+    /// produces does not hold a decoded batch each.
+    #[tokio::test]
+    async fn a_produce_that_waits_for_the_permit_holds_no_decoded_batch() -> Result<()> {
+        let (tx, mut rx) = bounded_channel(1);
+        let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
+
+        // The permit is taken, so the produce below has to wait for it.
+        let permit = proxy.semaphore.clone().acquire_owned().await?;
+
+        let (inflated, dropped) = probe();
+        let tp = Topition::new("xyz", 3);
+
+        let produce = proxy.produce_inflated(
+            Some("transaction"),
+            &tp,
+            deflated::Batch::default(),
+            inflated,
+        );
+
+        let release = async {
+            // Every branch has been polled once after this yield, so the produce is waiting.
+            yield_now().await;
+            let held = !dropped.load(Ordering::SeqCst);
+
+            drop(permit);
+
+            held
+        };
+
+        let answer = async {
+            let ChannelRequest {
+                request,
+                response: reply,
+                ..
+            } = rx.recv().await.expect("a produce request");
+
+            let Request::Produce {
+                transaction_id,
+                topition,
+                inflated,
+                ..
+            } = request
+            else {
+                panic!("{request:?}");
+            };
+
+            reply
+                .send(Ok(Response::Produce(Ok(0))))
+                .expect("the producer");
+
+            (transaction_id, topition, inflated.is_none())
+        };
+
+        let (offset, held, (transaction_id, topition, sent_without)) =
+            tokio::join!(produce, release, answer);
+
+        assert_eq!(0, offset?);
+        assert!(!held, "the waiting produce still held the decoded batch");
+        assert!(sent_without, "the produce reached storage with the batch");
+
+        // A waiting produce that lost its transaction id would be stored as a non-transactional
+        // batch.
+        assert_eq!(
+            Some("transaction"),
+            transaction_id.as_deref(),
+            "the waiting produce did not forward the transaction id"
+        );
+        assert_eq!(
+            tp, topition,
+            "the waiting produce did not forward the topition"
+        );
+
+        Ok(())
+    }
 
     /// A read that waits for the permit gives storage the same deadline that it was given, so the
     /// time spent waiting counts against that deadline.
