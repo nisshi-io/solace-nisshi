@@ -8635,6 +8635,37 @@ mod tests {
         Ok(())
     }
 
+    /// A read that holds its read permits and whose checkout fails the check on
+    /// a new connection gives the permits back, so the failed checkouts of a
+    /// read-only server do not use up the limits of the reads.
+    #[tokio::test]
+    async fn read_whose_checkout_fails_the_check_gives_its_permits_back() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) =
+            storage_with_schema("read_whose_checkout_fails_the_check", &CONNECTION, &cluster)
+                .await?
+        else {
+            return Ok(());
+        };
+
+        let storage = Postgres::builder(&read_only_server(""))?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        let available = storage.fetch_reads.available_permits();
+
+        for _ in 0..3 {
+            let permits = storage.fetch_read_permits().await?;
+            assert_eq!(available - 1, storage.fetch_reads.available_permits());
+
+            assert!(storage.abandonable_connection(permits).await.is_err());
+            assert_eq!(available, storage.fetch_reads.available_permits());
+        }
+
+        Ok(())
+    }
+
     /// `read_only_check_every=0` turns the check off, and a checkout of a
     /// connection to a read-only server succeeds as it did before the check.
     #[tokio::test]
