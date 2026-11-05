@@ -16,9 +16,10 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
         txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -3355,6 +3356,7 @@ impl Storage for Delegate {
                         (max_bytes as i64),
                         high_watermark,
                         key_bytes,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
@@ -3369,6 +3371,7 @@ impl Storage for Delegate {
                         offset,
                         (max_bytes as i64),
                         high_watermark,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
