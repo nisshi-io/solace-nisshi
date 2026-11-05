@@ -21,7 +21,11 @@
 //! - Proxy: a Kafka API proxy
 //! - Topic: Topic administration
 
-use std::process;
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    process,
+};
 
 use crate::Result;
 use clap::{CommandFactory as _, Parser, Subcommand};
@@ -71,6 +75,8 @@ fn lakes() -> Vec<&'static str> {
 
 fn after_help() -> String {
     [
+        "With no command, nisshi runs the broker. `nisshi broker --help` lists its options."
+            .to_owned(),
         format!(
             "Storage engines: {}",
             storage_engines()
@@ -95,15 +101,38 @@ fn after_help() -> String {
     version,
     about,
     long_about = None,
-    after_help = after_help(),
-    args_conflicts_with_subcommands = true
+    after_help = after_help()
 )]
 pub struct Cli {
+    // The broker's options are not flattened into `Cli`: clap reads the environment variable of
+    // every flattened option, so a bad `STORAGE_ENGINE` would fail `nisshi topic list`, which
+    // never uses it. `with_default_command` makes `broker` the command instead.
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
+}
 
-    #[clap(flatten)]
-    broker: broker::Arg,
+/// Returns `args` (the command line, program name first) with `broker` inserted as the command
+/// when the user gave none, so that `nisshi`, `nisshi --listener-url ...` and `nisshi iceberg ...`
+/// still run the broker. The rule is as narrow as it can be: an unknown word such as
+/// `nisshi foo` is left alone, so clap reports it as an unrecognized subcommand, and so are
+/// `--help`, `-h`, `--version` and `-V`, which describe `nisshi` and not the broker.
+fn with_default_command(mut args: Vec<OsString>) -> Vec<OsString> {
+    let default_to_broker = match args.get(1).map(OsString::as_os_str) {
+        None => true,
+        Some(first) if first == OsStr::new("-h") => false,
+        Some(first) if first == OsStr::new("--help") => false,
+        Some(first) if first == OsStr::new("-V") => false,
+        Some(first) if first == OsStr::new("--version") => false,
+        Some(first) => {
+            first.to_string_lossy().starts_with('-') || missing_feature::is_gated_subcommand(first)
+        }
+    };
+
+    if default_to_broker {
+        args.insert(1.min(args.len()), OsString::from("broker"));
+    }
+
+    args
 }
 
 /// The `--help` note of each tool that connects to a broker as a Kafka client.
@@ -188,14 +217,16 @@ impl Cli {
 
     /// Parses the command line, or explains why it can't be parsed and exits.
     pub fn from_command_line() -> Self {
-        Cli::try_parse().unwrap_or_else(|error| {
-            missing_feature::explain(
-                error,
-                &missing_feature::built_features(),
-                &mut Cli::command(),
-            )
-            .exit()
-        })
+        Cli::try_parse_from(with_default_command(env::args_os().collect())).unwrap_or_else(
+            |error| {
+                missing_feature::explain(
+                    error,
+                    &missing_feature::built_features(),
+                    &mut Cli::command(),
+                )
+                .exit()
+            },
+        )
     }
 
     /// Whether the command is a client tool: one that connects to a broker, prints its result on
@@ -205,14 +236,12 @@ impl Cli {
     /// author has chosen.
     pub fn is_client_tool(&self) -> bool {
         match &self.command {
-            None | Some(Command::Broker(_) | Command::Proxy(_)) => false,
-            Some(
-                Command::Cat { .. }
-                | Command::Generator(_)
-                | Command::Perf(_)
-                | Command::Topic { .. }
-                | Command::User { .. },
-            ) => true,
+            Command::Broker(_) | Command::Proxy(_) => false,
+            Command::Cat { .. }
+            | Command::Generator(_)
+            | Command::Perf(_)
+            | Command::Topic { .. }
+            | Command::User { .. } => true,
         }
     }
 
@@ -225,7 +254,7 @@ impl Cli {
 
         let cli = self;
 
-        match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
+        match cli.command {
             Command::Broker(arg) => arg.main().await.map(Outcome::from),
             Command::Cat { command } => command.main().await.map(Outcome::from),
             Command::Generator(arg) => arg.main().await.map(Outcome::from),
@@ -324,17 +353,31 @@ mod tests {
         }
 
         assert!(!parse(Some(REGISTRY), &[]).is_client_tool(), "no command");
+        assert!(
+            !parse(Some(REGISTRY), &["--listener-url", "tcp://[::]:1"]).is_client_tool(),
+            "broker options"
+        );
     }
 
     const REGISTRY: &str = "file://./etc/schema";
     const OTHER_REGISTRY: &str = "s3://nisshi/";
 
+    /// Parses `nisshi <args>` as the binary does, with the environment `vars`.
+    fn try_parse(vars: &[(&str, Option<&str>)], args: &[&str]) -> Result<Cli, clap::Error> {
+        temp_env::with_vars(vars, || {
+            Cli::try_parse_from(with_default_command(
+                std::iter::once("nisshi")
+                    .chain(args.iter().copied())
+                    .map(OsString::from)
+                    .collect(),
+            ))
+        })
+    }
+
     /// Parses `nisshi <args>` with `SCHEMA_REGISTRY` set to `env`, or unset.
     fn parse(env: Option<&str>, args: &[&str]) -> Cli {
-        temp_env::with_var("SCHEMA_REGISTRY", env, || {
-            Cli::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
-                .unwrap_or_else(|e| panic!("{args:?} with SCHEMA_REGISTRY={env:?}: {e}"))
-        })
+        try_parse(&[("SCHEMA_REGISTRY", env)], args)
+            .unwrap_or_else(|e| panic!("{args:?} with SCHEMA_REGISTRY={env:?}: {e}"))
     }
 
     /// Asserts that `nisshi <args>` parses, with `SCHEMA_REGISTRY` set to `env`, or unset.
@@ -346,7 +389,7 @@ mod tests {
     fn cat_schema_registry(subcommand: &str, env: Option<&str>, args: &[&str]) -> Option<Url> {
         let args = [&["cat", subcommand, "t"], args].concat();
         match parse(env, &args).command {
-            Some(Command::Cat {
+            Command::Cat {
                 command:
                     cat::Command::Produce {
                         schema_registry, ..
@@ -354,7 +397,7 @@ mod tests {
                     | cat::Command::Consume {
                         schema_registry, ..
                     },
-            }) => schema_registry.map(EnvVarExp::into_inner),
+            } => schema_registry.map(EnvVarExp::into_inner),
             other => panic!("{args:?}: expected a cat produce or consume, got {other:?}"),
         }
     }
@@ -363,9 +406,7 @@ mod tests {
         Some(Url::parse(url).expect(url))
     }
 
-    /// The broker's `--schema-registry` is `global`, so clap merges the matches of a tool that
-    /// declares its own into the flattened broker arguments. Parsing only `cat`'s arguments
-    /// hides that: it has to go through `Cli`.
+    /// Parses `cat` through `Cli`, as the binary does, with its own `--schema-registry`.
     #[test]
     fn cat_gets_its_schema_registry_from_flag_and_environment() {
         for subcommand in ["produce", "consume"] {
@@ -447,5 +488,189 @@ mod tests {
         parses(None, &["--schema-registry", REGISTRY]);
         parses(None, &["broker", "--schema-registry", REGISTRY]);
         parses(Some(REGISTRY), &["broker"]);
+    }
+
+    fn words(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_command_line_without_a_command_runs_the_broker() {
+        for (given, expected) in [
+            (&["nisshi"][..], &["nisshi", "broker"][..]),
+            (
+                &["nisshi", "--listener-url", "tcp://[::]:1"],
+                &["nisshi", "broker", "--listener-url", "tcp://[::]:1"],
+            ),
+            (
+                &["nisshi", "--kafka-cluster-id=x"],
+                &["nisshi", "broker", "--kafka-cluster-id=x"],
+            ),
+            // A lake subcommand is the broker's, whether this binary was built with it or not.
+            (
+                &["nisshi", "iceberg", "--help"],
+                &["nisshi", "broker", "iceberg", "--help"],
+            ),
+            (&["nisshi", "parquet"], &["nisshi", "broker", "parquet"]),
+            // A command, and what describes `nisshi` itself, are left as given.
+            (&["nisshi", "broker"], &["nisshi", "broker"]),
+            (&["nisshi", "topic", "list"], &["nisshi", "topic", "list"]),
+            (&["nisshi", "help"], &["nisshi", "help"]),
+            (&["nisshi", "--help"], &["nisshi", "--help"]),
+            (&["nisshi", "-h"], &["nisshi", "-h"]),
+            (&["nisshi", "--version"], &["nisshi", "--version"]),
+            (&["nisshi", "-V"], &["nisshi", "-V"]),
+            // An unknown word is clap's to report.
+            (&["nisshi", "foo"], &["nisshi", "foo"]),
+        ] {
+            assert_eq!(
+                with_default_command(words(given)),
+                words(expected),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_line_that_is_not_utf8_does_not_panic() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let odd = OsString::from_vec(vec![b'-', 0xff]);
+        let args = with_default_command(vec![OsString::from("nisshi"), odd.clone()]);
+        assert_eq!(
+            args,
+            vec![OsString::from("nisshi"), OsString::from("broker"), odd]
+        );
+    }
+
+    /// Returns the environment variables that `command` and its subcommands read.
+    fn environment(command: &clap::Command) -> Vec<String> {
+        command
+            .get_arguments()
+            .filter_map(|arg| arg.get_env())
+            .map(|name| name.to_string_lossy().into_owned())
+            .chain(command.get_subcommands().flat_map(environment))
+            .collect()
+    }
+
+    /// The command lines of every tool other than the broker.
+    const TOOLS: &[&[&str]] = &[
+        &["topic", "list"],
+        &["user", "delete", "alice"],
+        &["cat", "consume", "t"],
+        &["cat", "produce", "t"],
+        &["perf", "t", "produce"],
+        &["generator", "t", "--schema-registry", REGISTRY],
+        &["proxy"],
+    ];
+
+    /// A value that none of the broker's options accepts: not a URL, a number, a duration or a
+    /// boolean.
+    const BAD_VALUE: &str = "0 bad:";
+
+    /// A broker option that is wrong in the environment must not fail a tool that does not read
+    /// that variable. clap reads the variable of every option that it parses, so this checks that
+    /// `Cli` parses none of the broker's options for a tool. It walks the broker's variables, so
+    /// an option added later is covered.
+    #[test]
+    fn a_bad_broker_environment_variable_does_not_affect_a_tool() {
+        let broker = environment(&broker::Arg::command());
+        assert!(
+            broker.iter().any(|name| name == "STORAGE_ENGINE"),
+            "{broker:?}"
+        );
+
+        for tool in TOOLS {
+            let own = environment(
+                Cli::command()
+                    .find_subcommand(tool[0])
+                    .expect("the tool is a subcommand"),
+            );
+
+            for name in broker.iter().filter(|name| !own.contains(name)) {
+                let result = try_parse(&[(name, Some(BAD_VALUE))], tool);
+                assert!(
+                    result.is_ok(),
+                    "{tool:?} with {name}={BAD_VALUE}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// The reverse: the broker, named or not, still reads its variables.
+    #[test]
+    fn a_bad_broker_environment_variable_fails_the_broker() {
+        for args in [&["broker"][..], &[], &["--cluster-id", "x"]] {
+            for name in ["STORAGE_ENGINE", "NUM_PARTITIONS", "GROUP_POLL_INTERVAL"] {
+                let error = try_parse(&[(name, Some(BAD_VALUE))], args)
+                    .expect_err(&format!("{args:?} with {name}"));
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            }
+        }
+    }
+
+    /// A tool still fails on a bad value of a variable that it reads.
+    #[test]
+    fn a_bad_tool_environment_variable_fails_the_tool() {
+        assert!(
+            try_parse(
+                &[("ADVERTISED_LISTENER_URL", Some(BAD_VALUE))],
+                &["cat", "consume", "t"]
+            )
+            .is_err()
+        );
+        assert!(try_parse(&[("ORIGIN_URL", Some(BAD_VALUE))], &["proxy"]).is_err());
+    }
+
+    #[test]
+    fn a_command_line_with_an_unknown_command_is_rejected() {
+        let error = try_parse(&[], &["foo"]).expect_err("foo is not a command");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn broker_options_parse_with_and_without_the_broker_command() {
+        for args in [
+            &["--listener-url", "tcp://127.0.0.1:1"][..],
+            &["broker", "--listener-url", "tcp://127.0.0.1:1"],
+            &[],
+        ] {
+            assert!(
+                matches!(parse(None, args).command, Command::Broker(_)),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// A lake subcommand is the broker's, with or without the word `broker` before it, and takes
+    /// the broker's `--schema-registry` on either side of its own name.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn a_lake_subcommand_runs_in_the_broker() {
+        for args in [
+            &["parquet", "--location", "file:///x"][..],
+            &["broker", "parquet", "--location", "file:///x"],
+            &[
+                "broker",
+                "--schema-registry",
+                REGISTRY,
+                "parquet",
+                "--location",
+                "file:///x",
+            ],
+            &[
+                "parquet",
+                "--location",
+                "file:///x",
+                "--schema-registry",
+                REGISTRY,
+            ],
+        ] {
+            assert!(
+                matches!(parse(None, args).command, Command::Broker(_)),
+                "{args:?}"
+            );
+        }
     }
 }

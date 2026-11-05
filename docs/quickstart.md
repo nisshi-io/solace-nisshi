@@ -82,7 +82,7 @@ In Step 3, add `--broker` with the same address after the topic name in each com
 ./bin/nisshi topic create hello --broker tcp://127.0.0.1:9093
 ```
 
-The release includes several storage engines. The `./bin/nisshi --help` command lists the available storage engines and includes the options for TLS (`--cert` and `--key`) and authentication (`--authentication`).
+The release includes several storage engines. The `./bin/nisshi --help` command lists the available storage engines, and `./bin/nisshi broker --help` lists the broker's options, including the options for TLS (`--cert` and `--key`) and authentication (`--authentication`).
 
 ## Step 3: Send and Read a Message
 

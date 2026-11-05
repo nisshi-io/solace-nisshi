@@ -44,6 +44,14 @@ const GATED_SUBCOMMANDS: [GatedSubcommand; 3] = [
     },
 ];
 
+/// Whether `word` names a subcommand of [`GATED_SUBCOMMANDS`], built or not. `nisshi iceberg` runs
+/// the broker's `iceberg` subcommand, so it is a command that `Cli` does not have.
+pub(super) fn is_gated_subcommand(word: &std::ffi::OsStr) -> bool {
+    GATED_SUBCOMMANDS
+        .iter()
+        .any(|gated| word == gated.subcommand)
+}
+
 /// Returns the features of [`GATED_SUBCOMMANDS`] that this binary was built with.
 pub(super) fn built_features() -> Vec<&'static str> {
     vec![
@@ -59,8 +67,9 @@ pub(super) fn built_features() -> Vec<&'static str> {
 /// Returns the gated subcommand that `error` reports as unknown, when its feature is not in
 /// `built`.
 fn unbuilt_subcommand(error: &Error, built: &[&str]) -> Option<&'static GatedSubcommand> {
-    // clap reports `nisshi broker iceberg` as an unknown argument, and `nisshi iceberg` as
-    // an unknown subcommand, because the broker's arguments are also flattened into `nisshi`.
+    // clap reports `nisshi broker iceberg` as an unknown argument when this binary has no lake
+    // subcommand, and as an unknown subcommand when it has another one. `nisshi iceberg` is the
+    // same command, because `Cli::from_command_line` puts `broker` in front of it.
     let context = match error.kind() {
         ErrorKind::UnknownArgument => ContextKind::InvalidArg,
         ErrorKind::InvalidSubcommand => ContextKind::InvalidSubcommand,
@@ -102,16 +111,14 @@ mod tests {
 
     use super::*;
 
-    /// A parser shaped like `nisshi` built without a lake feature: the broker's arguments
-    /// are both flattened at the top level and under a `broker` subcommand.
+    /// A parser shaped like `nisshi` built without a lake feature: a `broker` subcommand with
+    /// the broker's arguments. `nisshi iceberg` reaches it as `nisshi broker iceberg`, because
+    /// `Cli::from_command_line` puts `broker` in front of a lake subcommand.
     #[derive(Debug, Parser)]
-    #[command(name = "nisshi", args_conflicts_with_subcommands = true)]
+    #[command(name = "nisshi")]
     struct WithoutLakes {
         #[command(subcommand)]
-        command: Option<Top>,
-
-        #[command(flatten)]
-        broker: Broker,
+        command: Top,
     }
 
     #[derive(Debug, Subcommand)]
@@ -155,23 +162,6 @@ mod tests {
                     gated.feature
                 )),
                 "{message}"
-            );
-        }
-    }
-
-    #[test]
-    fn top_level_lake_subcommand_names_its_feature() {
-        for gated in GATED_SUBCOMMANDS {
-            let args = ["nisshi", gated.subcommand, "--location", "x"];
-
-            assert_eq!(
-                Some(gated.feature),
-                unbuilt_feature(&parse_error(&args), &[])
-            );
-            assert!(
-                explained(&args, &[]).contains(&format!("--features {}", gated.feature)),
-                "{}",
-                explained(&args, &[])
             );
         }
     }

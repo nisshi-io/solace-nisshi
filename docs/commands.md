@@ -15,8 +15,7 @@ Nisshi is a single statically linked binary containing the following:
 The broker subcommand is default if no other command is supplied.
 
 ```shell
-Usage: nisshi [OPTIONS]
-       nisshi <COMMAND>
+Usage: nisshi <COMMAND>
 
 Commands:
   broker     Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
@@ -29,21 +28,17 @@ Commands:
   help       Print this message or the help of the given subcommand(s)
 
 Options:
-      --kafka-cluster-id <KAFKA_CLUSTER_ID>
-          All members of the same cluster should use the same id [env: CLUSTER_ID=RvQwrYegSUCkIPkaiAZQlQ] [default: nisshi_cluster]
-      --kafka-listener-url <KAFKA_LISTENER_URL>
-          The broker will listen on this address [env: LISTENER_URL=] [default: tcp://[::]:9092]
-      --kafka-advertised-listener-url <KAFKA_ADVERTISED_LISTENER_URL>
-          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://127.0.0.1:9092] [default: tcp://127.0.0.1:9092]
-      --storage-engine <STORAGE_ENGINE>
-          Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/ [env: STORAGE_ENGINE=s3://nisshi/] [default: memory://nisshi/]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+  -h, --help     Print help
+  -V, --version  Print version
+
+With no command, nisshi runs the broker. `nisshi broker --help` lists its options.
+Storage engines: dynostore, libsql, postgres
+Data lakes:
 ```
+
+`nisshi` and `nisshi broker` are the same command, and so are `nisshi --listener-url tcp://127.0.0.1:9092` and
+`nisshi broker --listener-url tcp://127.0.0.1:9092`. Run `nisshi broker --help` for the broker's options.
+The broker reads its environment variables, such as `STORAGE_ENGINE`, only when it is the command that runs.
 
 A broker can be started by simply running `nisshi`, all options have defaults. Nisshi pickup any existing environment,
 loading any found in `.env`. An [example.env](../example.env) is provided as part of the distribution
@@ -76,8 +71,6 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```
@@ -284,8 +277,6 @@ Options:
           The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
       --otlp-endpoint-url <OTLP_ENDPOINT_URL>
           OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```
