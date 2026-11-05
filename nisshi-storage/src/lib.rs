@@ -192,7 +192,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::{sync::AcquireError, task::JoinError};
+use tokio::{sync::AcquireError, task::JoinError, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
@@ -225,12 +225,12 @@ pub use producer::{
     producer_claim,
 };
 pub use proxy::SemaphoreProxy;
-pub use service::deadline;
+pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequest, ChannelRequestLayer,
     ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
     CreateTopicsValidationLayer, CreateTopicsValidationService, DELETE_RECORDS_CONCURRENCY,
     DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency, DeleteRecordsService,
@@ -2080,14 +2080,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
 
     /// Fetch deflated batches from storage.
     ///
-    /// The batches hold at most `max_bytes`, except that a read can exceed it by
-    /// one batch. A read returns the first batch at or after `offset` even when
-    /// that batch alone is larger than `max_bytes`, so that a consumer gets past
-    /// it (KIP-74). The fetch service relies on this: without it, a consumer
-    /// whose fetch limit is smaller than a record never reads past that record.
+    /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
+    /// returns the first batch at or after `offset` even when that batch alone is larger than
+    /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
+    /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
-    /// For a topic or partition that does not exist, see
-    /// [`Storage::offset_stage`].
+    /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
+    ///
+    /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
+    /// for the read without a time limit of their own, so a read that overruns its deadline holds
+    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
+    /// that a read finished.
+    ///
+    /// The batches run in offset order from the batch that holds `offset`, with no gap between
+    /// them, also when the deadline stops the read. An answer with no batches is always valid.
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2095,7 +2101,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>>;
 
     /// Query the offset stage for a topic partition.
@@ -2399,10 +2405,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -2688,10 +2694,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 

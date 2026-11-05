@@ -32,7 +32,7 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, instrument};
 use url::Url;
 use uuid::Uuid;
@@ -40,9 +40,9 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    Version, service::read_deadline::ReadDeadline,
 };
 
 #[derive(Clone, Debug)]
@@ -162,12 +162,19 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        self.introduce_latency().await?;
+        let Ok(latency) = ReadDeadline::new(StorageOperation::Fetch, deadline)
+            .timeout(self.introduce_latency())
+            .await
+        else {
+            return Ok(vec![]);
+        };
+
+        latency?;
 
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 

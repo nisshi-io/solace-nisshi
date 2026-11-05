@@ -1071,7 +1071,7 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<Batch>> {
         // Get the high watermark based on isolation level
         let offset_stage = self.offset_stage(topition).await?;
@@ -1128,6 +1128,11 @@ impl Storage for Engine {
                 .unwrap_or(offset),
         };
 
+        // The read checks the deadline between steps, and can overrun it by one step.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(vec![]);
+        }
+
         let mut i = {
             let from =
                 postcard::to_stdvec(&BatchKey::scan_from(metadata.id, topition.partition, start))?;
@@ -1140,7 +1145,9 @@ impl Storage for Engine {
         let min_bytes = min_bytes as usize;
         let max_bytes = max_bytes as usize;
 
-        while let Some(kv) = i.next().await? {
+        while let Some(kv) = i.next().await?
+            && tokio::time::Instant::now() < deadline
+        {
             // Check if the key still belongs to the same topic/partition
             if !kv.key.starts_with(&prefix) {
                 break;

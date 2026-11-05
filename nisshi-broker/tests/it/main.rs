@@ -40,6 +40,7 @@ pub mod describe_topic_partitions;
 pub mod dynostore_meta_cache;
 pub mod fetch;
 pub mod fetch_after_delete_records;
+pub mod fetch_deadline;
 pub mod fetch_max_wait;
 pub mod fetch_unknown_partition;
 pub mod fetch_wire;

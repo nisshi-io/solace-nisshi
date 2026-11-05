@@ -42,7 +42,7 @@ use rand::{
     prelude::*,
     rng,
 };
-use std::{env, io::ErrorKind, sync::Arc, thread};
+use std::{env, future::Future, io::ErrorKind, sync::Arc, thread};
 use tokio::fs::remove_file;
 use tracing::{debug, subscriber::DefaultGuard};
 use tracing_subscriber::EnvFilter;
@@ -297,6 +297,16 @@ pub(crate) async fn postgres_storage(
         None,
     )
     .await
+}
+
+/// Runs `future` to its end on a single-threaded Tokio runtime of its own, for code that needs a
+/// Tokio runtime, such as a storage read with a deadline, called from outside one.
+pub(crate) fn block_on_tokio<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("a Tokio runtime")
+        .block_on(future)
 }
 
 pub(crate) fn alphanumeric_string(length: usize) -> String {

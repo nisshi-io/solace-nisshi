@@ -41,7 +41,8 @@ use nisshi_sans_io::{
     sync_group_request::SyncGroupRequestAssignment,
 };
 use nisshi_storage::{
-    Request, RequestChannelService, RequestStorageService, Storage, Topition, bounded_channel,
+    ChannelRequest, Request, RequestChannelService, RequestStorageService, Storage, Topition,
+    bounded_channel,
 };
 use rama::Service as _;
 use rand::{prelude::*, rng};
@@ -234,7 +235,12 @@ where
     let service = RequestStorageService::new(storage.clone());
 
     _ = tokio::spawn(async move {
-        while let Some((request, reply)) = receiver.recv().await {
+        while let Some(ChannelRequest {
+            request,
+            response: reply,
+            ..
+        }) = receiver.recv().await
+        {
             if let Request::UpdateGroup { group_id, .. } = &request {
                 let pending = removal
                     .lock()

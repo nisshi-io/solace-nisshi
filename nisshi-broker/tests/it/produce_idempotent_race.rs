@@ -134,7 +134,7 @@ impl Producer {
                     1,
                     1024 * 1024,
                     IsolationLevel::ReadUncommitted,
-                    Duration::ZERO,
+                    Instant::now() + Duration::from_secs(5),
                 )
                 .await?;
             assert!(!batches.is_empty(), "no batch at {next_offset}");

@@ -28,7 +28,7 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, StorageOperation, Topition,
     service::{
-        deadline::{DELETE_RECORDS_DEADLINE, Missed, queued, started_before, within},
+        read_deadline::{DELETE_RECORDS_DEADLINE, Missed, QueueWait as _, ReadDeadline, ReadWait},
         storage_error_code,
     },
 };
@@ -122,7 +122,7 @@ where
     ///
     /// The wait for a permit that the engine shares across requests ends at
     /// the deadline, because a call that has not started can be dropped. A
-    /// call that has started runs to its end, see [`started_before`].
+    /// call that has started runs to its end, see [`ReadDeadline::start`].
     async fn call(
         storage: &G,
         deadline: Instant,
@@ -131,12 +131,13 @@ where
     ) -> Result<Result<Vec<DeleteRecordsTopicResult>>, Missed> {
         let _permit = match permits {
             Some(permits) => {
-                match within(
-                    StorageOperation::DeleteRecords,
-                    deadline,
-                    queued(permits.acquire_owned()),
-                )
-                .await
+                match ReadDeadline::new(StorageOperation::DeleteRecords, deadline)
+                    .timeout(
+                        permits
+                            .acquire_owned()
+                            .queued_for(ReadWait::EngineWriteLimit),
+                    )
+                    .await
                 {
                     Ok(Ok(permit)) => Some(permit),
                     Ok(Err(closed)) => return Ok(Err(closed.into())),
@@ -147,12 +148,9 @@ where
             None => None,
         };
 
-        started_before(
-            StorageOperation::DeleteRecords,
-            deadline,
-            storage.delete_records(slice::from_ref(request)),
-        )
-        .await
+        ReadDeadline::new(StorageOperation::DeleteRecords, deadline)
+            .start(storage.delete_records(slice::from_ref(request)))
+            .await
     }
 
     /// Deletes the records of each partition with its own storage call, as
@@ -362,7 +360,7 @@ mod tests {
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use rama::{Service as _, extensions::Extensions};
-    use tokio::sync::Semaphore;
+    use tokio::{sync::Semaphore, time::Instant};
     use url::Url;
     use uuid::Uuid;
 
@@ -373,7 +371,7 @@ mod tests {
         NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceRequestBatcher,
         ProducerIdResponse, Result, ScramCredential, SemaphoreProxy, Storage, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version, service::deadline::DELETE_RECORDS_DEADLINE,
+        Version, service::read_deadline::DELETE_RECORDS_DEADLINE,
     };
 
     /// What the stub engine does with a partition.
@@ -545,7 +543,7 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _max_wait: Duration,
+            _deadline: Instant,
         ) -> Result<Vec<deflated::Batch>> {
             unimplemented!()
         }
@@ -940,7 +938,7 @@ mod tests {
         )
         .with_delay(Duration::from_secs(2));
 
-        let started_at = tokio::time::Instant::now();
+        let started_at = Instant::now();
 
         assert_eq!(
             vec![(
@@ -1041,7 +1039,7 @@ mod tests {
         )
         .with_delay(Duration::from_secs(2));
 
-        let started_at = tokio::time::Instant::now();
+        let started_at = Instant::now();
 
         let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
 
@@ -1099,7 +1097,7 @@ mod tests {
         .with_delay(Duration::from_secs(2))
         .with_concurrency(DeleteRecordsConcurrency::serial());
 
-        let started_at = tokio::time::Instant::now();
+        let started_at = Instant::now();
 
         let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
 
@@ -1151,7 +1149,7 @@ mod tests {
                 Arc::new(Semaphore::new(2)),
             ));
 
-        let started_at = tokio::time::Instant::now();
+        let started_at = Instant::now();
 
         let (first, second) = tokio::join!(
             delete_records(&stub, vec![topic("a", Some(&partitions))]),
@@ -1196,7 +1194,7 @@ mod tests {
             Arc::clone(&permits),
         ));
 
-        let started_at = tokio::time::Instant::now();
+        let started_at = Instant::now();
 
         let answers = delete_records(&stub, vec![topic("a", Some(&partitions))]).await?;
 

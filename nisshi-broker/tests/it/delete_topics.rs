@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{collections::BTreeMap, slice, time::Duration};
+use tokio::time::Instant;
 
 use crate::common::{
     alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
@@ -338,7 +339,14 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
     // good_name was never named in a request, so its data and committed
     // offset must still be there, exactly as produced/committed above.
     let good_fetch = storage
-        .fetch(&good_topition, 0, min_bytes, max_bytes, isolation, max_wait)
+        .fetch(
+            &good_topition,
+            0,
+            min_bytes,
+            max_bytes,
+            isolation,
+            Instant::now() + max_wait,
+        )
         .await?;
     assert!(!good_fetch.is_empty());
 
@@ -366,7 +374,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
                 min_bytes,
                 max_bytes,
                 isolation,
-                max_wait
+                Instant::now() + max_wait
             )
             .await,
         Err(nisshi_storage::Error::Api(
@@ -397,7 +405,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
             min_bytes,
             max_bytes,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await?;
     assert!(doomed_fetch.is_empty(), "{doomed_fetch:?}");

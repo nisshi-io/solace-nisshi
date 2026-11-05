@@ -20,6 +20,7 @@
 //! so a new batch answered as one would be acknowledged and lost.
 
 use std::{assert_matches, time::Duration};
+use tokio::time::Instant;
 
 use crate::common::{alphanumeric_string, init_tracing, register_broker};
 use bytes::Bytes;
@@ -124,7 +125,7 @@ where
                     1,
                     1 << 20,
                     IsolationLevel::ReadUncommitted,
-                    Duration::from_millis(500),
+                    Instant::now() + Duration::from_millis(500),
                 )
                 .await?;
 

@@ -182,7 +182,7 @@ impl Storage for CountingStorage {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        _deadline: tokio::time::Instant,
     ) -> Result<Vec<deflated::Batch>> {
         unimplemented!()
     }

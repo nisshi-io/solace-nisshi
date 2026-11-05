@@ -256,8 +256,9 @@ clients from each other here.
 Behind the proxy, this shows as reads that miss their deadline: Fetch
 responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
 partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
-`stage` set to `queued` and `limit` set to `engine`. A larger `pool_max_size`
-does not fix this, because one client can still take the whole limit.
+`stage` set to `queued` and `wait` set to `engine_read_limit`. A larger
+`pool_max_size` does not fix this, because one client can still take the whole
+limit.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not
