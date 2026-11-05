@@ -41,7 +41,7 @@ Decide from the remote, not the working tree, so a rerun after a dropped session
 4. A `release/TAG` branch exists locally or on `origin` without a PR: read its commits, finish any phase that's missing, and continue at phase 5.
 
 The release-PR lookup is `gh pr list --head release/TAG --state <state> --json number,isCrossRepository,author,mergeCommit,body`, filtered to PRs where `isCrossRepository` is `false` and `author.login` is the operator (`gh api user --jq .login`). `gh pr list --head` matches the branch name in any fork, so without the filter a fork PR from a branch named `release/TAG` would pass for the release PR. If any other PR matches the branch name, stop and show it to the operator. If the PR description has no `Drafted from` line, stop and ask the operator for the draft base.
-5. None of these: `git switch --no-track -c release/TAG origin/main`, then start at phase 3 (stable) or phase 4 (pre-release).
+5. None of these: first check that `fuzz/Cargo.lock` is current on `origin/main`. Run `git switch --detach origin/main`, then `cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null`. `fuzz/` is a workspace of its own, and its lock can fall behind between releases: a PR that adds or raises a dependency of a crate the fuzz targets build updates only the root lock, and `just clippy` and `cargo fuzz` re-resolve `fuzz/Cargo.lock` without saving it. If the command fails with `cannot update the lock file`, land the refresh before the release. Run `git switch --no-track -c build/refresh-fuzz-lock origin/main` and the same command without `--locked`. Commit only `fuzz/Cargo.lock`, as `build(fuzz): refresh fuzz/Cargo.lock`, signed off. Push it, open a PR with that title, and stop: ask the operator to merge it and then rerun `/cut-release VERSION`. The release PR is squash-merged, so a refresh committed on `release/TAG` would land inside `chore(release): prepare TAG` without its own review. Once the check passes, run `git switch --no-track -c release/TAG origin/main`, then start at phase 3 (stable) or phase 4 (pre-release).
 
 ## 3. Draft the changelog section (stable only)
 
@@ -109,8 +109,8 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - In `Cargo.toml`, set `[workspace.package] version` to `VERSION`, and set the `version =` of every internal entry in `[workspace.dependencies]` to `VERSION`: `nisshi` and each `nisshi-*`. Other files that name a version (the README, comments) are examples or history. Leave them.
 - `grep -E '^nisshi(-[a-z-]+)? = \{ version = ' Cargo.toml | grep -v -F 'version = "VERSION"'` must print nothing.
-- Run `cargo update --workspace`, then `cargo metadata --locked --format-version 1 > /dev/null` to check that `Cargo.lock` matches.
-- `git diff --text -U0 Cargo.lock | grep '^[-+][^-+]' | grep -v '^[-+]version = '` must print nothing: the lock file changes only the workspace crates' own versions. `--text` is required, because `.gitattributes` marks `Cargo.lock` as `-diff`, and without it `git diff` prints only "Binary files differ", so the check passes whatever changed.
+- Run `cargo update --workspace`, then `cargo metadata --locked --format-version 1 > /dev/null` to check that `Cargo.lock` matches. Run `cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null` too: `fuzz/Cargo.lock` names the workspace crates the fuzz targets build, and phase 2 checked that it was current before the bump.
+- `git diff --text -U0 Cargo.lock fuzz/Cargo.lock | grep '^[-+][^-+]' | grep -v '^[-+]version = '` must print nothing: the lock files change only the workspace crates' own versions. `--text` is required, because `.gitattributes` marks `Cargo.lock` as `-diff`, and without it `git diff` prints only "Binary files differ", so the check passes whatever changed.
 
 ### Self-check
 
@@ -121,7 +121,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 ## 5. Open the PR
 
-- Commit only `Cargo.toml`, `Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
+- Commit only `Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
 - Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/solace-nisshi/pull/1004):
   - **What changes, and why?** The version bump from the old to the new version, and (stable) the section: which range it covers, and the upgrade notes that no commit body mentioned. Say that after the merge, `/cut-release` tags the squash commit on `main`, which publishes the image, the GitHub release and the crates. Stable only: end the section with the line `Drafted from <DRAFT_BASE>.`, using the full SHA.
   - **Upgrade impact:** none from the PR itself. For a stable release, the changelog describes the impact of upgrading.

@@ -23,6 +23,10 @@ vendoredDependencies:
       - "./etc"
       - "./fuzz"
 
+# FOSSA's cargo strategy runs `cargo metadata` on the root Cargo.toml, which
+# reports every member of the workspace, and doesn't look for a Cargo.toml
+# below it. So these paths can't take a crate out of the scan; fuzz/ stays out
+# because it is a workspace of its own, not a member of the root one.
 paths:
   exclude:
     - ./.git

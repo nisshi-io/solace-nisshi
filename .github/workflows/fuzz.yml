@@ -93,6 +93,8 @@ jobs:
           toolchain: nightly
           # a new nightly lint shouldn't fail the fuzz build
           build-warnings: warn
+          # fuzz/ is a workspace of its own and builds into fuzz/target
+          cache-workspaces: fuzz -> target
           cache-shared-key: fuzz
           cache-save-if: false
       - name: Install cargo-fuzz
@@ -157,6 +159,7 @@ jobs:
         with:
           toolchain: nightly
           build-warnings: warn
+          cache-workspaces: fuzz -> target
           cache-shared-key: fuzz
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-fuzz
