@@ -660,7 +660,7 @@ jobs:
             echo
             # A changed fixture list moves a row without a change in the decoder.
             if ! diff -q base/nisshi-sans-io/src/bin/bench.rs nisshi-sans-io/src/bin/bench.rs > /dev/null; then
-              echo '> This change edits `bench.rs`, so a row can differ because the fixtures differ.'
+              echo "> This change edits \`bench.rs\`, so a row can differ because the fixtures differ."
               echo
             fi
             cat "$RUNNER_TEMP/table.md"
