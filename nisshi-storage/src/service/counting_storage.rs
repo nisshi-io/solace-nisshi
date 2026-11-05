@@ -18,7 +18,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -39,7 +42,7 @@ use nisshi_sans_io::{
     record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use tokio::time::Duration;
+use tokio::{sync::Semaphore, time::Duration};
 use url::Url;
 use uuid::Uuid;
 
@@ -101,6 +104,8 @@ pub(crate) struct CountingStorage {
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
     produced: Arc<Mutex<Vec<Produced>>>,
+    produce_gate: Option<Arc<Semaphore>>,
+    parked: Arc<AtomicUsize>,
 }
 
 impl CountingStorage {
@@ -135,6 +140,21 @@ impl CountingStorage {
     /// Returns this storage, with the lookup of named topics answering as `lookup`.
     pub(crate) fn with_lookup(self, lookup: Lookup) -> Self {
         Self { lookup, ..self }
+    }
+
+    /// Returns this storage, with `produce_inflated` waiting for a permit of `gate` before it
+    /// answers, as an engine waits for a connection. The batch it was given stays held while it
+    /// waits.
+    pub(crate) fn with_produce_gate(self, gate: Arc<Semaphore>) -> Self {
+        Self {
+            produce_gate: Some(gate),
+            ..self
+        }
+    }
+
+    /// The number of `produce_inflated` calls now waiting for the gate.
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.load(Ordering::SeqCst)
     }
 
     /// Deletes the topic `name`.
@@ -309,6 +329,13 @@ impl Storage for CountingStorage {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
+        if let Some(gate) = &self.produce_gate {
+            _ = self.parked.fetch_add(1, Ordering::SeqCst);
+            let permit = gate.acquire().await;
+            _ = self.parked.fetch_sub(1, Ordering::SeqCst);
+            permit?.forget();
+        }
+
         self.produced.lock()?.push(Produced {
             transaction_id: transaction_id.map(str::to_owned),
             topition: topition.clone(),

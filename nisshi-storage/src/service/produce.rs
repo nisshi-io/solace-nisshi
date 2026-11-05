@@ -15,21 +15,27 @@
 use std::{
     borrow::Cow,
     sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use tokio::time::Instant;
 
 use nisshi_sans_io::{
     Ack, ApiKey, BatchAttribute, Compression, ConfigResource, ErrorCode, ProduceRequest,
     ProduceResponse, RequestInput, SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse, TopicProduceResponse},
-    record::{deflated, inflated},
+    record::{MAX_DECODED_BATCH_BYTES, Record, deflated, inflated},
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, Result, Storage, Topition, message_timestamp_type, offload};
+use crate::{
+    Error, METER, Result, Storage, Topition,
+    decoded_budget::{self, DecodedBytesBudget, Exhausted},
+    message_timestamp_type, offload,
+};
 
 /// Counts the connections closed by a failed `acks=0` Produce, by the error
 /// code of the first failing partition.
@@ -1436,6 +1442,49 @@ mod produce_service_tests {
     }
 }
 
+/// The message that goes with `REQUEST_TIMED_OUT` when the decoded-batch budget stays spent.
+const BUDGET_SPENT: &str =
+    "the broker is holding too many decoded produce batches, retry the request";
+
+/// What a Produce request needs to reserve the bytes of a decoded batch: the budget, and the
+/// time by which the whole request must have them.
+#[derive(Clone, Copy)]
+struct Admission<'a> {
+    budget: &'a DecodedBytesBudget,
+    deadline: Instant,
+}
+
+/// The most that decoding `batch` can charge to the budget.
+///
+/// A compressed batch can decode to any size up to [`MAX_DECODED_BATCH_BYTES`], and nothing in
+/// the batch says which: a Snappy block declares a size that a client controls, and a zstd
+/// frame from a streaming encoder, which is what Kafka clients write, carries none. So the
+/// reservation is the maximum, and [`Reservation::shrink_to`] returns the excess after the
+/// decode.
+///
+/// An uncompressed batch decodes to its records, whose `Bytes` share the wire buffer, so the
+/// decoded size is the `Record` and `Header` structures. A record is at least 7 bytes on the
+/// wire and `size_of::<Record>()` decoded, and a header at least 2 bytes on the wire and 64
+/// decoded, so 32 times the record data bounds the headers, and each counted record bounds the
+/// records.
+///
+/// [`Reservation::shrink_to`]: crate::decoded_budget::Reservation::shrink_to
+fn decoded_upper_bound(batch: &deflated::Batch) -> usize {
+    match Compression::try_from(batch.attributes) {
+        Ok(Compression::None) => batch
+            .record_data
+            .len()
+            .saturating_mul(32)
+            .saturating_add(
+                usize::try_from(batch.record_count)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(size_of::<Record>()),
+            )
+            .min(MAX_DECODED_BATCH_BYTES),
+        _ => MAX_DECODED_BATCH_BYTES,
+    }
+}
+
 /// A [`Service`] using its [`Storage`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```no_run
 /// use bytes::Bytes;
@@ -1708,6 +1757,7 @@ where
         name: &str,
         timestamp_type: TimestampType,
         partition: PartitionProduceData,
+        admission: Admission<'_>,
     ) -> PartitionProduceResponse {
         // The decoder turns a zero-length records field into `None`, so it
         // counts as zero batches.
@@ -1760,6 +1810,31 @@ where
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
+        // The reservation is held until `produce_inflated` returns, and dropped on every other
+        // path out of this function. A partition that waits here holds only its compressed
+        // batch.
+        let compression = Compression::try_from(batch.attributes).unwrap_or_default();
+        let mut reservation = match admission
+            .budget
+            .reserve(decoded_upper_bound(&batch), admission.deadline)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(Exhausted { requested, waited }) => {
+                warn!(
+                    topic = name,
+                    partition = partition.index,
+                    requested,
+                    ?waited,
+                    "decoded-batch budget stayed spent, answering REQUEST_TIMED_OUT"
+                );
+
+                return self
+                    .error(partition.index, ErrorCode::RequestTimedOut)
+                    .error_message(Some(BUDGET_SPENT.into()));
+            }
+        };
+
         let inflated = match validate_timestamps_offloaded(batch, timestamp_type, now).await {
             Ok((validated, Ok(inflated))) => {
                 batch = validated;
@@ -1773,6 +1848,15 @@ where
                 return self.error(partition.index, ErrorCode::UnknownServerError);
             }
         };
+
+        // The decoded size is known now. A compressed batch is charged for its inflated record
+        // bytes as well as its `Record` structures, which is what the decoder charges, and these
+        // bytes are what a few KB of compressed input turns into.
+        reservation.shrink_to(
+            inflated
+                .decoded_size(&compression)
+                .unwrap_or_else(|_| reservation.bytes()),
+        );
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
         let log_append_time_ms = match timestamp_type {
@@ -1883,6 +1967,7 @@ where
         &self,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
+        admission: Admission<'_>,
     ) -> TopicProduceResponse {
         let partition_data = topic.partition_data.unwrap_or_default();
         let mut partitions = Vec::with_capacity(partition_data.len());
@@ -1891,8 +1976,14 @@ where
             Ok(timestamp_type) => {
                 for partition in partition_data {
                     partitions.push(
-                        self.partition(transaction_id, &topic.name, timestamp_type, partition)
-                            .await,
+                        self.partition(
+                            transaction_id,
+                            &topic.name,
+                            timestamp_type,
+                            partition,
+                            admission,
+                        )
+                        .await,
                     )
                 }
             }
@@ -1928,9 +2019,34 @@ where
     type Output = ProduceResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
+        self.serve_with(
+            &decoded_budget::produce(),
+            decoded_budget::WAIT_TIMEOUT,
+            input.into(),
+        )
+        .await
+    }
+}
+
+impl<G> ProduceService<G>
+where
+    G: Storage,
+{
+    /// Serves `input`, with its decoded batches held against `budget`.
+    #[instrument(skip(self, budget, wait, input))]
+    pub(super) async fn serve_with(
+        &self,
+        budget: &DecodedBytesBudget,
+        wait: Duration,
+        input: RequestInput<ProduceRequest>,
+    ) -> Result<ProduceResponse> {
+        // One deadline for the whole request, so that a request with many partitions does not
+        // wait the full time for each one.
+        let admission = Admission {
+            budget,
+            deadline: Instant::now() + wait,
+        };
 
         let topics = input.request.topic_data.unwrap_or_default();
         let mut responses = Vec::with_capacity(topics.len());
@@ -1960,7 +2076,7 @@ where
         } else {
             for topic in topics {
                 responses.push(
-                    self.topic(input.request.transactional_id.as_deref(), topic)
+                    self.topic(input.request.transactional_id.as_deref(), topic, admission)
                         .await,
                 )
             }

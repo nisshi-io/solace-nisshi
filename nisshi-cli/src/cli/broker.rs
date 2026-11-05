@@ -129,6 +129,13 @@ pub(super) struct Arg {
     #[arg(long, env = "NUM_PARTITIONS", default_value_t = DEFAULT_NUM_PARTITIONS, value_parser = clap::value_parser!(i32).range(1..))]
     num_partitions: i32,
 
+    /// The bytes of decoded batches that Produce requests may hold at once, from the decode of a
+    /// batch until storage returns. A request over the budget waits, then answers
+    /// REQUEST_TIMED_OUT after 10 seconds. Defaults to 1 GiB, or 100 MiB for each runtime worker
+    /// when that is more
+    #[arg(long, env = "PRODUCE_DECODED_BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    produce_decoded_bytes: Option<u64>,
+
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
@@ -563,6 +570,13 @@ impl Arg {
             None => None,
         };
 
+        if let Some(bytes) = self.produce_decoded_bytes {
+            // Nothing has served a request yet, so this sets the budget.
+            _ = nisshi_storage::configure_produce_decoded_bytes(
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            );
+        }
+
         let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
@@ -768,6 +782,30 @@ mod tests {
         let arg = parse(&["--auto-create-topics-enable=false"]).expect("false parses");
 
         assert!(!arg.auto_create_topics_enable);
+    }
+
+    #[test]
+    fn produce_decoded_bytes_is_unset_by_default_and_rejects_zero() {
+        temp_env::with_vars_unset(["PRODUCE_DECODED_BYTES"], || {
+            assert_eq!(
+                None,
+                parse(&[]).expect("defaults parse").produce_decoded_bytes
+            );
+
+            assert_eq!(
+                Some(1 << 30),
+                parse(&["--produce-decoded-bytes=1073741824"])
+                    .expect("a byte count parses")
+                    .produce_decoded_bytes
+            );
+
+            assert_eq!(
+                clap::error::ErrorKind::ValueValidation,
+                parse(&["--produce-decoded-bytes=0"])
+                    .expect_err("0 would admit no produce")
+                    .kind()
+            );
+        });
     }
 
     #[test]

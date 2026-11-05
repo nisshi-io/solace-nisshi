@@ -205,6 +205,7 @@ mod batch;
 pub mod config;
 #[cfg(test)]
 mod decoded_batch_probe;
+mod decoded_budget;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
@@ -220,6 +221,9 @@ mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
+pub use decoded_budget::{
+    configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
+};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
