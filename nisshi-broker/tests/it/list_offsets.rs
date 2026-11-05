@@ -1079,6 +1079,19 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn no_timestamp_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::no_timestamp_batch(sc).await
+    }
+
+    #[tokio::test]
     async fn multiple_record() -> Result<()> {
         let _guard = init_tracing()?;
 
