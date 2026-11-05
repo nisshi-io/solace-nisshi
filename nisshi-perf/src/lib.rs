@@ -23,7 +23,10 @@ use std::{
     num::{NonZero, NonZeroU32},
     ops::AddAssign,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    sync::{
+        Arc, LazyLock, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -684,8 +687,11 @@ impl Info {
                 .unwrap_or_default()
     }
 
-    fn records_sent_per_second(&self) -> f64 {
-        self.records_sent() as f64 / self.elapsed().as_secs() as f64
+    /// The rate over the elapsed time with its fraction, or `None` when no time has elapsed.
+    fn records_sent_per_second(&self) -> Option<f64> {
+        let seconds = self.elapsed().as_secs_f64();
+
+        (seconds > 0.0).then(|| self.records_sent() as f64 / seconds)
     }
 
     /// The report as one line of JSON. Unlike the text, it divides by the elapsed time with its
@@ -746,10 +752,11 @@ impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
+            "elapsed: {}, {} records sent, {} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
             self.elapsed().format_duration(),
             self.records_sent(),
-            self.records_sent_per_second(),
+            self.records_sent_per_second()
+                .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
             self.bandwidth().format_iec(),
             self.current
                 .latency
@@ -806,6 +813,8 @@ struct MetricExporter {
     temporality: Temporality,
     previous: Mutex<Option<ObservationLatency>>,
     cancellation: CancellationToken,
+    /// Set by the export that prints the summary, so that the summary prints once.
+    summarised: AtomicBool,
     report: ReportFormat,
 }
 
@@ -817,6 +826,7 @@ impl MetricExporter {
             temporality: Default::default(),
             previous: Default::default(),
             cancellation,
+            summarised: AtomicBool::new(false),
             report,
         }
     }
@@ -871,12 +881,20 @@ impl MetricExporter {
 
 impl PushMetricExporter for MetricExporter {
     async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
-        let cancelled = self.cancellation.is_cancelled();
-
         let mut previous = self
             .previous
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Read under the lock, so that an export of the timer that runs while the run shuts down
+        // either prints its interval before the summary or is the one that prints the summary.
+        let cancelled = self.cancellation.is_cancelled();
+
+        // The summary prints once: an export of the timer after the token is cancelled and the
+        // export of the shutdown both see a cancelled token, and the second has nothing to add.
+        if cancelled && self.summarised.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
 
         // The export of a shutdown, after the token was cancelled, has the totals since the start
         // of the run: its line is the summary, over the whole run, so it has no previous line.
@@ -926,6 +944,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn info_display_has_no_rate_without_elapsed_time() {
+        let now = SystemTime::now();
+        let mut info = Info::new(now);
+        info.current.observation.taken_at = now;
+        info.current.observation.record_count = 5;
+
+        assert_eq!(None, info.records_sent_per_second());
+        let line = info.to_string();
+        assert!(line.contains("5 records sent, - records/s"), "{line}");
+        assert!(!line.contains("NaN") && !line.contains("inf"), "{line}");
+    }
+
+    #[test]
+    fn info_display_has_a_rate_for_less_than_a_second() {
+        let now = SystemTime::now();
+        let mut info = Info::new(now.checked_sub(Duration::from_millis(500)).unwrap());
+        info.current.observation.taken_at = now;
+        info.current.observation.record_count = 50;
+
+        assert_eq!(Some(100.0), info.records_sent_per_second());
+    }
+
+    #[test]
     fn info_display_without_latency_samples() {
         let info = Info::new(SystemTime::now());
         let line = info.to_string();
@@ -935,7 +976,10 @@ mod tests {
 
     #[test]
     fn json_report_is_valid_without_samples_or_elapsed_time() {
-        let info = Info::new(SystemTime::now());
+        let now = SystemTime::now();
+        let mut info = Info::new(now);
+        // The default observation is taken when it is built, a moment after `now`.
+        info.current.observation.taken_at = now;
 
         for kind in [ReportKind::Interval, ReportKind::Summary] {
             let json: serde_json::Value = serde_json::from_str(&info.json_line(kind)).unwrap();
@@ -1042,7 +1086,7 @@ mod tests {
 
         assert_eq!(elapsed, info.elapsed());
         assert_eq!(5_555, info.bandwidth().0);
-        assert_eq!(111f64, info.records_sent_per_second());
+        assert_eq!(Some(111f64), info.records_sent_per_second());
     }
 
     #[test]
@@ -1067,6 +1111,6 @@ mod tests {
 
         assert_eq!(elapsed, info.elapsed());
         assert_eq!(16_364, info.bandwidth().0);
-        assert_eq!(164f64, info.records_sent_per_second());
+        assert_eq!(Some(164f64), info.records_sent_per_second());
     }
 }
