@@ -228,11 +228,61 @@ static FETCH_FULL_LISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The most `maintain` passes that a partition whose reclaim keeps failing is skipped for (see
+/// [`ReclaimBackoff`]). It counts passes, so the cap scales with the broker's maintenance
+/// interval: at the default 10 minutes, 16 passes is a retry about every 2 hours 40 minutes.
+const MAX_RECLAIM_BACKOFF_PASSES: u32 = 16;
+
+/// The reclaim failures of one partition, as this broker has seen them since it started or the
+/// partition last reclaimed (see [`DynoStore::reclaim_records`]).
+///
+/// A bucket that refuses deletes (a role without `s3:DeleteObject`, S3 Object Lock, a GCS retention
+/// policy) fails the same reclaim on every pass, and each pass lists the whole partition. After a
+/// failure, the partition is skipped for a number of passes that doubles with each consecutive
+/// failure: none after the first, so that a transient error costs one pass, then 1, 2, 4, 8 and
+/// [`MAX_RECLAIM_BACKOFF_PASSES`] at most. A success, or a pass that finds nothing to reclaim,
+/// removes the entry.
+///
+/// This lives in the broker's memory and not in the partition's [`Watermark`]. A write to the
+/// bucket that refuses deletes can fail as well, and every broker would then have to write on each
+/// failure. A restart forgets it, and costs one retry, and `Watermark::reclaimed` still decides
+/// what is reclaimed, so the backoff can only delay a reclaim and never skip a cut. Brokers that
+/// share a bucket each keep their own backoff, so a stalled partition costs one listing per broker
+/// per retry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReclaimBackoff {
+    /// The failures in a row.
+    failures: u32,
+
+    /// The passes that remain to skip.
+    skip: u32,
+}
+
+impl ReclaimBackoff {
+    /// Records one more failure, and sets the passes to skip.
+    fn failed(self) -> Self {
+        let failures = self.failures.saturating_add(1);
+
+        let skip = match failures {
+            0 | 1 => 0,
+            n => 1u32
+                .checked_shl(n - 2)
+                .map_or(MAX_RECLAIM_BACKOFF_PASSES, |passes| {
+                    passes.min(MAX_RECLAIM_BACKOFF_PASSES)
+                }),
+        };
+
+        Self { failures, skip }
+    }
+}
+
 /// Counts the partitions that `maintain` tried to reclaim batch objects for, by `outcome`:
 /// `reclaimed` (the objects are deleted and the cut is recorded), `delete_failed` (at least one
 /// object was not deleted), `listing_failed`, or `state_failed` (the partition's watermark or
-/// topic could not be read, or the cut could not be recorded). A partition that stays in a
-/// failed outcome has objects that stay in the bucket after a `DeleteRecords` cut.
+/// topic could not be read, or the cut could not be recorded), or `backed_off` (the partition
+/// failed on earlier passes, and this pass skipped it, see [`ReclaimBackoff`]). A partition that
+/// stays in a failed outcome has objects that stay in the bucket after a `DeleteRecords` cut, and
+/// shows as failed outcomes that thin out into a steady `backed_off` count.
 ///
 /// Every broker visits every partition, so one cut is counted once for each broker.
 static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -337,6 +387,11 @@ pub struct DynoStore {
     /// each reading every batch of the partition.
     backfills: Arc<Mutex<BTreeMap<Topition, Arc<tokio::sync::Mutex<()>>>>>,
     meta: OptiCon<Meta>,
+
+    /// The partitions, by topic ID and index, whose reclaim failed on a recent `maintain` pass (see
+    /// [`ReclaimBackoff`]). The ID keeps a topic that is created again under a deleted topic's
+    /// name from inheriting that topic's backoff.
+    reclaim_backoff: Arc<Mutex<BTreeMap<(Uuid, i32), ReclaimBackoff>>>,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -1138,6 +1193,7 @@ impl DynoStore {
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             backfills: Arc::new(Mutex::new(BTreeMap::new())),
+            reclaim_backoff: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -1333,7 +1389,7 @@ impl DynoStore {
                     ?error,
                     ?topition,
                     cutoff,
-                    "listing the batch objects below the cut failed, maintain tries again on its next pass"
+                    "listing the batch objects below the cut failed, maintain tries again later"
                 );
                 self.count_reclaim("listing_failed");
                 return false;
@@ -1396,7 +1452,7 @@ impl DynoStore {
             cutoff,
             deleted_objects,
             failed_objects,
-            "deleting the batch objects below the cut failed, maintain tries again on its next pass"
+            "deleting the batch objects below the cut failed, maintain tries again later"
         );
         self.count_reclaim("delete_failed");
 
@@ -1431,7 +1487,9 @@ impl DynoStore {
     /// retries it.
     ///
     /// A failure on one partition is logged and does not stop the others. A
-    /// pass costs one read of each partition's watermark, as Kafka's
+    /// partition that fails again and again backs off (see [`ReclaimBackoff`]), so a
+    /// bucket that refuses deletes costs a listing every few passes, and not on each.
+    /// A pass costs one read of each partition's watermark, as Kafka's
     /// retention check visits every log, and one listing for each partition
     /// with something to reclaim. It visits up to [`CONCURRENT_RECLAIMS`]
     /// partitions at once, and up to [`CONCURRENT_RECLAIM_DELETES`] of them
@@ -1465,40 +1523,103 @@ impl DynoStore {
             }
         };
 
-        let partitions = topics.values().flat_map(|metadata| {
-            (0..metadata.topic.num_partitions).map(|partition| {
-                (
-                    Topition::new(metadata.topic.name.as_str(), partition),
-                    metadata.id,
-                )
+        let partitions = topics
+            .values()
+            .flat_map(|metadata| {
+                (0..metadata.topic.num_partitions).map(|partition| {
+                    (
+                        Topition::new(metadata.topic.name.as_str(), partition),
+                        metadata.id,
+                    )
+                })
             })
-        });
+            .collect::<Vec<_>>();
+
+        // A deleted topic's partitions leave the backoff, so the map holds no more
+        // than the partitions that fail now.
+        if let Ok(mut backoff) = self.reclaim_backoff.lock() {
+            let known = partitions
+                .iter()
+                .map(|(topition, topic_id)| (*topic_id, topition.partition()))
+                .collect::<BTreeSet<_>>();
+
+            backoff.retain(|key, _| known.contains(key));
+        }
 
         let deletes = Semaphore::new(CONCURRENT_RECLAIM_DELETES);
         let deletes = &deletes;
 
         stream::iter(partitions)
             .for_each_concurrent(CONCURRENT_RECLAIMS, |(topition, topic_id)| async move {
-                if let Err(error) = self.reclaim_partition(&topition, &topic_id, deletes).await {
-                    error!(
-                        ?error,
-                        ?topition,
-                        "reading or recording the cut of a partition failed, maintain tries again on its next pass"
-                    );
-                    self.count_reclaim("state_failed");
+                if self.skip_backed_off(&topic_id, &topition) {
+                    self.count_reclaim("backed_off");
+                    return;
                 }
+
+                let settled = match self.reclaim_partition(&topition, &topic_id, deletes).await {
+                    Ok(settled) => settled,
+
+                    Err(error) => {
+                        error!(
+                            ?error,
+                            ?topition,
+                            "reading or recording the cut of a partition failed, maintain tries again later"
+                        );
+                        self.count_reclaim("state_failed");
+                        false
+                    }
+                };
+
+                self.record_reclaim(&topic_id, &topition, settled);
             })
             .await;
     }
 
+    /// Whether this pass skips `topition`, because its reclaim failed on earlier passes
+    /// (see [`ReclaimBackoff`]). A skip uses up one of the passes to skip.
+    fn skip_backed_off(&self, topic_id: &Uuid, topition: &Topition) -> bool {
+        let Ok(mut backoff) = self.reclaim_backoff.lock() else {
+            return false;
+        };
+
+        match backoff.get_mut(&(*topic_id, topition.partition())) {
+            Some(entry) if entry.skip > 0 => {
+                entry.skip -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Records the outcome of one reclaim of `topition`: `settled` removes its backoff,
+    /// and a failure extends it.
+    fn record_reclaim(&self, topic_id: &Uuid, topition: &Topition, settled: bool) {
+        let Ok(mut backoff) = self.reclaim_backoff.lock() else {
+            return;
+        };
+
+        if settled {
+            _ = backoff.remove(&(*topic_id, topition.partition()));
+        } else {
+            let entry = backoff
+                .entry((*topic_id, topition.partition()))
+                .or_default();
+            *entry = entry.failed();
+
+            debug!(?topition, ?entry, "reclaim failed, the partition backs off");
+        }
+    }
+
     /// Reclaims one partition (see [`Self::reclaim_records`]), once it holds a permit of
-    /// `deletes` for its listing and deletes.
+    /// `deletes` for its listing and deletes. The result is `true` when the partition has
+    /// nothing left to reclaim, and `false` when its objects or its cut could not be
+    /// handled, which is logged and counted, and leaves the retry to the backoff.
     async fn reclaim_partition(
         &self,
         topition: &Topition,
         topic_id: &Uuid,
         deletes: &Semaphore,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let watermark = self.watermark_without_caching(topition)?;
 
         // The high watermark is read before the listing, as the cut check in
@@ -1514,7 +1635,7 @@ impl DynoStore {
 
         let Some(low) = low.filter(|&low| low > 0 && reclaimed.is_none_or(|done| done < low))
         else {
-            return Ok(());
+            return Ok(true);
         };
 
         let deleted = {
@@ -1525,7 +1646,7 @@ impl DynoStore {
         };
 
         if !deleted {
-            return Ok(());
+            return Ok(false);
         }
 
         // The topic can have been deleted while the objects went, and
@@ -1537,7 +1658,7 @@ impl DynoStore {
             .await?
             .is_none_or(|metadata| &metadata.id != topic_id)
         {
-            return Ok(());
+            return Ok(true);
         }
 
         watermark
@@ -1549,7 +1670,7 @@ impl DynoStore {
 
         self.count_reclaim("reclaimed");
 
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the handle that this broker already caches for `topition`'s watermark document,
