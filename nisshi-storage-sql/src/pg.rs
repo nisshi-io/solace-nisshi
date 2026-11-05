@@ -33,8 +33,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deadpool::managed;
 use deadpool_postgres::{
-    Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime, TimeoutType,
-    Transaction,
+    Hook, HookError, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
+    TimeoutType, Transaction,
 };
 use futures::pin_mut;
 use nisshi_sans_io::topic_config;
@@ -247,6 +247,8 @@ pub struct PoolParts {
     pool_max_size: usize,
     /// Whether the storage URL, in its query or in `options`, sets `application_name`.
     named_by_operator: bool,
+    /// The value of [`READ_ONLY_CHECK_EVERY`], which [`ReadOnlyCheck`] runs on.
+    read_only_check_every: u32,
     /// The machine's name, which [`application_name`] puts in the name of each connection.
     host: Option<String>,
     /// The pool with the plain [`APPLICATION_NAME_PREFIX`] as its name, built where the storage
@@ -260,46 +262,59 @@ impl Debug for PoolParts {
             .field("config", &self.config)
             .field("pool_max_size", &self.pool_max_size)
             .field("named_by_operator", &self.named_by_operator)
+            .field("read_only_check_every", &self.read_only_check_every)
             .field("host", &self.host)
             .finish_non_exhaustive()
     }
 }
 
 impl PoolParts {
-    /// Opens a pool of connections that use `config`.
+    /// Opens a pool of connections that use `config`, and that run `check` on them unless
+    /// `check.every` is 0.
     fn open(
         config: Config,
         tls: MakeRustlsConnect,
         pool_max_size: usize,
+        check: &ReadOnlyCheck,
     ) -> std::result::Result<Pool, deadpool_postgres::BuildError> {
         let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Custom(RECYCLE_QUERY.into()),
+            recycling_method: RecyclingMethod::Fast,
         };
 
-        Pool::builder(Manager::from_config(config, tls, mgr_config))
+        let builder = Pool::builder(Manager::from_config(config, tls, mgr_config))
             .max_size(pool_max_size)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
-            .recycle_timeout(Some(DEFAULT_POOL_RECYCLE_TIMEOUT))
-            .build()
+            .recycle_timeout(Some(DEFAULT_POOL_RECYCLE_TIMEOUT));
+
+        if check.every == 0 {
+            builder.build()
+        } else {
+            builder
+                .post_create(check.post_create())
+                .pre_recycle(check.pre_recycle())
+                .build()
+        }
     }
 
     /// The pool for the broker of `cluster`: its connections are named by
-    /// [`application_name`] unless the operator named them.
+    /// [`application_name`] unless the operator named them, and the check that it runs counts in
+    /// `cluster`.
     fn pool_of(&self, cluster: &str, node: i32) -> Pool {
-        if self.named_by_operator {
-            return self.pool.clone();
+        let mut config = self.config.clone();
+
+        if !self.named_by_operator {
+            _ = config.application_name(application_name(self.host.as_deref(), cluster, node));
         }
 
-        let mut config = self.config.clone();
-        _ = config.application_name(application_name(self.host.as_deref(), cluster, node));
+        let check = ReadOnlyCheck::new(self.read_only_check_every, cluster);
 
         // The only way that opening a pool fails is a timeout without a runtime, and `open` sets
         // both. The pool that `from_str` built with the same settings stands in, so that this
         // can never stop the broker.
-        Self::open(config, self.tls.clone(), self.pool_max_size).unwrap_or_else(|err| {
-            error!(?err, "opening the pool with the broker's name failed");
+        Self::open(config, self.tls.clone(), self.pool_max_size, &check).unwrap_or_else(|err| {
+            error!(?err, "opening the pool for the cluster failed");
             self.pool.clone()
         })
     }
@@ -645,18 +660,40 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
     name
 }
 
-/// How long checking an idle pooled connection with [`RECYCLE_QUERY`] may take. A connection
-/// whose peer vanished without a reset passes the pool's `is_closed` check, and without a bound
-/// the query would wait for TCP to give up. On a timeout the pool drops that connection and tries
-/// the next idle one, which gets its own timeout, so the pool opens a new connection only when no
-/// idle one is left. A checkout can take up to this timeout for each idle connection, plus
+/// How long [`ReadOnlyCheck::run`] may take for one connection. A connection whose peer vanished
+/// without a reset passes the pool's `is_closed` check, and without a bound the query would wait
+/// for TCP to give up. On a timeout the pool drops that connection and tries the next idle one,
+/// which gets its own timeout, so the pool opens a new connection only when no idle one is left. A
+/// checkout can take up to this timeout for each idle connection, plus
 /// [`DEFAULT_POOL_CREATE_TIMEOUT`], and `connection()` puts no other bound around the checkout.
-/// The deadpool-postgres warning for a failed check sits inside the future that the timeout drops,
-/// so a timed-out check is not logged.
+///
+/// The pool applies the same value to its own recycle step, which only checks that the socket is
+/// open.
 const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run on each idle pooled connection before the pool hands it out. It fails when the session
-/// is read-only, which makes the pool drop the connection and open a new one.
+/// The storage URL option that sets how often the pool checks a connection for a read-only
+/// session, see [`ReadOnlyCheck`].
+const READ_ONLY_CHECK_EVERY: &str = "read_only_check_every";
+
+/// How many checkouts of an idle connection pass between two checks when the storage URL does not
+/// set [`READ_ONLY_CHECK_EVERY`].
+///
+/// A check on every checkout adds a round trip to each one. Against a local PostgreSQL it halved
+/// the throughput of a pool that runs statements as short as the check, and cost 8% to 16% with a
+/// statement of a few milliseconds, where every fourth checkout cost nothing that the noise of the
+/// runs hid. A connection that turns read-only then serves at most 3 checkouts before the check
+/// finds it, and each of those fails its writes with a transient error that the client retries.
+const DEFAULT_READ_ONLY_CHECK_EVERY: u32 = 4;
+
+/// The range of [`READ_ONLY_CHECK_EVERY`]. 0 turns the check off.
+const READ_ONLY_CHECK_EVERY_RANGE: RangeInclusive<u32> = 0..=1_000_000;
+
+/// The values that [`READ_ONLY_CHECK_EVERY`] takes, as an error message gives them.
+const READ_ONLY_CHECK_EVERY_EXPECTED: &str =
+    "a whole number from 0 to 1000000, where 0 turns the check off";
+
+/// Run on a pooled connection to find out whether its session is read-only. It fails when it is,
+/// with a failed integer cast whose message says so.
 ///
 /// After a failover, the old primary can stay up and turn read-only. A connection to it still
 /// looks open, so [`RecyclingMethod::Fast`] and [`RecyclingMethod::Verified`] keep it, and
@@ -668,18 +705,207 @@ const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// fail every check and open a connection for every checkout. The message is concatenated
 /// with a stable function so the planner doesn't fold the cast into an error for every
 /// session.
-///
-/// deadpool-postgres logs a failed check at `warn`, with the target `deadpool.postgres`, as
-/// `Connection could not be recycled: {error}`, and tokio-postgres displays a server error as
-/// only `db error`. The broker log therefore does not carry the message above. The server log does.
-///
-/// A new connection isn't checked, so one opened to a server that is still read-only is
-/// dropped at its next checkout. Add `target_session_attrs=read-write` to the storage URL to
-/// refuse such a server when connecting, see `docs/storage.md`.
 const RECYCLE_QUERY: &str = "SELECT CASE WHEN pg_is_in_recovery() \
     OR current_setting('transaction_read_only')::bool \
     THEN ('connection is read-only, transaction_read_only=' \
     || current_setting('transaction_read_only'))::int END";
+
+/// The text that [`RECYCLE_QUERY`] puts in its error when the session is read-only. The server's
+/// message quotes it inside an `invalid input syntax for type integer` error.
+const READ_ONLY_MESSAGE: &str = "connection is read-only";
+
+/// The number of pooled connections that the pool dropped before use, by the stage that dropped
+/// them and the reason.
+static POOL_REPLACED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_sql_pool_replaced")
+        .with_description("The number of pooled connections dropped before use")
+        .build()
+});
+
+/// Where a pooled connection failed [`ReadOnlyCheck::run`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckStage {
+    /// A new connection, before its first use.
+    Create,
+    /// An idle connection, at its checkout.
+    Recycle,
+}
+
+impl CheckStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Recycle => "recycle",
+        }
+    }
+}
+
+/// Why a pooled connection failed [`ReadOnlyCheck::run`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckFailure {
+    /// The session is read-only.
+    ReadOnly,
+    /// The connection is closed.
+    Closed,
+    /// The check took longer than [`DEFAULT_POOL_RECYCLE_TIMEOUT`].
+    Timeout,
+    /// Any other error from the server or the socket.
+    Error,
+}
+
+impl CheckFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Closed => "closed",
+            Self::Timeout => "timeout",
+            Self::Error => "error",
+        }
+    }
+
+    fn of(error: &tokio_postgres::Error) -> Self {
+        match error.as_db_error() {
+            Some(db) if db.message().contains(READ_ONLY_MESSAGE) => Self::ReadOnly,
+            Some(_) => Self::Error,
+            None if error.is_closed() => Self::Closed,
+            None => Self::Error,
+        }
+    }
+}
+
+/// The check that keeps a pooled connection to a read-only server out of use, set up by
+/// [`PoolParts::open`] unless the storage URL sets [`READ_ONLY_CHECK_EVERY`] to 0.
+///
+/// It runs [`RECYCLE_QUERY`] on every new connection before its first use, and on every
+/// `every`-th checkout of an idle connection. A connection that fails is dropped, and the pool
+/// tries the next idle one. A new connection that fails makes the checkout fail with a
+/// [`PoolError::PostCreateHook`], which is a transient error to the caller, so a broker whose
+/// endpoint still reaches a read-only server fails each checkout fast instead of using the
+/// connection for one request and dropping it at the next.
+///
+/// The pool logs a failed recycle only as the error's `Display`, which tokio-postgres limits to
+/// `db error`, and logs nothing for a timeout, so this check logs each failure itself, with the
+/// server's message, and counts it in [`POOL_REPLACED`].
+#[derive(Clone, Debug)]
+struct ReadOnlyCheck {
+    /// Check every `every`-th checkout of an idle connection. 1 checks every checkout.
+    every: u32,
+    cluster: String,
+    replaced: Counter<u64>,
+}
+
+impl ReadOnlyCheck {
+    fn new(every: u32, cluster: &str) -> Self {
+        Self::counting(every, cluster, POOL_REPLACED.clone())
+    }
+
+    fn counting(every: u32, cluster: &str, replaced: Counter<u64>) -> Self {
+        Self {
+            every,
+            cluster: cluster.to_owned(),
+            replaced,
+        }
+    }
+
+    /// Checks `client`, and logs and counts a failure.
+    async fn run(
+        &self,
+        stage: CheckStage,
+        client: &deadpool_postgres::ClientWrapper,
+    ) -> std::result::Result<(), CheckFailure> {
+        let failure = if client.is_closed() {
+            CheckFailure::Closed
+        } else {
+            match timeout(
+                DEFAULT_POOL_RECYCLE_TIMEOUT,
+                client.simple_query(RECYCLE_QUERY),
+            )
+            .await
+            {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(error)) => {
+                    let failure = CheckFailure::of(&error);
+                    warn!(
+                        cluster = self.cluster,
+                        stage = stage.as_str(),
+                        reason = failure.as_str(),
+                        ?error,
+                        "a pooled connection failed its check and is dropped"
+                    );
+                    failure
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        cluster = self.cluster,
+                        stage = stage.as_str(),
+                        reason = CheckFailure::Timeout.as_str(),
+                        timeout = ?DEFAULT_POOL_RECYCLE_TIMEOUT,
+                        "a pooled connection failed its check and is dropped"
+                    );
+                    CheckFailure::Timeout
+                }
+            }
+        };
+
+        self.replaced.add(
+            1,
+            &[
+                KeyValue::new("cluster_id", self.cluster.clone()),
+                KeyValue::new("stage", stage.as_str()),
+                KeyValue::new("reason", failure.as_str()),
+            ],
+        );
+
+        Err(failure)
+    }
+
+    /// The hook that checks a new connection.
+    fn post_create(&self) -> Hook {
+        let check = self.clone();
+
+        Hook::async_fn(move |client, _metrics| {
+            let check = check.clone();
+
+            Box::pin(async move {
+                check
+                    .run(CheckStage::Create, client)
+                    .await
+                    .map_err(|failure| {
+                        HookError::message(format!(
+                            "a new connection failed its check: {}",
+                            failure.as_str()
+                        ))
+                    })
+            })
+        })
+    }
+
+    /// The hook that checks an idle connection at its checkout, on every `every`-th one.
+    fn pre_recycle(&self) -> Hook {
+        let check = self.clone();
+
+        Hook::async_fn(move |client, metrics| {
+            let check = check.clone();
+
+            Box::pin(async move {
+                if metrics.recycle_count % usize::try_from(check.every).unwrap_or(usize::MAX) != 0 {
+                    return Ok(());
+                }
+
+                check
+                    .run(CheckStage::Recycle, client)
+                    .await
+                    .map_err(|failure| {
+                        HookError::message(format!(
+                            "an idle connection failed its check: {}",
+                            failure.as_str()
+                        ))
+                    })
+            })
+        })
+    }
+}
 
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
@@ -794,6 +1020,26 @@ fn take_client_read_share(config: &mut String) -> Result<Option<usize>> {
     )
 }
 
+/// Removes every [`READ_ONLY_CHECK_EVERY`] option from `config`, a connection URL, and returns
+/// the value that the last one sets, or [`DEFAULT_READ_ONLY_CHECK_EVERY`] when the URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a number in
+/// [`READ_ONLY_CHECK_EVERY_RANGE`].
+fn take_read_only_check_every(config: &mut String) -> Result<u32> {
+    take_option(
+        config,
+        READ_ONLY_CHECK_EVERY,
+        READ_ONLY_CHECK_EVERY_EXPECTED,
+        |value| {
+            value
+                .parse()
+                .ok()
+                .filter(|every| READ_ONLY_CHECK_EVERY_RANGE.contains(every))
+        },
+    )
+    .map(|every| every.unwrap_or(DEFAULT_READ_ONLY_CHECK_EVERY))
+}
+
 /// Removes every `option` from `config`, a connection URL, and returns what
 /// `parse` makes of the last one's value, or `None` when the URL sets none.
 ///
@@ -850,6 +1096,7 @@ where
     fn from_str(config: &str) -> Result<Self, Self::Err> {
         let mut config = config.to_owned();
         let pool_max_size = take_pool_max_size(&mut config)?;
+        let read_only_check_every = take_read_only_check_every(&mut config)?;
         let client_percent = take_client_read_share(&mut config)?;
         let read_limits = ReadLimits {
             client_percent,
@@ -910,7 +1157,12 @@ where
             tls: tls.clone(),
         });
 
-        let pool = PoolParts::open(default_config, tls.clone(), pool_max_size)?;
+        let pool = PoolParts::open(
+            default_config,
+            tls.clone(),
+            pool_max_size,
+            &ReadOnlyCheck::new(read_only_check_every, ""),
+        )?;
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
         Ok(Self {
@@ -919,6 +1171,7 @@ where
                 tls,
                 pool_max_size,
                 named_by_operator,
+                read_only_check_every,
                 host: local_host_name(),
                 pool,
             },
@@ -8167,7 +8420,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_pooled_connection_is_replaced() -> Result<()> {
         let cluster = alphanumeric_string(15);
-        let storage = Postgres::builder(&CONNECTION)?
+        let storage = Postgres::builder(&format!("{}?read_only_check_every=1", *CONNECTION))?
             .cluster(&cluster)
             .node(rng().random_range(0..i32::MAX))
             .build();
@@ -8215,6 +8468,321 @@ mod tests {
         assert_eq!(1, storage.pool.status().size);
 
         Ok(())
+    }
+
+    /// The URL of a server that every session of is read-only, as the old primary
+    /// of a failover is, with `suffix` after it.
+    fn read_only_server(suffix: &str) -> String {
+        format!(
+            "{}?options=-c%20default_transaction_read_only%3Don{suffix}",
+            *CONNECTION
+        )
+    }
+
+    /// While the endpoint still reaches a read-only server, each checkout fails
+    /// fast with a transient pool error and the pool does not grow, instead of
+    /// each checkout using a new connection once and dropping it at the next.
+    #[tokio::test]
+    async fn read_only_server_fails_each_checkout_fast_without_growing_the_pool() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) = storage_with_schema(
+            "read_only_server_fails_each_checkout_fast",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let storage = Postgres::builder(&read_only_server(""))?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        for _ in 0..3 {
+            let started = Instant::now();
+            let error = storage
+                .connection()
+                .await
+                .expect_err("a connection to a read-only server must not be handed out");
+
+            assert!(started.elapsed() < Duration::from_secs(5), "{error:?}");
+            assert_matches!(&error, Error::Pool(_));
+            assert_eq!(0, storage.pool.status().size);
+        }
+
+        Ok(())
+    }
+
+    /// `read_only_check_every=0` turns the check off, and a checkout of a
+    /// connection to a read-only server succeeds as it did before the check.
+    #[tokio::test]
+    async fn read_only_check_every_zero_hands_out_a_read_only_connection() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) = storage_with_schema(
+            "read_only_check_every_zero_hands_out",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let storage = Postgres::builder(&read_only_server("&read_only_check_every=0"))?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let connection = storage.connection().await?;
+        let row = connection
+            .query_one("SELECT current_setting('transaction_read_only')", &[])
+            .await?;
+
+        assert_eq!("on", row.get::<_, String>(0));
+        assert_eq!(1, storage.pool.status().size);
+
+        Ok(())
+    }
+
+    /// With `read_only_check_every=2`, a connection that turns read-only is
+    /// replaced at the checkout that checks it, and the checkout between two
+    /// checks keeps it.
+    #[tokio::test]
+    async fn read_only_check_every_skips_the_checkouts_between_two_checks() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) = storage_with_schema(
+            "read_only_check_every_skips_checkouts",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let storage = Postgres::builder(&format!("{}?read_only_check_every=2", *CONNECTION))?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        storage.pool.resize(1);
+
+        async fn pid_and_read_only(storage: &Postgres) -> Result<(i32, String)> {
+            let connection = storage.connection().await?;
+            let row = connection
+                .query_one(
+                    "SELECT pg_backend_pid(), current_setting('transaction_read_only')",
+                    &[],
+                )
+                .await?;
+            Ok((row.get(0), row.get(1)))
+        }
+
+        // Checkout 1 creates the connection.
+        let (pid, _) = pid_and_read_only(&storage).await?;
+
+        // Checkout 2 is its first recycle, which is checked and passes. The connection then
+        // turns read-only.
+        storage
+            .connection()
+            .await?
+            .batch_execute("SET default_transaction_read_only = on")
+            .await?;
+
+        // Checkout 3 is its second recycle: it is not checked, so the read-only connection is
+        // kept.
+        assert_eq!(
+            (pid, String::from("on")),
+            pid_and_read_only(&storage).await?
+        );
+
+        // Checkout 4 is its third recycle, which is checked, and replaces it.
+        let (replacement, read_only) = pid_and_read_only(&storage).await?;
+        assert_ne!(pid, replacement);
+        assert_eq!("off", read_only);
+
+        Ok(())
+    }
+
+    /// The counter of dropped connections counts by stage and reason: a new
+    /// connection to a read-only server, and an idle one that turned
+    /// read-only.
+    #[tokio::test]
+    async fn dropped_connections_are_counted_by_stage_and_reason() -> Result<()> {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) =
+            storage_with_schema("dropped_connections_are_counted", &CONNECTION, &cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let counter = provider
+            .meter("test")
+            .u64_counter("nisshi_sql_pool_replaced")
+            .build();
+        let check = ReadOnlyCheck::counting(1, &cluster, counter);
+
+        let counted = |stage: &str, reason: &str| -> u64 {
+            provider.force_flush().expect("flush");
+
+            exporter
+                .get_finished_metrics()
+                .expect("finished metrics")
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .filter_map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+                    _ => None,
+                })
+                .flat_map(|sum| sum.data_points())
+                .filter(|point| {
+                    let has = |key: &str, value: &str| {
+                        point
+                            .attributes()
+                            .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                    };
+
+                    has("cluster_id", &cluster) && has("stage", stage) && has("reason", reason)
+                })
+                .map(|point| point.value())
+                .max()
+                .unwrap_or(0)
+        };
+
+        let read_only = Postgres::builder(&read_only_server(""))?;
+        let pool = PoolParts::open(
+            read_only.pool.config.clone(),
+            read_only.pool.tls.clone(),
+            2,
+            &check,
+        )?;
+
+        assert_matches!(pool.get().await, Err(PoolError::PostCreateHook(_)));
+        assert_eq!(1, counted("create", "read_only"));
+        assert_eq!(0, counted("recycle", "read_only"));
+
+        let writable = Postgres::builder(&CONNECTION)?;
+        let pool = PoolParts::open(
+            writable.pool.config.clone(),
+            writable.pool.tls.clone(),
+            1,
+            &check,
+        )?;
+
+        pool.get()
+            .await?
+            .batch_execute("SET default_transaction_read_only = on")
+            .await?;
+        let replacement = pool.get().await?;
+
+        assert_eq!(
+            "off",
+            replacement
+                .query_one("SELECT current_setting('transaction_read_only')", &[])
+                .await?
+                .get::<_, String>(0)
+        );
+        assert_eq!(1, counted("recycle", "read_only"));
+        assert_eq!(1, counted("create", "read_only"));
+
+        Ok(())
+    }
+
+    /// [`CheckFailure::of`] tells a read-only session from any other server
+    /// error.
+    #[tokio::test]
+    async fn check_failure_names_the_read_only_session() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) =
+            storage_with_schema("check_failure_names_read_only", &CONNECTION, &cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        let connection = storage.connection().await?;
+
+        let other = connection
+            .simple_query("SELECT 1/0")
+            .await
+            .expect_err("a division by zero is an error");
+        assert_eq!(CheckFailure::Error, CheckFailure::of(&other));
+
+        connection
+            .batch_execute("SET default_transaction_read_only = on")
+            .await?;
+        let read_only = connection
+            .simple_query(RECYCLE_QUERY)
+            .await
+            .expect_err("a read-only session fails the check");
+        assert_eq!(CheckFailure::ReadOnly, CheckFailure::of(&read_only));
+
+        Ok(())
+    }
+
+    /// Without `read_only_check_every`, the check runs on every checkout, and
+    /// the option takes the numbers in [`READ_ONLY_CHECK_EVERY_RANGE`]. The
+    /// other options in the URL still reach tokio-postgres.
+    #[test]
+    fn read_only_check_every_is_read_from_the_url() -> Result<()> {
+        let default = Postgres::builder(&CONNECTION)?;
+        assert_eq!(
+            DEFAULT_READ_ONLY_CHECK_EVERY,
+            default.pool.read_only_check_every
+        );
+
+        for every in [0, 1, 7, 1_000_000] {
+            let builder = Postgres::builder(&format!(
+                "{}?options=-c%20statement_timeout%3D120000&read_only_check_every={every}",
+                *CONNECTION
+            ))?;
+
+            assert_eq!(every, builder.pool.read_only_check_every);
+        }
+
+        Ok(())
+    }
+
+    /// A `read_only_check_every` that is not a number in
+    /// [`READ_ONLY_CHECK_EVERY_RANGE`] stops the build before any connection,
+    /// and the error names the option and its value.
+    #[test]
+    fn read_only_check_every_rejects_invalid_values() {
+        for value in ["banana", "", "-1", "1000001", "18446744073709551616"] {
+            let error =
+                Postgres::builder(&format!("{}?read_only_check_every={value}", *CONNECTION))
+                    .expect_err(value);
+
+            assert_matches!(
+                &error,
+                Error::InvalidStorageOptionValue { scheme, option, value: rejected, expected }
+                    if scheme == "postgres"
+                        && option == READ_ONLY_CHECK_EVERY
+                        && rejected == value
+                        && *expected == READ_ONLY_CHECK_EVERY_EXPECTED,
+                "{value}"
+            );
+        }
     }
 
     /// Returns storage on a pool of one connection that connects with a
