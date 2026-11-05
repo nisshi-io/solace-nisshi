@@ -975,3 +975,44 @@ fn heartbeat_illegal_generation_rejoins_with_member_id_and_drops_assignment() ->
 
     Ok(())
 }
+
+#[test]
+fn join_unknown_member_id_after_illegal_generation_rejoins_without_member_id() -> Result<(), Error>
+{
+    let _guard = init_tracing()?;
+
+    for leader_id in LEADER_IDS {
+        let mut consumer = assigned(leader_id)?;
+
+        // The illegal generation makes the consumer rejoin with its member id, which the
+        // coordinator can then reject as unknown.
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::HeartbeatResponse(
+            HeartbeatResponse::default().error_code(i16::from(ErrorCode::IllegalGeneration)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+        assert_eq!(MEMBER_ID, req.member_id, "leader: {leader_id}");
+
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::JoinGroupResponse(
+            JoinGroupResponse::default().error_code(i16::from(ErrorCode::UnknownMemberId)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+
+        assert_eq!(NO_MEMBER_ID, req.member_id, "leader: {leader_id}");
+        assert_joins_owning_nothing(&req)?;
+        assert!(consumer.is_outsider(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.generation_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_assignment(), "leader: {leader_id}");
+        assert_eq!(
+            Some(&1),
+            consumer.errors()?.get(&ErrorCode::UnknownMemberId),
+            "leader: {leader_id}"
+        );
+    }
+
+    Ok(())
+}

@@ -653,11 +653,13 @@ impl GroupConsumer {
     /// Resets the consumer to an outsider after the coordinator rejected its membership with
     /// `error_code`, and returns the JoinGroup request that rejoins the group.
     ///
-    /// Kafka's consumer clears its generation after a [SyncGroup] or a [Heartbeat] error, and so
-    /// treats its partitions as [lost]. This consumer does the same, and clears its assignment.
-    /// It keeps its member id only for [`ErrorCode::IllegalGeneration`], because the coordinator
-    /// still knows the member and rejects only its generation.
+    /// Kafka's consumer clears its generation after a [JoinGroup], a [SyncGroup] or a
+    /// [Heartbeat] error, and so treats its partitions as [lost]. This consumer does the same,
+    /// and clears its assignment. It keeps its member id only for
+    /// [`ErrorCode::IllegalGeneration`], because the coordinator still knows the member and
+    /// rejects only its generation.
     ///
+    /// [JoinGroup]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L682-L690
     /// [SyncGroup]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L876-L882
     /// [Heartbeat]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L1263-L1270
     /// [lost]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L773-L774
@@ -757,6 +759,14 @@ impl GroupConsumer {
                 )
                 .map(Into::into)
             }
+
+            (
+                MemberState::Outsider { .. },
+                Some(Body::JoinGroupResponse(JoinGroupResponse { error_code, .. })),
+            ) if error_code == i16::from(ErrorCode::UnknownMemberId) => self.rejoin(
+                ErrorCode::UnknownMemberId,
+                "join after join with unknown member id",
+            ),
 
             (
                 MemberState::Outsider { .. },
