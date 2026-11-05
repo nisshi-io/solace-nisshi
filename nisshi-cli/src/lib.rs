@@ -76,43 +76,51 @@ pub enum Error {
     Server(Box<nisshi_broker::Error>),
     #[error(transparent)]
     Tls(#[from] rustls::Error),
-    /// The `--cert` file could not be read or parsed as PEM certificates.
+    /// A certificate file could not be read or parsed as PEM certificates. `option` is the flag
+    /// that named it: `--cert` for the broker, `--tls-cert-file` or `--tls-ca-file` otherwise.
     ///
     /// The message carries `cause`, so the field is not named `source`: thiserror would also
     /// return it from `source()`, and a reporter that prints the chain would show it twice. The
     /// other variants with a `cause` follow the same rule.
     #[error(
         "TLS certificate {} could not be loaded: {cause}. Expected one or more PEM certificates \
-            (--cert).",
+            ({option}).",
         path.display()
     )]
     TlsCertificate {
+        option: &'static str,
         path: PathBuf,
         cause: rustls::pki_types::pem::Error,
     },
-    /// The `--key` file could not be read or parsed as a PEM private key.
+    /// The private key file could not be read or parsed as a PEM private key. `option` is the
+    /// flag that named it: `--key` for the broker, `--tls-key-file` otherwise.
     #[error(
         "TLS private key {} could not be loaded: {cause}. Expected a PKCS#8, SEC1 or RSA PEM \
-            key (--key).",
+            key ({option}).",
         path.display()
     )]
     TlsPrivateKey {
+        option: &'static str,
         path: PathBuf,
         cause: rustls::pki_types::pem::Error,
     },
-    /// The `--key` file is encrypted but no `--key-passphrase-file` was given.
+    /// The private key is encrypted but no passphrase file was given. `option` is the passphrase
+    /// file's flag: `--key-passphrase-file` for the broker, `--tls-key-passphrase-file` otherwise.
     #[error(
-        "TLS private key {} is encrypted: pass --key-passphrase-file <file>.",
+        "TLS private key {} is encrypted: pass {option} <file>.",
         path.display()
     )]
-    TlsKeyPassphraseRequired { path: PathBuf },
-    /// The passphrase did not decrypt the key.
+    TlsKeyPassphraseRequired { option: &'static str, path: PathBuf },
+    /// The passphrase did not decrypt the key. `option` is the passphrase file's flag.
     #[error(
-        "TLS private key {} could not be decrypted: {cause}. Check the passphrase in \
-            --key-passphrase-file.",
+        "TLS private key {} could not be decrypted: {cause}. Check the passphrase in {option}.",
         path.display()
     )]
-    TlsKeyDecrypt { path: PathBuf, cause: pkcs8::Error },
+    TlsKeyDecrypt {
+        option: &'static str,
+        path: PathBuf,
+        cause: pkcs8::Error,
+    },
     /// The key is encrypted with an algorithm this build does not support,
     /// named by `algorithm` (a friendly name, or the OID when unknown).
     #[error(
@@ -130,12 +138,13 @@ pub enum Error {
         path.display()
     )]
     TlsKeyLegacyEncrypted { path: PathBuf },
-    /// The `--key-passphrase-file` could not be read.
+    /// The passphrase file could not be read. `option` is the flag that named it.
     #[error(
-        "TLS key passphrase file {} could not be read: {cause}.",
+        "TLS key passphrase file {} could not be read: {cause} ({option}).",
         path.display()
     )]
     TlsKeyPassphraseFile {
+        option: &'static str,
         path: PathBuf,
         cause: std::io::Error,
     },
@@ -304,7 +313,47 @@ mod tests {
         );
         assert_eq!(
             "TLS private key /etc/nisshi/tls.key is encrypted: pass --key-passphrase-file <file>.",
-            Error::TlsKeyPassphraseRequired { path: path.clone() }.to_string()
+            Error::TlsKeyPassphraseRequired {
+                option: "--key-passphrase-file",
+                path: path.clone()
+            }
+            .to_string()
+        );
+        assert_eq!(
+            "TLS private key /etc/nisshi/tls.key is encrypted: pass --tls-key-passphrase-file \
+                <file>.",
+            Error::TlsKeyPassphraseRequired {
+                option: "--tls-key-passphrase-file",
+                path: path.clone()
+            }
+            .to_string()
+        );
+        assert!(
+            Error::TlsKeyDecrypt {
+                option: "--tls-key-passphrase-file",
+                path: path.clone(),
+                cause: pkcs8::Error::KeyMalformed,
+            }
+            .to_string()
+            .ends_with("Check the passphrase in --tls-key-passphrase-file.")
+        );
+        assert!(
+            Error::TlsPrivateKey {
+                option: "--tls-key-file",
+                path: path.clone(),
+                cause: rustls::pki_types::pem::Error::NoItemsFound,
+            }
+            .to_string()
+            .ends_with("key (--tls-key-file).")
+        );
+        assert!(
+            Error::TlsCertificate {
+                option: "--cert",
+                path: path.clone(),
+                cause: rustls::pki_types::pem::Error::NoItemsFound,
+            }
+            .to_string()
+            .ends_with("PEM certificates (--cert).")
         );
         assert_eq!(
             "TLS private key /etc/nisshi/tls.key uses legacy OpenSSL PEM encryption, which is not \
@@ -341,6 +390,7 @@ mod tests {
         let message = format!("{cause}");
 
         let err = Error::TlsCertificate {
+            option: "--cert",
             path: path.clone(),
             cause,
         };
@@ -348,6 +398,7 @@ mod tests {
         assert!(err.source().is_none());
 
         let err = Error::TlsKeyPassphraseFile {
+            option: "--key-passphrase-file",
             path,
             cause: std::io::Error::other("permission denied"),
         };

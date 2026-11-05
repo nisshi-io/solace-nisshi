@@ -155,7 +155,24 @@ pub(super) struct Arg {
     silent: bool,
 }
 
-pub(super) fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
+/// The options that name a private key and its passphrase file, so that an error names the flag
+/// the user gave: the broker's or a client command's.
+#[derive(Clone, Copy)]
+pub(super) struct KeyOptions {
+    pub(super) key: &'static str,
+    pub(super) passphrase_file: &'static str,
+}
+
+const BROKER_KEY_OPTIONS: KeyOptions = KeyOptions {
+    key: "--key",
+    passphrase_file: "--key-passphrase-file",
+};
+
+/// Reads PEM certificates from `filename`, which the user gave as `option`.
+pub(super) fn load_certs(
+    filename: &Path,
+    option: &'static str,
+) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(filename)
         .and_then(|der| der.collect::<Result<Vec<_>, TlsPkiPemError>>())
         .and_then(|certs| {
@@ -168,6 +185,7 @@ pub(super) fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>
             }
         })
         .map_err(|cause| Error::TlsCertificate {
+            option,
             path: filename.to_path_buf(),
             cause,
         })
@@ -177,7 +195,10 @@ pub(super) fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>
 /// editors and `echo`) is not part of the passphrase. An empty file means
 /// "no passphrase", matching how OpenSSL reads a `file:` password source and
 /// how mounted secrets behave.
-pub(super) fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>> {
+pub(super) fn load_passphrase(
+    filename: Option<&Path>,
+    option: &'static str,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let Some(filename) = filename else {
         return Ok(None);
     };
@@ -186,6 +207,7 @@ pub(super) fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizin
         fs::read(filename)
             .map(Zeroizing::new)
             .map_err(|cause| Error::TlsKeyPassphraseFile {
+                option,
                 path: filename.to_path_buf(),
                 cause,
             })?;
@@ -253,8 +275,10 @@ fn unsupported_encryption(error: &pkcs8::Error) -> Option<String> {
 pub(super) fn load_private_key(
     filename: &Path,
     passphrase: Option<&[u8]>,
+    options: KeyOptions,
 ) -> Result<PrivateKeyDer<'static>> {
     let key_error = |cause| Error::TlsPrivateKey {
+        option: options.key,
         path: filename.to_path_buf(),
         cause,
     };
@@ -277,6 +301,7 @@ pub(super) fn load_private_key(
     if let Some(section) = encrypted_pkcs8_section(&pem) {
         let Some(passphrase) = passphrase else {
             return Err(Error::TlsKeyPassphraseRequired {
+                option: options.passphrase_file,
                 path: filename.to_path_buf(),
             });
         };
@@ -286,6 +311,7 @@ pub(super) fn load_private_key(
         return decrypt_pkcs8(section, passphrase).map_err(|cause| {
             unsupported_encryption(&cause).map_or_else(
                 || Error::TlsKeyDecrypt {
+                    option: options.passphrase_file,
                     path: filename.to_path_buf(),
                     cause,
                 },
@@ -299,8 +325,9 @@ pub(super) fn load_private_key(
 
     if passphrase.is_some() {
         warn!(
-            "TLS private key {} is not encrypted; --key-passphrase-file ignored",
-            filename.display()
+            "TLS private key {} is not encrypted; {} ignored",
+            filename.display(),
+            options.passphrase_file
         );
     }
 
@@ -312,7 +339,7 @@ fn server_config(
     private_key: &Path,
     passphrase_file: Option<&Path>,
 ) -> Result<ServerConfig> {
-    let passphrase = load_passphrase(passphrase_file)?;
+    let passphrase = load_passphrase(passphrase_file, BROKER_KEY_OPTIONS.passphrase_file)?;
 
     // Both `ring` and `aws-lc-rs` are compiled into this binary (via other
     // dependencies), so the provider must be chosen explicitly: rustls panics
@@ -321,8 +348,12 @@ fn server_config(
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(
-            load_certs(certs)?,
-            load_private_key(private_key, passphrase.as_deref().map(Vec::as_slice))?,
+            load_certs(certs, "--cert")?,
+            load_private_key(
+                private_key,
+                passphrase.as_deref().map(Vec::as_slice),
+                BROKER_KEY_OPTIONS,
+            )?,
         )
         .map_err(Into::into)
 }
@@ -843,7 +874,7 @@ mod tests {
         let err = server_config(&pem.cert, &encrypted, None).expect_err("encrypted key must fail");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }
@@ -889,7 +920,8 @@ mod tests {
                 err,
                 Error::TlsCertificate {
                     ref path,
-                    cause: TlsPkiPemError::NoItemsFound
+                    cause: TlsPkiPemError::NoItemsFound,
+                    ..
                 } if *path == pem.key
             ),
             "{err:?}"
@@ -1051,7 +1083,7 @@ mod tests {
             .expect_err("encrypted key without a passphrase must fail");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }
@@ -1161,7 +1193,7 @@ mod tests {
             .expect_err("an empty passphrase file is no passphrase");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }
