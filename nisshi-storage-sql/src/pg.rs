@@ -6152,12 +6152,15 @@ mod tests {
 
             let storage = builder.cluster(cluster).node(111).build();
 
+            // Only the first case may mean that there is no database. A later case that fails
+            // to connect fails the test.
             let name = match connection_name(&storage).await {
                 Ok(name) => name,
-                Err(err) => {
+                Err(err) if names.is_empty() => {
                     eprintln!("skipping brokers_are_told_apart_in_pg_stat_activity: {err:?}");
                     return Ok(());
                 }
+                Err(err) => return Err(err),
             };
 
             assert!(name.starts_with("nisshi-"), "{name}");
