@@ -431,12 +431,25 @@ where
                 .await;
 
             if fetched.is_ok() && Instant::now() >= partition_deadline {
-                debug!(
-                    ?tp,
-                    offset,
-                    elapsed = ?started_at.elapsed(),
-                    "fetch read stopped at its deadline"
-                );
+                // A partition whose reads returned nothing by its deadline makes no progress for
+                // its consumer, so it warns. A read cut short with batches still moves the
+                // consumer on, so it logs at debug.
+                if batches.is_empty() && matches!(&fetched, Ok(Ok(read)) if read.is_empty()) {
+                    warn!(
+                        ?tp,
+                        offset,
+                        elapsed = ?started_at.elapsed(),
+                        "fetch read stopped at its deadline with no records"
+                    );
+                } else {
+                    debug!(
+                        ?tp,
+                        offset,
+                        elapsed = ?started_at.elapsed(),
+                        "fetch read stopped at its deadline"
+                    );
+                }
+
                 stalled = true;
             }
 
