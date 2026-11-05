@@ -2086,6 +2086,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// it (KIP-74). The fetch service relies on this: without it, a consumer
     /// whose fetch limit is smaller than a record never reads past that record.
     ///
+    /// `max_bytes` can be 0, and the read still returns that first batch. The
+    /// fetch service passes 0 for the first partition that has records when the
+    /// request's limit is 0, as Kafka does.
+    ///
     /// For a topic or partition that does not exist, see
     /// [`Storage::offset_stage`].
     async fn fetch(

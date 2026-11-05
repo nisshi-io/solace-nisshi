@@ -45,6 +45,11 @@ use tokio::time::sleep;
 use tracing::{debug, instrument};
 use url::Url;
 
+/// A `partition_max_bytes` that leaves the request's `max_bytes` to bound
+/// what a partition returns, as in Kafka, which reads each partition within
+/// the smaller of the two.
+const NO_PARTITION_LIMIT: i32 = i32::MAX;
+
 const LOREM_IPSUM: Bytes =
     Bytes::from_static(b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do");
 
@@ -280,7 +285,10 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(partition)].into(),
+                            [FetchPartition::default()
+                                .partition(partition)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -367,7 +375,10 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(partition)].into(),
+                            [FetchPartition::default()
+                                .partition(partition)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -479,7 +490,10 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -730,7 +744,10 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency_reads_every_batch() -> Result<
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -878,7 +895,10 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency_reads_every_batch() -> Result<
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -1018,7 +1038,10 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -1159,7 +1182,10 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -1301,7 +1327,10 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
@@ -1459,7 +1488,10 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() ->
                     [FetchTopic::default()
                         .topic(Some(name.into()))
                         .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
+                            [FetchPartition::default()
+                                .partition(PARTITION)
+                                .partition_max_bytes(NO_PARTITION_LIMIT)]
+                            .into(),
                         ))]
                     .into(),
                 ))
