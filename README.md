@@ -55,7 +55,7 @@ Nisshi OSS is provided as-is, with no warranty and no Solace Support commitment.
 Other ways to run Nisshi, both described in [Install and run Nisshi](docs/install.md):
 
 - Docker Compose — if you have Docker installed. See [Running with Docker Compose](docs/install.md#running-with-docker-compose).
-- cargo — if you have Rust installed, or there is no prebuilt binary for your platform, such as Windows or an Intel Mac. See [Installing with crates.io](docs/install.md#installing-with-cratesio).
+- cargo — if you have Rust installed, or there is no prebuilt binary for your platform, such as an Intel Mac. See [Installing with crates.io](docs/install.md#installing-with-cratesio).
 
 ### Examples
 

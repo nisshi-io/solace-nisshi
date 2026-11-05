@@ -11,12 +11,15 @@ Select the release file for your platform from the [releases page](https://githu
 | macOS, Apple silicon | `Darwin arm64` | `nisshi-aarch64-apple-darwin.tar.gz` |
 | Linux, x86-64 | `Linux x86_64` | `nisshi-x86_64-unknown-linux-musl.tar.gz` |
 | Linux, Arm64 | `Linux aarch64` | `nisshi-aarch64-unknown-linux-musl.tar.gz` |
+| Windows, x86-64 | — | `nisshi-x86_64-pc-windows-msvc.zip` |
 
 macOS blocks a file that you download with a browser and displays "Not Opened". Downloading with `curl` avoids the block. To unblock a file that a browser downloaded, extract the archive, and then run `xattr -d com.apple.quarantine bin/nisshi`.
 
+The Windows binary is not signed, so Windows SmartScreen can block it when a browser downloaded it, and display "Windows protected your PC". Downloading with `curl.exe` avoids the block. To unblock a zip that a browser downloaded, run `Unblock-File` on the zip in PowerShell before you extract it.
+
 For other operating systems, you can build Nisshi from source by following the steps in [Build from Source](#build-from-source).
 
-To download a release and extract it into a new directory, run the following commands in a terminal:
+To download a release and extract it into a new directory on macOS or Linux, run the following commands in a terminal:
 
 ```shell
 mkdir nisshi && cd nisshi
@@ -25,9 +28,18 @@ curl -fLO https://github.com/nisshi-io/solace-nisshi/releases/latest/download/$F
 tar -xzf $FILE
 ```
 
-The archive extracts into the current directory, which is why the commands above start in a new one. The broker is `bin/nisshi`.
+On Windows, run the commands on this page in PowerShell, and run `.\bin\nisshi.exe` wherever the page runs `./bin/nisshi`. Windows 10 version 1803 and later include `curl.exe` and `tar`, which extracts a zip:
 
-To verify the download, compare the output of `shasum -a 256 $FILE` on macOS or `sha256sum $FILE` on Linux with the SHA-256 digest that the releases page lists for the file.
+```powershell
+mkdir nisshi; cd nisshi
+$FILE = "nisshi-x86_64-pc-windows-msvc.zip"
+curl.exe -fLO https://github.com/nisshi-io/solace-nisshi/releases/latest/download/$FILE
+tar -xf $FILE
+```
+
+The archive extracts into the current directory, which is why the commands above start in a new one. The broker is `bin/nisshi`, or `bin\nisshi.exe` on Windows.
+
+To verify the download, compare the output of `shasum -a 256 $FILE` on macOS, `sha256sum $FILE` on Linux, or `Get-FileHash $FILE` on Windows with the SHA-256 digest that the releases page lists for the file.
 
 ## Step 2: Start the Broker
 
@@ -48,7 +60,7 @@ ready in 12ms
 
 Your version number, list of storage engines, and startup time can differ.
 
-After `ready`, the broker logs only warnings and errors. To see each request, start the broker with `RUST_LOG=nisshi_service::frame=debug` before the command. That setting is verbose: it logs each request's API key as a number, and the whole request and response.
+After `ready`, the broker logs only warnings and errors. To see each request, start the broker with `RUST_LOG=nisshi_service::frame=debug` before the command. That setting is verbose: it logs each request's API key as a number, and the whole request and response. In PowerShell, run `$env:RUST_LOG = "nisshi_service::frame=debug"` first, and then start the broker. The setting applies to every later command in that PowerShell window.
 
 By default, the broker keeps topics and messages in memory, and loses them when it stops. To keep them, you can start the broker with a SQLite file by running the following command:
 
@@ -128,7 +140,7 @@ Nisshi also has capabilities beyond this quickstart:
 
 ## Build from Source
 
-If there is no release for your operating system or architecture, for example Windows or an Intel-based Mac (`Darwin x86_64`), you can build Nisshi from source. To build it, perform these steps:
+If there is no release for your operating system or architecture, for example an Intel-based Mac (`Darwin x86_64`), you can build Nisshi from source. To build it, perform these steps:
 
 1. Install Rust with [rustup](https://rustup.rs).
 2. Restart your shell so that `cargo` is on your `PATH`.
