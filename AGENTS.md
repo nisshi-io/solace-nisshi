@@ -223,6 +223,10 @@ On a pull_request, a `changes` job in `ci.yml`, `codeql.yml`, `dependencies.yml`
 | `nisshi-sans-io/build.rs` | Code generator: JSON descriptors -> Rust types |
 | `fuzz/` | `cargo-fuzz` targets exercising the sans-io codec and storage services (see Fuzz Testing) |
 
+## Comments
+
+Follow `.claude/rules/comments.md` for every comment and doc comment in the file types it lists. Before you hand off a change, reread each comment that you added or changed against that file's "Before You Hand Off" checklist.
+
 ## Lint Configuration
 
 Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`, `private_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors) and `just doc`, which runs rustdoc with warnings denied.

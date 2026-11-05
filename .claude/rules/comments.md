@@ -70,7 +70,7 @@ fn read_records(frame: &mut Bytes, count: usize) -> Result<Vec<Record>> {
 - **Never narrate history.** No "changed this because…", no "previously we…", no ticket numbers as scar tissue. Comments describe the end state; write for a future reader who has no context about what changed. The *external* defect a workaround exists for is end state and belongs (see Markers below) — a live constraint, not a record of a past edit.
 - **Never section-label straight-line code.** `// Step 1`, `// Options` are a sign the block wants to be a function.
 - **Never describe another file.** See "Remote Comments" below.
-- **Never rewrite a comment that already passes these rules.** In a comment pass, change a comment only when it breaks a rule. A different wording that also passes is churn, and a reviewer has to check it again. When a comment does need a rewrite, keep every true fact from the old comment, and keep the most important one first.
+- **Never rewrite a comment that already passes these rules.** In a comment pass, change a comment only when it breaks a rule. A different wording that also passes is churn, and a reviewer has to check it again. When a comment does need a rewrite, keep every true fact from the old comment that belongs on this item, and keep the most important one first. Move a fact that belongs elsewhere to its place (see "Document the item, not its consumers").
 
 ## Function-Header Scope vs. Inline Detail
 
@@ -140,6 +140,12 @@ A doc comment (a language's own doc-comment convention — Rust's `///`, a Pytho
 - **Make the summary explain the name.** A reader reads the name first, then the summary, so the summary uses the name's own words and says what each word means here. Define a word in the name that the reader can't know. If the summary needs other words to say what the item does, rename the item instead.
   - No: `/// Returns a pool that closes a connection after it has been unused for a while.` above `fn with_idle_timeout(&self, timeout: Duration)`. The summary never says "idle timeout", and it doesn't say how long "a while" is.
   - Yes: `/// Returns a pool with the given idle timeout: how long the pool keeps an unused connection open before closing it.`
+- **Document the item, not its consumers.** Say what the item is, holds or does. Don't say who reads it or what they conclude from it: a metric built from it, the operator who reads that metric, a caller that branches on it. Those consumers change without touching this item, so the comment goes stale and nothing here notices. The code that links the item to a consumer, such as a method that builds a metric's attributes, documents the link where it makes it. Advice for a consumer goes where that consumer meets the value, such as the metric's description or the operator docs.
+  - No: ``/// Why a request failed. Operators read it from the `reason` attribute of `requests_failed`, where `timeout` points at a slow backend.``
+  - Yes: `/// Why a request failed.`
+- **Describe the contract, not the cases.** Say what the item guarantees, and why when that is not obvious. Which helper handles which case, how a value is encoded, or the order of the steps belongs in the code, and a reader who needs it reads the code. A list of cases goes stale when one case changes, and nothing here notices.
+  - No: ``/// Parses the header. A short frame goes to `read_more`, an unknown key goes to `reject_unknown`, and the rest go to `dispatch`.``
+  - Yes: `/// Parses the header and routes the frame to its handler.`
 - Longer form only when there is a real invariant, unit, or failure mode to state — see "Function-Header Scope vs. Inline Detail" above for where the line falls.
 - **No boilerplate that restates the signature with no new information.** "Returns a `Result`" adds nothing the signature doesn't already show. Say which condition gives which error, or when the function panics, only when the signature can't show it, and then in a plain sentence after the summary: "Returns [`Error::Api`] with [`ErrorCode::UnknownTopicOrPartition`] for an unknown topic." Don't use a `# Errors` or `# Panics` header. A header and its blank lines take three lines before the one sentence that matters.
 
@@ -207,6 +213,13 @@ Form is not enough on its own. The failure below survives every rule above, and 
 
 - No: `// That flag ignores quiet, which marks a failure the caller expects; nobody expects the command to be absent.`
 - Yes: `// quiet does not ignore a missing command, because that is a critical failure.`
+
+**Write a condition as a clause of its own, not as a relative clause on the subject.** When a sentence says what happens to a thing under a condition, put the condition in an "if" or "when" clause, with its own subject, verb and object. A relative clause in which the noun before it is not the subject, such as "whose first step the deadline stops" or "that the deadline stops", makes the reader hold the noun, the inner subject and the inner object before any verb arrives.
+
+- No: `// A read whose first step the deadline keeps from starting counts as not_started.`
+- Yes: `// If the deadline keeps the first step of a read from starting, the read counts as not_started.`
+
+The test: find each "that", "which" or "whose" between a sentence's subject and its main verb. If the subject is not also the subject of that inner clause, rewrite the sentence. The same clause on an object, as in "returns the batches that it read", is fine, because the main verb has already arrived.
 
 **State the fact. Do not invent a condition that the code has already decided.** When the code sets a value, say what the value does. A conditional word implies a choice that the reader does not have.
 
@@ -279,3 +292,17 @@ If a marker is genuinely warranted, it must name the problem, the remedy, and a 
 // TODO(#1234): drop the fallback once every client is upgraded; needs the
 // downgrade path removed from the compatibility matrix first.
 ```
+
+## Before You Hand Off
+
+Writing a comment and checking it are two steps. After you write or change comments, reread each new or changed comment on its own against this file, before anyone else reads the change. A reviewer should not be the first reader of a comment.
+
+- The first sentence says what the item does or holds, as subject, verb, object, in the words of the item's name.
+- The comment describes the contract, not the cases, helpers or steps that the code already shows.
+- Each comment makes one point, and sits above the line that it explains.
+- The comment does not name the item's callers or describe another file's internals.
+- Each condition is an "if" or "when" clause, not a relative clause such as "a read that the deadline stops".
+- Every noun is a thing that the code names. A noun pile such as "the offset stage read" becomes "the read of the offset stage".
+- Every line fits the file's width. rustfmt does not wrap comments, or the arguments of a macro such as `debug!`, so check those lines yourself.
+
+Fix each comment that fails, then hand off.
