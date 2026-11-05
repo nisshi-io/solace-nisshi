@@ -1446,12 +1446,27 @@ mod produce_service_tests {
 const BUDGET_SPENT: &str =
     "the broker is holding too many decoded produce batches, retry the request";
 
-/// What a Produce request needs to reserve the bytes of a decoded batch: the budget, and the
-/// time by which the whole request must have them.
-#[derive(Clone, Copy)]
+/// What a Produce request needs to reserve the bytes of a decoded batch: the budget, and how
+/// long the whole request may still wait for it.
+///
+/// Only the time that a partition spends waiting for the budget counts. The time that an earlier
+/// partition spends decoding or in the storage engine does not, so a slow storage engine does
+/// not make a later partition answer `REQUEST_TIMED_OUT` while the budget is free. Partitions run
+/// one after another, so the remaining wait needs no synchronisation.
 struct Admission<'a> {
     budget: &'a DecodedBytesBudget,
-    deadline: Instant,
+    remaining: Duration,
+}
+
+impl Admission<'_> {
+    /// Waits for `bytes` of the budget, for at most the remaining wait, and takes the time that
+    /// this took, on success as well as on failure, out of the remaining wait.
+    async fn reserve(&mut self, bytes: usize) -> Result<decoded_budget::Reservation, Exhausted> {
+        let started = Instant::now();
+        let reserved = self.budget.reserve(bytes, started + self.remaining).await;
+        self.remaining = self.remaining.saturating_sub(started.elapsed());
+        reserved
+    }
 }
 
 /// The most that decoding `batch` can charge to the budget.
@@ -1757,7 +1772,7 @@ where
         name: &str,
         timestamp_type: TimestampType,
         partition: PartitionProduceData,
-        admission: Admission<'_>,
+        admission: &mut Admission<'_>,
     ) -> PartitionProduceResponse {
         // The decoder turns a zero-length records field into `None`, so it
         // counts as zero batches.
@@ -1814,11 +1829,7 @@ where
         // path out of this function. A partition that waits here holds only its compressed
         // batch.
         let compression = Compression::try_from(batch.attributes).unwrap_or_default();
-        let mut reservation = match admission
-            .budget
-            .reserve(decoded_upper_bound(&batch), admission.deadline)
-            .await
-        {
+        let mut reservation = match admission.reserve(decoded_upper_bound(&batch)).await {
             Ok(reservation) => reservation,
             Err(Exhausted { requested, waited }) => {
                 warn!(
@@ -1967,7 +1978,7 @@ where
         &self,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
-        admission: Admission<'_>,
+        admission: &mut Admission<'_>,
     ) -> TopicProduceResponse {
         let partition_data = topic.partition_data.unwrap_or_default();
         let mut partitions = Vec::with_capacity(partition_data.len());
@@ -2041,11 +2052,11 @@ where
         wait: Duration,
         input: RequestInput<ProduceRequest>,
     ) -> Result<ProduceResponse> {
-        // One deadline for the whole request, so that a request with many partitions does not
-        // wait the full time for each one.
-        let admission = Admission {
+        // One wait for the whole request, so that a request with many partitions does not wait
+        // the full time for each one. Each partition takes the time that it waited out of it.
+        let mut admission = Admission {
             budget,
-            deadline: Instant::now() + wait,
+            remaining: wait,
         };
 
         let topics = input.request.topic_data.unwrap_or_default();
@@ -2076,8 +2087,12 @@ where
         } else {
             for topic in topics {
                 responses.push(
-                    self.topic(input.request.transactional_id.as_deref(), topic, admission)
-                        .await,
+                    self.topic(
+                        input.request.transactional_id.as_deref(),
+                        topic,
+                        &mut admission,
+                    )
+                    .await,
                 )
             }
         }

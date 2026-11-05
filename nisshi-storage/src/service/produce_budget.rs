@@ -29,7 +29,11 @@ use nisshi_sans_io::{
     record::{MAX_DECODED_BATCH_BYTES, Record, deflated, deflated::Frame, inflated},
 };
 use rama::extensions::Extensions;
-use tokio::{sync::Semaphore, task::JoinSet, time::sleep};
+use tokio::{
+    sync::Semaphore,
+    task::JoinSet,
+    time::{Instant, sleep},
+};
 
 use crate::{
     ProduceService, Result,
@@ -72,6 +76,49 @@ fn compressible() -> Result<deflated::Batch> {
     );
 
     Ok(batch)
+}
+
+/// Produces one batch to each of the partitions `0` and `1` in one request, and returns the
+/// partitions' responses in order.
+async fn produce_two_partitions(
+    storage: &CountingStorage,
+    budget: &DecodedBytesBudget,
+    wait: Duration,
+) -> Result<Vec<PartitionProduceResponse>> {
+    let partition = |index| -> Result<_> {
+        Ok(PartitionProduceData::default()
+            .index(index)
+            .records(Some(Frame {
+                batches: vec![compressible()?],
+            })))
+    };
+
+    let response = ProduceService {
+        storage: storage.clone(),
+    }
+    .serve_with(
+        budget,
+        wait,
+        RequestInput {
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(TOPIC.into())
+                        .partition_data(Some([partition(0)?, partition(1)?].into()))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        },
+    )
+    .await?;
+
+    Ok(response
+        .responses
+        .unwrap_or_default()
+        .remove(0)
+        .partition_responses
+        .unwrap_or_default())
 }
 
 async fn produce(
@@ -221,6 +268,69 @@ async fn a_produce_that_cannot_get_its_bytes_in_time_is_told_to_retry() -> Resul
     // The bytes are back, so the same produce now succeeds.
     let retried = produce(&storage, &budget, Duration::from_secs(60), compressible()?).await?;
     assert_eq!(i16::from(ErrorCode::None), retried.error_code);
+
+    Ok(())
+}
+
+/// The wait for the budget is the same for every partition of a request, and only the time spent
+/// waiting for the budget counts against it. The first partition spends longer in storage than the
+/// whole wait, and then the second partition waits a short time for the budget behind another
+/// request. It still gets its bytes, because the budget stayed spent for much less than the wait.
+#[tokio::test]
+async fn a_slow_earlier_partition_does_not_use_up_the_wait_of_a_later_one() -> Result<()> {
+    // One compressed batch at a time: a reservation is the 100 MiB maximum, clamped to the budget.
+    let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
+    let gate = Arc::new(Semaphore::new(0));
+    let storage =
+        CountingStorage::new(Listing::Topics, &[TOPIC]).with_produce_gate(Arc::clone(&gate));
+
+    let request = tokio::spawn({
+        let (storage, budget) = (storage.clone(), Arc::clone(&budget));
+        async move { produce_two_partitions(&storage, &budget, Duration::from_secs(1)).await }
+    });
+
+    // The first partition holds the budget and waits in storage.
+    for _ in 0..2_000 {
+        if storage.parked() == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(1, storage.parked());
+
+    // Another request queues for the budget ahead of the second partition, and holds it a while
+    // once it has it.
+    let other = tokio::spawn({
+        let budget = Arc::clone(&budget);
+        async move {
+            let reservation = budget
+                .reserve(
+                    MAX_DECODED_BATCH_BYTES,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .await;
+            sleep(Duration::from_millis(300)).await;
+            drop(reservation);
+        }
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    // The first partition outlasts the 1 second wait without waiting for the budget at all.
+    sleep(Duration::from_millis(1_200)).await;
+    gate.add_permits(2);
+
+    let responses = request.await??;
+    other.await?;
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::None); 2],
+        responses
+            .iter()
+            .map(|response| response.error_code)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(2, storage.produced().len());
+    assert_eq!(0, budget.in_use_bytes());
 
     Ok(())
 }
