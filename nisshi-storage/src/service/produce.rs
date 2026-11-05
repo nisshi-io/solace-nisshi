@@ -138,6 +138,12 @@ const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
 ///   `INVALID_RECORD`.
+/// - A batch with a producer ID must have a base sequence of at least 0. A
+///   negative one is refused before any producer state is read, as
+///   `LogValidator` does ([LogValidator.java#L513-L516]): the client sees
+///   `INVALID_RECORD` and the batch is not stored, whatever the engine keeps
+///   for the producer. A batch without a producer ID (-1) carries the
+///   no-sequence value -1 and passes. `INVALID_RECORD`.
 /// - The compression codec in the attributes must be one Kafka defines. An
 ///   unknown codec id is a defect in the client's batch header, like a bad
 ///   record count. Kafka returns `UNKNOWN_SERVER_ERROR` for it only because
@@ -157,6 +163,7 @@ const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///
 /// [DefaultRecordBatch.java#L393-L398]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L393-L398
 /// [UnifiedLog.scala#L1189-L1193]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1189-L1193
+/// [LogValidator.java#L513-L516]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L513-L516
 fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
     if batch.computed_crc() != batch.crc {
         return Some((ErrorCode::CorruptMessage, CRC_MISMATCH));
@@ -166,6 +173,14 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
         return Some((
             ErrorCode::InvalidRecord,
             "clients may not write control batches",
+        ));
+    }
+
+    // Kafka's `hasProducerId()` is `producerId > -1`.
+    if batch.producer_id > -1 && batch.base_sequence < 0 {
+        return Some((
+            ErrorCode::InvalidRecord,
+            "negative base sequence with a producer ID",
         ));
     }
 
@@ -272,6 +287,40 @@ mod rejection_tests {
             Some((ErrorCode::CorruptMessage, CRC_MISMATCH)),
             rejection(&batch)
         );
+    }
+
+    #[test]
+    fn a_negative_base_sequence_with_a_producer_id_is_an_invalid_record() {
+        for base_sequence in [-1, -3, i32::MIN] {
+            let batch = with_valid_crc(deflated::Batch {
+                producer_id: 7,
+                base_sequence,
+                record_count: 1,
+                last_offset_delta: 0,
+                ..Default::default()
+            });
+
+            assert_eq!(
+                Some((
+                    ErrorCode::InvalidRecord,
+                    "negative base sequence with a producer ID"
+                )),
+                rejection(&batch)
+            );
+        }
+    }
+
+    #[test]
+    fn the_no_sequence_value_without_a_producer_id_is_not_rejected() {
+        let batch = with_valid_crc(deflated::Batch {
+            producer_id: -1,
+            base_sequence: -1,
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        });
+
+        assert_eq!(None, rejection(&batch));
     }
 
     #[test]
