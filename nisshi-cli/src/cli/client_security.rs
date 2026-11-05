@@ -20,13 +20,18 @@ use clap::{Args, ValueEnum};
 use nisshi_client::{Sasl, SaslMechanism, Security, Tls, TlsOptions};
 use zeroize::Zeroizing;
 
-use super::broker::{load_certs, load_passphrase, load_private_key};
+use super::broker::{KeyOptions, load_certs, load_passphrase, load_private_key};
 use crate::{Error, Result};
 
 /// The environment variable that holds the SASL password, as an alternative to
 /// `--sasl-password-file`. There is no option for the password itself, because an option lands
 /// in the shell history and in the process list.
 const SASL_PASSWORD: &str = "SASL_PASSWORD";
+
+const CLIENT_KEY_OPTIONS: KeyOptions = KeyOptions {
+    key: "--tls-key-file",
+    passphrase_file: "--tls-key-passphrase-file",
+};
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, PartialOrd, Ord, ValueEnum)]
 pub(super) enum Mechanism {
@@ -131,17 +136,24 @@ impl ClientSecurity {
         let ca_certificates = self
             .tls_ca_file
             .as_deref()
-            .map(load_certs)
+            .map(|ca| load_certs(ca, "--tls-ca-file"))
             .transpose()?
             .unwrap_or_default();
 
         let client_identity = match (self.tls_cert_file.as_deref(), self.tls_key_file.as_deref()) {
             (Some(cert), Some(key)) => {
-                let passphrase = load_passphrase(self.tls_key_passphrase_file.as_deref())?;
+                let passphrase = load_passphrase(
+                    self.tls_key_passphrase_file.as_deref(),
+                    CLIENT_KEY_OPTIONS.passphrase_file,
+                )?;
 
                 Some((
-                    load_certs(cert)?,
-                    load_private_key(key, passphrase.as_deref().map(Vec::as_slice))?,
+                    load_certs(cert, "--tls-cert-file")?,
+                    load_private_key(
+                        key,
+                        passphrase.as_deref().map(Vec::as_slice),
+                        CLIENT_KEY_OPTIONS,
+                    )?,
                 ))
             }
             (None, None) => None,
@@ -226,7 +238,7 @@ impl ClientSecurity {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use clap::{CommandFactory as _, Parser};
     use nisshi_client::{Sasl, SaslMechanism, Security};
@@ -387,6 +399,67 @@ mod tests {
             Security::default(),
             build(&["--tls-no-hostname-check"], None).unwrap()
         );
+    }
+
+    /// The message must send the user to the flag they gave, not the broker's `--cert`.
+    #[test]
+    fn a_bad_tls_file_error_names_the_client_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("ca.pem");
+        fs::write(&file, "not a certificate").unwrap();
+
+        let message = build(&["--tls-ca-file", file.to_str().unwrap()], None)
+            .expect_err("a file with no certificate")
+            .to_string();
+
+        assert!(message.ends_with("(--tls-ca-file)."), "{message}");
+        assert!(!message.contains("--cert"), "{message}");
+    }
+
+    /// Each client option, not just the CA file, must reach its message.
+    #[test]
+    fn every_tls_file_error_names_the_client_option_that_was_given() {
+        let directory = tempfile::tempdir().unwrap();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap();
+        let good_cert = directory.path().join("cert.pem");
+        fs::write(&good_cert, cert.pem()).unwrap();
+        let good_key = directory.path().join("key.pem");
+        fs::write(&good_key, signing_key.serialize_pem()).unwrap();
+        let garbage = directory.path().join("garbage.pem");
+        fs::write(&garbage, "not a pem file").unwrap();
+        let encrypted = directory.path().join("encrypted.pem");
+        fs::write(
+            &encrypted,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIBvTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQI\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let missing = directory.path().join("missing.txt");
+
+        let message = |cert: &Path, key: &Path, passphrase: Option<&Path>| {
+            let mut args = vec![
+                "--tls-cert-file",
+                cert.to_str().unwrap(),
+                "--tls-key-file",
+                key.to_str().unwrap(),
+            ];
+            if let Some(passphrase) = passphrase {
+                args.extend(["--tls-key-passphrase-file", passphrase.to_str().unwrap()]);
+            }
+            build(&args, None).expect_err("a bad file").to_string()
+        };
+
+        let text = message(&garbage, &good_key, None);
+        assert!(text.ends_with("(--tls-cert-file)."), "{text}");
+        let text = message(&good_cert, &garbage, None);
+        assert!(text.ends_with("(--tls-key-file)."), "{text}");
+        let text = message(&good_cert, &encrypted, None);
+        assert!(
+            text.ends_with("pass --tls-key-passphrase-file <file>."),
+            "{text}"
+        );
+        let text = message(&good_cert, &encrypted, Some(&missing));
+        assert!(text.ends_with("(--tls-key-passphrase-file)."), "{text}");
     }
 
     #[test]
