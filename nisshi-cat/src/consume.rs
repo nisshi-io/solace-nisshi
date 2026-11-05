@@ -30,7 +30,7 @@ use nisshi_schema::{AsJsonValue, Registry};
 use serde_json::{Value, json};
 use tokio::io::stdout;
 use tokio_util::codec::{FramedWrite, LinesCodec};
-use tracing::debug;
+use tracing::{debug, error};
 use url::Url;
 
 #[derive(Clone, Debug, Default)]
@@ -307,7 +307,20 @@ impl Consume {
 
                     if let Some(ref schema) = schema {
                         writer
-                            .send(schema.as_json_value(&batch).map(|kv| kv.to_string())?)
+                            .send(
+                                schema
+                                    .as_json_value(&batch)
+                                    .map(|kv| kv.to_string())
+                                    // The error names no offset, and a failed batch prints no
+                                    // record, so the log says where the batch starts.
+                                    .inspect_err(|err| {
+                                        error!(
+                                            base_offset = batch.base_offset,
+                                            ?err,
+                                            "a record in this batch cannot be printed"
+                                        )
+                                    })?,
+                            )
                             .await?;
                     } else {
                         writer.send( Value::from(

@@ -22,7 +22,7 @@ use crate::{
 
 use bytes::Bytes;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use nisshi_sans_io::{ErrorCode, record::inflated::Batch};
 use tracing::{debug, instrument, warn};
@@ -56,29 +56,36 @@ impl AsRef<str> for MessageKind {
     }
 }
 
+/// Parses the key or value of a record, which the schema has a schema for, as JSON.
+///
+/// A record that is missing or not JSON is `INVALID_RECORD`, and the error holds no part of the
+/// record. [`validate`] and [`json_value`] both parse through this function, so that a produce and
+/// a consume refuse the same records.
+fn parse(encoded: Option<Bytes>) -> Result<Value> {
+    encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
+        serde_json::from_slice(&encoded[..]).map_err(|err| {
+            warn!(?err, len = encoded.len());
+            Error::Api(ErrorCode::InvalidRecord)
+        })
+    })
+}
+
 fn validate(validator: Option<&jsonschema::Validator>, encoded: Option<Bytes>) -> Result<()> {
     debug!(validator = ?validator, len = ?encoded.as_ref().map(Bytes::len));
 
     validator
         .map_or(Ok(()), |validator| {
-            encoded.map_or(Err(Error::Api(ErrorCode::InvalidRecord)), |encoded| {
-                serde_json::from_reader(&encoded[..])
-                    .map_err(|err| {
-                        warn!(?err, len = encoded.len());
-                        Error::Api(ErrorCode::InvalidRecord)
+            parse(encoded).and_then(|instance| {
+                validator
+                    .validate(&instance)
+                    .inspect_err(|err| {
+                        warn!(
+                            instance_path = %err.instance_path(),
+                            schema_path = %err.schema_path(),
+                            ?validator
+                        );
                     })
-                    .and_then(|instance| {
-                        validator
-                            .validate(&instance)
-                            .inspect_err(|err| {
-                                warn!(
-                                    instance_path = %err.instance_path(),
-                                    schema_path = %err.schema_path(),
-                                    ?validator
-                                );
-                            })
-                            .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
-                    })
+                    .map_err(|_err| Error::Api(ErrorCode::InvalidRecord))
             })
         })
         .inspect(|r| debug!(?r))
@@ -163,10 +170,31 @@ impl Generator for Schema {
     }
 }
 
+/// The JSON value of a record's key or value, or `Null` when the schema has no schema for it.
+///
+/// This function parses the record but does not validate it against the schema, because a
+/// consumer prints what the topic holds. Avro and Protobuf cannot print a record that breaks its
+/// schema, since they decode it with the schema.
+fn json_value(validator: Option<&jsonschema::Validator>, encoded: Option<Bytes>) -> Result<Value> {
+    validator.map_or(Ok(Value::Null), |_| parse(encoded))
+}
+
 impl AsJsonValue for Schema {
     fn as_json_value(&self, batch: &Batch) -> Result<Value> {
-        let _ = batch;
-        todo!()
+        batch
+            .records
+            .iter()
+            .map(|record| {
+                let key = json_value(self.key.as_ref(), record.key.clone())?;
+                let value = json_value(self.value.as_ref(), record.value.clone())?;
+
+                Ok(Value::Object(Map::from_iter([
+                    (MessageKind::Key.as_ref().to_owned(), key),
+                    (MessageKind::Value.as_ref().to_owned(), value),
+                ])))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array)
     }
 }
 
@@ -253,7 +281,7 @@ mod tests {
 
     use nisshi_sans_io::record::Record;
     use serde_json::json;
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -893,6 +921,132 @@ mod tests {
                 .evaluate(&json!({"name": "alice", "email": "alice@example.com"}))
                 .flag()
                 .valid
+        );
+
+        Ok(())
+    }
+
+    async fn registry_with(topic: &str, schema: &Value) -> Result<Registry> {
+        let object_store = InMemory::new();
+        _ = object_store
+            .put(
+                &Path::from(format!("{topic}.json")),
+                serde_json::to_vec(schema)
+                    .map(Bytes::from)
+                    .map(PutPayload::from)?,
+            )
+            .await?;
+
+        Ok(Registry::new(object_store))
+    }
+
+    fn encoded(value: &Value) -> Result<Bytes> {
+        serde_json::to_vec(value)
+            .map(Bytes::from)
+            .map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn as_json_value_prints_key_and_value() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let topic = "abc";
+        let registry = registry_with(
+            topic,
+            &json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "number"},
+                    "value": {"type": "object"}
+                }
+            }),
+        )
+        .await?;
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .key(encoded(&json!(12320))?.into())
+                    .value(encoded(&json!({"name": "alice"}))?.into()),
+            )
+            .record(
+                Record::builder()
+                    .key(encoded(&json!(12321))?.into())
+                    .value(encoded(&json!({"name": "bob"}))?.into()),
+            )
+            .build()?;
+
+        let schema = registry.schema(topic).await?.expect("a schema");
+
+        assert_eq!(
+            json!([
+                {"key": 12320, "value": {"name": "alice"}},
+                {"key": 12321, "value": {"name": "bob"}},
+            ]),
+            schema.as_json_value(&batch)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_json_value_is_null_for_a_side_without_a_schema() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let topic = "abc";
+        let registry = registry_with(
+            topic,
+            &json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}}
+            }),
+        )
+        .await?;
+
+        let batch = Batch::builder()
+            .record(Record::builder().value(encoded(&json!("alice"))?.into()))
+            .build()?;
+
+        let schema = registry.schema(topic).await?.expect("a schema");
+
+        assert_eq!(
+            json!([{"key": null, "value": "alice"}]),
+            schema.as_json_value(&batch)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn as_json_value_refuses_a_record_that_is_not_json() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let topic = "abc";
+        let registry = registry_with(
+            topic,
+            &json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}}
+            }),
+        )
+        .await?;
+
+        let schema = registry.schema(topic).await?.expect("a schema");
+
+        let not_json = Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(b"{not json").into()))
+            .build()?;
+
+        assert_matches!(
+            schema.as_json_value(&not_json),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        let no_value = Batch::builder().record(Record::builder()).build()?;
+
+        assert_matches!(
+            schema.as_json_value(&no_value),
+            Err(Error::Api(ErrorCode::InvalidRecord))
         );
 
         Ok(())
