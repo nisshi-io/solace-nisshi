@@ -5934,7 +5934,7 @@ const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
 ///
 /// Only this write side is checked. The read side of a timestamp before 1601 is unchecked: the
 /// `postgres-types` `FromSql<SystemTime>` conversion and the fetch paths can panic a Windows
-/// broker on a row that a Linux broker wrote (SOL-157415).
+/// broker on a row that a Linux broker wrote (SOL-157762).
 fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
     if timestamp >= 0 {
         to_system_time(timestamp).map_err(Into::into)
