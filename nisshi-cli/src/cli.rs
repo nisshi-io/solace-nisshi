@@ -279,9 +279,7 @@ mod tests {
         Some(Url::parse(url).expect(url))
     }
 
-    /// The broker's `--schema-registry` is `global`, so clap merges the matches of a tool that
-    /// declares its own into the flattened broker arguments. Parsing only `cat`'s arguments
-    /// hides that: it has to go through `Cli`.
+    /// Goes through `Cli`, as the `nisshi` binary does, not `cat`'s arguments alone.
     #[test]
     fn cat_gets_its_schema_registry_from_flag_and_environment() {
         for subcommand in ["produce", "consume"] {
@@ -319,37 +317,79 @@ mod tests {
         });
     }
 
-    /// An argument that clap merges into a `global` one must have the global's type, or reading
-    /// the merged value panics at run time. Walks every command, so a tool added later is covered.
+    /// A `global` argument is merged into every tool below it, and clap reads its environment
+    /// variable for each of them. `--schema-registry` was one, so only the tools that use it
+    /// may declare it now.
     #[test]
-    fn an_argument_with_a_global_arguments_name_has_its_type() {
-        fn check(command: &clap::Command, globals: &[&clap::Arg], path: &str) {
+    fn no_argument_is_global() {
+        fn check(command: &clap::Command, path: &str) {
             for arg in command.get_arguments() {
-                if let Some(global) = globals
-                    .iter()
-                    .find(|global| global.get_id() == arg.get_id())
-                {
-                    assert_eq!(
-                        arg.get_value_parser().type_id(),
-                        global.get_value_parser().type_id(),
-                        "`{path}` declares `--{}` with another type than the global argument",
-                        arg.get_id(),
-                    );
-                }
-            }
-            let mut inherited = globals.to_vec();
-            inherited.extend(command.get_arguments().filter(|arg| arg.is_global_set()));
-            for subcommand in command.get_subcommands() {
-                check(
-                    subcommand,
-                    &inherited,
-                    &format!("{path} {}", subcommand.get_name()),
+                assert!(
+                    !arg.is_global_set(),
+                    "`{path}` declares `--{}` as global",
+                    arg.get_id()
                 );
+            }
+            for subcommand in command.get_subcommands() {
+                check(subcommand, &format!("{path} {}", subcommand.get_name()));
             }
         }
 
         let cli = Cli::command();
-        check(&cli, &[], cli.get_name());
+        check(&cli, cli.get_name());
+    }
+
+    /// `build` propagates the arguments that are `global`, so this fails if one is added back.
+    #[test]
+    fn only_the_tools_that_use_a_schema_registry_accept_one() {
+        let mut cli = Cli::command();
+        cli.build();
+        let accepts = |name: &str| {
+            cli.find_subcommand(name)
+                .unwrap_or_else(|| panic!("no `{name}` command"))
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("schema-registry"))
+        };
+
+        for tool in ["topic", "user", "perf", "proxy"] {
+            assert!(!accepts(tool), "`{tool}` accepts --schema-registry");
+        }
+        for tool in ["broker", "generator"] {
+            assert!(accepts(tool), "`{tool}` does not accept --schema-registry");
+        }
+    }
+
+    #[test]
+    fn a_tool_that_does_not_use_a_schema_registry_rejects_the_flag() {
+        for args in [
+            &["topic", "list"][..],
+            &["user", "delete", "u"],
+            &["perf", "t", "consume"],
+            &["proxy"],
+        ] {
+            let args = [args, &["--schema-registry", REGISTRY]].concat();
+            let err = Cli::try_parse_from(std::iter::once("nisshi").chain(args.iter().copied()))
+                .expect_err(&format!("{args:?} must be rejected"));
+            assert_eq!(
+                clap::error::ErrorKind::UnknownArgument,
+                err.kind(),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// The flattened broker arguments are read for every tool, so a bad `SCHEMA_REGISTRY` must
+    /// not fail the tools that never use it.
+    #[test]
+    fn an_invalid_schema_registry_variable_does_not_fail_a_tool_that_ignores_it() {
+        for args in [
+            &["topic", "list"][..],
+            &["user", "delete", "u"],
+            &["perf", "t", "consume"],
+            &["proxy"],
+        ] {
+            parses(Some("foo"), args);
+        }
     }
 
     #[test]

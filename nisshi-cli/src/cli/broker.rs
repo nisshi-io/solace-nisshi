@@ -17,6 +17,7 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    str::FromStr as _,
     sync::Arc,
     time::Duration,
 };
@@ -102,12 +103,11 @@ pub(super) struct Arg {
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
     ///
-    /// `global` propagates this argument into every top-level tool, because `Cli` flattens this
-    /// struct. clap merges the matches of a tool that declares its own `schema_registry` into this
-    /// one, so every such tool must declare it as `EnvVarExp<Url>`, or reading it here panics. The test
-    /// `an_argument_with_a_global_arguments_name_has_its_type` checks this for every tool.
-    #[arg(long, env = "SCHEMA_REGISTRY", global = true)]
-    schema_registry: Option<EnvVarExp<Url>>,
+    /// A `String`, not a `Url`: `Cli` flattens this struct, and clap reads this environment
+    /// variable for every tool, so a `Url` here would make a bad `SCHEMA_REGISTRY` fail
+    /// `nisshi topic list`. `build` parses it, so only the broker pays for a bad value.
+    #[arg(long, env = "SCHEMA_REGISTRY")]
+    schema_registry: Option<String>,
 
     /// Schema registry cache expiry duration
     #[arg(long,value_parser = humantime::parse_duration)]
@@ -327,6 +327,19 @@ fn server_config(
         .map_err(Into::into)
 }
 
+/// The `--schema-registry` of a lake subcommand, for `broker iceberg --schema-registry y`.
+///
+/// It has no `env`: the `SCHEMA_REGISTRY` variable reaches `Arg::schema_registry`, and a lake
+/// copy that read it too would beat an explicit `broker --schema-registry x iceberg`.
+#[derive(Clone, Debug, Default, clap::Args)]
+#[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+pub(super) struct LakeRegistry {
+    /// Schema registry examples are: file://./etc/schema or s3://nisshi/. Overrides one given
+    /// before the subcommand, and the SCHEMA_REGISTRY environment variable
+    #[arg(long = "schema-registry")]
+    schema_registry: Option<String>,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 pub(super) enum Lake {
@@ -348,6 +361,9 @@ pub(super) enum Lake {
         /// Iceberg warehouse
         #[arg(long, env = "ICEBERG_WAREHOUSE")]
         warehouse: Option<String>,
+
+        #[command(flatten)]
+        registry: LakeRegistry,
     },
 
     /// Schema topics are written as Delta Lake tables
@@ -364,6 +380,9 @@ pub(super) enum Lake {
         /// Throttle the maximum number of records per second
         #[clap(long)]
         records_per_second: Option<u32>,
+
+        #[command(flatten)]
+        registry: LakeRegistry,
     },
 
     /// Schema topics are written in Parquet format
@@ -372,6 +391,9 @@ pub(super) enum Lake {
         /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
         #[arg(long, env = "DATA_LAKE")]
         location: EnvVarExp<Url>,
+
+        #[command(flatten)]
+        registry: LakeRegistry,
     },
 }
 
@@ -388,6 +410,22 @@ impl Lake {
             #[cfg(feature = "parquet")]
             Self::Parquet { .. } => "parquet",
         }
+    }
+
+    /// The registry given after the lake subcommand, which wins over one given before it.
+    fn schema_registry(&self) -> Option<&str> {
+        match self {
+            #[cfg(feature = "iceberg")]
+            Self::Iceberg { registry, .. } => registry,
+
+            #[cfg(feature = "delta")]
+            Self::Delta { registry, .. } => registry,
+
+            #[cfg(feature = "parquet")]
+            Self::Parquet { registry, .. } => registry,
+        }
+        .schema_registry
+        .as_deref()
     }
 }
 
@@ -421,6 +459,27 @@ impl Arg {
             .map_err(Into::into)
     }
 
+    /// The schema registry to use. The flag after a lake subcommand wins over the one before it,
+    /// which wins over the `SCHEMA_REGISTRY` environment variable.
+    fn schema_registry_url(&self) -> Result<Option<Url>> {
+        #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+        let lake_registry = self.command.as_ref().and_then(Lake::schema_registry);
+        #[cfg(not(any(feature = "parquet", feature = "iceberg", feature = "delta")))]
+        let lake_registry = None;
+
+        lake_registry
+            .or(self.schema_registry.as_deref())
+            .map(|value| {
+                EnvVarExp::<Url>::from_str(value)
+                    .map(EnvVarExp::into_inner)
+                    .map_err(|cause| Error::SchemaRegistry {
+                        value: value.to_owned(),
+                        cause: cause.to_string(),
+                    })
+            })
+            .transpose()
+    }
+
     async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
         // A bad TLS configuration must fail startup loudly rather than silently
         // falling back to a plaintext listener. It is checked first: it is a
@@ -448,6 +507,8 @@ impl Arg {
             );
         }
 
+        let schema_registry_url = self.schema_registry_url()?;
+
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -457,10 +518,6 @@ impl Arg {
         let storage_engine = self.storage_engine.into_inner();
         let advertised_listener = self.advertised_listener_url.into_inner();
         let listener = self.listener_url.into_inner();
-
-        let schema_registry_url = self
-            .schema_registry
-            .map(|env_var_exp| env_var_exp.into_inner());
 
         let schema_registry = schema_registry_url
             .clone()
@@ -484,6 +541,7 @@ impl Arg {
                 catalog,
                 namespace,
                 warehouse,
+                ..
             }) => Some(
                 nisshi_schema::lake::House::iceberg()
                     .location(location.into_inner())
@@ -504,6 +562,7 @@ impl Arg {
                 location,
                 database,
                 records_per_second,
+                ..
             }) => Some(
                 nisshi_schema::lake::House::delta()
                     .location(location.into_inner())
@@ -518,7 +577,7 @@ impl Arg {
             ),
 
             #[cfg(feature = "parquet")]
-            Some(Lake::Parquet { location }) => Some(
+            Some(Lake::Parquet { location, .. }) => Some(
                 nisshi_schema::lake::House::parquet()
                     .location(location.into_inner())
                     .schema_registry(
@@ -1261,6 +1320,7 @@ mod tests {
             {
                 Lake::Parquet {
                     location: "file://./lake".parse().expect("valid url"),
+                    registry: LakeRegistry::default(),
                 }
             }
 
@@ -1270,6 +1330,7 @@ mod tests {
                     location: "file://./lake".parse().expect("valid url"),
                     database: None,
                     records_per_second: None,
+                    registry: LakeRegistry::default(),
                 }
             }
 
@@ -1280,6 +1341,123 @@ mod tests {
                     catalog: "http://localhost:8181/".parse().expect("valid url"),
                     namespace: None,
                     warehouse: None,
+                    registry: LakeRegistry::default(),
+                }
+            }
+        }
+
+        const LOCATION: [&str; 2] = ["--location", "file://./lake"];
+
+        /// The subcommand each enabled lake feature adds, with the arguments it requires.
+        fn lake_commands() -> Vec<Vec<&'static str>> {
+            #[allow(clippy::vec_init_then_push)]
+            {
+                let mut commands = Vec::new();
+                #[cfg(feature = "parquet")]
+                commands.push([&["parquet"], &LOCATION[..]].concat());
+                #[cfg(feature = "delta")]
+                commands.push([&["delta"], &LOCATION[..]].concat());
+                #[cfg(feature = "iceberg")]
+                commands.push(
+                    [
+                        &["iceberg", "--catalog", "http://localhost:8181/"],
+                        &LOCATION[..],
+                    ]
+                    .concat(),
+                );
+                commands
+            }
+        }
+
+        /// The registry that `nisshi broker <before> <lake> <after>` resolves, with
+        /// `SCHEMA_REGISTRY` set to `env`, or unset.
+        fn resolved(env: Option<&str>, before: &[&str], after: &[&str]) -> Vec<Option<String>> {
+            temp_env::with_var("SCHEMA_REGISTRY", env, || {
+                lake_commands()
+                    .iter()
+                    .map(|lake| {
+                        let args = [before, lake, after].concat();
+                        parse(&args)
+                            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+                            .schema_registry_url()
+                            .expect("a valid registry")
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+        }
+
+        fn all(url: &str) -> Vec<Option<String>> {
+            lake_commands()
+                .iter()
+                .map(|_| Some(url.to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn a_lake_takes_the_registry_from_before_or_after_it() {
+            assert_eq!(
+                resolved(None, &["--schema-registry", "s3://a/"], &[]),
+                all("s3://a/")
+            );
+            assert_eq!(
+                resolved(None, &[], &["--schema-registry", "s3://a/"]),
+                all("s3://a/")
+            );
+            assert_eq!(resolved(Some("s3://a/"), &[], &[]), all("s3://a/"));
+        }
+
+        #[test]
+        fn the_flag_after_a_lake_beats_the_flag_before_it_and_the_environment() {
+            assert_eq!(
+                resolved(
+                    Some("s3://env/"),
+                    &["--schema-registry", "s3://before/"],
+                    &["--schema-registry", "s3://after/"],
+                ),
+                all("s3://after/"),
+            );
+            assert_eq!(
+                resolved(
+                    Some("s3://env/"),
+                    &[],
+                    &["--schema-registry", "s3://after/"]
+                ),
+                all("s3://after/"),
+            );
+            // The environment variable must not beat an explicit flag before the lake.
+            assert_eq!(
+                resolved(
+                    Some("s3://env/"),
+                    &["--schema-registry", "s3://before/"],
+                    &[]
+                ),
+                all("s3://before/"),
+            );
+        }
+
+        #[test]
+        fn an_invalid_registry_is_reported_as_a_sentence_by_build() {
+            for (before, after) in [
+                (&["--schema-registry", "foo"][..], &[][..]),
+                (&[][..], &["--schema-registry", "foo"][..]),
+            ] {
+                let registries = temp_env::with_var("SCHEMA_REGISTRY", None::<&str>, || {
+                    lake_commands()
+                        .iter()
+                        .map(|lake| {
+                            let args = [before, lake, after].concat();
+                            parse(&args)
+                                .expect("clap accepts any string")
+                                .schema_registry_url()
+                        })
+                        .collect::<Vec<_>>()
+                });
+                for err in registries {
+                    assert_eq!(
+                        "invalid value 'foo' for '--schema-registry <SCHEMA_REGISTRY>': invalid URL: relative URL without a base",
+                        err.expect_err("a relative url").to_string()
+                    );
                 }
             }
         }
@@ -1370,6 +1548,27 @@ mod tests {
         ])
         .expect("--schema-registry given after the subcommand must parse");
 
-        assert!(arg.schema_registry.is_some());
+        assert!(arg.schema_registry_url().expect("valid").is_some());
+    }
+
+    /// With no lake subcommand, which is the common build, a bad registry stops the broker with
+    /// a message that names the option.
+    #[tokio::test]
+    async fn an_invalid_schema_registry_fails_build_naming_the_option() {
+        let arg = temp_env::with_var("SCHEMA_REGISTRY", None::<&str>, || {
+            parse(&["--silent", "--schema-registry", "foo"])
+                .expect("clap leaves the value to build")
+        });
+
+        let err = arg
+            .build()
+            .await
+            .expect_err("a relative url must fail build");
+
+        std::assert_matches!(err, Error::SchemaRegistry { .. });
+        assert_eq!(
+            "invalid value 'foo' for '--schema-registry <SCHEMA_REGISTRY>': invalid URL: relative URL without a base",
+            err.to_string()
+        );
     }
 }

@@ -44,6 +44,9 @@ pub enum Error {
     LakeRequiresSchemaRegistry { lake: &'static str },
     #[error(transparent)]
     Perf(#[from] nisshi_perf::Error),
+    /// The broker's `--schema-registry`, or the `SCHEMA_REGISTRY` variable, is not a URL.
+    #[error("invalid value '{value}' for '--schema-registry <SCHEMA_REGISTRY>': {cause}")]
+    SchemaRegistry { value: String, cause: String },
     #[error(transparent)]
     Proxy(#[from] nisshi_proxy::Error),
     #[error(transparent)]
@@ -249,19 +252,14 @@ mod tests {
         assert_eq!("invalid URL: relative URL without a base", err.to_string());
     }
 
+    /// The broker reads `--schema-registry` as a string, so a bad value fails its startup, not
+    /// the parse of every tool that flattens the broker's arguments.
     #[test]
-    fn clap_reports_an_invalid_schema_registry_url_as_a_sentence() {
+    fn clap_leaves_an_invalid_schema_registry_to_the_broker() {
         use clap::Parser as _;
 
-        let err = Cli::try_parse_from(["nisshi", "broker", "--schema-registry", "foo"])
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            err.contains("invalid URL: relative URL without a base"),
-            "{err}"
-        );
-        assert!(!err.contains("RelativeUrlWithoutBase"), "{err}");
+        let _ = Cli::try_parse_from(["nisshi", "broker", "--schema-registry", "foo"])
+            .expect("clap leaves the value to the broker");
     }
 
     /// The `nisshi` binary prints these messages as they are, so the text here is the text a

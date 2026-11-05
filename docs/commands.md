@@ -67,7 +67,7 @@ The `nisshi topic` command has the following subcommands:
 nisshi topic --help
 Create, list or delete topics managed by the broker
 
-Usage: nisshi topic [OPTIONS] <COMMAND>
+Usage: nisshi topic <COMMAND>
 
 Commands:
   create  Create a topic
@@ -76,8 +76,6 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```
@@ -224,8 +222,6 @@ Options:
           The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
       --otlp-endpoint-url <OTLP_ENDPOINT_URL>
           OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```

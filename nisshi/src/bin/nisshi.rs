@@ -409,6 +409,7 @@ fn report_error(err: &nisshi_cli::Error) {
         | nisshi_cli::Error::SaslPasswordFile { .. }
         | nisshi_cli::Error::SaslPasswordMissing
         | nisshi_cli::Error::SaslPasswordNotUnicode
+        | nisshi_cli::Error::SchemaRegistry { .. }
         | nisshi_cli::Error::LakeRequiresSchemaRegistry { .. } => report_failure!("{err}"),
         nisshi_cli::Error::Tls(error) => report_failure!(
             "TLS configuration rejected: {error}. Check that --key is the private key for the \
