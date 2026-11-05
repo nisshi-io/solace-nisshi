@@ -1082,7 +1082,8 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          # The same settings as release, for the same reasons.
+          # Empty, so the action does not set RUSTFLAGS, which would replace
+          # the static C runtime setting in .cargo/config.toml.
           rustflags: ""
           build-warnings: ""
           cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -1094,14 +1095,24 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
       - if: ${{github.ref_type == 'tag'}}
-        run: cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+        run: |
+          # The licence scan needs no build output, so it runs beside the build.
+          # wait returns the scan's exit status, so a failed scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
+          cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
+      # A dynamically linked C runtime shows up as an import of VCRUNTIME140.dll.
       - if: ${{github.ref_type == 'tag'}}
-        run: cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html
+        run: |
+          bin=target/"${TARGET}"/release/nisshi.exe
+          [ -f "$bin" ] || { echo "::error::$bin does not exist"; exit 1; }
+          ! grep -a -q -i vcruntime140 "$bin" || { echo "::error::$bin imports the Visual C++ runtime DLL"; exit 1; }
       # Git Bash on the runner has no zip command, and PowerShell has
       # Compress-Archive built in.
       - if: ${{github.ref_type == 'tag'}}

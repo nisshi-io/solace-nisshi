@@ -319,11 +319,17 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$env:TARGET"
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
       - run: cargo auditable build --release --bin nisshi --all-features --target "$env:TARGET"
+      # The same check as the windows job in ci.yml.
+      - shell: bash
+        run: |
+          bin=target/"${TARGET}"/release/nisshi.exe
+          [ -f "$bin" ] || { echo "::error::$bin does not exist"; exit 1; }
+          ! grep -a -q -i vcruntime140 "$bin" || { echo "::error::$bin imports the Visual C++ runtime DLL"; exit 1; }
   # The release profile, the linker and cargo-auditable, which the `macos`
   # and `windows` jobs in ci.yml skip off a tag. It uploads nothing.
   macos-release:
