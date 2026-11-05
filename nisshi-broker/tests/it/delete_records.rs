@@ -960,6 +960,117 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+    use nisshi_storage::ArcDynStorage;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_up_to_offset() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_up_to_offset(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_offset_inside_a_batch_keeps_the_whole_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_offset_inside_a_batch_keeps_the_whole_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_to_high_watermark_keeps_latest() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_to_high_watermark_keeps_latest(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_above_high_watermark_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_above_high_watermark_is_rejected(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_negative_offset_other_than_minus_one_is_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_negative_offset_other_than_minus_one_is_rejected(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_at_or_below_log_start_is_a_noop() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_at_or_below_log_start_is_a_noop(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_topic_or_partition_does_not_fail_siblings() -> Result<()> {
+        let _guard = init_tracing()?;
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+        super::delete_unknown_topic_or_partition_does_not_fail_siblings(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

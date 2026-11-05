@@ -621,6 +621,60 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        crate::common::turso_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_by_uuid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::delete_unknown_by_uuid(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_delete_create_by_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_delete_create_by_name(storage).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

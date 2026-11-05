@@ -276,6 +276,74 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        crate::common::turso_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage, broker_id).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_create_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::auto_create_topic(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_create_topic_invalid_name() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::auto_create_topic_invalid_name(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_create_topic_not_allowed() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::auto_create_topic_not_allowed(storage).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

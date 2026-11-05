@@ -230,3 +230,9 @@ backend!(
     crate::common::postgres_storage,
     Stores::Credentials
 );
+backend!(
+    turso,
+    "turso",
+    crate::common::turso_storage,
+    Stores::Credentials
+);

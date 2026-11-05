@@ -1354,4 +1354,34 @@ mod turso {
         )
         .await
     }
+
+    #[tokio::test]
+    async fn virtual_keyed_topic_fetch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::virtual_keyed_topic_fetch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn non_virtual_topic_with_slash_streams_all() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::non_virtual_topic_with_slash_streams_all(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
 }

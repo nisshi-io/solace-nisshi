@@ -541,6 +541,116 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        crate::common::turso_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn simple() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::simple(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn broker_default_configs_are_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::broker_default_configs_are_empty(storage).await
+    }
+
+    #[tokio::test]
+    async fn own_broker_id_is_described() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::own_broker_id_is_described(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn other_broker_id_is_invalid_request() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::other_broker_id_is_invalid_request(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn non_integer_broker_id_is_invalid_request() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_integer_broker_id_is_invalid_request(storage).await
+    }
+
+    #[tokio::test]
+    async fn broker_id_is_parsed_as_kafka_parses_it() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::broker_id_is_parsed_as_kafka_parses_it(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn topic_named_after_broker_id_is_not_described_as_broker() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::topic_named_after_broker_id_is_not_described_as_broker(storage, broker_id).await
+    }
+
+    #[tokio::test]
+    async fn broker_error_stays_with_its_resource() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::broker_error_stays_with_its_resource(storage, broker_id).await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

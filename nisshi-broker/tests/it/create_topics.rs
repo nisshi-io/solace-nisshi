@@ -1519,6 +1519,150 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use crate::common::turso_storage;
+    use nisshi_broker::Result;
+    use nisshi_storage::ArcDynStorage;
+    use rand::{RngExt as _, rng};
+    use uuid::Uuid;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        turso_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn create() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_with_default() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::create_with_default(broker_id, storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::duplicate(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_name_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_name_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_partitions_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_partitions_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn total_partitions_cap_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::total_partitions_cap_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_replication_factor_rejected() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::invalid_replication_factor_rejected(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_partial_success_replication_factor() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::mixed_batch_partial_success_replication_factor(storage).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use crate::common::slate_storage;

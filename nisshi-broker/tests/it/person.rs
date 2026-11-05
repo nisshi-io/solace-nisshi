@@ -347,6 +347,74 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use crate::common::{StorageType, init_tracing};
+    use nisshi_broker::Error;
+    use nisshi_schema::Registry;
+    use nisshi_storage::ArcDynStorage;
+    use std::env;
+    use url::Url;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        let current_dir = env::current_dir()?;
+        debug!(?current_dir);
+
+        let schemas = Url::parse("file://../etc/schema")
+            .map_err(Error::from)
+            .and_then(|url| {
+                Registry::builder_try_from_url(&url)
+                    .map(|builder| builder.build())
+                    .map_err(Into::into)
+            })
+            .map(Some)?;
+
+        common::storage_container(
+            StorageType::Turso,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            schemas,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn person_valid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::person_valid(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn person_invalid() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::person_invalid(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use crate::common::{StorageType, init_tracing};

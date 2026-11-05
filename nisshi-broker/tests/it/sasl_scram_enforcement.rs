@@ -30,7 +30,9 @@
 
 use std::sync::Arc;
 
-use crate::common::{init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage};
+use crate::common::{
+    init_tracing, lite_storage, memory_storage, postgres_storage, slate_storage, turso_storage,
+};
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_broker::{
     Error, Result,
@@ -268,6 +270,32 @@ mod lite {
         node: i32,
     ) -> Result<ArcDynStorage> {
         lite_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn scram_rejects_unverified_client() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::scram_rejects_unverified_client(storage).await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        turso_storage(cluster, node).await
     }
 
     #[tokio::test]

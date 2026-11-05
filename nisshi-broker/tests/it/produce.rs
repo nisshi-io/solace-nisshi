@@ -2241,6 +2241,189 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+    ) -> Result<ArcDynStorage> {
+        crate::common::turso_storage(cluster, node).await
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_unknown_producer_id(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_duplicate_sequence(storage, ErrorCode::DuplicateSequenceNumber)
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_txn_idempotent_sequence_out_of_order() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::non_txn_idempotent_sequence_out_of_order(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_offsets() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::list_offsets(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_last_offset_delta_mismatch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_last_offset_delta_mismatch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_control_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_control_batch(storage).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_future_timestamp() -> Result<()> {
+        {
+            let _guard = init_tracing()?;
+
+            let cluster_id = Uuid::now_v7();
+            let broker_id = rng().random_range(0..i32::MAX);
+
+            let storage = storage_container(cluster_id, broker_id).await?;
+
+            super::produce_rejects_future_timestamp(storage).await?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_max_timestamp() -> Result<()> {
+        {
+            let _guard = init_tracing()?;
+
+            let cluster_id = Uuid::now_v7();
+            let broker_id = rng().random_range(0..i32::MAX);
+
+            let storage = storage_container(cluster_id, broker_id).await?;
+
+            super::produce_rewrites_header_max_timestamp(storage).await?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_header_below_records_is_found_by_timestamp_lookup() -> Result<()> {
+        {
+            let _guard = init_tracing()?;
+
+            let cluster_id = Uuid::now_v7();
+            let broker_id = rng().random_range(0..i32::MAX);
+
+            let storage = storage_container(cluster_id, broker_id).await?;
+
+            super::produce_header_below_records_is_found_by_timestamp_lookup(storage).await?;
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_rewrites_header_for_every_codec() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rewrites_header_for_every_codec(storage).await
+    }
+
+    #[tokio::test]
+    async fn produce_rejects_corrupt_batch_before_rewrite() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let storage = storage_container(cluster_id, broker_id).await?;
+
+        super::produce_rejects_corrupt_batch_before_rewrite(storage).await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use super::*;

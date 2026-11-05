@@ -725,3 +725,66 @@ mod lite {
         acks_zero_storage_failure_closes_connection(sqlite_url(&name).await?).await
     }
 }
+
+#[cfg(feature = "turso")]
+mod turso {
+    use std::{env, io::ErrorKind, thread};
+
+    use tokio::fs::remove_file;
+
+    use super::*;
+
+    async fn turso_url(name: &str) -> Result<Url> {
+        let relative = format!("../logs/{}/{name}.db", env!("CARGO_PKG_NAME"));
+        let mut path = env::current_dir()?;
+        path.push(&relative);
+
+        match remove_file(path).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }?;
+
+        Url::parse(&format!("turso://{relative}")).map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn success_is_not_written() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_success_is_not_written(turso_url(&name).await?).await
+    }
+
+    #[tokio::test]
+    async fn acks_zero_then_acks_one() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_then_acks_one_on_one_connection(turso_url(&name).await?).await
+    }
+
+    #[tokio::test]
+    async fn failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_failure_closes_connection(turso_url(&name).await?).await
+    }
+
+    #[tokio::test]
+    async fn storage_failure_closes_connection() -> Result<()> {
+        let _guard = init_tracing()?;
+        let name = thread::current()
+            .name()
+            .ok_or_else(|| anyhow!("unnamed thread"))?
+            .to_owned();
+        acks_zero_storage_failure_closes_connection(turso_url(&name).await?).await
+    }
+}
