@@ -68,7 +68,7 @@ pub(crate) const DELETE_RECORDS_DEADLINE: Duration = Duration::from_secs(5);
 static READ_DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_storage_read_deadline_exceeded")
-        .with_description("Storage reads, or steps of a read, abandoned at their deadline")
+        .with_description("Storage reads stopped at their deadline")
         .build()
 });
 
