@@ -2089,7 +2089,11 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
     /// for the read without a time limit of their own, so a read that overruns its deadline holds
-    /// up the whole response.
+    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
+    /// that a read finished.
+    ///
+    /// The batches run in offset order from the batch that holds `offset`, with no gap between
+    /// them, also when the deadline stops the read. An answer with no batches is always valid.
     async fn fetch(
         &self,
         topition: &'_ Topition,
