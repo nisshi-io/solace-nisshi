@@ -64,6 +64,17 @@ static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
 static BATCH_RESPONSES_LENGTH: LazyLock<Gauge<u64>> =
     LazyLock::new(|| METER.u64_gauge("batch_response_gauge").build());
 
+static BATCH_DECODED_HELD: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("batch_decoded_held_bytes")
+        .with_unit("By")
+        .with_description(
+            "The decoded size of the batches that queued produce requests hold, counted as the \
+             budget counts it. The heap use is larger: record buffers keep spare capacity",
+        )
+        .build()
+});
+
 static BATCH_TICKET_POLL: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("batch_ticket_poll")
@@ -261,6 +272,16 @@ impl<G> Drop for QueueGuard<G> {
             return;
         }
 
+        // A plain `produce` is dropped the same way, and its request is then never written, where
+        // the next flush of its key would have written it. That is safe because a dropped produce
+        // means that nobody is waiting for the outcome: the broker's request was cancelled (the
+        // client's connection closed), the client never gets an offset for it, and a client that
+        // retries an unacknowledged produce would write the records a second time. Kafka appends a
+        // request that it has read whatever the client does after, so this is a deliberate
+        // difference: we trade a write that no one is told about for no duplicate.
+        //
+        // Remove only this request. Every non-idempotent producer on a partition shares one key,
+        // so removing the key would drop the other producers' requests.
         if let Ok(mut requests) = self.batcher.requests.lock()
             && let Some(queue) = requests.get_mut(&self.key)
         {
@@ -300,6 +321,16 @@ pub struct ProduceRequestBatcher<G> {
     /// The largest decoded size of a merged batch, [`MAX_DECODED_BATCH_BYTES`] outside tests.
     decoded_limit: usize,
 
+    /// Whether the batcher holds the decoded batch of an idempotent producer's request.
+    ///
+    /// A queue of a non-idempotent producer is merged, and the merge reads the decoded batches, so
+    /// the batcher always holds those. The flush writes an idempotent producer's queue one batch at
+    /// a time, so the only reader of its held batch is the inner storage, through
+    /// [`Storage::produce_inflated`]. When that storage drops the batch (plain S3 or GCS), holding
+    /// it costs a decoded size pass and a share of the budget for `maximum_delay`, and the shares
+    /// can crowd out the batches that a merge would save a decode for.
+    hold_decoded: bool,
+
     /// The decoded size of the batches that queued requests hold, at most `decoded_limit`.
     ///
     /// This bounds the memory that waiting for `maximum_delay` adds: the queues hold at most
@@ -331,6 +362,9 @@ impl<G> ProduceRequestBatcher<G> {
                     .map(|responses| responses.len() as u64)
                     .map(|length| BATCH_RESPONSES_LENGTH.record(length, &[])),
             )
+            .inspect(|()| {
+                BATCH_DECODED_HELD.record(self.decoded_held.load(Ordering::Acquire) as u64, &[]);
+            })
     }
 }
 
@@ -344,6 +378,7 @@ where
             minimum_size: Default::default(),
             maximum_delay: Default::default(),
             decoded_limit: MAX_DECODED_BATCH_BYTES,
+            hold_decoded: true,
             decoded_held: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             merge_error: None,
@@ -363,6 +398,16 @@ where
     pub fn with_maximum_delay(self, maximum_delay: Option<Duration>) -> Self {
         Self {
             maximum_delay,
+            ..self
+        }
+    }
+
+    /// Sets whether the batcher holds the decoded batch of an idempotent producer's request, which
+    /// only the inner storage reads. The default is to hold it. Pass whether the inner storage
+    /// reads a decoded batch it is given: a storage that drops it makes holding pure cost.
+    pub fn with_hold_decoded(self, hold_decoded: bool) -> Self {
+        Self {
+            hold_decoded,
             ..self
         }
     }
@@ -815,12 +860,22 @@ where
                 .await;
         }
 
+        // An idempotent producer's queue is written as sent, so nothing but the inner storage
+        // reads the held batch. Drop it now when that storage drops it too.
+        if deflated.is_idempotent() && !self.hold_decoded {
+            drop(inflated);
+
+            return self
+                .produce_with(transaction_id, topition, deflated, None)
+                .await;
+        }
+
         let decoded = BatchAttribute::try_from(deflated.attributes)
             .and_then(|attributes| inflated.decoded_size(&attributes.compression))
             .ok()
             .and_then(|size| Reservation::take(&self.decoded_held, size, self.decoded_limit))
             .map(|reservation| {
-                produce_path::direct();
+                produce_path::direct(produce_path::Stage::Batcher);
 
                 Decoded {
                     batch: inflated,
@@ -829,7 +884,7 @@ where
             });
 
         if decoded.is_none() {
-            produce_path::fallback();
+            produce_path::fallback(produce_path::Stage::Batcher);
         }
 
         self.produce_with(transaction_id, topition, deflated, decoded)
@@ -3676,12 +3731,118 @@ mod tests {
     }
 
     /// A produce that is dropped while it waits leaves the queue, and gives back its share of the
-    /// decoded budget, so that abandoned requests cannot use the budget up.
+    /// decoded budget, so that abandoned requests cannot use the budget up. It takes only its own
+    /// request: every non-idempotent producer on a partition shares one queue, and the others'
+    /// requests stay and are answered. It also leaves no waker behind in `responses`.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_produce_leaves_the_queue_and_frees_its_decoded_budget() -> Result<()> {
         let recorder = FlightRecorder::new();
         let batcher = ProduceRequestBatcher::new(recorder.clone())
             .with_maximum_delay(Some(Duration::from_secs(1)));
+        let topition = Topition::new("abc", 0);
+
+        let abandoned = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"a")])?,
+        );
+        yield_now().await;
+        let kept = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"b")])?,
+        );
+        yield_now().await;
+
+        let held_by_both = batcher.decoded_held.load(Ordering::SeqCst);
+        assert!(held_by_both > 0);
+        assert_eq!(
+            Some(2),
+            batcher.requests.lock()?.values().map(Vec::len).next()
+        );
+        assert_eq!(2, batcher.responses.lock()?.len());
+
+        abandoned.abort();
+        _ = abandoned.await;
+
+        assert_eq!(
+            Some(1),
+            batcher.requests.lock()?.values().map(Vec::len).next(),
+            "only the second request stays in the queue"
+        );
+        assert_eq!(
+            1,
+            batcher.responses.lock()?.len(),
+            "the abandoned request leaves no waker"
+        );
+        assert_eq!(
+            held_by_both / 2,
+            batcher.decoded_held.load(Ordering::SeqCst)
+        );
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, kept.await.expect("join_handle")?);
+
+        let stored = recorder.produced(&topition)?.unwrap_or_default();
+        assert_eq!(1, stored.len());
+        assert_eq!(
+            vec![Some(Bytes::from_static(b"b"))],
+            stored[0]
+                .records
+                .iter()
+                .map(|record| record.value())
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+        assert!(batcher.requests.lock()?.is_empty());
+        assert!(batcher.responses.lock()?.is_empty());
+
+        Ok(())
+    }
+
+    /// A plain `produce` that is dropped while it waits is not written by the next flush of its
+    /// key, and leaves nothing behind. This is deliberate: see the comment on [`QueueGuard`]'s drop.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_plain_produce_is_not_written() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)));
+        let topition = Topition::new("abc", 0);
+
+        let produce = spawn_produce(
+            &batcher,
+            &topition,
+            batch_of(-1, 0, &Bytes::from_static(b"a"))?,
+        );
+        yield_now().await;
+
+        assert_eq!(1, batcher.requests.lock()?.len());
+
+        produce.abort();
+        _ = produce.await;
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(None, recorder.produced(&topition)?);
+        assert!(batcher.requests.lock()?.is_empty());
+        assert!(batcher.responses.lock()?.is_empty());
+
+        Ok(())
+    }
+
+    /// With a storage that drops the decoded batch, an idempotent producer's request holds nothing
+    /// and reaches the storage as bytes.
+    #[tokio::test(start_paused = true)]
+    async fn an_idempotent_produce_holds_no_decoded_batch_for_a_storage_that_drops_it() -> Result<()>
+    {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_hold_decoded(false);
         let topition = Topition::new("abc", 0);
 
         let produce = spawn_produce_inflated(
@@ -3691,14 +3852,52 @@ mod tests {
         );
         yield_now().await;
 
-        assert!(batcher.decoded_held.load(Ordering::SeqCst) > 0);
         assert_eq!(1, batcher.requests.lock()?.len());
-
-        produce.abort();
-        _ = produce.await;
-
         assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
-        assert!(batcher.requests.lock()?.is_empty());
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, produce.await.expect("join_handle")?);
+        assert_eq!(0, recorder.inflated_produces.load(Ordering::SeqCst));
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// A non-idempotent producer's queue is merged, which reads the decoded batches, so the
+    /// batcher holds them whatever the storage does with a decoded batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_idempotent_produce_holds_its_decoded_batch_for_a_storage_that_drops_it()
+    -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_hold_decoded(false);
+        let topition = Topition::new("abc", 0);
+
+        let first = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"a")])?,
+        );
+        yield_now().await;
+        let second = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"b")])?,
+        );
+        yield_now().await;
+
+        assert!(batcher.decoded_held.load(Ordering::SeqCst) > 0);
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, first.await.expect("join_handle")?);
+        assert_eq!(1, second.await.expect("join_handle")?);
+        assert_eq!(1, recorder.produced(&topition)?.unwrap().len());
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
 
         Ok(())
     }
