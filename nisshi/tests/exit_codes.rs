@@ -117,8 +117,22 @@ fn closed_port() -> u16 {
 /// seconds before it gives up, so the tools run side by side.
 #[test]
 fn a_broker_that_is_not_there_is_3_for_every_client_tool() {
-    let url = format!("tcp://127.0.0.1:{}", closed_port());
-    let (registry, schema_registry) = schema_registry("unreachable");
+    every_tool_ends_with_3(&format!("tcp://127.0.0.1:{}", closed_port()), "unreachable");
+}
+
+/// Runs each tool against a host name that does not resolve. The top-level domain `.invalid` is
+/// reserved so that no name under it ever resolves (RFC 2606), and a lookup that fails needs no
+/// network.
+#[test]
+fn an_address_that_does_not_resolve_is_3_for_every_client_tool() {
+    every_tool_ends_with_3("tcp://nisshi-no-such-host.invalid:9092", "unresolved");
+}
+
+/// Runs every client tool against the broker at `url`, side by side, and asserts that each ends
+/// with 3. `name` keeps the schema registry directory of one test apart from another's.
+fn every_tool_ends_with_3(url: &str, name: &str) {
+    let url = url.to_owned();
+    let (registry, schema_registry) = schema_registry(name);
 
     let runs = TOOLS.map(|args| {
         let mut args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();

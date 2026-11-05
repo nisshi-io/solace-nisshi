@@ -51,13 +51,19 @@ fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> St
             ),
             _ => failed(),
         },
-        FailureKind::Unreachable => match error {
-            nisshi_client::Error::Pool(cause) => format!(
+        // The pool wraps the failure of an attempt to open a connection, including an address
+        // that does not resolve.
+        FailureKind::Unreachable => {
+            let cause = match error {
+                nisshi_client::Error::Pool(cause) => cause.to_string(),
+                error => error.to_string(),
+            };
+
+            format!(
                 "Could not connect to the broker: {cause}. Check that it is running (nisshi \
                 broker) and that {broker_option} points at it."
-            ),
-            _ => failed(),
-        },
+            )
+        }
         FailureKind::Refused => refusal_message(error, broker_option).unwrap_or_else(failed),
         // A broker that serves only TLS, or that requires authentication, accepts the connection
         // and then closes it when the plaintext request arrives. The same broker closes a

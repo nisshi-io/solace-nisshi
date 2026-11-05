@@ -194,6 +194,22 @@ pub enum Error {
     UnknownHost(Url),
 }
 
+/// The kind of failure that an I/O error on the connection to the broker is.
+fn io_failure_kind(error: &io::Error) -> FailureKind {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => FailureKind::Closed,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::AddrNotAvailable => FailureKind::Unreachable,
+        _ => FailureKind::Other,
+    }
+}
+
 /// What a failed [`Error`] means to whoever has to act on it, as [`Error::failure_kind`] says.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FailureKind {
@@ -239,22 +255,18 @@ impl Error {
             | Self::Tls(_)
             | Self::TlsRejected(_) => FailureKind::Refused,
             Self::Timeout(_) => FailureKind::TimedOut,
-            Self::Io(cause) => match cause.kind() {
-                io::ErrorKind::UnexpectedEof
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::BrokenPipe => FailureKind::Closed,
-                io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::TimedOut
-                | io::ErrorKind::HostUnreachable
-                | io::ErrorKind::NetworkUnreachable
-                | io::ErrorKind::AddrNotAvailable => FailureKind::Unreachable,
-                _ => FailureKind::Other,
-            },
+            Self::Io(cause) => io_failure_kind(cause),
             // The pool wraps what its connection manager returned while it opened a connection.
             // Only a failed attempt to reach the broker, or a create timeout, is unreachable:
             // waiting for a free connection is not.
             Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                // The connection manager looks up the broker's address before it connects, and
+                // that is the only thing that raises a service error while it opens a
+                // connection. A lookup that fails does not say why in the kind of its I/O
+                // error, so any such failure means the address does not resolve.
+                Some(PoolError::Backend(Self::Service(
+                    nisshi_service::Error::Io(_) | nisshi_service::Error::UnknownHost(_),
+                ))) => FailureKind::Unreachable,
                 Some(PoolError::Backend(error)) => error.failure_kind(),
                 Some(PoolError::Timeout(TimeoutType::Create)) => FailureKind::Unreachable,
                 Some(
@@ -272,8 +284,10 @@ impl Error {
             | Self::ParseFilter(_)
             | Self::Poison
             | Self::Protocol(_)
-            | Self::Service(_)
             | Self::UnknownApiKey(_) => FailureKind::Other,
+            Self::Service(nisshi_service::Error::UnknownHost(_)) => FailureKind::Unreachable,
+            Self::Service(nisshi_service::Error::Io(cause)) => io_failure_kind(cause),
+            Self::Service(_) => FailureKind::Other,
         }
     }
 
@@ -1486,9 +1500,42 @@ mod failure_kind_tests {
             backend(io_error(io::ErrorKind::HostUnreachable)),
             Error::from(PoolError::<Error>::Timeout(TimeoutType::Create)),
             Error::UnknownHost("tcp://nowhere:9092".parse().expect("url")),
+            Error::Service(nisshi_service::Error::UnknownHost(
+                "tcp://nowhere:9092".parse().expect("url"),
+            )),
         ] {
             assert_eq!(FailureKind::Unreachable, error.failure_kind(), "{error}");
         }
+    }
+
+    /// `ConnectionManager::create` resolves the broker's address first. A host that does not
+    /// resolve comes out of the pool as a service error, from `lookup_host`, whose I/O error has
+    /// no kind that says so (`Uncategorized`), or as `UnknownHost` when the lookup finds no IPv4
+    /// address.
+    #[test]
+    fn an_address_that_does_not_resolve_is_unreachable_inside_the_pool() {
+        let lookup_failed = || {
+            nisshi_service::Error::Io(Arc::new(io::Error::other(
+                "failed to lookup address information: Name or service not known",
+            )))
+        };
+        let unknown_host = || {
+            nisshi_service::Error::UnknownHost("tcp://nowhere.invalid:9092".parse().expect("url"))
+        };
+
+        for error in [
+            backend(Error::Service(lookup_failed())),
+            backend(Error::Service(unknown_host())),
+        ] {
+            assert_eq!(FailureKind::Unreachable, error.failure_kind(), "{error}");
+            assert!(error.is_connect_failure(), "{error}");
+        }
+
+        // Outside the pool, a service error is unreachable only when it says so.
+        assert_eq!(
+            FailureKind::Other,
+            Error::Service(lookup_failed()).failure_kind()
+        );
     }
 
     /// A broker that closes the connection during the login or the handshake is a closed
