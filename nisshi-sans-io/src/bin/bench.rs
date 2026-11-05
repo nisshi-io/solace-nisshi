@@ -2147,9 +2147,9 @@ pub fn main() -> Result<()> {
     let cli = Arg::parse();
 
     if cli.list_api_keys {
-        let api_keys = benches.iter().map(Codec::api_key).collect::<BTreeSet<_>>();
-        for api_key in api_keys {
-            println!("{api_key}");
+        let api_ids = benches.iter().map(Codec::api_key).collect::<BTreeSet<_>>();
+        for api_id in api_ids {
+            println!("{api_id}");
         }
         return Ok(());
     }
