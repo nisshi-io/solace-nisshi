@@ -218,15 +218,81 @@ impl<C, N, L, P> Builder<C, N, L, P> {
     }
 }
 
-impl Builder<String, i32, Url, Pool> {
+/// What the builder needs to open the pool: the connection config, the TLS connector and the
+/// pool's size, kept until [`Builder::build`] knows the cluster and the node that name the
+/// connections. Building a pool does not connect, so the pool opens its first connection later.
+#[derive(Clone)]
+pub struct PoolParts {
+    /// The operator's settings, without a default `application_name`.
+    config: Config,
+    tls: MakeRustlsConnect,
+    pool_max_size: usize,
+    /// Whether the storage URL, in its query or in `options`, sets `application_name`.
+    named_by_operator: bool,
+    /// The pool with the plain [`APPLICATION_NAME_PREFIX`] as its name, built where the storage
+    /// URL is parsed, so that an unusable setting fails there.
+    pool: Pool,
+}
+
+impl Debug for PoolParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolParts")
+            .field("config", &self.config)
+            .field("pool_max_size", &self.pool_max_size)
+            .field("named_by_operator", &self.named_by_operator)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolParts {
+    /// Opens a pool of connections that use `config`.
+    fn open(
+        config: Config,
+        tls: MakeRustlsConnect,
+        pool_max_size: usize,
+    ) -> std::result::Result<Pool, deadpool_postgres::BuildError> {
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+
+        Pool::builder(Manager::from_config(config, tls, mgr_config))
+            .max_size(pool_max_size)
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+            .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
+            .build()
+    }
+
+    /// The pool for the broker `node` of `cluster`: its connections are named by
+    /// [`application_name`] unless the operator named them.
+    fn pool_of(&self, cluster: &str, node: i32) -> Pool {
+        if self.named_by_operator {
+            return self.pool.clone();
+        }
+
+        let mut config = self.config.clone();
+        _ = config.application_name(application_name(cluster, node));
+
+        // The only way that opening a pool fails is a timeout without a runtime, and `open` sets
+        // both. The pool that `from_str` built with the same settings stands in, so that this
+        // can never stop the broker.
+        Self::open(config, self.tls.clone(), self.pool_max_size).unwrap_or_else(|err| {
+            error!(?err, "opening the pool with the broker's name failed");
+            self.pool.clone()
+        })
+    }
+}
+
+impl Builder<String, i32, Url, PoolParts> {
     pub fn build(self) -> Postgres {
-        let delete_records_limit = delete_records_limit(self.pool.status().max_size);
+        let pool = self.pool.pool_of(&self.cluster, self.node);
+        let delete_records_limit = delete_records_limit(pool.status().max_size);
 
         Postgres {
             cluster: self.cluster,
             node: self.node,
             advertised_listener: self.advertised_listener,
-            pool: self.pool,
+            pool,
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(self.read_limits.list_offsets)),
             fetch_reads: Arc::new(Semaphore::new(self.read_limits.fetch)),
@@ -441,11 +507,43 @@ const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// resolved address, not the TLS/auth steps that follow it).
 const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `application_name` of the broker's connections when the storage URL sets
-/// none, so a row in `pg_stat_activity` names the broker. A fixed name, because the
-/// pool opens its connections before the builder sets the cluster and node, and
-/// `client_addr` and `pid` already tell the brokers of one database apart.
-const DEFAULT_APPLICATION_NAME: &str = "nisshi";
+/// The start of the `application_name` of the broker's connections when the storage URL sets
+/// none, so that `application_name LIKE 'nisshi%'` finds every Nisshi connection in
+/// `pg_stat_activity`. [`application_name`] adds the node and the cluster.
+const APPLICATION_NAME_PREFIX: &str = "nisshi";
+
+/// The longest `application_name` that the server keeps. It cuts a longer name to
+/// `NAMEDATALEN - 1`, which is 63 bytes, without an error.
+const APPLICATION_NAME_MAX_LEN: usize = 63;
+
+/// The `application_name` of the broker's connections when the storage URL sets none:
+/// `nisshi-<node>-<cluster>`. A row in `pg_stat_activity` then names the broker's node and
+/// the cluster, which tells apart the clusters that share a database even where a pooler or
+/// proxy hides `client_addr`. Every broker has the same node today, so two brokers of one
+/// cluster get one name, and an operator who needs more sets `application_name` in the URL.
+///
+/// A character of the cluster that is not an ASCII letter, digit, `.`, `_` or `-` becomes `_`,
+/// because the server replaces a byte outside printable ASCII with `?` and a name with a space
+/// or a quote is hard to filter on. The node comes first and the cluster is cut at
+/// [`APPLICATION_NAME_MAX_LEN`], so the cut never removes the node.
+fn application_name(cluster: &str, node: i32) -> String {
+    let mut name = format!("{APPLICATION_NAME_PREFIX}-{node}-");
+
+    name.extend(
+        cluster
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(APPLICATION_NAME_MAX_LEN.saturating_sub(name.len())),
+    );
+
+    name
+}
 
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
@@ -575,7 +673,7 @@ fn take_pool_max_size(config: &mut String) -> Result<usize> {
     Ok(pool_max_size)
 }
 
-impl<C, N> FromStr for Builder<C, N, Url, Pool>
+impl<C, N> FromStr for Builder<C, N, Url, PoolParts>
 where
     C: Default,
     N: Default,
@@ -603,16 +701,11 @@ where
         // An operator's own `application_name` wins over the default, whether it is in the URL
         // or in `options`. The server applies a named `application_name` after `options`, so a
         // default set here would override one that only `options` sets.
-        if pg_config.get_application_name().is_none() && !options_set_application_name(&options) {
-            _ = pg_config.application_name(DEFAULT_APPLICATION_NAME);
-        }
+        let named_by_operator =
+            pg_config.get_application_name().is_some() || options_set_application_name(&options);
 
         _ = pg_config.options(options);
         _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
-
-        let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        };
 
         let root_store = {
             let mut roots = rustls::RootCertStore::empty();
@@ -630,32 +723,40 @@ where
         .map(|config| config.with_no_client_auth())?;
 
         let tls = MakeRustlsConnect::new(config);
+
+        // The cluster and the node are not known here, so this pool carries the plain prefix as
+        // its name. `Builder::build` opens the pool that names them.
+        let mut default_config = pg_config.clone();
+
+        if !named_by_operator {
+            _ = default_config.application_name(APPLICATION_NAME_PREFIX);
+        }
+
         let cancel = Some(CancelRequests {
-            config: pg_config.clone(),
+            config: default_config.clone(),
             tls: tls.clone(),
         });
 
-        let mgr = Manager::from_config(pg_config, tls, mgr_config);
+        let pool = PoolParts::open(default_config, tls.clone(), pool_max_size)?;
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
-        Pool::builder(mgr)
-            .max_size(pool_max_size)
-            .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
-            .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
-            .build()
-            .map(|pool| Self {
+        Ok(Self {
+            pool: PoolParts {
+                config: pg_config,
+                tls,
+                pool_max_size,
+                named_by_operator,
                 pool,
-                read_limits,
-                cancel,
-                abandoned_statement_bound,
-                advertised_listener,
-                node: N::default(),
-                cluster: C::default(),
-                schemas: None,
-                lake: None,
-            })
-            .map_err(Into::into)
+            },
+            read_limits,
+            cancel,
+            abandoned_statement_bound,
+            advertised_listener,
+            node: N::default(),
+            cluster: C::default(),
+            schemas: None,
+            lake: None,
+        })
     }
 }
 
@@ -1279,7 +1380,7 @@ impl Postgres {
 
     pub fn builder(
         connection: &str,
-    ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
+    ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, PoolParts>> {
         // Do not log `connection` here: it is the raw, unparsed connection
         // string (e.g. `postgres://user:password@host/db`) and would leak
         // the password in plaintext. `Builder::from_str` below logs the
@@ -5880,23 +5981,62 @@ mod tests {
         );
     }
 
-    /// Every connection of the pool is named in `pg_stat_activity`, and a
-    /// name that the operator sets, in the URL or in `options`, wins.
+    /// The name has the node first and the cluster after it.
+    #[test]
+    fn application_name_names_the_node_then_the_cluster() {
+        assert_eq!(
+            "nisshi-111-cluster.a_b-c",
+            application_name("cluster.a_b-c", 111)
+        );
+        assert_eq!("nisshi--1-c", application_name("c", -1));
+    }
+
+    /// A character that the server would turn into `?`, or that a filter would
+    /// have to quote, becomes `_`.
+    #[test]
+    fn application_name_replaces_characters_a_filter_cannot_use() {
+        assert_eq!(
+            "nisshi-1-a_b_c_d_e_",
+            application_name("a b'c\"d\u{e9}e\n", 1)
+        );
+    }
+
+    /// The server keeps 63 bytes of a name. A cluster that is longer is cut,
+    /// and the node, which comes first, stays.
+    #[test]
+    fn application_name_is_cut_at_the_servers_limit_and_keeps_the_node() {
+        let name = application_name(&"c".repeat(200), i32::MAX);
+
+        assert_eq!(APPLICATION_NAME_MAX_LEN, name.len());
+        assert!(
+            name.starts_with(&format!("nisshi-{}-c", i32::MAX)),
+            "{name}"
+        );
+
+        let exact = application_name(&"c".repeat(APPLICATION_NAME_MAX_LEN), 1);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, exact.len());
+    }
+
+    /// Reads the `application_name` that the server shows for the connection of
+    /// `storage`.
+    async fn connection_name(storage: &Postgres) -> Result<String> {
+        let connection = storage.connection().await?;
+
+        connection
+            .query_one(
+                "select application_name from pg_stat_activity where pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map(|row| row.get::<_, String>(0))
+            .map_err(Into::into)
+    }
+
+    /// Every connection of the pool is named in `pg_stat_activity` by its node
+    /// and cluster, and a name that the operator sets, in the URL or in
+    /// `options`, wins.
     #[tokio::test]
     async fn connections_are_named_in_pg_stat_activity() -> Result<()> {
-        let cases = [
-            ("", "nisshi"),
-            ("?application_name=from_url", "from_url"),
-            (
-                "?options=-c%20application_name%3Dfrom_options",
-                "from_options",
-            ),
-            (
-                "?options=-c%20application-name%3Dfrom_dashes",
-                "from_dashes",
-            ),
-        ];
-
         // Only an unreachable database skips the test. A case that fails to connect after
         // this probe did is a regression of the `options` merge, so it fails the test.
         let probe = Postgres::builder(&CONNECTION)?
@@ -5909,23 +6049,74 @@ mod tests {
             return Ok(());
         }
 
+        let cluster = alphanumeric_string(15);
+        let node = rng().random_range(0..i32::MAX);
+
+        let cases = [
+            ("", format!("nisshi-{node}-{cluster}")),
+            ("?application_name=from_url", "from_url".to_owned()),
+            (
+                "?options=-c%20application_name%3Dfrom_options",
+                "from_options".to_owned(),
+            ),
+            (
+                "?options=-c%20application-name%3Dfrom_dashes",
+                "from_dashes".to_owned(),
+            ),
+        ];
+
         for (query, expected) in cases {
             let storage = Postgres::builder(&format!("{}{query}", *CONNECTION))?
-                .cluster(alphanumeric_string(15))
-                .node(rng().random_range(0..i32::MAX))
+                .cluster(cluster.clone())
+                .node(node)
                 .build();
 
-            let connection = storage.connection().await?;
-
-            let row = connection
-                .query_one(
-                    "select application_name from pg_stat_activity where pid = pg_backend_pid()",
-                    &[],
-                )
-                .await?;
-
-            assert_eq!(expected, row.get::<_, &str>(0), "for {query:?}");
+            assert_eq!(expected, connection_name(&storage).await?, "for {query:?}");
         }
+
+        Ok(())
+    }
+
+    /// Brokers of one database that differ in node or in cluster show
+    /// different names, and the name stays within what the server keeps, so
+    /// the server shows exactly the name that was set.
+    #[tokio::test]
+    async fn brokers_are_told_apart_in_pg_stat_activity() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let brokers = [
+            (cluster.clone(), 1),
+            (cluster.clone(), 2),
+            (alphanumeric_string(15), 1),
+            ("c".repeat(200), i32::MAX),
+        ];
+
+        let mut names = Vec::new();
+
+        for (cluster, node) in brokers {
+            let storage = Postgres::builder(&CONNECTION)?
+                .cluster(cluster)
+                .node(node)
+                .build();
+
+            let name = match connection_name(&storage).await {
+                Ok(name) => name,
+                Err(err) => {
+                    eprintln!("skipping brokers_are_told_apart_in_pg_stat_activity: {err:?}");
+                    return Ok(());
+                }
+            };
+
+            assert!(name.starts_with("nisshi-"), "{name}");
+            assert!(name.len() <= APPLICATION_NAME_MAX_LEN, "{name}");
+            names.push(name);
+        }
+
+        let distinct = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), distinct.len(), "{names:?}");
+        assert_eq!(format!("nisshi-1-{cluster}"), names[0]);
+        assert_eq!(format!("nisshi-2-{cluster}"), names[1]);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, names[3].len());
 
         Ok(())
     }
@@ -5985,7 +6176,7 @@ mod tests {
     fn pool_builds_with_configured_timeouts() -> Result<()> {
         let builder = Postgres::builder(&CONNECTION)?;
 
-        let timeouts = builder.pool.timeouts();
+        let timeouts = builder.pool.pool.timeouts();
         assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
         assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
 
