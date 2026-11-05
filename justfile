@@ -500,7 +500,7 @@ cat-consume topic:
     target/debug/nisshi cat consume {{ topic }} --max-wait-time-ms=5000
 
 generator topic *args:
-    target/debug/nisshi generator {{ args }} {{ topic }} 2>&1 >generator.log
+    target/debug/nisshi generator {{ args }} {{ topic }} >generator.log 2>&1
 
 duckdb-k-unnest-v-parquet topic:
     duckdb -init etc/duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"

@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::{self, Write};
+
 use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, NULL_TOPIC_ID,
-    delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
+    delete_topics_request::DeleteTopicState,
 };
 use tracing::debug;
 use url::Url;
 
-use crate::{Error, Result, Topic};
+use crate::{Error, Format, Result, Topic};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N> {
     broker: B,
     security: Security,
     name: N,
+    format: Format,
 }
 
 impl<B, N> Builder<B, N> {
@@ -40,7 +43,13 @@ impl<B, N> Builder<B, N> {
             broker,
             security: self.security,
             name: self.name,
+            format: self.format,
         }
+    }
+
+    /// How the result is printed, by default nothing.
+    pub fn format(self, format: Format) -> Self {
+        Self { format, ..self }
     }
 
     pub fn name(self, name: impl Into<String>) -> Builder<B, String> {
@@ -48,6 +57,7 @@ impl<B, N> Builder<B, N> {
             broker: self.broker,
             security: self.security,
             name: name.into(),
+            format: self.format,
         }
     }
 }
@@ -58,6 +68,7 @@ impl Builder<Url, String> {
             broker: self.broker,
             security: self.security,
             name: self.name,
+            format: self.format,
         })
     }
 }
@@ -67,6 +78,7 @@ pub struct Configuration {
     broker: Url,
     security: Security,
     name: String,
+    format: Format,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -112,10 +124,22 @@ impl Delete {
         let responses = responses.unwrap_or_default();
         assert_eq!(1, responses.len());
 
-        let DeletableTopicResult { error_code, .. } = responses.first().ok_or_else(|| {
+        let result = responses.first().ok_or_else(|| {
             Error::Message(format!("expected exactly one response: {responses:?}"))
         })?;
 
-        ErrorCode::try_from(error_code).map_err(Into::into)
+        let error_code = ErrorCode::try_from(result.error_code)?;
+
+        // The table format prints nothing, as it always has. The JSON array is the one result
+        // as the broker sent it, printed whether or not it carries an error code, so a script
+        // reads both the code and the exit status.
+        if self.configuration.format == Format::Json {
+            // The broker has already acted, so a failure to print, such as a closed pipe, is
+            // ignored: a non-zero exit would send a caller that retries into "unknown topic".
+            _ = writeln!(io::stdout(), "{}", serde_json::to_string(&[result])?)
+                .inspect_err(|error| debug!(?error));
+        }
+
+        Ok(error_code)
     }
 }

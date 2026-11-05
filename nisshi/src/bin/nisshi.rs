@@ -15,7 +15,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Outcome};
+use nisshi_cli::{Cli, ExitStatus, Outcome};
+use nisshi_client::FailureKind;
 use nisshi_sans_io::ErrorCode;
 use std::{
     io,
@@ -36,9 +37,63 @@ const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
 
 /// Returns the error message for a command whose Kafka client failed. `broker_option` names
 /// the option and the environment variable that give the command its broker.
+///
+/// The match on [`nisshi_client::FailureKind`] is the one that `ExitStatus::of_client_error` makes,
+/// so the message and the exit status of a failure agree.
 fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
+    let failed = || format!("The request to the broker failed: {error}");
+
+    match error.failure_kind() {
+        FailureKind::Options => match error {
+            nisshi_client::Error::TlsConfiguration(reason) => format!(
+                "The TLS options can't be used: {reason}. Check --tls-ca-file, --tls-cert-file, \
+                --tls-key-file and --tls-server-name."
+            ),
+            _ => failed(),
+        },
+        // The pool wraps the failure of an attempt to open a connection, including an address
+        // that does not resolve.
+        FailureKind::Unreachable => {
+            let cause = match error {
+                nisshi_client::Error::Pool(cause) => cause.to_string(),
+                error => error.to_string(),
+            };
+
+            format!(
+                "Could not connect to the broker: {cause}. Check that it is running (nisshi \
+                broker) and that {broker_option} points at it."
+            )
+        }
+        FailureKind::Refused => refusal_message(error, broker_option).unwrap_or_else(failed),
+        // A broker that serves only TLS, or that requires authentication, accepts the connection
+        // and then closes it when the plaintext request arrives. The same broker closes a
+        // connection that it restarted or lost.
+        FailureKind::Closed => error.io_error().map_or_else(failed, |cause| {
+            format!(
+                "Connected to the broker, but it closed the connection: {cause}. Without \
+                --tls (or another --tls-* option) this command connects in plaintext, so it \
+                can't use a broker that serves only TLS (--cert and --key). Without \
+                --sasl-username it does not log in, so it can't use a broker that requires \
+                authentication (--authentication). A broker that restarted also closes its \
+                connections. The broker may have applied the request, so check before you retry."
+            )
+        }),
+        FailureKind::TimedOut => match error {
+            nisshi_client::Error::Timeout(deadline) => format!(
+                "The broker did not answer within {deadline:?}. The command connected and sent \
+                its request, so the broker may have applied it: check before you retry."
+            ),
+            _ => failed(),
+        },
+        FailureKind::Other => failed(),
+    }
+}
+
+/// Returns the error message for a TLS connection or a login that was refused, or for a SCRAM
+/// login that the client refused, or `None` when `error` is none of those.
+fn refusal_message(error: &nisshi_client::Error, broker_option: &str) -> Option<String> {
     if let Some((iterations, accepted)) = error.scram_iterations() {
-        return format!(
+        return Some(format!(
             "The client refused the SCRAM login: the broker asked for {iterations} iterations, \
             and the client accepts {} to {}. Kafka's own client refuses fewer than {}. Recreate \
             the user's credential with `nisshi user create --iterations` set within that range \
@@ -47,58 +102,37 @@ fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> St
             accepted.start(),
             accepted.end(),
             accepted.start()
-        );
+        ));
     }
 
     if let Some(rejection) = error.tls_rejection() {
-        return tls_rejection_message(rejection);
+        return Some(tls_rejection_message(rejection));
     }
 
-    match error {
-        _ if error.sasl_not_used() => format!(
+    if error.sasl_not_used() {
+        return Some(format!(
             "The broker's listener does not use SASL, so the command must not log in: it is a \
             PLAINTEXT or SSL listener, or a Nisshi broker started without --authentication. \
             Remove --sasl-username (and unset a stray SASL_USERNAME), or point {broker_option} \
             at the broker's SASL listener."
-        ),
-        _ if error.login_failure().is_some() => format!(
-            "The broker refused the login: {}. Check --sasl-username, the password in \
-            SASL_PASSWORD (or --sasl-password-file) and --sasl-mechanism.",
-            error.login_failure().unwrap_or_default()
-        ),
-        nisshi_client::Error::TlsConfiguration(reason) => format!(
-            "The TLS options can't be used: {reason}. Check --tls-ca-file, --tls-cert-file, \
-            --tls-key-file and --tls-server-name."
-        ),
-        _ if error.tls_failure().is_some() => format!(
-            "The TLS handshake with the broker failed: {}. Without --tls the command connects \
-            in plaintext. With it, add --tls-ca-file for a broker certificate that the system \
-            doesn't trust, and --tls-server-name (or --tls-no-hostname-check) when the \
-            certificate is for another name.",
-            error.tls_failure().unwrap_or_default()
-        ),
-        nisshi_client::Error::Pool(cause) if error.is_connect_failure() => format!(
-            "Could not connect to the broker: {cause}. Check that it is running (nisshi broker) \
-            and that {broker_option} points at it."
-        ),
-        // A broker that serves only TLS, or that requires authentication, accepts the connection
-        // and then closes it when the plaintext request arrives.
-        nisshi_client::Error::Io(cause)
-            if matches!(
-                cause.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            format!(
-                "Connected to the broker, but it closed the connection: {cause}. Without \
-                --tls (or another --tls-* option) this command connects in plaintext, so it \
-                can't use a broker that serves only TLS (--cert and --key). Without \
-                --sasl-username it does not log in, so it can't use a broker that requires \
-                authentication (--authentication)."
-            )
-        }
-        _ => format!("The request to the broker failed: {error}"),
+        ));
     }
+
+    if let Some(reason) = error.login_failure() {
+        return Some(format!(
+            "The broker refused the login: {reason}. Check --sasl-username, the password in \
+            SASL_PASSWORD (or --sasl-password-file) and --sasl-mechanism."
+        ));
+    }
+
+    error.tls_failure().map(|reason| {
+        format!(
+            "The TLS handshake with the broker failed: {reason}. Without --tls the command \
+            connects in plaintext. With it, add --tls-ca-file for a broker certificate that the \
+            system doesn't trust, and --tls-server-name (or --tls-no-hostname-check) when the \
+            certificate is for another name."
+        )
+    })
 }
 
 /// Returns the error message for a TLS alert that rejected the connection.
@@ -215,16 +249,31 @@ fn invalid_storage_option_value_message(
     format!("storage option {option}={value} is not valid for the {scheme} engine: give {expected}")
 }
 
-/// Runs the command, and exits with failure when it returns an error or a Kafka error code.
+/// Runs the command. A client tool exits with the [`ExitStatus`] that names how it ended:
+/// failure when it returns an error that no other status names, and refused when it returns a
+/// Kafka error code. `nisshi broker` and `nisshi proxy` are servers, not scripted tools: they
+/// exit with 0, or with 1 for any failure, as they always have.
 ///
-/// `main` reports an error and then returns [`ExitCode::FAILURE`], instead of returning the
-/// error, because Rust prints the `Debug` form of an error that `main` returns, after the
-/// message that this function has already reported.
+/// `main` reports an error and then returns an exit code, instead of returning the error,
+/// because Rust prints the `Debug` form of an error that `main` returns, after the message that
+/// this function has already reported.
 #[tokio::main]
 async fn main() -> ExitCode {
     _ = dotenv().ok();
 
-    let _guard = match otel::init(TracingFormat::Text) {
+    // Parse before logging starts, so that the command says where its log lines go: a client
+    // tool prints its result on stdout, so its log lines go to stderr, where a script that
+    // parses `--output json` does not read them. The broker and the proxy log to stdout.
+    let cli = Cli::from_command_line();
+    let client_tool = cli.is_client_tool();
+
+    let init = if client_tool {
+        otel::init_stderr
+    } else {
+        otel::init
+    };
+
+    let _guard = match init(TracingFormat::Text) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("Error: {err:?}");
@@ -232,7 +281,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match Cli::run().await {
+    match cli.run().await {
         Ok(outcome) => {
             match outcome {
                 Outcome {
@@ -243,12 +292,21 @@ async fn main() -> ExitCode {
                 _ => error!("{}", outcome.error_code),
             }
 
-            outcome.error_code.report()
+            if client_tool {
+                ExitStatus::of_error_code(outcome.error_code).into()
+            } else {
+                outcome.error_code.report()
+            }
         }
 
         Err(err) => {
             report_error(&err);
-            ExitCode::FAILURE
+
+            if client_tool {
+                ExitStatus::of_error(&err).into()
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -304,6 +362,7 @@ fn report_error(err: &nisshi_cli::Error) {
         nisshi_cli::Error::Client(error) => {
             report_failure!("{}", client_error_message(error, TOPIC_BROKER_OPTION))
         }
+        nisshi_cli::Error::Box(error) => report_failure!("{error}"),
         nisshi_cli::Error::Server(error) => match &**error {
             #[cfg(any(feature = "dynostore", feature = "slatedb"))]
             nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
@@ -563,13 +622,33 @@ mod tests {
         assert!(message.contains("--authentication"), "{message}");
     }
 
+    /// The request was sent before the deadline passed, so the message says that the broker may
+    /// have applied it, and does not say that the broker was unreachable.
     #[test]
-    fn request_failure_after_connecting_is_not_reported_as_a_connect_failure() {
+    fn request_without_an_answer_says_the_broker_may_have_applied_it() {
         let error = nisshi_client::Error::Timeout(Duration::from_secs(30));
 
         assert_eq!(
-            "The request to the broker failed: Timeout(30s)",
+            "The broker did not answer within 30s. The command connected and sent its request, \
+            so the broker may have applied it: check before you retry.",
             client_error_message(&error, BROKER_OPTION)
+        );
+    }
+
+    #[test]
+    fn broker_that_closes_the_connection_says_the_request_may_have_been_applied() {
+        let error =
+            nisshi_client::Error::Io(Arc::new(io::Error::from(io::ErrorKind::ConnectionReset)));
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(
+            message.starts_with("Connected to the broker, but it closed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("may have applied the request, so check before you retry"),
+            "{message}"
         );
     }
 

@@ -107,7 +107,11 @@ impl Arg {
                 .await
                 .map_err(Into::into),
 
-            Command::Consume => todo!(),
+            // Not implemented: a clean failure, with an exit status that a script can read,
+            // instead of a panic.
+            Command::Consume => Err(crate::Error::Box(
+                "perf consume is not implemented: only perf produce is available".into(),
+            )),
         }
     }
 }

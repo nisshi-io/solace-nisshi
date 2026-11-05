@@ -22,12 +22,11 @@ use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     CreateTopicsRequest, CreateTopicsResponse, ErrorCode,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    create_topics_response::CreatableTopicResult,
 };
 use tracing::debug;
 use url::Url;
 
-use crate::{Error, Result};
+use crate::{Error, Format, Result};
 
 use super::Topic;
 
@@ -39,6 +38,7 @@ pub struct Builder<B, N, P> {
     partitions: P,
     configs: HashMap<String, String>,
     confirm: bool,
+    format: Format,
 }
 
 impl<B, N, P> Builder<B, N, P> {
@@ -55,6 +55,7 @@ impl<B, N, P> Builder<B, N, P> {
             partitions: self.partitions,
             configs: self.configs,
             confirm: self.confirm,
+            format: self.format,
         }
     }
 
@@ -66,6 +67,7 @@ impl<B, N, P> Builder<B, N, P> {
             partitions: self.partitions,
             configs: self.configs,
             confirm: self.confirm,
+            format: self.format,
         }
     }
 
@@ -77,11 +79,18 @@ impl<B, N, P> Builder<B, N, P> {
             partitions,
             configs: self.configs,
             confirm: self.confirm,
+            format: self.format,
         }
     }
 
     pub fn config(self, configs: HashMap<String, String>) -> Builder<B, N, P> {
         Self { configs, ..self }
+    }
+
+    /// How the result is printed: `Json` prints it whether or not the broker created the topic,
+    /// and `Table` prints the confirmation line when [`confirm`](Self::confirm) is set.
+    pub fn format(self, format: Format) -> Builder<B, N, P> {
+        Self { format, ..self }
     }
 
     /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
@@ -99,6 +108,7 @@ impl Builder<Url, String, i32> {
             partitions: self.partitions,
             configs: self.configs,
             confirm: self.confirm,
+            format: self.format,
         })
     }
 }
@@ -111,6 +121,7 @@ pub struct Configuration {
     partitions: i32,
     configs: HashMap<String, String>,
     confirm: bool,
+    format: Format,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,17 +181,20 @@ impl Create {
         let topics = topics.unwrap_or_default();
         assert_eq!(1, topics.len());
 
-        let CreatableTopicResult {
-            error_code,
-            num_partitions,
-            ..
-        } = topics
+        let result = topics
             .first()
             .ok_or_else(|| Error::Message(format!("expected exactly one response: {topics:?}")))?;
+        let num_partitions = result.num_partitions;
 
-        let error_code = ErrorCode::try_from(error_code)?;
+        let error_code = ErrorCode::try_from(result.error_code)?;
 
-        if error_code == ErrorCode::None && self.configuration.confirm {
+        if self.configuration.format == Format::Json {
+            // The result as the broker sent it, whether or not it carries an error code, so a
+            // script reads both the code and the exit status. As below, a failure to print is
+            // ignored once the broker has created the topic.
+            _ = writeln!(io::stdout(), "{}", serde_json::to_string(&[result])?)
+                .inspect_err(|error| debug!(?error));
+        } else if error_code == ErrorCode::None && self.configuration.confirm {
             // A response before version 5 omits the partition count, and a request may leave the
             // count to the broker with -1, so the line names the count only when one is positive.
             let partitions = num_partitions

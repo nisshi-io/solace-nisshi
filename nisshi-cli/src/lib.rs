@@ -16,9 +16,11 @@
 use std::{collections::HashMap, env::vars, path::PathBuf, result, str::FromStr};
 
 mod cli;
+mod exit_status;
 mod insecure_tls;
 
 pub use cli::{Cli, Outcome};
+pub use exit_status::ExitStatus;
 use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]
