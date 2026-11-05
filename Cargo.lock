@@ -6209,7 +6209,7 @@ dependencies = [
  "object_store 0.14.2",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
- "ordered-float 5.5.0",
+ "ordered-float 5.5.1",
  "parquet",
  "pretty_assertions",
  "protobuf",
@@ -7036,9 +7036,9 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "5.5.0"
+version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
+checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
 dependencies = [
  "num-traits",
 ]
@@ -9973,7 +9973,7 @@ checksum = "dfadb8526b6da90704feb293b0701a6aae62ea14983143344be2dc5ce30f1d82"
 dependencies = [
  "fnv",
  "nom 7.1.3",
- "ordered-float 5.5.0",
+ "ordered-float 5.5.1",
  "serde",
  "serde_json",
 ]
