@@ -154,6 +154,8 @@ pub struct ReadDeadline {
     timer: Pin<Box<Sleep>>,
     /// Whether a future has started under this deadline.
     started: bool,
+    /// Whether this deadline has counted a miss. A read counts at most one.
+    counted: bool,
 }
 
 impl ReadDeadline {
@@ -167,6 +169,7 @@ impl ReadDeadline {
             deadline,
             timer: Box::pin(sleep_until(deadline)),
             started: false,
+            counted: false,
         }
     }
 
@@ -180,12 +183,12 @@ impl ReadDeadline {
     ///
     /// An engine checks this between steps that the timer can't interrupt, such as a statement
     /// that runs synchronously, and stops the read at the first miss.
-    pub fn continue_reading(&self) -> Result<(), Missed> {
+    pub fn continue_reading(&mut self) -> Result<(), Missed> {
         if !self.has_passed() {
             return Ok(());
         }
 
-        READ_DEADLINE_EXCEEDED.add(1, &Missed::Reading.attributes(self.operation));
+        self.count(Missed::Reading);
         Err(Missed::Reading)
     }
 
@@ -222,7 +225,7 @@ impl ReadDeadline {
                 .map_or(Missed::Reading, Missed::Queued),
         };
 
-        READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(self.operation));
+        self.count(missed);
         Err(missed)
     }
 
@@ -239,20 +242,31 @@ impl ReadDeadline {
         Ok(future.await)
     }
 
-    /// Returns [`Missed::NotStarted`] if the deadline has passed. It counts the miss only when no
-    /// future has started under this deadline. Once one has, the read is under way, and a later
-    /// step that the deadline keeps from starting is not counted again.
+    /// Returns [`Missed::NotStarted`] if the deadline has passed. If the deadline keeps the first
+    /// step of a read from starting, the read counts as `not_started`. If the deadline stops a read
+    /// before a later step, the read counts as `reading`, because it was under way.
     fn check_start(&mut self) -> Result<(), Missed> {
         if !self.has_passed() {
             self.started = true;
             return Ok(());
         }
 
-        if !self.started {
-            READ_DEADLINE_EXCEEDED.add(1, &Missed::NotStarted.attributes(self.operation));
-        }
+        self.count(if self.started {
+            Missed::Reading
+        } else {
+            Missed::NotStarted
+        });
 
         Err(Missed::NotStarted)
+    }
+
+    /// Counts `missed` in the `nisshi_storage_read_deadline_exceeded` counter, unless this deadline
+    /// has counted a miss already.
+    fn count(&mut self, missed: Missed) {
+        if !self.counted {
+            self.counted = true;
+            READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(self.operation));
+        }
     }
 }
 
@@ -564,11 +578,10 @@ mod tests {
         );
     }
 
-    /// A future that the deadline keeps from starting counts as `not_started` only when no future
-    /// has started under the deadline. Once one has, the read is under way, and a later step that
-    /// the deadline keeps from starting is not counted again.
+    /// If its deadline keeps a read from starting a later step, the read counts once, as
+    /// `reading`, because it was under way.
     #[tokio::test(start_paused = true)]
-    async fn counts_not_started_only_before_any_future_started() {
+    async fn counts_a_read_stopped_before_a_later_step_once_as_reading() {
         let (provider, exporter) = install_exporter();
 
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
@@ -578,24 +591,27 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
 
         assert_eq!(Err(Missed::NotStarted), deadline.timeout(async {}).await);
+        assert_eq!(Err(Missed::NotStarted), deadline.timeout(async {}).await);
 
         provider.force_flush().expect("flush");
 
+        assert_eq!(1, exceeded(&exporter, &[("stage", "reading")]));
         assert_eq!(0, exceeded(&exporter, &[("stage", "not_started")]));
     }
 
-    /// A read that an engine stops between steps, once its deadline has passed, counts as
-    /// `reading`.
+    /// If an engine stops a read between steps after its deadline has passed, the read counts
+    /// once, as `reading`.
     #[tokio::test(start_paused = true)]
     async fn counts_a_read_stopped_between_steps() {
         let (provider, exporter) = install_exporter();
 
-        let deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
+        let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
         assert_eq!(Ok(()), deadline.continue_reading());
 
         tokio::time::advance(Duration::from_secs(1)).await;
 
+        assert_eq!(Err(Missed::Reading), deadline.continue_reading());
         assert_eq!(Err(Missed::Reading), deadline.continue_reading());
 
         provider.force_flush().expect("flush");
