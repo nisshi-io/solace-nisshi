@@ -5897,19 +5897,25 @@ mod tests {
             ),
         ];
 
+        // Only an unreachable database skips the test. A case that fails to connect after
+        // this probe did is a regression of the `options` merge, so it fails the test.
+        let probe = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15))
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = probe.connection().await {
+            eprintln!("skipping connections_are_named_in_pg_stat_activity: {err:?}");
+            return Ok(());
+        }
+
         for (query, expected) in cases {
             let storage = Postgres::builder(&format!("{}{query}", *CONNECTION))?
                 .cluster(alphanumeric_string(15))
                 .node(rng().random_range(0..i32::MAX))
                 .build();
 
-            let connection = match storage.connection().await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    eprintln!("skipping connections_are_named_in_pg_stat_activity: {err:?}");
-                    return Ok(());
-                }
-            };
+            let connection = storage.connection().await?;
 
             let row = connection
                 .query_one(
