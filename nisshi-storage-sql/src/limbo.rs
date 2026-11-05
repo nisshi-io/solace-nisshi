@@ -4803,6 +4803,44 @@ mod tests {
         Ok(())
     }
 
+    /// The keyed statement limits the rows that match the key, not the rows that it passes over.
+    /// A limit on the rows passed over could return an empty read while matching records remain,
+    /// and the fetch service takes an empty read as caught up. With 10 records under another key
+    /// and then 5 under `k`, a limit of 4 returns the first 4 records under `k`.
+    #[tokio::test]
+    async fn fetch_keyed_limit_counts_only_matching_rows() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        for offset in 0..15 {
+            let key: &[u8] = if offset < 10 { b"x" } else { b"k" };
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, ?2)",
+                    (offset, Value::Blob(key.to_vec())),
+                )
+                .await?;
+        }
+
+        assert_eq!(
+            vec![10, 11, 12, 13],
+            fetched_offsets_limited(
+                &connection,
+                "record_fetch_keyed.sql",
+                Some(b"k"),
+                1 << 20,
+                15,
+                4
+            )
+            .await?
+        );
+
+        Ok(())
+    }
+
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
     /// first row. Returns whether it returned a row.
     async fn insert_returning(

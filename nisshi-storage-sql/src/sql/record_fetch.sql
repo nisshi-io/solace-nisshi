@@ -107,8 +107,8 @@ candidates c) sized_rows)
 -- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
 -- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
 -- does not know about batches or about the other partitions of the fetch. The query finds the
--- first row by its ordinal, not by a running total equal to its own size, because a later
--- row can have the same size as the first.
+-- first row by its ordinal, so that finding it does not depend on every record having a
+-- non-zero size.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441

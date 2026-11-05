@@ -109,8 +109,8 @@ candidates)
 -- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
 -- does not know about batches or about the other partitions of the fetch.
 --
--- The query finds the first row by its ordinal, not by a running total equal to its own size,
--- because a later row can have the same size as the first. It does not compare offset_id
+-- The query finds the first row by its ordinal, so that finding it does not depend on every
+-- record having a non-zero size. It does not compare offset_id
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
 --
