@@ -284,7 +284,7 @@ impl<G> Drop for QueueGuard<G> {
         // Kafka differs: once its socket server has read a request it mutes the connection until
         // the response is sent, and the request handler appends the records whatever the client
         // does after
-        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1165-L1166,
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1163-L1165,
         // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L736-L747).
         // So this is a deliberate difference: we trade a write that no one is told about for no
         // duplicate.
