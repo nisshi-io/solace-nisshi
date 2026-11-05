@@ -1,3 +1,7 @@
+---
+paths:
+  - "**/*.rs"
+---
 ## Testable Design
 
 A test checks the code that production runs, through the interface that production code calls.
@@ -23,9 +27,14 @@ changes.
   A test installs an in-memory exporter as that provider, before the code creates its first
   instrument, and reads what the code exported. nextest runs each test in a process of its own,
   so the provider belongs to that test.
-- **Control time with Tokio's paused clock,** not with a clock parameter.
-  `#[tokio::test(start_paused = true)]` and `tokio::time::advance` move the time that
-  `Instant::now` and timers read.
+- **Control monotonic time with Tokio's paused clock.** `#[tokio::test(start_paused = true)]` and
+  `tokio::time::advance` move `tokio::time::Instant` and Tokio's timers, so code that measures
+  elapsed time or waits for a deadline reads `tokio::time::Instant`, not `std::time::Instant`.
+  The paused clock doesn't move `SystemTime`, so code that depends on wall-clock time takes `now`
+  as a parameter, which production passes anew on every call.
+- **Give a test what the code needs, at the narrowest point.** When a test runs where the code's
+  environment is missing, provide that environment around the calls that need it, instead of
+  changing the code to run without it.
 - **Keep test helpers in test code.** A helper that builds a fixture or reads a result lives in
   the `tests` module or under `tests/`, never in the item's `impl`.
 - **When a test needs a hook, change the design.** A hook usually points at a value that the
