@@ -20,6 +20,7 @@ nisshi-service.workspace = true
 
 [dev-dependencies]
 arbitrary.workspace = true
+nisshi-broker.workspace = true
 nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
 nisshi-storage.workspace = true
 nisshi-storage-dynostore.workspace = true

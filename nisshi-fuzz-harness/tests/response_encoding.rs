@@ -30,11 +30,19 @@
 //! and a field that only a success path fills is checked only where a request happens to succeed.
 //! What the test guarantees is one answered request at every version of every route. A route that
 //! needs connection state, the SASL ones, is served with none, so only its refusal is checked.
+//!
+//! The test lives in this crate, which is not published, because it needs the harness and the
+//! broker together, and a test of the broker's own crate that imports the harness would not compile
+//! from the published package.
+
+#![allow(clippy::expect_used)]
 
 use std::{
+    any::Any,
     assert_matches,
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
     time::Duration,
 };
 
@@ -44,15 +52,16 @@ use nisshi_broker::{
     coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
     service::routes,
 };
-use nisshi_fuzz_harness::{check_response_body, pseudo_random_bytes, request_at_version};
+use nisshi_fuzz_harness::{
+    RequestAtVersion, check_response_body, pseudo_random_bytes, request_at_version,
+};
 use nisshi_sans_io::{ApiKey as _, Body, EndTxnRequest, Error, Frame, Header};
 use nisshi_service::routable_range;
-use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, TopicCreationConfig};
+use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, StorageContainer, TopicCreationConfig};
+use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use tokio::time::timeout;
 use url::Url;
-
-use crate::common::{StorageType, storage_container};
 
 /// The requests of each API that are served at each of its versions. The harness's own tests use
 /// 200 for each version of one API, and this serves every API, so it is smaller.
@@ -69,11 +78,13 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(24 * 60 * 60);
 fn unanswered() -> BTreeMap<i16, &'static str> {
     BTreeMap::from([(
         EndTxnRequest::KEY,
-        // Transactions are out of scope for Nisshi, so nobody fixes or tracks anything here. A
-        // random transactional ID is never one that `InitProducerId` registered, so the storage
-        // refuses every request with `TransactionalIdNotFound`, and the route closes the
-        // connection instead of answering.
-        "transactions are out of scope: the route fails every request for an unknown transactional ID",
+        // A random transactional ID is never one that `InitProducerId` registered, and
+        // `InitProducerId` refuses every transactional ID, so this test cannot register one. The
+        // storage refuses every request with `TransactionalIdNotFound`, and the route closes the
+        // connection. Kafka 3.9.1 answers an unknown transactional ID with
+        // `INVALID_PRODUCER_ID_MAPPING` in the response:
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L511-L513
+        "the route closes the connection for an unknown transactional ID, where Kafka answers INVALID_PRODUCER_ID_MAPPING",
     )])
 }
 
@@ -112,19 +123,71 @@ fn requests(api_keys: &[i16]) -> BTreeMap<i16, Vec<Body>> {
     found
 }
 
+/// What became of the requests served at one version of one API.
+#[derive(Debug, Default)]
+struct Tally {
+    /// Requests that the encoder refused at this version, so that none was served, and the first
+    /// field that it refused.
+    no_encoding: usize,
+    first_refused_field: Option<String>,
+
+    /// Requests that the route failed, which closes the connection, and the first error.
+    route_failed: usize,
+    first_route_error: Option<String>,
+
+    /// Requests that the route did not answer within [`ANSWER_WITHIN`].
+    timed_out: usize,
+
+    /// Requests that the route answered.
+    answered: usize,
+}
+
+impl Tally {
+    fn describe(&self) -> String {
+        format!(
+            "answered {}, no encoding {} (first field: {}), route failed {} (first error: {}), timed out {}",
+            self.answered,
+            self.no_encoding,
+            self.first_refused_field.as_deref().unwrap_or("none"),
+            self.route_failed,
+            self.first_route_error.as_deref().unwrap_or("none"),
+            self.timed_out,
+        )
+    }
+}
+
+/// The message of a panic, whatever its payload: a `String` from a formatted message, a `&str` from
+/// a literal one, or a note that there was none.
+fn panic_message(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+        })
+        .unwrap_or_else(|| String::from("panicked with no message"))
+}
+
+async fn memory_storage() -> ArcDynStorage {
+    let mut builder = StorageContainer::builder()
+        .cluster_id("response-encoding")
+        .node_id(NODE_ID)
+        .advertised_listener(Url::parse("tcp://127.0.0.1:9092").expect("static url"));
+    builder.with_factory(Arc::new(MemoryEngineFactory));
+
+    builder
+        .storage(Url::parse("memory://response-encoding").expect("static url"))
+        .silent(true)
+        .build()
+        .await
+        .expect("in-memory storage always builds")
+}
+
 #[tokio::test(start_paused = true)]
 async fn every_routed_response_encodes_at_every_routed_version() {
-    let listener = Url::parse("tcp://127.0.0.1:9092").unwrap();
-
-    let storage: ArcDynStorage = storage_container(
-        StorageType::InMemory,
-        "response-encoding",
-        NODE_ID,
-        listener,
-        None,
-    )
-    .await
-    .unwrap();
+    let storage = memory_storage().await;
 
     let route = routes(
         Controller::new(storage.clone(), GroupCoordinatorConfig::default()),
@@ -132,25 +195,39 @@ async fn every_routed_response_encodes_at_every_routed_version() {
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
     )
-    .unwrap()
+    .expect("the broker's routes build")
     .build()
-    .unwrap();
+    .expect("the broker's routes build");
 
     let api_keys: Vec<i16> = route.api_keys().collect();
     let requests = requests(&api_keys);
 
     let unanswered = unanswered();
     let mut failures = vec![];
-    let mut served = BTreeMap::<(i16, i16), usize>::new();
+    let mut tallies = BTreeMap::<(i16, i16), Tally>::new();
 
     for api_key in &api_keys {
         let versions = routable_range(*api_key).expect("a routed API has protocol metadata");
 
         for api_version in versions {
+            let tally = tallies.entry((*api_key, api_version)).or_default();
+
             for body in &requests[api_key] {
-                let Some(body) = request_at_version(body.clone(), *api_key, api_version).unwrap()
-                else {
-                    continue;
+                let body = match request_at_version(body.clone(), *api_key, api_version) {
+                    Ok(RequestAtVersion::Encoded(body)) => body,
+
+                    Ok(RequestAtVersion::Refused { field }) => {
+                        tally.no_encoding += 1;
+                        if tally.first_refused_field.is_none() {
+                            tally.first_refused_field = Some(field);
+                        }
+                        continue;
+                    }
+
+                    Err(error) => {
+                        failures.push(format!("{error}"));
+                        continue;
+                    }
                 };
 
                 let frame = Frame {
@@ -166,11 +243,24 @@ async fn every_routed_response_encodes_at_every_routed_version() {
 
                 // A route that fails the request closes the connection, or never answers: there
                 // is no response to encode.
-                let Ok(Ok(answer)) = timeout(ANSWER_WITHIN, route.serve(frame)).await else {
-                    continue;
+                let answer = match timeout(ANSWER_WITHIN, route.serve(frame)).await {
+                    Ok(Ok(answer)) => answer,
+
+                    Ok(Err(error)) => {
+                        tally.route_failed += 1;
+                        if tally.first_route_error.is_none() {
+                            tally.first_route_error = Some(format!("{error:?}"));
+                        }
+                        continue;
+                    }
+
+                    Err(_elapsed) => {
+                        tally.timed_out += 1;
+                        continue;
+                    }
                 };
 
-                *served.entry((*api_key, api_version)).or_default() += 1;
+                tally.answered += 1;
 
                 let encoded = catch_unwind(AssertUnwindSafe(|| {
                     check_response_body(answer.body, *api_key, api_version)
@@ -179,11 +269,10 @@ async fn every_routed_response_encodes_at_every_routed_version() {
                 match encoded {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => failures.push(format!("{error}")),
-                    Err(panic) => {
-                        failures.push(panic.downcast_ref::<String>().cloned().unwrap_or_else(
-                            || format!("api key {api_key} v{api_version}: panicked"),
-                        ))
-                    }
+                    Err(panic) => failures.push(format!(
+                        "api key {api_key} v{api_version}: {}",
+                        panic_message(panic.as_ref())
+                    )),
                 }
             }
         }
@@ -195,26 +284,26 @@ async fn every_routed_response_encodes_at_every_routed_version() {
         failures.join("\n")
     );
 
-    let silent: Vec<String> = api_keys
+    let silent: Vec<String> = tallies
         .iter()
-        .flat_map(|api_key| {
-            routable_range(*api_key)
-                .expect("a routed API has protocol metadata")
-                .map(move |version| (*api_key, version))
+        .filter(|(_, tally)| tally.answered == 0)
+        .filter(|((api_key, _), _)| !unanswered.contains_key(api_key))
+        .map(|((api_key, version), tally)| {
+            format!("api key {api_key} v{version}: {}", tally.describe())
         })
-        .filter(|pair| !served.contains_key(pair))
-        .filter(|(api_key, _)| !unanswered.contains_key(api_key))
-        .map(|(api_key, version)| format!("api key {api_key} v{version}"))
         .collect();
 
     assert!(
         silent.is_empty(),
-        "no request was answered, so no response was checked: {silent:?}"
+        "no request was answered, so no response was checked:\n{}",
+        silent.join("\n")
     );
 
     for (api_key, reason) in &unanswered {
         assert!(
-            !served.keys().any(|(key, _)| key == api_key),
+            !tallies
+                .iter()
+                .any(|((key, _), tally)| key == api_key && tally.answered > 0),
             "api key {api_key} answers now, so remove it from the list of unanswered routes ({reason})"
         );
     }
@@ -236,5 +325,35 @@ fn a_response_that_leaves_a_required_field_unset_fails_the_check() {
             6,
         ),
         Err(Error::Message(message)) if message.contains("protocol_name")
+    );
+}
+
+/// A panic with a literal message has a `&str` payload, and any panic must keep its message.
+#[test]
+fn a_panic_keeps_its_message_whatever_its_payload() {
+    let literal = catch_unwind(|| panic!("a literal message")).unwrap_err();
+    let formatted = catch_unwind(|| panic!("a message with {}", 1)).unwrap_err();
+    let bare = catch_unwind(|| std::panic::panic_any(7_u8)).unwrap_err();
+
+    assert_eq!("a literal message", panic_message(literal.as_ref()));
+    assert_eq!("a message with 1", panic_message(formatted.as_ref()));
+    assert_eq!("panicked with no message", panic_message(bare.as_ref()));
+}
+
+/// A request that no client could send at a version is counted as refused, with the field that the
+/// encoder refused, and not dropped without a trace.
+#[test]
+fn a_request_with_no_encoding_at_a_version_reports_the_field() {
+    use nisshi_sans_io::{MetadataRequest, metadata_request::MetadataRequestTopic};
+
+    // A topic's `Name` is nullable from v10, so a request at v9 that leaves it unset has no
+    // encoding.
+    let request: Body = MetadataRequest::default()
+        .topics(Some(vec![MetadataRequestTopic::default().name(None)]))
+        .into();
+
+    assert_matches!(
+        request_at_version(request, MetadataRequest::KEY, 9),
+        Ok(RequestAtVersion::Refused { field }) if field.contains("name")
     );
 }

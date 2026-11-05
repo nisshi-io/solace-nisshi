@@ -145,18 +145,31 @@ where
     })
 }
 
+/// What [`request_at_version`] made of a request.
+#[derive(Clone, Debug)]
+pub enum RequestAtVersion {
+    /// The request that a client could send: the request encoded and decoded again.
+    Encoded(Body),
+
+    /// The encoder refused the request because it leaves `field` unset, and the field is mandatory
+    /// at the version.
+    Refused { field: String },
+}
+
 /// The request that a client could send as `body` at `api_version`: `body` encoded and decoded
 /// again, for a caller that serves requests and so needs one that has an encoding at that version.
 ///
 /// A fuzzed request is an arbitrary in-memory value, so it may leave a field unset that is
 /// mandatory at `api_version` and nullable only at a later one. No client could send that at this
-/// version, and the encoder refuses it with [`Error::MandatoryFieldUnset`], so the answer is
-/// `None`, whatever the field. [`check_request`] is stricter, and names the fields that it allows.
+/// version, and the encoder refuses it with [`Error::MandatoryFieldUnset`]. [`check_request`]
+/// names the fields that it allows to be refused and fails on any other. This function allows every
+/// field, and returns the field that the encoder refused, so that the caller can count the refusals
+/// and report them.
 pub fn request_at_version(
     body: Body,
     api_key: i16,
     api_version: i16,
-) -> Result<Option<Body>, Error> {
+) -> Result<RequestAtVersion, Error> {
     let header = Header::Request {
         api_key,
         api_version,
@@ -165,12 +178,12 @@ pub fn request_at_version(
     };
 
     match Frame::request(header, body) {
-        Err(Error::MandatoryFieldUnset { .. }) => Ok(None),
+        Err(Error::MandatoryFieldUnset { field, .. }) => Ok(RequestAtVersion::Refused { field }),
         encoded => {
             let encoded = encoded.map_err(|error| at_version(error, api_key, api_version))?;
 
             Frame::request_from_bytes(encoded)
-                .map(|frame| Some(frame.body))
+                .map(|frame| RequestAtVersion::Encoded(frame.body))
                 .map_err(|error| at_version(error, api_key, api_version))
         }
     }

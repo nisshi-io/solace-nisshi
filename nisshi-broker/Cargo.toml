@@ -77,12 +77,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-arbitrary.workspace = true
 crc-fast.workspace = true
-# A path and no version: the harness is `publish = false`, and cargo leaves a dev-dependency with
-# no version out of the published manifest.
-nisshi-fuzz-harness = { path = "../nisshi-fuzz-harness" }
-nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
 nisshi-schema.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
 nisshi-storage-sql = { workspace = true, features = ["test-support"] }

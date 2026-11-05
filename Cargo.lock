@@ -5896,7 +5896,6 @@ name = "nisshi-broker"
 version = "0.8.2"
 dependencies = [
  "anyhow",
- "arbitrary",
  "async-trait",
  "bytes",
  "clap",
@@ -5913,7 +5912,6 @@ dependencies = [
  "jsonschema",
  "libc",
  "nisshi-auth",
- "nisshi-fuzz-harness",
  "nisshi-model",
  "nisshi-otel",
  "nisshi-sans-io",
@@ -6051,6 +6049,7 @@ name = "nisshi-fuzz-harness"
 version = "0.8.2"
 dependencies = [
  "arbitrary",
+ "nisshi-broker",
  "nisshi-sans-io",
  "nisshi-service",
  "nisshi-storage",
