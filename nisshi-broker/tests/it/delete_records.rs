@@ -29,7 +29,7 @@ use nisshi_storage::{
 };
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
@@ -211,6 +211,10 @@ where
     assert_eq!(ErrorCode::None, ErrorCode::try_from(result.error_code)?);
     assert_eq!(cutoff, result.low_watermark);
 
+    // DynoStore deletes the batch objects below the cut in `maintain`, so the
+    // fetch below reads the partition after they are gone.
+    sc.maintain(SystemTime::now()).await?;
+
     let stage = sc.offset_stage(&topition).await?;
     assert_eq!(cutoff, stage.log_start());
     assert_eq!(record_count, stage.high_watermark());
@@ -298,6 +302,11 @@ where
     let result = delete_records_partition(&sc, &topic_name, 0, cutoff).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(result.error_code)?);
     assert_eq!(cutoff, result.low_watermark);
+
+    // DynoStore deletes the batch objects below the cut in `maintain`. Without
+    // this call no object is deleted, and the test passes whatever rule
+    // DynoStore uses to choose the objects.
+    sc.maintain(SystemTime::now()).await?;
 
     let stage = sc.offset_stage(&topition).await?;
     assert_eq!(cutoff, stage.log_start());
@@ -395,6 +404,10 @@ where
     let result = delete_records_partition(&sc, &topic_name, 0, -1).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(result.error_code)?);
     assert_eq!(record_count, result.low_watermark);
+
+    // DynoStore deletes the batch objects below the cut in `maintain`, so the
+    // assertions below see the partition after they are gone.
+    sc.maintain(SystemTime::now()).await?;
 
     let stage = sc.offset_stage(&topition).await?;
     assert_eq!(record_count, stage.log_start());
