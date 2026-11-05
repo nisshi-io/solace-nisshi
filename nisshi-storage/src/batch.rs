@@ -273,12 +273,21 @@ impl<G> Drop for QueueGuard<G> {
         }
 
         // A plain `produce` is dropped the same way, and its request is then never written, where
-        // the next flush of its key would have written it. That is safe because a dropped produce
-        // means that nobody is waiting for the outcome: the broker's request was cancelled (the
-        // client's connection closed), the client never gets an offset for it, and a client that
-        // retries an unacknowledged produce would write the records a second time. Kafka appends a
-        // request that it has read whatever the client does after, so this is a deliberate
-        // difference: we trade a write that no one is told about for no duplicate.
+        // the next flush of its key would have written it. A produce is dropped only when the task
+        // that awaits it is. The connection task serves a request inline and reads nothing from
+        // its socket until the response is written, so a client that closes its connection does
+        // not drop it. What drops it is the listener ending (the accept loop's `JoinSet` aborts
+        // the connection tasks when the loop is cancelled) or an abort of the task. Then no one is
+        // told the outcome, the client never gets an offset for the records, and a client that
+        // retries an unacknowledged produce would write them a second time.
+        //
+        // Kafka differs: once its socket server has read a request it mutes the connection until
+        // the response is sent, and the request handler appends the records whatever the client
+        // does after
+        // (https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1165-L1166,
+        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L736-L747).
+        // So this is a deliberate difference: we trade a write that no one is told about for no
+        // duplicate.
         //
         // Remove only this request. Every non-idempotent producer on a partition shares one key,
         // so removing the key would drop the other producers' requests.
@@ -3804,7 +3813,8 @@ mod tests {
     }
 
     /// A plain `produce` that is dropped while it waits is not written by the next flush of its
-    /// key, and leaves nothing behind. This is deliberate: see the comment on [`QueueGuard`]'s drop.
+    /// key, and leaves nothing behind, while a produce queued after it on the same key is written.
+    /// This is deliberate: see the comment on [`QueueGuard`]'s drop.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_plain_produce_is_not_written() -> Result<()> {
         let recorder = FlightRecorder::new();
@@ -3812,7 +3822,7 @@ mod tests {
             .with_maximum_delay(Some(Duration::from_secs(1)));
         let topition = Topition::new("abc", 0);
 
-        let produce = spawn_produce(
+        let dropped = spawn_produce(
             &batcher,
             &topition,
             batch_of(-1, 0, &Bytes::from_static(b"a"))?,
@@ -3821,13 +3831,38 @@ mod tests {
 
         assert_eq!(1, batcher.requests.lock()?.len());
 
-        produce.abort();
-        _ = produce.await;
+        dropped.abort();
+        _ = dropped.await;
+
+        assert!(batcher.requests.lock()?.is_empty());
+        assert!(batcher.responses.lock()?.is_empty());
+
+        // The aborted produce was the only one that could flush its key, so a flush that writes
+        // what is queued needs another produce on the same key. Without the guard, that flush
+        // would write both requests.
+        let kept = spawn_produce(
+            &batcher,
+            &topition,
+            batch_of(-1, 0, &Bytes::from_static(b"b"))?,
+        );
+        yield_now().await;
 
         advance(Duration::from_secs(5)).await;
         yield_now().await;
 
-        assert_eq!(None, recorder.produced(&topition)?);
+        assert_eq!(0, kept.await.expect("join_handle")?);
+
+        let stored = recorder.produced(&topition)?.unwrap_or_default();
+        assert_eq!(1, stored.len());
+        assert_eq!(
+            vec![Some(Bytes::from_static(b"b"))],
+            stored[0]
+                .records
+                .iter()
+                .map(|record| record.value())
+                .collect::<Vec<_>>()
+        );
+
         assert!(batcher.requests.lock()?.is_empty());
         assert!(batcher.responses.lock()?.is_empty());
 
