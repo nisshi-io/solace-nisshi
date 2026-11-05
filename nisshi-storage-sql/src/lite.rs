@@ -16,10 +16,12 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
-        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+        Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, consumer_group_select,
+        consumer_offset_select, consumer_offset_select_by_group, default_hash,
+        idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, topic_configuration_select, topic_select,
+        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -503,6 +505,87 @@ impl PoolConnection {
             })
     }
 
+    /// Runs `query`, and returns its rows, each read as `T` when the caller reaches it.
+    async fn query_rows<T: QueryRow>(
+        &self,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<QueryRowCursor<Rows, T>> {
+        let query = query.key();
+        let rows = self.query(query, params).await?;
+        QueryRowCursor::new(
+            &ResultColumns::libsql(query, &rows),
+            rows,
+            self.column_error_count(query),
+        )
+    }
+
+    /// Returns the count of `query`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, query: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(&SQL_ERROR, vec![KeyValue::new("key", query.to_owned())])
+    }
+
+    /// Runs `query`, and returns the first row of its result as `T`, or `None` when the result
+    /// has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    #[instrument(skip_all)]
+    async fn query_first<T: QueryRow>(
+        &self,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<Option<T>> {
+        let query = query.key();
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql = query);
+
+        let start = SystemTime::now();
+
+        let statement = self.prepared_statement(query).await?;
+
+        let mut rows = statement
+            .query(params)
+            .await
+            .inspect(|rows| debug!(?rows))
+            .inspect_err(|err| self.record_query_error(query, start, err))?;
+
+        let reader = T::reader(&ResultColumns::libsql(query, &rows))
+            .inspect_err(|err| self.column_error_count(query).record(err))?;
+
+        // libSQL reports an error of the statement's first step from this call, not from
+        // `query`.
+        let row = rows
+            .next()
+            .await
+            .inspect(|row| debug!(?row))
+            .inspect_err(|err| self.record_query_error(query, start, err))?
+            .map(|row| T::read(&reader, &row))
+            .transpose()
+            .inspect_err(|err| self.column_error_count(query).record(err))?;
+
+        let attributes = [KeyValue::new("sql", query.to_owned())];
+
+        SQL_DURATION.record(elapsed_millis(start), &attributes);
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok(row)
+    }
+
+    /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
+    ///
+    /// A unique-constraint violation is logged at debug level and not counted, because some
+    /// callers expect one, as a topic insert does for an existing topic.
+    fn record_query_error(&self, query: &str, start: SystemTime, err: &libsql::Error) {
+        if is_unique_constraint(err) {
+            debug!(?err);
+        } else {
+            error!(?err, elapsed_millis = elapsed_millis(start));
+            SQL_ERROR.add(1, &self.attributes_for_error(Some(query), err)[..]);
+        }
+    }
+
     #[instrument(skip_all)]
     async fn execute<P>(&self, sql: &str, params: P) -> result::Result<usize, libsql::Error>
     where
@@ -756,8 +839,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let mut rows = connection
-            .query(
+        let epochs = connection
+            .query_first(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -766,28 +849,14 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-        let columns = ResultColumns::libsql(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)? as i32;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)? as i32;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)? as i32;
-
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+        if let Some(epochs) = epochs {
             let stored = StoredEpochs {
-                transactional: row
-                    .get::<i32>(transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: i16::try_from(
-                    row.get::<i32>(newest_epoch)
-                        .inspect_err(|err| error!(?err))?,
-                )?,
-                partition: row
-                    .get::<Option<i32>>(partition_epoch)
-                    .inspect_err(|err| error!(?err))?
-                    .map(i16::try_from)
-                    .transpose()?,
+                transactional: epochs.transactional != 0,
+                newest: epochs.newest_epoch,
+                partition: epochs.partition_epoch,
             };
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
@@ -875,8 +944,8 @@ impl Delegate {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
-        let mut rows = connection
-            .query(
+        connection
+            .query_first(
                 watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
@@ -884,27 +953,9 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
-
-        let columns = ResultColumns::libsql(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)? as i32;
-        let high = columns.index(watermark_select_for_write::HIGH)? as i32;
-        let max_message_bytes =
-            columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)? as i32;
-
-        let Some(row) = rows
-            .next()
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        Ok(watermark_select_for_write::Row {
-            low: row.get(low).inspect_err(|err| error!(?err))?,
-            high: row.get(high).inspect_err(|err| error!(?err))?,
-            max_message_bytes: row.get(max_message_bytes).inspect_err(|err| error!(?err))?,
-        })
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     /// Refuses a client's transactional batch for a partition that is not in its producer's
@@ -4274,31 +4325,26 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query("topic_select.sql", (self.cluster.as_str(), name))
+            .query(topic_select::QUERY, (self.cluster.as_str(), name))
             .await?;
 
         if rows.next().await?.is_some() {
             let mut rows = c
-                .query(
-                    "topic_configuration_select.sql",
+                .query_rows(
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
             let mut configs = vec![];
 
-            while let Some(row) = rows.next().await? {
-                let name = row.get_str(0).inspect_err(|err| error!(?err))?;
-                let value = row
-                    .get::<Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
-
+            while let Some(topic_configuration_select::Row { name, value }) =
+                rows.next().await.inspect_err(|err| error!(?err))?
+            {
                 configs.push(
                     DescribeConfigsResourceResult::default()
-                        .name(name.to_owned())
-                        .value(value)
+                        .name(name)
+                        .value(Some(value.unwrap_or_default()))
                         .read_only(false)
                         .is_default(Some(false))
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
@@ -4551,22 +4597,14 @@ impl Storage for Delegate {
         let mut listed_groups = vec![];
 
         let mut rows = c
-            .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
+            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::libsql(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)? as i32;
-        let detail = columns.index(consumer_group_select::DETAIL)? as i32;
+        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_str(name)?.to_owned();
-
-            let stored = row
-                .get::<Option<String>>(detail)
-                .map_err(Error::from)?
-                .map(|detail| serde_json::from_str::<GroupDetail>(&detail));
-
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups).inspect(|_| {

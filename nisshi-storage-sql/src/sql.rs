@@ -12,11 +12,232 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Declares `Row`, one row of a query's result, and `RowReader`, which reads it, in the query's
+/// module. The macro takes one line for each column, such as `low: Option<i64>`: the field and its
+/// type. The field's name is the column's name in the query's result, so a query that needs another
+/// Rust name renames the column with `as`.
+///
+/// `RowReader::new` finds each column's index by its name once, before the first row, and
+/// `RowReader::read_row` reads each row by those indexes through any
+/// [`DriverRow`](driver::DriverRow). Each field's type implements [`FromColumn`](driver::FromColumn).
+/// A read error names the query and the column. The macro implements [`QueryRow`] for `Row`, so
+/// that an engine's query helpers read each row of a result as `Row`.
+macro_rules! sql_row {
+    (
+        $(#[$row_attribute:meta])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute:meta])*
+                $field:ident: $type:ty
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$row_attribute])*
+        pub(crate) struct Row {
+            $(
+                $(#[$field_attribute])*
+                pub(crate) $field: $type,
+            )+
+        }
+
+        /// Reads each [`Row`] of the query's result by the index of each of its columns.
+        #[derive(Clone, Debug)]
+        pub(crate) struct RowReader {
+            query: &'static str,
+            $($field: usize,)+
+        }
+
+        impl RowReader {
+            /// Returns a reader for the result with `columns`, or
+            /// [`Error::MissingColumn`](nisshi_storage::Error::MissingColumn) for the first
+            /// column of [`Row`] that the result does not have.
+            pub(crate) fn new(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<Self> {
+                Ok(Self {
+                    query: columns.query(),
+                    $($field: columns.index(stringify!($field))?,)+
+                })
+            }
+
+            /// Reads `row`, or returns [`Error::UnreadableColumn`](nisshi_storage::Error::UnreadableColumn) for the
+            /// first column that the reader can't read as its field's type.
+            pub(crate) fn read_row<R>(&self, row: &R) -> ::nisshi_storage::Result<Row>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                Ok(Row {
+                    $(
+                        $field: <$type as $crate::sql::driver::FromColumn>::from_column(
+                            row,
+                            self.$field,
+                        )
+                            .map_err(|source| ::nisshi_storage::Error::UnreadableColumn {
+                                query: self.query,
+                                column: stringify!($field),
+                                source: Box::new(source),
+                            })?,
+                    )+
+                })
+            }
+        }
+
+        impl $crate::sql::QueryRow for Row {
+            type Reader = RowReader;
+
+            fn reader(
+                columns: &$crate::sql::result_columns::ResultColumns,
+            ) -> ::nisshi_storage::Result<RowReader> {
+                RowReader::new(columns)
+            }
+
+            fn read<R>(reader: &RowReader, row: &R) -> ::nisshi_storage::Result<Self>
+            where
+                R: $crate::sql::driver::DriverRow,
+            {
+                reader.read_row(row)
+            }
+        }
+    };
+}
+
+/// A query whose result an engine reads as rows of `R`: the query's name in the SQL cache, typed
+/// with its row.
+///
+/// The query's module declares it as `QUERY`, beside the row. An engine's query helpers take a
+/// `Query<T>` and return rows of `T`, so a call site can't pass one query with another query's
+/// row, which compiles and reads the wrong columns when both have columns of the same names.
+pub(crate) struct Query<R> {
+    key: &'static str,
+    row: PhantomData<fn() -> R>,
+}
+
+impl<R> Query<R> {
+    /// Returns the query that the SQL cache holds under `key`.
+    pub(crate) const fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            row: PhantomData,
+        }
+    }
+
+    /// Returns the query's name in the SQL cache.
+    pub(crate) const fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
+// A derive would require `R: Clone` and `R: Copy`, which a row is not.
+impl<R> Clone for Query<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for Query<R> {}
+
+impl<R> fmt::Debug for Query<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Query").field(&self.key).finish()
+    }
+}
+
+/// A row of one query's result, which [`sql_row!`] declares, read by column name. An engine's query
+/// helpers take the row's [`Query`], as in `query_first(topic_select_name::QUERY, params)`, and
+/// return each row read as it.
+pub(crate) trait QueryRow: Sized {
+    /// The reader that finds each column of a result by its name, before the first row.
+    type Reader;
+
+    /// Returns the reader for the result with `columns`.
+    fn reader(columns: &result_columns::ResultColumns) -> Result<Self::Reader>;
+
+    /// Reads `row` with `reader`.
+    fn read<R: driver::DriverRow>(reader: &Self::Reader, row: &R) -> Result<Self>;
+}
+
+/// Returns the kind of `error` when a row reader returned it: `missing_column`,
+/// `duplicate_column` or `unreadable_column`. Returns `None` for any other error.
+///
+/// Each engine counts a column error in its SQL error counter with this kind. The query has run
+/// by then, so the driver reports no error, and a count of the driver's errors alone shows a
+/// query that doesn't match its row, or a corrupt stored row, as healthy.
+pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::MissingColumn { .. } => Some("missing_column"),
+        Error::DuplicateColumn { .. } => Some("duplicate_column"),
+        Error::UnreadableColumn { .. } => Some("unreadable_column"),
+        _ => None,
+    }
+}
+
+/// Counts each column error of one query in an engine's SQL error counter, with the labels that
+/// the engine gives the query and the error's [`column_error_kind`] as `kind`.
+pub(crate) struct ColumnErrorCount {
+    counter: &'static Counter<u64>,
+    attributes: Vec<KeyValue>,
+}
+
+impl ColumnErrorCount {
+    /// Returns a count in `counter`, with the query's labels `attributes`.
+    pub(crate) fn new(counter: &'static Counter<u64>, attributes: Vec<KeyValue>) -> Self {
+        Self {
+            counter,
+            attributes,
+        }
+    }
+
+    /// Counts `error` when a row reader returned it, and ignores any other error.
+    pub(crate) fn record(&self, error: &Error) {
+        if let Some(kind) = column_error_kind(error) {
+            let mut attributes = self.attributes.clone();
+            attributes.push(KeyValue::new("kind", kind));
+            self.counter.add(1, &attributes);
+        }
+    }
+}
+
+/// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
+/// [`QueryRow`], in order. It reads a row only when the caller reaches it.
+pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
+    driver_cursor: R,
+    reader: T::Reader,
+    column_errors: ColumnErrorCount,
+}
+
+impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
+    /// Returns a cursor over the result with `columns`, which reads each row from
+    /// `driver_cursor` and counts each column error in `column_errors`.
+    pub(crate) fn new(
+        columns: &result_columns::ResultColumns,
+        driver_cursor: R,
+        column_errors: ColumnErrorCount,
+    ) -> Result<Self> {
+        let reader = T::reader(columns).inspect_err(|err| column_errors.record(err))?;
+
+        Ok(Self {
+            driver_cursor,
+            reader,
+            column_errors,
+        })
+    }
+
+    /// Returns the next row as `T`, or `None` after the last row.
+    pub(crate) async fn next(&mut self) -> Result<Option<T>> {
+        self.driver_cursor
+            .next()
+            .await?
+            .map(|row| T::read(&self.reader, &row))
+            .transpose()
+            .inspect_err(|err| self.column_errors.record(err))
+    }
+}
+
 pub(crate) mod consumer_group_select;
 pub(crate) mod consumer_offset_select;
 pub(crate) mod consumer_offset_select_by_group;
+pub(crate) mod driver;
 pub(crate) mod producer_epochs_select;
-#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
 pub(crate) mod topic_configuration_select;
 pub(crate) mod topic_configuration_select_keys;
@@ -27,9 +248,12 @@ pub(crate) mod watermark_select_for_write;
 
 use nisshi_sans_io::{ErrorCode, record::deflated};
 use nisshi_storage::{Error, ProduceEpoch, Result, StoredEpochs};
+use opentelemetry::{KeyValue, metrics::Counter};
 use std::{
     cmp::Ordering,
+    fmt,
     hash::{DefaultHasher, Hash, Hasher as _},
+    marker::PhantomData,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -96,7 +320,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/consumer_group_select_by_name.sql"),
         ),
         (
-            consumer_group_select::QUERY,
+            consumer_group_select::QUERY.key(),
             include_sql!("sql/consumer_group_select.sql"),
         ),
         (
@@ -231,7 +455,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/producer_epoch_insert_given.sql"),
         ),
         (
-            producer_epochs_select::QUERY,
+            producer_epochs_select::QUERY.key(),
             include_sql!("sql/producer_epochs_select.sql"),
         ),
         (
@@ -304,7 +528,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/topic_configuration_delete.sql"),
         ),
         (
-            topic_configuration_select::QUERY,
+            topic_configuration_select::QUERY.key(),
             include_sql!("sql/topic_configuration_select.sql"),
         ),
         (
@@ -338,7 +562,7 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("pg/topic_select_uuid.sql"),
         ),
         (
-            topic_configuration_select_keys::QUERY,
+            topic_configuration_select_keys::QUERY.key(),
             include_sql!("pg/topic_configuration_select_keys.sql"),
         ),
         (
@@ -499,11 +723,11 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/watermark_insert.sql"),
         ),
         (
-            watermark_select_for_write::QUERY,
+            watermark_select_for_write::QUERY.key(),
             include_sql!("sql/watermark_select_for_write.sql"),
         ),
         (
-            watermark_select_for_write::LITE_QUERY,
+            watermark_select_for_write::LITE_QUERY.key(),
             include_sql!("lite/watermark_select_for_write.sql"),
         ),
         (
@@ -717,5 +941,35 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Each error that a row reader returns has a kind for the SQL error counters, and a
+    /// driver's error has none, because the engine counts it where the driver returns it.
+    #[test]
+    fn column_error_kind() {
+        assert_eq!(
+            Some("missing_column"),
+            super::column_error_kind(&Error::MissingColumn {
+                query: "q.sql",
+                column: "c",
+                found: vec![],
+            })
+        );
+        assert_eq!(
+            Some("duplicate_column"),
+            super::column_error_kind(&Error::DuplicateColumn {
+                query: "q.sql",
+                column: "c",
+            })
+        );
+        assert_eq!(
+            Some("unreadable_column"),
+            super::column_error_kind(&Error::UnreadableColumn {
+                query: "q.sql",
+                column: "c",
+                source: Box::new(Error::UnexpectedNull),
+            })
+        );
+        assert_eq!(None, super::column_error_kind(&Error::UnexpectedNull));
     }
 }

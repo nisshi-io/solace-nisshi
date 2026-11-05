@@ -19,15 +19,21 @@
 //! The query takes four parameters: `$1` is the cluster's name, `$2` the producer ID, `$3` the
 //! topic's name, and `$4` the partition's index.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "producer_epochs_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("producer_epochs_select.sql");
 
-/// The column that holds the producer's newest epoch.
-pub(crate) const NEWEST_EPOCH: &str = "newest_epoch";
-
-/// The column that holds the producer's newest epoch with a sequence on the partition, or null
-/// when the producer has not written to the partition.
-pub(crate) const PARTITION_EPOCH: &str = "partition_epoch";
-
-/// The column that holds 1 when a transactional ID owns the producer, and 0 otherwise.
-pub(crate) const TRANSACTIONAL: &str = "transactional";
+sql_row! {
+    /// The epochs that a produced batch is checked against.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The producer's newest epoch.
+        newest_epoch: i16,
+        /// The producer's newest epoch with a sequence on the partition, or `None` when the
+        /// producer has not written to the partition.
+        partition_epoch: Option<i16>,
+        /// 1 when a transactional ID owns the producer, and 0 otherwise.
+        transactional: i32,
+    }
+}

@@ -292,6 +292,13 @@ pub enum Error {
 
     ChronoParse(#[from] chrono::ParseError),
 
+    /// The result of `query` has more than one column named `column`, so a reader can't tell which
+    /// one holds the field.
+    DuplicateColumn {
+        query: &'static str,
+        column: &'static str,
+    },
+
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
 
@@ -362,6 +369,15 @@ pub enum Error {
         limit: usize,
     },
     Message(String),
+
+    /// The result of `query` does not have a column named `column`. `found` holds the names it
+    /// has.
+    MissingColumn {
+        query: &'static str,
+        column: &'static str,
+        found: Vec<String>,
+    },
+
     NoSuchEntry {
         nth: u32,
     },
@@ -436,6 +452,18 @@ pub enum Error {
     UnexpectedBody(Box<Body>),
 
     UnexpectedServiceResponse(Box<Response>),
+
+    /// A column that a query's row declares as not null held a null.
+    UnexpectedNull,
+
+    /// The reader of `query`'s result could not read the column `column` of a row as the column's
+    /// declared type. `source` is the error of that read: the driver's error, an integer overflow,
+    /// or [`Error::UnexpectedNull`].
+    UnreadableColumn {
+        query: &'static str,
+        column: &'static str,
+        source: Box<Error>,
+    },
 
     #[cfg(feature = "turso")]
     UnexpectedValue(turso::Value),
