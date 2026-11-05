@@ -3045,6 +3045,40 @@ mod tests {
         Ok(())
     }
 
+    /// If a read runs past its partition deadline, as it does on an engine that ignores its
+    /// deadline, the fetch waits for the read, and answers that partition with the batches that the
+    /// read returned. The fetch skips the partitions after it, because their deadlines have passed
+    /// by then, and answers each of them with no batches and no error.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_overruns_its_deadline_leaves_the_later_partitions_unread() -> Result<()> {
+        // Partition 0's read returns a whole fetch deadline after its own deadline, so it ends
+        // after the fetch deadline.
+        let storage = Partitions::new([
+            (0, vec![Read::Assemble(batch(0, &[0])?, FETCH_DEADLINE)]),
+            (1, vec![Read::Batch(batch(0, &[0])?)]),
+            (2, vec![Read::Batch(batch(0, &[0])?)]),
+        ]);
+
+        let (partitions, elapsed) = fetch(storage.clone(), &[0, 1, 2]).await?;
+
+        assert!(elapsed > FETCH_DEADLINE, "{elapsed:?}");
+        assert_eq!(1, batches(&partitions[0]));
+
+        for partition in [1, 2] {
+            assert!(storage.calls(partition).is_empty(), "partition {partition}");
+
+            let data = &partitions[usize::try_from(partition)?];
+            assert_eq!(0, batches(data), "partition {partition}");
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(data.error_code)?,
+                "partition {partition}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// A partition with little time until its partition deadline still keeps what its read
     /// assembled by that deadline. After five stalls the last partition has a 32nd of the fetch
     /// deadline, under 200ms.
