@@ -77,8 +77,10 @@ unused_results = "warn"
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
-# fuzz/Cargo.toml repeats the bytes, rama, tokio and url requirements; change
-# them there too.
+# fuzz/Cargo.toml's [dependencies] repeats the bytes, rama, tokio and url
+# requirements; change them there too. .github/dependabot.yml's fuzz-shared
+# group moves both for minor and major bumps only, so keep patch bumps equal
+# by hand.
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
@@ -212,8 +214,8 @@ zstd = "0.14.0"
 # Line tables keep file:line in workspace backtraces; full debug info costs
 # disk and link time. Build with `--profile debugging` for a debugger.
 #
-# fuzz/Cargo.toml repeats [profile.dev] and [profile.dev.package."*"]; change
-# them there too.
+# fuzz/Cargo.toml repeats [profile.dev] and [profile.dev.package."*"] at its
+# end; change them there too.
 [profile.dev]
 debug = "line-tables-only"
 

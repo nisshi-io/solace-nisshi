@@ -15,7 +15,9 @@ cargo-fuzz = true
 [workspace]
 
 # bytes, rama, tokio and url repeat the requirements in the root Cargo.toml's
-# [workspace.dependencies]; change both together.
+# [workspace.dependencies]; change both together. .github/dependabot.yml's
+# fuzz-shared group moves both for minor and major bumps only, so keep patch
+# bumps equal by hand.
 [dependencies]
 bytes = { version = "1", features = ["serde"] }
 libfuzzer-sys = "0.4"
@@ -248,7 +250,8 @@ codegen-units = 1
 # fewer inputs per second.
 lto = false
 
-# These two tables must stay equal to the root Cargo.toml's dev profile.
+# These two tables must stay equal to the root Cargo.toml's [profile.dev] and
+# [profile.dev.package."*"].
 # `just clippy` checks this workspace in target/ after the root one, and a
 # different profile builds each shared dependency again.
 [profile.dev]

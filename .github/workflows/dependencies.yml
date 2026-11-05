@@ -81,3 +81,36 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo-deny --all-features --locked check --warn unmaintained
+  # fuzz/ is a workspace of its own, so cargo-deny above doesn't read
+  # fuzz/Cargo.lock. Not a required check: a PR that raises a dependency of a
+  # crate the fuzz targets build leaves fuzz/Cargo.lock behind, and this job
+  # fails on that PR and on main after it, without blocking the queue. Only
+  # /cut-release stops on a stale lock; see .claude/skills/cut-release.
+  # Skipped in the merge queue, which waits only for required checks.
+  fuzz-lock:
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && needs.changes.outputs.rust != 'false' }}
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny
+      - name: Check that fuzz/Cargo.lock is current
+        run: |
+          cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null || {
+            echo "::error file=fuzz/Cargo.lock::fuzz/Cargo.lock is out of date. Run 'cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null' and commit fuzz/Cargo.lock."
+            exit 1
+          }
+      # Advisories and sources only: licenses and bans are checked on the
+      # root graph, which names every crate of this one except libfuzzer-sys,
+      # though a stale fuzz/Cargo.lock can pin other versions of them.
+      # --locked scans the committed lock, not a re-resolved one.
+      - name: cargo-deny over fuzz/Cargo.lock
+        run: cargo-deny --manifest-path fuzz/Cargo.toml --locked check --warn unmaintained advisories sources

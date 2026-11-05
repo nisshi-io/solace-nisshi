@@ -112,7 +112,9 @@ updates:
     groups:
       # fuzz/Cargo.toml repeats these requirements from the root Cargo.toml,
       # and the fuzz targets pass their types into the workspace crates, so a
-      # minor or major bump moves both directories in one PR.
+      # minor or major bump moves both directories in one PR. Patch bumps
+      # aren't grouped, so keep those equal by hand. Both manifests name this
+      # group next to the four requirements; keep the list equal to theirs.
       fuzz-shared:
         patterns: ["bytes", "rama", "tokio", "url"]
         update-types: ["minor", "major"]
