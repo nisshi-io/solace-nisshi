@@ -6609,6 +6609,10 @@ mod tests {
             records < RECORDS,
             "the deadline didn't stop the fetch: it returned all {records} of {RECORDS} records"
         );
+        assert!(
+            records > 0,
+            "the fetch kept none of the records that it read before its deadline"
+        );
 
         Ok(())
     }
