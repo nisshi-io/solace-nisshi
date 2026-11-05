@@ -650,6 +650,38 @@ impl GroupConsumer {
             })
     }
 
+    /// Resets the consumer to an outsider after the coordinator rejected its membership with
+    /// `error_code`, and returns the JoinGroup request that rejoins the group.
+    ///
+    /// Kafka's consumer clears its generation after a [SyncGroup] or a [Heartbeat] error, and so
+    /// treats its partitions as [lost]. This consumer does the same, and clears its assignment.
+    /// It keeps its member id only for [`ErrorCode::IllegalGeneration`], because the coordinator
+    /// still knows the member and rejects only its generation.
+    ///
+    /// [SyncGroup]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L876-L882
+    /// [Heartbeat]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L1263-L1270
+    /// [lost]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L773-L774
+    fn rejoin(&mut self, error_code: ErrorCode, reason: &str) -> Result<Body, Error> {
+        self.errors
+            .lock()
+            .map(|mut errors| *errors.entry(error_code).or_default() += 1)?;
+
+        let member_id = if error_code == ErrorCode::IllegalGeneration {
+            self.member_state.member_id().map(ToOwned::to_owned)
+        } else {
+            None
+        };
+
+        self.member_state = MemberState::Outsider {
+            generation_id: None,
+            member_id: member_id.clone(),
+            member_assignment: None,
+        };
+
+        self.join_request(None, member_id, None, reason)
+            .map(Into::into)
+    }
+
     #[instrument(skip(self, input), fields(group_id = self.group_id, member_state = ?self.member_state), ret)]
     pub fn next_action(&mut self, input: Option<Body>) -> Result<Body, Error> {
         match (&mut self.member_state, input) {
@@ -897,6 +929,22 @@ impl GroupConsumer {
                 .map(Into::into)
             }
 
+            (
+                MemberState::Leader { .. } | MemberState::Follower { .. },
+                Some(Body::SyncGroupResponse(SyncGroupResponse { error_code, .. })),
+            ) if error_code == i16::from(ErrorCode::UnknownMemberId) => self.rejoin(
+                ErrorCode::UnknownMemberId,
+                "join after sync with unknown member id",
+            ),
+
+            (
+                MemberState::Leader { .. } | MemberState::Follower { .. },
+                Some(Body::SyncGroupResponse(SyncGroupResponse { error_code, .. })),
+            ) if error_code == i16::from(ErrorCode::IllegalGeneration) => self.rejoin(
+                ErrorCode::IllegalGeneration,
+                "join after sync with illegal generation",
+            ),
+
             // Heartbeat
             //
             (
@@ -934,6 +982,14 @@ impl GroupConsumer {
                 )
                 .map(Into::into)
             }
+
+            (
+                MemberState::Leader { .. } | MemberState::Follower { .. },
+                Some(Body::HeartbeatResponse(HeartbeatResponse { error_code, .. })),
+            ) if error_code == i16::from(ErrorCode::IllegalGeneration) => self.rejoin(
+                ErrorCode::IllegalGeneration,
+                "join after illegal generation",
+            ),
 
             (
                 MemberState::Leader {

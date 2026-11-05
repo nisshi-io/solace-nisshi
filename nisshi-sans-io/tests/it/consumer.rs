@@ -17,8 +17,8 @@ use std::{assert_matches, io, sync::Arc};
 use crate::common::init_tracing;
 use bytes::{BufMut, Bytes, BytesMut};
 use nisshi_sans_io::{
-    Body, Error, ErrorCode, HeartbeatResponse, JoinGroupResponse, MetadataResponse, Result,
-    SyncGroupResponse,
+    Body, Error, ErrorCode, HeartbeatResponse, JoinGroupRequest, JoinGroupResponse,
+    MetadataResponse, Result, SyncGroupResponse,
     consumer::{
         Assignor, CONSUMER, ConsumerProtocolAssignment, ConsumerProtocolSubscription,
         GroupConsumer, MemberAssignment, MemberMetadata, TopicPartition,
@@ -787,5 +787,191 @@ fn member_assignment_user_data_claim_beyond_the_input_fails() -> Result<()> {
         .expect_err("a claimed length beyond the input must be rejected");
 
     assert_matches!(err, Error::Io(ref io) if io.kind() == io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+const GROUP_ID: &str = "g1";
+const TOPIC: &str = "t";
+const MEMBER_ID: &str = "me";
+const OTHER_MEMBER_ID: &str = "other";
+const GENERATION_ID: i32 = 1;
+
+/// The member id that a JoinGroup request carries when the consumer joins as a new member.
+const NO_MEMBER_ID: &str = "";
+
+/// The generation that a JoinGroup request's subscription carries when the consumer has none.
+const NO_GENERATION_ID: i32 = -1;
+
+/// The leader ids that make the consumer under test the group's leader, and then a follower.
+const LEADER_IDS: [&str; 2] = [MEMBER_ID, OTHER_MEMBER_ID];
+
+/// Returns a consumer that joined generation [`GENERATION_ID`] as [`MEMBER_ID`], in a group
+/// that `leader_id` leads, and that waits for its SyncGroup response.
+fn awaiting_sync(leader_id: &str) -> Result<GroupConsumer, Error> {
+    let mut consumer = GroupConsumer::builder(GROUP_ID)
+        .topics([TOPIC])
+        .metadata(make_metadata(&[(TOPIC, 1)]))
+        .build();
+
+    _ = consumer.next_action(Some(Body::JoinGroupResponse(
+        JoinGroupResponse::default()
+            .error_code(i16::from(ErrorCode::None))
+            .generation_id(GENERATION_ID)
+            .member_id(MEMBER_ID.into())
+            .leader(leader_id.into())
+            .protocol_name(Some(Assignor::RANGE.into()))
+            .protocol_type(Some(CONSUMER.into()))
+            .members(Some(vec![
+                JoinGroupResponseMember::default()
+                    .member_id(MEMBER_ID.into())
+                    .metadata(member_meta(&[TOPIC])?),
+            ])),
+    )))?;
+
+    Ok(consumer)
+}
+
+/// Returns a consumer like [`awaiting_sync`] that also received partition 0 of [`TOPIC`] in its
+/// SyncGroup response, and that waits for its Heartbeat response.
+fn assigned(leader_id: &str) -> Result<GroupConsumer, Error> {
+    let mut consumer = awaiting_sync(leader_id)?;
+
+    let assignment = Bytes::try_from(
+        &MemberAssignment::default()
+            .version(ConsumerProtocolSubscription::V3)
+            .assignment(ConsumerProtocolAssignment::default().assigned_partitions([
+                TopicPartition {
+                    topic: TOPIC.into(),
+                    partitions: vec![0],
+                },
+            ])),
+    )?;
+
+    _ = consumer.next_action(Some(Body::SyncGroupResponse(
+        SyncGroupResponse::default()
+            .error_code(i16::from(ErrorCode::None))
+            .assignment(assignment),
+    )))?;
+
+    Ok(consumer)
+}
+
+/// Asserts that each protocol of `request` subscribes with no generation and no owned
+/// partitions, so the coordinator does not count a partition that the consumer gave up.
+fn assert_joins_owning_nothing(request: &JoinGroupRequest) -> Result<(), Error> {
+    for protocol in request.protocols.as_deref().unwrap_or_default() {
+        let metadata = MemberMetadata::try_from(protocol.metadata.clone())?;
+
+        assert_eq!(
+            Some(NO_GENERATION_ID),
+            metadata.subscription.generation_id,
+            "protocol: {}",
+            protocol.name
+        );
+        assert!(
+            metadata
+                .subscription
+                .owned_partitions
+                .as_ref()
+                .is_none_or(|owned_partitions| owned_partitions.is_empty()),
+            "protocol: {}",
+            protocol.name
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn sync_unknown_member_id_rejoins_without_member_id() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    for leader_id in LEADER_IDS {
+        let mut consumer = awaiting_sync(leader_id)?;
+
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::SyncGroupResponse(
+            SyncGroupResponse::default().error_code(i16::from(ErrorCode::UnknownMemberId)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+
+        assert_eq!(NO_MEMBER_ID, req.member_id, "leader: {leader_id}");
+        assert_joins_owning_nothing(&req)?;
+        assert!(consumer.is_outsider(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.generation_id(), "leader: {leader_id}");
+        assert_eq!(
+            Some(&1),
+            consumer.errors()?.get(&ErrorCode::UnknownMemberId),
+            "leader: {leader_id}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn sync_illegal_generation_rejoins_with_member_id() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    for leader_id in LEADER_IDS {
+        let mut consumer = awaiting_sync(leader_id)?;
+
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::SyncGroupResponse(
+            SyncGroupResponse::default().error_code(i16::from(ErrorCode::IllegalGeneration)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+
+        assert_eq!(MEMBER_ID, req.member_id, "leader: {leader_id}");
+        assert_joins_owning_nothing(&req)?;
+        assert!(consumer.is_outsider(), "leader: {leader_id}");
+        assert_eq!(Some(MEMBER_ID), consumer.member_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.generation_id(), "leader: {leader_id}");
+        assert_eq!(
+            Some(&1),
+            consumer.errors()?.get(&ErrorCode::IllegalGeneration),
+            "leader: {leader_id}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn heartbeat_illegal_generation_rejoins_with_member_id_and_drops_assignment() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    for leader_id in LEADER_IDS {
+        let mut consumer = assigned(leader_id)?;
+
+        // The rejoin must give up an assignment that the consumer holds, so the setup must
+        // hold one.
+        assert!(
+            consumer.member_assignment().is_some(),
+            "leader: {leader_id}"
+        );
+
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::HeartbeatResponse(
+            HeartbeatResponse::default().error_code(i16::from(ErrorCode::IllegalGeneration)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+
+        assert_eq!(MEMBER_ID, req.member_id, "leader: {leader_id}");
+        assert_joins_owning_nothing(&req)?;
+        assert!(consumer.is_outsider(), "leader: {leader_id}");
+        assert_eq!(None, consumer.generation_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_assignment(), "leader: {leader_id}");
+        assert_eq!(
+            Some(&1),
+            consumer.errors()?.get(&ErrorCode::IllegalGeneration),
+            "leader: {leader_id}"
+        );
+    }
+
     Ok(())
 }
