@@ -3014,23 +3014,33 @@ mod tests {
     /// 172ms and the 128th is 43ms.
     const HALVING_MAX_WAIT: Duration = Duration::from_millis(504);
 
-    /// After a read of the records reaches its partition deadline, the service does not read the
-    /// partition's offset stage again. The partition answers with the batches that the read
-    /// returned, and with a high watermark that includes them.
+    /// A partition's answer reports a high watermark past every record in it. The service reads
+    /// the partition's offset stage, which holds the high watermark, before it reads the records,
+    /// so a record written during the fetch can be past that high watermark. The service usually
+    /// reads the offset stage a second time to cover such a record. When its reads of the records
+    /// ran until the partition deadline, it skips the second read, and sets the high watermark just
+    /// past the last record that it returns.
     #[tokio::test(start_paused = true)]
     async fn a_read_that_reaches_its_partition_deadline_is_not_followed_by_a_stage_read()
     -> Result<()> {
-        // The offset stage's high watermark is 1,000, so its last record is at offset 999. The
-        // first read returns a record at 1,000, as if a producer wrote it during the fetch. The
-        // second read returns nothing and runs until the partition deadline.
-        let storage = Partitions::new([(0, vec![Read::Batch(batch(1_000, &[0])?), Read::Stall])]);
+        let storage = Partitions::new([
+            // The offset stage reads a high watermark of 1,000. The first read of the records
+            // returns a record at offset 1,000, as if a producer wrote it during the fetch. The
+            // second read of the records runs until the partition deadline.
+            (0, vec![Read::Batch(batch(1_000, &[0])?), Read::Stall]),
+            // Partition 1 leaves the fetch time after partition 0's deadline, so only the skip
+            // stops the service from reading partition 0's offset stage a second time.
+            (1, vec![Read::Batch(batch(0, &[0])?)]),
+        ]);
 
-        let (partitions, elapsed) = fetch(storage.clone(), &[0]).await?;
+        let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
 
-        assert_eq!(FETCH_DEADLINE, elapsed);
+        // The service read partition 0's offset stage once, before the records.
         assert_eq!(1, storage.offset_stage_reads(0));
         assert_eq!(1, batches(&partitions[0]));
+        // 1,001 is just past the record at offset 1,000.
         assert_eq!(1_001, partitions[0].high_watermark);
+        assert_eq!(1, batches(&partitions[1]));
 
         Ok(())
     }
