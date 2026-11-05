@@ -153,7 +153,7 @@ nisshi-storage-slatedb = { version = "0.8.2", path = "nisshi-storage-slatedb", d
 nisshi-storage-sql = { version = "0.8.2", path = "nisshi-storage-sql", default-features = false }
 nisshi-topic = { version = "0.8.2", path = "nisshi-topic", default-features = false }
 nonzero_ext = "0.3.0"
-num-bigint = "0.4"
+num-bigint = "0.5"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.33.0"
 opentelemetry-otlp = "0.33.0"
