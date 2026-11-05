@@ -30,7 +30,7 @@ use crate::{
     Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
     service::{
         read_deadline::{Missed, ReadDeadline, ReadWait},
-        read_share::{ClientIdentity, FetchReadShare},
+        read_share::{FetchReadShare, warn_miss_at_client_share},
     },
 };
 use validation::ValidatedFetchRequest;
@@ -118,22 +118,11 @@ fn missed(
                 "fetch read not started"
             )
         }
-        // A client share names the client in the log, not in the metric, because a client
-        // chooses its `client_id`. It tells a client that abandons reads from a consumer group
-        // whose instances share one `client_id`, and those need different fixes.
+        // The log names the client, see `warn_miss_at_client_share`. A storage engine logs it
+        // itself when its read misses the deadline during the wait for the share, so this arm
+        // covers the reads that the service makes, such as the offset stage.
         Missed::Queued(ReadWait::ClientReadLimit) => {
-            let client = ClientIdentity::current();
-            warn!(
-                ?tp,
-                %operation,
-                offset,
-                stage,
-                wait,
-                elapsed = ?started_at.elapsed(),
-                client_id = ?client.as_ref().and_then(ClientIdentity::client_id),
-                principal = ?client.as_ref().and_then(ClientIdentity::principal),
-                "fetch read deadline exceeded"
-            )
+            warn_miss_at_client_share(tp, operation, offset, started_at)
         }
         Missed::Queued(_) | Missed::Reading => {
             warn!(

@@ -76,7 +76,10 @@ use nisshi_storage::{
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
     read_deadline::{Missed, QueueWait as _, ReadDeadline, ReadWait},
-    read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
+    read_share::{
+        ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare,
+        warn_miss_at_client_share,
+    },
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -4463,6 +4466,7 @@ impl Storage for Postgres {
         isolation_level: IsolationLevel,
         deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
+        let started_at = Instant::now();
         let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         // A `/` in the name checks out a connection of its own, so this
@@ -4483,8 +4487,22 @@ impl Storage for Postgres {
                 .await
         };
 
-        let Ok(connection) = read_deadline.timeout(connection).await else {
-            return Ok(vec![]);
+        let connection = match read_deadline.timeout(connection).await {
+            Ok(connection) => connection,
+            Err(missed) => {
+                // The Fetch service sees only an answer with no records here, so the engine names
+                // the client when its wait for the client's share missed the deadline.
+                if missed == Missed::Queued(ReadWait::ClientReadLimit) {
+                    warn_miss_at_client_share(
+                        topition,
+                        StorageOperation::Fetch,
+                        offset,
+                        started_at,
+                    );
+                }
+
+                return Ok(vec![]);
+            }
         };
 
         let mut connection = connection?;
@@ -7290,6 +7308,91 @@ mod tests {
             storage.fetch_reads.available_permits() == limits.fetch
         })
         .await;
+
+        Ok(())
+    }
+
+    /// A Fetch that reaches its deadline while it waits for its client's share answers with no
+    /// records, and the engine logs a warning that names the client, because the Fetch service
+    /// sees nothing but the empty answer.
+    #[tokio::test]
+    async fn fetch_missing_its_deadline_at_the_client_share_names_the_client() -> Result<()> {
+        use std::io::{self, Write};
+
+        #[derive(Clone, Default)]
+        struct WarnLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for WarnLog {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping fetch_missing_its_deadline_at_the_client_share_names_the_client: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("reporting"));
+        let marker = alphanumeric_string(15);
+
+        // The client abandons as many reads as the limit allows, each from a new connection, so
+        // that its share and the limit are used up.
+        for _ in 0..limits.fetch {
+            let permits = client
+                .clone()
+                .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        let log = WarnLog::default();
+        let writer = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        let batches = client
+            .scope(FetchReadShare::default().scope(storage.fetch(
+                &Topition::new("orders", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_millis(300),
+            )))
+            .await?;
+
+        assert!(batches.is_empty(), "{batches:?}");
+
+        let log = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(log.contains("alice"), "{log:?}");
+        assert!(log.contains("reporting"), "{log:?}");
+        assert!(log.contains("client_read_limit"), "{log:?}");
+
+        _ = cancel_backends(&monitor, &marker).await?;
 
         Ok(())
     }

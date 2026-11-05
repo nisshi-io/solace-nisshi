@@ -167,9 +167,12 @@ use rama::extensions::{Extension, Extensions};
 use tokio::{
     sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore},
     task::LocalKey,
+    time::Instant,
 };
+use tracing::warn;
 
 use super::read_deadline::{QueueWait as _, ReadWait};
+use crate::{StorageOperation, Topition};
 
 tokio::task_local! {
     /// The identity of the client whose request the task is answering.
@@ -184,6 +187,35 @@ tokio::task_local! {
 pub struct ClientIdentity {
     principal: Option<Arc<str>>,
     client_id: Option<Arc<str>>,
+}
+
+/// Logs at `warn` that a read of `operation` at `offset` of `topition`, which started at
+/// `started_at`, reached its deadline while it waited for the read share of its client.
+///
+/// The log names the client of the enclosing [`ClientIdentity::scope`], and the metric does not,
+/// because a client chooses its `client_id`. It tells a client that abandons its reads from a
+/// consumer group whose instances share one `client_id`, and those need different fixes. A
+/// storage engine calls this when its own wait for the share misses the deadline, because the
+/// Fetch service sees only an answer with no records then.
+pub fn warn_miss_at_client_share(
+    topition: &Topition,
+    operation: StorageOperation,
+    offset: i64,
+    started_at: Instant,
+) {
+    let client = ClientIdentity::current();
+
+    warn!(
+        ?topition,
+        %operation,
+        offset,
+        stage = "queued",
+        wait = ReadWait::ClientReadLimit.as_str(),
+        elapsed = ?started_at.elapsed(),
+        client_id = ?client.as_ref().and_then(ClientIdentity::client_id),
+        principal = ?client.as_ref().and_then(ClientIdentity::principal),
+        "read deadline exceeded waiting for the client's read share"
+    );
 }
 
 impl ClientIdentity {
