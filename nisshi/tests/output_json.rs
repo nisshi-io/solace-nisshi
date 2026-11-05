@@ -204,6 +204,19 @@ fn perf_prints_a_json_object_for_each_interval_and_a_summary() {
         assert_eq!("interval", interval["type"], "{interval}");
         assert!(interval["records_sent"].is_u64(), "{interval}");
     }
+
+    // The summary covers the whole run, not the last interval: it holds at least what the
+    // intervals add up to, and a run of 3 s, not of the 500 ms of an interval.
+    let interval_records: u64 = intervals
+        .iter()
+        .map(|interval| interval["records_sent"].as_u64().unwrap())
+        .sum();
+    assert!(
+        summary["records_sent"].as_u64().unwrap() >= interval_records,
+        "{output:?}"
+    );
+    let elapsed_ms = summary["elapsed_ms"].as_u64().unwrap();
+    assert!((2_500..10_000).contains(&elapsed_ms), "{summary}");
 }
 
 #[test]
@@ -223,7 +236,8 @@ fn perf_prints_a_json_summary_when_the_run_is_shorter_than_an_interval() {
             "--output",
             "json",
         ],
-        &[],
+        // An interval of a minute, whatever the runner sets.
+        &[("OTEL_METRIC_EXPORT_INTERVAL", "60000")],
     );
 
     assert_eq!(Some(0), output.status.code(), "{output:?}");
