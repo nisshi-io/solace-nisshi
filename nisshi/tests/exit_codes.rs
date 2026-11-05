@@ -90,6 +90,21 @@ fn a_refusal_by_the_broker_is_4() {
     assert_eq!(Some(4), output.status.code(), "{output:?}");
 }
 
+/// A schema registry directory with the `taxi` schema in it, which `generator` needs, and the
+/// `file://` URL that names it relative to the directory that the command runs in.
+fn schema_registry(name: &str) -> (std::path::PathBuf, String) {
+    let registry =
+        std::env::temp_dir().join(format!("nisshi-exit-codes-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&registry).expect("registry directory");
+    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
+    let url = format!(
+        "file://./{}",
+        registry.file_name().unwrap().to_str().unwrap()
+    );
+
+    (registry, url)
+}
+
 /// A TCP port with nothing listening on it.
 fn closed_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -103,13 +118,7 @@ fn closed_port() -> u16 {
 #[test]
 fn a_broker_that_is_not_there_is_3_for_every_client_tool() {
     let url = format!("tcp://127.0.0.1:{}", closed_port());
-    let registry = std::env::temp_dir().join(format!("nisshi-exit-codes-{}", std::process::id()));
-    std::fs::create_dir_all(&registry).expect("registry directory");
-    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
-    let schema_registry = format!(
-        "file://./{}",
-        registry.file_name().unwrap().to_str().unwrap()
-    );
+    let (registry, schema_registry) = schema_registry("unreachable");
 
     let runs = TOOLS.map(|args| {
         let mut args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
@@ -138,4 +147,74 @@ fn a_broker_that_is_not_there_is_3_for_every_client_tool() {
     for (args, output) in results {
         assert_eq!(Some(3), output.status.code(), "{args:?}: {output:?}");
     }
+}
+
+/// `generator` and `perf` log in when their first request needs a connection, inside a producer
+/// task, not when they start. A refused login must end the run with 4 then, not leave the
+/// producers idle until the run ends, with 0.
+#[test]
+fn a_refused_login_ends_generator_and_perf_with_4() {
+    // This broker has no SASL, so it refuses a login with `ILLEGAL_SASL_STATE`.
+    let broker = Broker::start();
+    let (registry, schema_registry) = schema_registry("login");
+    let password = [("SASL_PASSWORD", "secret")];
+
+    let perf = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--sasl-username",
+            "alice",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--duration",
+            "30s",
+        ],
+        &password,
+    );
+    assert_eq!(Some(4), perf.status.code(), "perf: {perf:?}");
+    assert!(
+        String::from_utf8_lossy(&perf.stderr).contains("does not use SASL"),
+        "perf: {perf:?}"
+    );
+
+    let generator = broker.run_unaided(
+        &[
+            "generator",
+            "taxi",
+            "--sasl-username",
+            "alice",
+            "--broker",
+            broker.url(),
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "1",
+            "--duration-seconds",
+            "30",
+        ],
+        &password,
+    );
+    _ = std::fs::remove_dir_all(&registry);
+    assert_eq!(Some(4), generator.status.code(), "generator: {generator:?}");
+    assert!(
+        String::from_utf8_lossy(&generator.stderr).contains("does not use SASL"),
+        "generator: {generator:?}"
+    );
+}
+
+/// `nisshi broker` keeps the exit status of a server, 1 for any failure. A certificate that
+/// can't be read is a usage error (2) for a client tool.
+#[test]
+fn a_broker_that_fails_to_start_exits_with_1() {
+    let output = run(&[
+        "broker",
+        "--cert",
+        "/no/such/cert.pem",
+        "--key",
+        "/no/such/key.pem",
+    ]);
+
+    assert_eq!(Some(1), output.status.code(), "{output:?}");
 }

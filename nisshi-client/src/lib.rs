@@ -194,34 +194,105 @@ pub enum Error {
     UnknownHost(Url),
 }
 
+/// What a failed [`Error`] means to whoever has to act on it, as [`Error::failure_kind`] says.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FailureKind {
+    /// The client's own options can't be used: the TLS options or the broker's URL. Nothing was
+    /// sent to a broker.
+    Options,
+
+    /// The client could not open a connection: the address does not resolve, or the attempt was
+    /// refused, failed or timed out.
+    Unreachable,
+
+    /// The client connected, and the TLS connection or the login was refused, or the client
+    /// refused what the broker offered.
+    Refused,
+
+    /// The client connected, and the broker closed the connection before it answered.
+    Closed,
+
+    /// The client connected and sent the request, and no answer came within the deadline. The
+    /// broker may have applied the request.
+    TimedOut,
+
+    /// Any other failure.
+    Other,
+}
+
 impl Error {
     fn tls(error: impl fmt::Display) -> Self {
         Self::TlsConfiguration(error.to_string())
     }
 
-    /// Returns whether the client failed to open a connection to the broker, as opposed to
-    /// failing after it connected. A pool error that comes from a refused, failed or timed out
-    /// connection attempt is a connect failure, and a pool error that comes from waiting for a
-    /// free connection is not.
-    pub fn is_connect_failure(&self) -> bool {
+    /// Returns what this failure means to whoever has to act on it. A command that reports the
+    /// failure and one that numbers its exit status both ask this, so the two agree. The match
+    /// has no wildcard arm: a new variant of [`Error`] does not compile until its author has
+    /// said which kind it is.
+    pub fn failure_kind(&self) -> FailureKind {
         match self {
-            Self::Pool(cause) => {
-                self.login_failure().is_none()
-                    && self.scram_iterations().is_none()
-                    && !self.sasl_not_used()
-                    && self.tls_failure().is_none()
-                    && self.tls_rejection().is_none()
-                    && !matches!(
-                        cause.downcast_ref::<PoolError<Error>>(),
-                        Some(
-                            PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
-                                | PoolError::Closed
-                                | PoolError::NoRuntimeSpecified
-                        )
-                    )
-            }
-            Self::UnknownHost(_) => true,
-            _ => false,
+            Self::TlsConfiguration(_) | Self::ParseUrl(_) => FailureKind::Options,
+            Self::UnknownHost(_) => FailureKind::Unreachable,
+            Self::Authentication(_)
+            | Self::SaslNotUsed
+            | Self::ScramIterations { .. }
+            | Self::Tls(_)
+            | Self::TlsRejected(_) => FailureKind::Refused,
+            Self::Timeout(_) => FailureKind::TimedOut,
+            Self::Io(cause) => match cause.kind() {
+                io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe => FailureKind::Closed,
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::AddrNotAvailable => FailureKind::Unreachable,
+                _ => FailureKind::Other,
+            },
+            // The pool wraps what its connection manager returned while it opened a connection.
+            // Only a failed attempt to reach the broker, or a create timeout, is unreachable:
+            // waiting for a free connection is not.
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(error)) => error.failure_kind(),
+                Some(PoolError::Timeout(TimeoutType::Create)) => FailureKind::Unreachable,
+                Some(
+                    PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
+                    | PoolError::Closed
+                    | PoolError::NoRuntimeSpecified
+                    | PoolError::PostCreateHook(_),
+                ) => FailureKind::Other,
+                // A pool error of another type: only opening a connection raises one.
+                None => FailureKind::Unreachable,
+            },
+            Self::DeadPoolBuild(_)
+            | Self::Join(_)
+            | Self::Message(_)
+            | Self::ParseFilter(_)
+            | Self::Poison
+            | Self::Protocol(_)
+            | Self::Service(_)
+            | Self::UnknownApiKey(_) => FailureKind::Other,
+        }
+    }
+
+    /// Returns whether the client failed to open a connection to the broker, as opposed to
+    /// failing after it connected.
+    pub fn is_connect_failure(&self) -> bool {
+        self.failure_kind() == FailureKind::Unreachable
+    }
+
+    /// Returns the I/O error behind this failure, when the connection to the broker failed or
+    /// closed, whether the client was opening the connection or using it.
+    pub fn io_error(&self) -> Option<&io::Error> {
+        match self {
+            Self::Io(cause) => Some(cause),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Io(cause))) => Some(cause),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1378,6 +1449,104 @@ mod connect_failure_tests {
     #[test]
     fn errors_after_connecting_are_not_connect_failures() {
         assert!(!Error::Timeout(std::time::Duration::from_secs(30)).is_connect_failure());
+    }
+}
+
+#[cfg(test)]
+mod failure_kind_tests {
+    use super::{Error, FailureKind, PoolError, TimeoutType};
+    use std::{io, sync::Arc, time::Duration};
+
+    fn io_error(kind: io::ErrorKind) -> Error {
+        Error::Io(Arc::new(io::Error::from(kind)))
+    }
+
+    fn backend(error: Error) -> Error {
+        Error::from(PoolError::Backend(error))
+    }
+
+    #[test]
+    fn options_that_cannot_be_used_are_options() {
+        assert_eq!(
+            FailureKind::Options,
+            Error::TlsConfiguration("bad".into()).failure_kind()
+        );
+        assert_eq!(
+            FailureKind::Options,
+            Error::ParseUrl(url::ParseError::EmptyHost).failure_kind()
+        );
+    }
+
+    #[test]
+    fn a_connection_that_does_not_open_is_unreachable() {
+        for error in [
+            io_error(io::ErrorKind::ConnectionRefused),
+            backend(io_error(io::ErrorKind::ConnectionRefused)),
+            backend(io_error(io::ErrorKind::TimedOut)),
+            backend(io_error(io::ErrorKind::HostUnreachable)),
+            Error::from(PoolError::<Error>::Timeout(TimeoutType::Create)),
+            Error::UnknownHost("tcp://nowhere:9092".parse().expect("url")),
+        ] {
+            assert_eq!(FailureKind::Unreachable, error.failure_kind(), "{error}");
+        }
+    }
+
+    /// A broker that closes the connection during the login or the handshake is a closed
+    /// connection, as it is when it closes one that the client is using. It is not a broker that
+    /// the client could not reach.
+    #[test]
+    fn a_closed_connection_is_closed_whether_or_not_the_pool_wrapped_it() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            for error in [io_error(kind), backend(io_error(kind))] {
+                assert_eq!(FailureKind::Closed, error.failure_kind(), "{error}");
+                assert_eq!(Some(kind), error.io_error().map(io::Error::kind));
+            }
+        }
+    }
+
+    #[test]
+    fn a_login_a_tls_failure_or_a_refused_offer_is_refused_even_inside_the_pool() {
+        for error in [
+            Error::Authentication("bad password".into()),
+            Error::SaslNotUsed,
+            Error::Tls("untrusted".into()),
+            Error::ScramIterations {
+                iterations: 1,
+                accepted: 4096..=65536,
+            },
+            backend(Error::Authentication("bad password".into())),
+            backend(Error::SaslNotUsed),
+            backend(Error::Tls("untrusted".into())),
+        ] {
+            assert_eq!(FailureKind::Refused, error.failure_kind(), "{error}");
+        }
+    }
+
+    /// The request was sent, so the broker may have applied it.
+    #[test]
+    fn a_request_without_an_answer_is_timed_out_not_unreachable() {
+        let error = Error::Timeout(Duration::from_secs(30));
+
+        assert_eq!(FailureKind::TimedOut, error.failure_kind());
+        assert!(!error.is_connect_failure());
+    }
+
+    #[test]
+    fn waiting_for_a_free_connection_is_neither_unreachable_nor_closed() {
+        for timeout in [TimeoutType::Wait, TimeoutType::Recycle] {
+            assert_eq!(
+                FailureKind::Other,
+                Error::from(PoolError::<Error>::Timeout(timeout)).failure_kind()
+            );
+        }
+        assert_eq!(
+            FailureKind::Other,
+            Error::Message("boom".into()).failure_kind()
+        );
     }
 }
 

@@ -407,12 +407,35 @@ fn a_tool_without_tls_is_told_how_to_connect() {
 
     let output = broker.run(&["topic", "list"], "");
 
-    assert!(!output.status.success(), "{output:?}");
+    // The broker closed the connection, and may have applied the request: a plain failure.
+    assert_eq!(Some(1), output.status.code(), "{output:?}");
     assert!(
         stderr(&output).lines().any(|line| {
             line.starts_with("error: Connected to the broker, but it closed the connection")
                 && line.contains("--tls")
         }),
+        "{output:?}"
+    );
+}
+
+/// Options for a login do not change what a TLS-only listener does: it closes the plaintext
+/// connection. That is a closed connection (1), not a broker that could not be reached (3),
+/// which a script retries without ever seeing the configuration mistake. `nisshi-client` tests
+/// the same failure when the pool wraps it.
+#[test]
+fn a_login_without_tls_to_a_tls_listener_is_a_closed_connection() {
+    let certificate = Certificate::new();
+    let broker = tls_broker(&certificate);
+
+    let output = broker.run_with_env(
+        &["topic", "list", "--sasl-username", USERNAME],
+        "",
+        &[("SASL_PASSWORD", PASSWORD)],
+    );
+
+    assert_eq!(Some(1), output.status.code(), "{output:?}");
+    assert!(
+        stderr(&output).contains("closed the connection"),
         "{output:?}"
     );
 }

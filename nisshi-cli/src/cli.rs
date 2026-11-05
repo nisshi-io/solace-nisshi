@@ -111,7 +111,7 @@ const CLIENT_TOOL_NOTE: &str = "Connects in plaintext and does not log in, unles
 
 /// The exit statuses of the client tools, as [`crate::ExitStatus`] numbers them. Part of every client
 /// tool's `--help`, and of docs/commands.md.
-const EXIT_STATUS_NOTE: &str = "Exit status: 0 success, 1 other failure, 2 usage error (a wrong command line or an unusable TLS or SASL option), 3 broker unreachable (no connection, or no answer in time), 4 broker refused (an error code in its answer, a refused login or TLS connection, or a closed connection). generator and perf keep running when the broker refuses a produce request, so that does not end them with 4, but a refused login or TLS connection does.";
+const EXIT_STATUS_NOTE: &str = "Exit status: 0 success, 1 other failure (including a connection that the broker closed and a request that got no answer in time: the broker may have applied the request, so check before you retry), 2 usage error (a wrong command line or an unusable TLS or SASL option), 3 broker unreachable (no connection opened), 4 broker refused (an error code in its answer, which --output json prints, a refused login, or a rejected TLS connection). generator and perf keep running when the broker refuses a produce request, so that does not end them with 4, but a refused login or TLS connection does.";
 
 fn client_tool_note() -> String {
     format!("{CLIENT_TOOL_NOTE}\n\n{EXIT_STATUS_NOTE}")
@@ -180,24 +180,50 @@ impl From<ErrorCode> for Outcome {
 
 impl Cli {
     pub async fn main() -> Result<ErrorCode> {
-        Self::run().await.map(|outcome| outcome.error_code)
+        Self::from_command_line()
+            .run()
+            .await
+            .map(|outcome| outcome.error_code)
     }
 
-    pub async fn run() -> Result<Outcome> {
-        debug!(
-            pid = process::id(),
-            storage = ?storage_engines(),
-            lakes = ?lakes()
-        );
-
-        let cli = Cli::try_parse().unwrap_or_else(|error| {
+    /// Parses the command line, or explains why it can't be parsed and exits.
+    pub fn from_command_line() -> Self {
+        Cli::try_parse().unwrap_or_else(|error| {
             missing_feature::explain(
                 error,
                 &missing_feature::built_features(),
                 &mut Cli::command(),
             )
             .exit()
-        });
+        })
+    }
+
+    /// Whether the command is a client tool: one that connects to a broker, prints its result on
+    /// stdout and ends with an [`crate::ExitStatus`]. Its log lines go to stderr, so a script that
+    /// reads its output does not read them. The broker and the proxy are servers, and log to
+    /// stdout. The match has no wildcard arm, so a new subcommand does not compile until its
+    /// author has chosen.
+    pub fn is_client_tool(&self) -> bool {
+        match &self.command {
+            None | Some(Command::Broker(_) | Command::Proxy(_)) => false,
+            Some(
+                Command::Cat { .. }
+                | Command::Generator(_)
+                | Command::Perf(_)
+                | Command::Topic { .. }
+                | Command::User { .. },
+            ) => true,
+        }
+    }
+
+    pub async fn run(self) -> Result<Outcome> {
+        debug!(
+            pid = process::id(),
+            storage = ?storage_engines(),
+            lakes = ?lakes()
+        );
+
+        let cli = self;
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
             Command::Broker(arg) => arg.main().await.map(Outcome::from),
@@ -252,6 +278,52 @@ mod tests {
         let broker = long_help("broker");
         assert!(!broker.contains(CLIENT_TOOL_NOTE), "{broker}");
         assert!(!broker.contains(PROXY_NOTE), "{broker}");
+    }
+
+    /// A client tool is the command whose `--help` carries the client tool note, and the one whose
+    /// log lines go to stderr and whose failure has an exit status. The table must name every
+    /// subcommand, so a new one fails this test until its author adds it.
+    #[test]
+    fn a_client_tool_is_the_command_with_the_client_tool_note() {
+        let command_lines: &[(&str, &[&str])] = &[
+            ("broker", &["broker"]),
+            ("cat", &["cat", "consume", "taxi"]),
+            ("generator", &["generator", "taxi"]),
+            ("perf", &["perf", "taxi", "produce"]),
+            ("proxy", &["proxy"]),
+            ("topic", &["topic", "list"]),
+            ("user", &["user", "delete", "alice"]),
+        ];
+
+        // Every subcommand whose `--help` carries the note is in the table.
+        let mut noted = Vec::new();
+        for subcommand in Cli::command().get_subcommands_mut() {
+            if subcommand
+                .render_long_help()
+                .to_string()
+                .contains(CLIENT_TOOL_NOTE)
+            {
+                noted.push(subcommand.get_name().to_owned());
+            }
+        }
+        let tools: Vec<_> = command_lines
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| noted.iter().any(|noted| noted == name))
+            .collect();
+        assert_eq!(noted, tools, "add each client tool to the table");
+
+        for (name, args) in command_lines {
+            let noted = long_help(name).contains(CLIENT_TOOL_NOTE);
+
+            assert_eq!(
+                noted,
+                parse(Some(REGISTRY), args).is_client_tool(),
+                "{name}"
+            );
+        }
+
+        assert!(!parse(Some(REGISTRY), &[]).is_client_tool(), "no command");
     }
 
     const REGISTRY: &str = "file://./etc/schema";

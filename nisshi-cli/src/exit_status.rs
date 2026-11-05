@@ -18,8 +18,9 @@
 //! `perf`) tells "I called it wrong", "the broker isn't there" and "the broker said no" apart by
 //! the exit status, without parsing the message on stderr. docs/commands.md documents the table.
 
-use std::{io, process::ExitCode};
+use std::process::ExitCode;
 
+use nisshi_client::FailureKind;
 use nisshi_sans_io::ErrorCode;
 
 use crate::Error;
@@ -32,7 +33,9 @@ pub enum ExitStatus {
     Success = 0,
 
     /// The command failed for a reason that none of the statuses below names: an input file it
-    /// can't read, a storage failure, or a response it can't make sense of.
+    /// can't read, a storage failure, a response it can't make sense of, a connection that the
+    /// broker closed, or a request that got no answer in time. After a closed connection or a
+    /// missing answer the broker may have applied the request, so check before you retry.
     Failure = 1,
 
     /// The command line is wrong: an unknown option, a missing argument, a value that doesn't
@@ -40,16 +43,15 @@ pub enum ExitStatus {
     /// ends a command with this status on its own, so the two agree.
     Usage = 2,
 
-    /// The command could not reach the broker: no connection opened, or the broker did not
-    /// answer a request in time. The broker may be down, or the address may be wrong. Retrying
-    /// later can succeed.
+    /// The command could not reach the broker: no connection opened. The broker may be down, or
+    /// the address may be wrong.
     Unreachable = 3,
 
-    /// The command connected, and the connection or the request was refused: the broker
-    /// answered with a Kafka error code, refused the login, rejected the TLS connection or
-    /// closed the connection, or the client refused what the broker offered (a certificate it
-    /// does not trust, a SCRAM iteration count out of range). Retrying the same command
-    /// won't help: change the options or the request.
+    /// The command connected, and the broker answered with a Kafka error code, refused the
+    /// login, or rejected the TLS connection, or the client refused what the broker offered (a
+    /// certificate it does not trust, a SCRAM iteration count out of range). The exit status
+    /// does not say whether a retry can succeed: for an error code, read the code, which
+    /// `--output json` prints.
     Refused = 4,
 }
 
@@ -67,7 +69,8 @@ impl ExitStatus {
         }
     }
 
-    /// The status of a command that returned this error.
+    /// The status of a command that returned this error. The match has no wildcard arm, so a new
+    /// variant of one of these errors does not compile until its author has chosen its status.
     pub fn of_error(error: &Error) -> Self {
         match error {
             Error::Client(error) => Self::of_client_error(error),
@@ -77,15 +80,68 @@ impl ExitStatus {
                 nisshi_cat::Error::Fetch { .. } | nisshi_cat::Error::Metadata { .. } => {
                     Self::Refused
                 }
-                _ => Self::Failure,
+                nisshi_cat::Error::InvalidJson { .. }
+                | nisshi_cat::Error::Io(_)
+                | nisshi_cat::Error::LinesCodec(_)
+                | nisshi_cat::Error::Message(_)
+                | nisshi_cat::Error::MessageWithoutKeyOrValue { .. }
+                | nisshi_cat::Error::NoMessages { .. }
+                | nisshi_cat::Error::NotAnArray { .. }
+                | nisshi_cat::Error::Protocol(_)
+                | nisshi_cat::Error::RecordOffsetOverflow { .. }
+                | nisshi_cat::Error::Schema(_)
+                | nisshi_cat::Error::SerdeJson(_) => Self::Failure,
             },
-            Error::Generate(nisshi_generator::Error::Client(error))
-            | Error::Perf(nisshi_perf::Error::Client(error))
-            | Error::Proxy(nisshi_proxy::Error::Client(error)) => Self::of_client_error(error),
+            Error::Generate(error) => match error {
+                nisshi_generator::Error::Client(error) => Self::of_client_error(error),
+                nisshi_generator::Error::Api(_) => Self::Refused,
+                nisshi_generator::Error::ExporterBuild(_)
+                | nisshi_generator::Error::InsufficientCapacity(_)
+                | nisshi_generator::Error::Io(_)
+                | nisshi_generator::Error::Otel(_)
+                | nisshi_generator::Error::OtelSdk(_)
+                | nisshi_generator::Error::Poison
+                | nisshi_generator::Error::Protocol(_)
+                | nisshi_generator::Error::Schema(_)
+                | nisshi_generator::Error::SchemaNotFoundForTopic(_)
+                | nisshi_generator::Error::UnknownHost(_) => Self::Failure,
+                nisshi_generator::Error::Url(_) => Self::Usage,
+            },
+            Error::Perf(error) => match error {
+                nisshi_perf::Error::Client(error) => Self::of_client_error(error),
+                nisshi_perf::Error::Api(_) => Self::Refused,
+                nisshi_perf::Error::ExporterBuild(_)
+                | nisshi_perf::Error::InsufficientCapacity(_)
+                | nisshi_perf::Error::Io(_)
+                | nisshi_perf::Error::OtelSdk(_)
+                | nisshi_perf::Error::Random(_)
+                | nisshi_perf::Error::Poison
+                | nisshi_perf::Error::Protocol(_)
+                | nisshi_perf::Error::UnknownHost(_) => Self::Failure,
+                nisshi_perf::Error::Url(_) => Self::Usage,
+            },
+            Error::Proxy(error) => match error {
+                nisshi_proxy::Error::Client(error) => Self::of_client_error(error),
+                nisshi_proxy::Error::ExporterBuild(_)
+                | nisshi_proxy::Error::FrameTooBig(_)
+                | nisshi_proxy::Error::Io(_)
+                | nisshi_proxy::Error::Join(_)
+                | nisshi_proxy::Error::Message(_)
+                | nisshi_proxy::Error::Otel(_)
+                | nisshi_proxy::Error::OtelSdk(_)
+                | nisshi_proxy::Error::ParseFilter(_)
+                | nisshi_proxy::Error::Protocol(_)
+                | nisshi_proxy::Error::ResourceLock { .. }
+                | nisshi_proxy::Error::Service(_)
+                | nisshi_proxy::Error::UnknownHost(_) => Self::Failure,
+            },
             Error::Topic(error) => match error {
                 nisshi_topic::Error::Client(error) => Self::of_client_error(error),
                 nisshi_topic::Error::Api(_) => Self::Refused,
-                _ => Self::Failure,
+                nisshi_topic::Error::Io(_)
+                | nisshi_topic::Error::Message(_)
+                | nisshi_topic::Error::Protocol(_)
+                | nisshi_topic::Error::SerdeJson(_) => Self::Failure,
             },
             Error::LakeRequiresSchemaRegistry { .. }
             | Error::SaslPasswordAmbiguous
@@ -102,44 +158,24 @@ impl ExitStatus {
             | Error::TlsPrivateKey { .. }
             | Error::TlsRequiresCertAndKey
             | Error::Url(_) => Self::Usage,
-            _ => Self::Failure,
+            Error::Box(_)
+            | Error::DotEnv(_)
+            | Error::InvalidLength(_)
+            | Error::Regex(_)
+            | Error::SansIo(_)
+            | Error::Schema(_)
+            | Error::Server(_) => Self::Failure,
         }
     }
 
-    /// The status of a failed Kafka client. Keep this in step with `client_error_message` in
-    /// `nisshi/src/bin/nisshi.rs`, which explains the same failures to the user.
+    /// The status of a failed Kafka client. `client_error_message` in `nisshi/src/bin/nisshi.rs`
+    /// explains the same failure to the user, from the same [`nisshi_client::FailureKind`].
     pub fn of_client_error(error: &nisshi_client::Error) -> Self {
-        if matches!(
-            error,
-            nisshi_client::Error::TlsConfiguration(_) | nisshi_client::Error::ParseUrl(_)
-        ) {
-            return Self::Usage;
-        }
-
-        if error.is_connect_failure() || matches!(error, nisshi_client::Error::Timeout(_)) {
-            return Self::Unreachable;
-        }
-
-        let refused = error.scram_iterations().is_some()
-            || error.sasl_not_used()
-            || error.login_failure().is_some()
-            || error.tls_failure().is_some()
-            || error.tls_rejection().is_some()
-            // A broker that serves only TLS, or that requires authentication, accepts the
-            // connection and closes it when the plaintext request arrives.
-            || matches!(
-                error,
-                nisshi_client::Error::Io(cause)
-                    if matches!(
-                        cause.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    )
-            );
-
-        if refused {
-            Self::Refused
-        } else {
-            Self::Failure
+        match error.failure_kind() {
+            FailureKind::Options => Self::Usage,
+            FailureKind::Unreachable => Self::Unreachable,
+            FailureKind::Refused => Self::Refused,
+            FailureKind::Closed | FailureKind::TimedOut | FailureKind::Other => Self::Failure,
         }
     }
 }
@@ -152,6 +188,8 @@ impl From<ExitStatus> for ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
 
     #[test]
@@ -197,28 +235,59 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_that_does_not_open_or_never_answers_is_unreachable() {
+    fn a_connection_that_does_not_open_is_unreachable() {
+        for error in [
+            client(nisshi_client::Error::Io(
+                io::Error::from(io::ErrorKind::ConnectionRefused).into(),
+            )),
+            client(nisshi_client::Error::UnknownHost(
+                "tcp://nowhere:9092".parse().expect("url"),
+            )),
+        ] {
+            assert_eq!(
+                ExitStatus::Unreachable,
+                ExitStatus::of_error(&error),
+                "{error}"
+            );
+        }
+    }
+
+    /// The request may have been applied, so the status makes no promise that a retry is safe.
+    #[test]
+    fn a_request_without_an_answer_is_a_plain_failure() {
         let timeout = client(nisshi_client::Error::Timeout(
             std::time::Duration::from_secs(30),
         ));
-        assert_eq!(ExitStatus::Unreachable, ExitStatus::of_error(&timeout));
+        assert_eq!(ExitStatus::Failure, ExitStatus::of_error(&timeout));
+    }
+
+    /// A closed connection ends in 1, and so does one that the pool wrapped while it opened the
+    /// connection (`nisshi-client` tests that case).
+    #[test]
+    fn a_closed_connection_is_a_plain_failure() {
+        let closed = client(nisshi_client::Error::Io(
+            io::Error::from(io::ErrorKind::UnexpectedEof).into(),
+        ));
+
+        assert_eq!(ExitStatus::Failure, ExitStatus::of_error(&closed));
     }
 
     #[test]
-    fn a_login_a_tls_alert_or_a_closed_connection_is_a_refusal() {
+    fn a_login_or_a_tls_alert_is_a_refusal() {
         for error in [
             client(nisshi_client::Error::SaslNotUsed),
             client(nisshi_client::Error::Authentication("bad password".into())),
             client(nisshi_client::Error::Tls("untrusted".into())),
-            client(nisshi_client::Error::Io(
-                io::Error::from(io::ErrorKind::UnexpectedEof).into(),
-            )),
             Error::Cat(Box::new(nisshi_cat::Error::Fetch {
                 topic: "taxi".into(),
                 partition: 0,
                 error_code: 3,
             })),
             Error::Topic(nisshi_topic::Error::Api(ErrorCode::TopicAlreadyExists)),
+            Error::Generate(nisshi_generator::Error::Api(
+                ErrorCode::UnknownTopicOrPartition,
+            )),
+            Error::Perf(nisshi_perf::Error::Api(ErrorCode::UnknownTopicOrPartition)),
         ] {
             assert_eq!(ExitStatus::Refused, ExitStatus::of_error(&error), "{error}");
         }

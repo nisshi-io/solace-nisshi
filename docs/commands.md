@@ -161,7 +161,9 @@ Results in the following output:
 ## Output and exit codes
 
 The client tools (`topic`, `cat`, `user`, `generator`, `perf`) are meant to be driven by
-scripts as well as by people. The exit codes apply to every subcommand that connects to a broker.
+scripts as well as by people. The exit codes below apply to these five tools. `nisshi broker` and
+`nisshi proxy` are servers: they exit with 0 after a clean stop and with 1 when they fail, as
+they always have.
 
 ### `--output json`
 
@@ -193,17 +195,19 @@ $ nisshi topic create taxi --output json
 | Code | Name | Meaning |
 |------|------|---------|
 | 0 | success | The command did what it was asked to. |
-| 1 | failure | Any other failure: an input file that can't be read, a storage failure, a response that makes no sense. |
+| 1 | failure | Any other failure: an input file that can't be read, a storage failure, a response that makes no sense, a connection that the broker closed, or a request that got no answer in time. After a closed connection or a missing answer the broker may have applied the request, so check before you retry. |
 | 2 | usage error | The command line is wrong, or a TLS or SASL option can't be used. Nothing was sent to a broker. |
-| 3 | broker unreachable | No connection opened, or the broker did not answer in time. Retrying later can succeed. |
-| 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login, rejected the TLS connection or closed the connection, or the client refused what the broker offered (a certificate it does not trust). Retrying the same command won't help. |
+| 3 | broker unreachable | No connection opened: the address does not resolve, or the connection attempt was refused, failed or timed out. |
+| 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login or rejected the TLS connection, or the client refused what the broker offered (a certificate it does not trust). The status does not say whether a retry can succeed. For an error code, read the code: `--output json` prints it. |
 
 `generator` and `perf` keep running when the broker refuses a produce request, so a refused
-produce does not end them with 4. A refused login or TLS connection still does. `nisshi perf
-consume` is not implemented and ends with 1.
+produce does not end them with 4. A refused login or TLS connection ends them with 4, because
+nothing can be produced. `nisshi perf consume` is not implemented and ends with 1.
 
-Releases up to 0.8.2 exited with 1 when the broker refused a request. A script that tests
-for `1` should test for non-zero, or for `4`.
+Releases up to 0.8.2 exited with 1 when the broker refused a request or could not be reached. A
+script that tests for `1` should test for non-zero, or for `3` and `4`. The client tools also log
+to stderr now, where they logged to stdout, so a script that searches stdout for an error line no
+longer finds one.
 
 ```shell
 nisshi topic create taxi

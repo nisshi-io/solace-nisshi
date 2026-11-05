@@ -87,6 +87,17 @@ pub enum Error {
     Url(#[from] url::ParseError),
 }
 
+impl Error {
+    /// Whether the broker refused the login or the TLS connection, or the client refused what
+    /// the broker offered. No producer can produce after that, so the run ends with the error.
+    fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(error) if error.failure_kind() == nisshi_client::FailureKind::Refused
+        )
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
@@ -347,19 +358,30 @@ impl Perf {
             _ = set.spawn(async move {
                 loop {
                     match producer.rate_limited().await {
-                        Ok(false) | Err(_) => break,
-                        _ => continue,
+                        Ok(false) => return Ok(()),
+                        Err(error) if error.is_refusal() => return Err(error),
+                        Err(_) => return Ok(()),
+                        Ok(true) => continue,
                     }
                 }
             });
         }
 
+        // Ends when every producer has ended, or with the error of the first producer that
+        // ended with one.
         let join_all = async {
             while !set.is_empty() {
                 debug!(len = set.len());
-                _ = set.join_next().await;
+
+                if let Some(Ok(Err(error))) = set.join_next().await {
+                    return Some(error);
+                }
             }
+
+            None
         };
+
+        let mut failure = None;
 
         let duration = self
             .duration
@@ -378,6 +400,12 @@ impl Perf {
 
             completed = join_all => {
                 debug!(?completed);
+
+                if completed.is_some() {
+                    token.cancel();
+                }
+
+                failure = completed;
                 None
             }
 
@@ -410,7 +438,7 @@ impl Perf {
             _ = set.join_next().await;
         }
 
-        Ok(ErrorCode::None)
+        failure.map_or(Ok(ErrorCode::None), Err)
     }
 }
 
@@ -531,9 +559,22 @@ impl Producer {
                 return Ok(false)
             },
 
-            Ok(_) = self.produce(frame) => {
-                PRODUCE_RECORD_COUNT.add(self.batch_size.get() as u64, &attributes);
-                PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+            produced = self.produce(frame) => match produced {
+                Ok(()) => {
+                    PRODUCE_RECORD_COUNT.add(self.batch_size.get() as u64, &attributes);
+                    PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+                }
+
+                // The login or the TLS connection was refused, so no producer can ever produce:
+                // end the run with the error.
+                Err(error) if error.is_refusal() => return Err(error),
+
+                // Any other failure of a request leaves this producer idle until the run ends.
+                Err(error) => {
+                    debug!(?error);
+                    self.token.cancelled().await;
+                    return Ok(false)
+                }
             },
         }
 
