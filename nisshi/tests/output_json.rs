@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::Broker;
+use common::{Broker, schema_registry};
 use serde_json::Value;
 use std::process::Output;
 
@@ -167,4 +167,151 @@ fn cat_consume_accepts_json_and_prints_a_json_array_on_each_line() {
         let batch: Value = serde_json::from_str(line).expect(line);
         assert_eq!("hello", batch[0]["value"], "{line}");
     }
+}
+
+#[test]
+fn perf_prints_a_json_object_for_each_interval_and_a_summary() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+
+    let output = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--duration",
+            "3s",
+            "--output",
+            "json",
+        ],
+        // Export every half second, not every minute, so that the run has intervals.
+        &[("OTEL_METRIC_EXPORT_INTERVAL", "500")],
+    );
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+
+    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}")))
+        .collect();
+
+    let (summary, intervals) = lines.split_last().expect("a summary");
+    assert_eq!("summary", summary["type"], "{output:?}");
+    assert!(summary["records_sent"].as_u64().unwrap() > 0, "{summary}");
+    assert!(!intervals.is_empty(), "{output:?}");
+    for interval in intervals {
+        assert_eq!("interval", interval["type"], "{interval}");
+        assert!(interval["records_sent"].is_u64(), "{interval}");
+    }
+}
+
+#[test]
+fn perf_prints_a_json_summary_when_the_run_is_shorter_than_an_interval() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+
+    let output = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--duration",
+            "1s",
+            "--output",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+    assert_eq!("summary", json(&output)["type"], "{output:?}");
+}
+
+#[test]
+fn generator_json_survives_a_closed_stdout() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json-closed");
+
+    let output = broker.run_with_closed_stdout(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--duration-seconds",
+            "1",
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+}
+
+#[test]
+fn generator_prints_one_json_summary_when_the_run_ends() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json");
+
+    let output = broker.run(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "10",
+            "--duration-seconds",
+            "2",
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+
+    let summary = json(&output);
+    assert_eq!("summary", summary["type"], "{summary}");
+    assert!(
+        summary["records_produced"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
+    assert_eq!(
+        summary["batches_produced"], summary["records_produced"],
+        "the default batch holds one record: {summary}"
+    );
+    assert!(summary["elapsed_ms"].as_u64().unwrap() >= 2000, "{summary}");
+}
+
+#[test]
+fn a_refused_produce_still_prints_the_json_summary_and_exits_4() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json-refused");
+
+    let output = broker.run(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--partition",
+            "7",
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
+    assert_eq!(0, json(&output)["records_produced"], "{output:?}");
 }

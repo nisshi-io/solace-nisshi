@@ -18,13 +18,17 @@
 //! Generate fake data for schema backed topics.
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Write as _},
     marker::PhantomData,
     num::NonZeroU32,
     pin::Pin,
     result,
-    sync::{Arc, LazyLock, PoisonError},
-    time::{Duration, SystemTime},
+    sync::{
+        Arc, LazyLock, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use governor::{InsufficientCapacity, Jitter, Quota, RateLimiter};
@@ -48,7 +52,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, span};
+use tracing::{Instrument, Level, debug, error, span};
 use url::Url;
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
@@ -80,13 +84,15 @@ pub enum Error {
 }
 
 impl Error {
-    /// Whether the broker refused the login or the TLS connection, or the client refused what
-    /// the broker offered. No producer can produce after that, so the run ends with the error.
+    /// Whether the broker refused the login, the TLS connection or a produce request, or the
+    /// client refused what the broker offered. The run ends with the error: a refusal repeats on
+    /// every batch, so going on would only count refusals.
     fn is_refusal(&self) -> bool {
-        matches!(
-            self,
-            Self::Client(error) if error.failure_kind() == nisshi_client::FailureKind::Refused
-        )
+        match self {
+            Self::Api(_) => true,
+            Self::Client(error) => error.failure_kind() == nisshi_client::FailureKind::Refused,
+            _ => false,
+        }
     }
 }
 
@@ -121,6 +127,44 @@ pub enum CancelKind {
     Timeout,
 }
 
+/// What the generator prints on stdout.
+#[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReportFormat {
+    /// Nothing: the generator has no report of its own for a person to read.
+    #[default]
+    Text,
+
+    /// One JSON object when the run ends, see [`Summary`].
+    Json,
+}
+
+/// What a run produced, printed as one line of JSON with [`ReportFormat::Json`].
+///
+/// Only batches that the broker accepted are counted.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct Summary {
+    r#type: &'static str,
+    elapsed_ms: u64,
+    batches_produced: u64,
+    records_produced: u64,
+}
+
+impl Summary {
+    fn new(elapsed: Duration, batches_produced: u64, records_produced: u64) -> Self {
+        Self {
+            r#type: "summary",
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            batches_produced,
+            records_produced,
+        }
+    }
+
+    /// The summary as the one line of JSON that [`ReportFormat::Json`] prints.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
@@ -134,6 +178,7 @@ pub struct Configuration {
     producers: u32,
     duration: Option<Duration>,
     otlp_endpoint_url: Option<Url>,
+    report: ReportFormat,
 }
 
 #[derive(Clone, Debug)]
@@ -247,20 +292,20 @@ pub async fn produce(
         )
     })?;
 
-    assert!(
-        response
-            .responses
-            .unwrap_or_default()
-            .into_iter()
-            .all(|topic| {
-                topic
-                    .partition_responses
-                    .unwrap_or_default()
-                    .iter()
-                    .inspect(|partition| debug!(topic = %topic.name, ?partition))
-                    .all(|partition| partition.error_code == i16::from(ErrorCode::None))
-            })
-    );
+    // The broker answers a produce request that it refuses with an error code in the partition
+    // response, not with a failed call.
+    for topic in response.responses.unwrap_or_default() {
+        for partition in topic.partition_responses.unwrap_or_default() {
+            debug!(topic = %topic.name, ?partition);
+
+            if partition.error_code != i16::from(ErrorCode::None) {
+                let code = ErrorCode::try_from(partition.error_code)
+                    .unwrap_or(ErrorCode::UnknownServerError);
+                error!(topic = %topic.name, partition = partition.index, ?code, message = ?partition.error_message, "the broker refused the produce request");
+                return Err(Error::Api(code));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -338,6 +383,9 @@ impl Generate {
         let mut set = JoinSet::new();
 
         let token = CancellationToken::new();
+        let started = Instant::now();
+        let batches_produced = Arc::new(AtomicU64::new(0));
+        let records_produced = Arc::new(AtomicU64::new(0));
 
         let client = ConnectionManager::builder(self.configuration.broker)
             .security(self.configuration.security.clone())
@@ -354,6 +402,8 @@ impl Generate {
             let partition = self.configuration.partition;
             let token = token.clone();
             let client = client.clone();
+            let batches_produced = batches_produced.clone();
+            let records_produced = records_produced.clone();
 
             _ = set.spawn(async move {
                     let span = span!(Level::DEBUG, "producer", producer);
@@ -404,12 +454,14 @@ impl Generate {
 
                                 produced = produce(client.clone(), topic.clone(), partition,  batch_size.get() as i32, frame) => match produced {
                                     Ok(()) => {
+                                        _ = batches_produced.fetch_add(1, Ordering::Relaxed);
+                                        _ = records_produced.fetch_add(batch_size.get() as u64, Ordering::Relaxed);
                                         PRODUCE_RECORD_COUNT.add(batch_size.get() as u64, &attributes);
                                         PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
                                     }
 
-                                    // The login or the TLS connection was refused, so no producer
-                                    // can ever produce: end the run with the error.
+                                    // The login, the TLS connection or the produce request was
+                                    // refused: end the run with the error.
                                     Err(error) if error.is_refusal() => return Err(error),
 
                                     // Any other failure of a request leaves this producer idle
@@ -485,6 +537,9 @@ impl Generate {
 
         debug!(?cancellation);
 
+        // Before the flush and the grace period below, which are not time spent producing.
+        let elapsed = started.elapsed();
+
         if let Some(meter_provider) = meter_provider {
             meter_provider
                 .force_flush()
@@ -504,6 +559,17 @@ impl Generate {
 
         while !set.is_empty() {
             _ = set.join_next().await;
+        }
+
+        if self.configuration.report == ReportFormat::Json {
+            let summary = Summary::new(
+                elapsed,
+                batches_produced.load(Ordering::Relaxed),
+                records_produced.load(Ordering::Relaxed),
+            );
+
+            // A closed stdout does not fail a run that already did its work.
+            _ = writeln!(io::stdout(), "{}", summary.to_json()).inspect_err(|error| debug!(?error));
         }
 
         failure.map_or(Ok(ErrorCode::None), Err)
@@ -528,6 +594,7 @@ pub struct Builder<B, T, P, S> {
     producers: u32,
     duration: Option<Duration>,
     otlp_endpoint_url: Option<Url>,
+    report: ReportFormat,
 }
 
 impl Default
@@ -546,6 +613,7 @@ impl Default
             producers: 1,
             duration: None,
             otlp_endpoint_url: None,
+            report: ReportFormat::default(),
         }
     }
 }
@@ -569,6 +637,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
             producers: self.producers,
             duration: self.duration,
             otlp_endpoint_url: self.otlp_endpoint_url,
+            report: self.report,
         }
     }
 
@@ -585,6 +654,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
             producers: self.producers,
             duration: self.duration,
             otlp_endpoint_url: self.otlp_endpoint_url,
+            report: self.report,
         }
     }
 
@@ -601,6 +671,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
             producers: self.producers,
             duration: self.duration,
             otlp_endpoint_url: self.otlp_endpoint_url,
+            report: self.report,
         }
     }
 
@@ -617,6 +688,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
             producers: self.producers,
             duration: self.duration,
             otlp_endpoint_url: self.otlp_endpoint_url,
+            report: self.report,
         }
     }
 
@@ -638,6 +710,11 @@ impl<B, T, P, S> Builder<B, T, P, S> {
 
     pub fn duration(self, duration: Option<Duration>) -> Self {
         Self { duration, ..self }
+    }
+
+    /// What to print on stdout, by default nothing.
+    pub fn report(self, report: ReportFormat) -> Self {
+        Self { report, ..self }
     }
 
     pub fn otlp_endpoint_url(self, otlp_endpoint_url: Option<Url>) -> Self {
@@ -662,6 +739,34 @@ impl Builder<Url, String, i32, Url> {
             producers: self.producers,
             duration: self.duration,
             otlp_endpoint_url: self.otlp_endpoint_url,
+            report: self.report,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_produce_is_a_refusal() {
+        assert!(Error::Api(ErrorCode::UnknownTopicOrPartition).is_refusal());
+        assert!(!Error::Poison.is_refusal());
+    }
+
+    #[test]
+    fn the_summary_is_one_json_object() {
+        let summary = Summary::new(Duration::from_millis(1500), 3, 30);
+        let json: serde_json::Value = serde_json::from_str(&summary.to_json()).unwrap();
+
+        assert_eq!(
+            serde_json::json!({
+                "type": "summary",
+                "elapsed_ms": 1500,
+                "batches_produced": 3,
+                "records_produced": 30,
+            }),
+            json
+        );
     }
 }

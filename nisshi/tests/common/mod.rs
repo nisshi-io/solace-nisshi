@@ -279,3 +279,18 @@ pub(crate) fn stdout(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
     String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
 }
+
+/// A schema registry directory with the `taxi` schema in it, which `generator` needs, and the
+/// `file://` URL that names it relative to the directory that the command runs in.
+pub(crate) fn schema_registry(name: &str) -> (std::path::PathBuf, String) {
+    let registry =
+        std::env::temp_dir().join(format!("nisshi-exit-codes-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&registry).expect("registry directory");
+    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
+    let url = format!(
+        "file://./{}",
+        registry.file_name().unwrap().to_str().unwrap()
+    );
+
+    (registry, url)
+}

@@ -111,7 +111,7 @@ const CLIENT_TOOL_NOTE: &str = "Connects in plaintext and does not log in, unles
 
 /// The exit statuses of the client tools, as [`crate::ExitStatus`] numbers them. Part of every client
 /// tool's `--help`, and of docs/commands.md.
-const EXIT_STATUS_NOTE: &str = "Exit status: 0 success, 1 other failure (including a connection that the broker closed and a request that got no answer in time: the broker may have applied the request, so check before you retry), 2 usage error (a wrong command line or an unusable TLS or SASL option), 3 broker unreachable (no connection opened), 4 broker refused (an error code in its answer, which --output json prints, a refused login, or a rejected TLS connection). generator and perf keep running when the broker refuses a produce request, so that does not end them with 4, but a refused login or TLS connection does.";
+const EXIT_STATUS_NOTE: &str = "Exit status: 0 success, 1 other failure (including a connection that the broker closed and a request that got no answer in time: the broker may have applied the request, so check before you retry), 2 usage error (a wrong command line or an unusable TLS or SASL option), 3 broker unreachable (no connection opened), 4 broker refused (an error code in its answer, which --output json prints, a refused login, or a rejected TLS connection). generator and perf stop at the first produce request that the broker refuses, and end with 4, as they do for a refused login or TLS connection.";
 
 fn client_tool_note() -> String {
     format!("{CLIENT_TOOL_NOTE}\n\n{EXIT_STATUS_NOTE}")
