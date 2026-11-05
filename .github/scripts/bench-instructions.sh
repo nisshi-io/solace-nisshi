@@ -6,7 +6,7 @@
 # instruction count of the same binary on the same input does not.
 #
 #   bench-instructions.sh measure BINARY OUTPUT.tsv [API_KEY...]
-#   bench-instructions.sh compare BASE.tsv HEAD.tsv [THRESHOLD_PERCENT]
+#   bench-instructions.sh compare BASE.tsv HEAD.tsv [THRESHOLD_PERCENT [MIN_INSTRUCTIONS]]
 #
 # `measure` runs BINARY under callgrind once for all fixtures (the `all` row)
 # and once for each API_KEY, and writes one `<key>\t<instructions>` line per
@@ -15,8 +15,11 @@
 # process start and the lazily built message metadata.
 #
 # `compare` prints a Markdown table of the change per row. It exits 1 when
-# any row grows by more than THRESHOLD_PERCENT (default 3), and writes a
-# `::warning::` line for each such row.
+# any row grows by more than THRESHOLD_PERCENT (default 3) and by more than
+# MIN_INSTRUCTIONS (default 1500), and writes a `::warning::` line for each
+# such row. The same binary measured twice differs by a few hundred
+# instructions in a row, which is a large percentage of a small row, so a
+# percentage alone would flag the small rows.
 #
 # Tested by bench-instructions.test.sh.
 #
@@ -65,17 +68,17 @@ measure() {
 }
 
 compare() {
-  local base="$1" head="$2" threshold="${3:-3}" rows
+  local base="$1" head="$2" threshold="${3:-3}" minimum="${4:-1500}" rows
   rows=$(mktemp)
   # A key present on one side only is a fixture added or removed, not a
   # change in cost, so it gets no percentage.
   join -t $'\t' -a1 -a2 -e - -o 0,1.2,2.2 \
     <(LC_ALL=C sort -t $'\t' -k1,1 "$base") <(LC_ALL=C sort -t $'\t' -k1,1 "$head") |
-    awk -F '\t' -v threshold="$threshold" '
+    awk -F '\t' -v threshold="$threshold" -v minimum="$minimum" '
       {
         if ($2 == "-" || $3 == "-") { printf "0\t%s\t%s\t%s\tn/a\t\n", $1, $2, $3; next }
         pct = ($3 - $2) * 100 / $2
-        flag = pct > threshold ? "regression" : ""
+        flag = (pct > threshold && $3 - $2 > minimum) ? "regression" : ""
         printf "%f\t%s\t%s\t%s\t%+.2f%%\t%s\n", pct, $1, $2, $3, pct, flag
       }' | LC_ALL=C sort -t $'\t' -k1,1 -g -r > "$rows"
 
@@ -96,7 +99,7 @@ compare() {
 case "${1:-}" in
   measure) [ "$#" -ge 3 ] || { echo "usage: $0 measure BINARY OUTPUT.tsv [API_KEY...]" >&2; exit 2; }
     shift; measure "$@" ;;
-  compare) [ "$#" -ge 3 ] || { echo "usage: $0 compare BASE.tsv HEAD.tsv [THRESHOLD_PERCENT]" >&2; exit 2; }
+  compare) [ "$#" -ge 3 ] || { echo "usage: $0 compare BASE.tsv HEAD.tsv [THRESHOLD_PERCENT [MIN_INSTRUCTIONS]]" >&2; exit 2; }
     shift; compare "$@" ;;
   *) echo "usage: $0 measure|compare ..." >&2; exit 2 ;;
 esac

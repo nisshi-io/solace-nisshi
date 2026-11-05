@@ -91,13 +91,20 @@ printf 'all\t10600\n18\t1000\n0\t2000\n' > "$WORK/slower.tsv"
 printf 'all\t9000\n18\t900\n0\t1800\n' > "$WORK/faster.tsv"
 printf 'all\t10000\n18\t1000\n0\t2000\n99\t500\n' > "$WORK/added.tsv"
 printf 'all\t10000\n0\t2000\n' > "$WORK/removed.tsv"
+printf 'all\t1000000\n' > "$WORK/big-base.tsv"
+printf 'all\t1060000\n' > "$WORK/big-slower.tsv"
+printf 'all\t1020000\n' > "$WORK/big-small.tsv"
 
 check "unchanged counts pass" pass "| all | 10000 | 10000 | +0.00% |" compare "$WORK/base.tsv" "$WORK/same.tsv"
 check "growth below the threshold passes" pass "+2.00%" compare "$WORK/base.tsv" "$WORK/small.tsv"
-check "growth above the threshold fails" fail "| all | 10000 | 10600 | +6.00% :warning: |" compare "$WORK/base.tsv" "$WORK/slower.tsv"
-check "the failure names a warning" fail "::warning::bench instructions for API key all grew +6.00%" compare "$WORK/base.tsv" "$WORK/slower.tsv"
-check "a lower threshold turns small growth into a failure" fail ":warning:" compare "$WORK/base.tsv" "$WORK/small.tsv" 1
-check "a higher threshold lets the same growth pass" pass "+6.00%" compare "$WORK/base.tsv" "$WORK/slower.tsv" 10
+check "growth above the threshold fails" fail "| all | 10000 | 10600 | +6.00% :warning: |" compare "$WORK/base.tsv" "$WORK/slower.tsv" 3 0
+check "the failure names a warning" fail "::warning::bench instructions for API key all grew +6.00%" compare "$WORK/base.tsv" "$WORK/slower.tsv" 3 0
+check "a lower threshold turns small growth into a failure" fail ":warning:" compare "$WORK/base.tsv" "$WORK/small.tsv" 1 0
+check "a higher threshold lets the same growth pass" pass "+6.00%" compare "$WORK/base.tsv" "$WORK/slower.tsv" 10 0
+# +6% of 10000 is 600 instructions: the default minimum of 1500 treats that as noise.
+check "growth below the minimum passes whatever the percentage" pass "+6.00%" compare "$WORK/base.tsv" "$WORK/slower.tsv"
+check "growth above both limits fails with the defaults" fail ":warning:" compare "$WORK/big-base.tsv" "$WORK/big-slower.tsv"
+check "a large row under the threshold passes with the defaults" pass "+2.00%" compare "$WORK/big-base.tsv" "$WORK/big-small.tsv"
 check "fewer instructions pass" pass "-10.00%" compare "$WORK/base.tsv" "$WORK/faster.tsv"
 check "an added key has no percentage" pass "| 99 | - | 500 | n/a |" compare "$WORK/base.tsv" "$WORK/added.tsv"
 check "a removed key has no percentage" pass "| 18 | 1000 | - | n/a |" compare "$WORK/base.tsv" "$WORK/removed.tsv"
