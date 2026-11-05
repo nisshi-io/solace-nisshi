@@ -16,7 +16,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::{Duration, SystemTime},
 };
@@ -52,7 +55,7 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version, inflate_produced, offload,
+    Version, inflate_produced, offload, produce_path,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -179,6 +182,101 @@ impl BatchRequest {
     }
 }
 
+/// The decoded size that queued requests hold, shared by the clones of a batcher.
+type DecodedHeld = Arc<AtomicUsize>;
+
+/// A share of the batcher's decoded-size budget, released when it drops.
+#[derive(Debug)]
+struct Reservation {
+    held: DecodedHeld,
+    bytes: usize,
+}
+
+impl Reservation {
+    /// Takes `bytes` from the budget if the batcher would then hold at most `limit`.
+    fn take(held: &DecodedHeld, bytes: usize, limit: usize) -> Option<Self> {
+        held.try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            held.checked_add(bytes).filter(|total| *total <= limit)
+        })
+        .ok()
+        .map(|_| Self {
+            held: held.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        _ = self.held.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// A batch that the caller decoded, held while its request waits in the queue, and the budget that
+/// it takes.
+#[derive(Debug)]
+struct Decoded {
+    batch: inflated::Batch,
+    _reservation: Reservation,
+}
+
+/// A request in the queue, with its decoded batch if the batcher held it.
+///
+/// A [`BatchRequest`] clones cheaply because the clone shares its record bytes, and the clones
+/// that `send_queued` keeps never hold a decoded batch.
+#[derive(Debug)]
+struct Queued {
+    request: BatchRequest,
+    decoded: Option<Decoded>,
+}
+
+impl From<BatchRequest> for Queued {
+    fn from(request: BatchRequest) -> Self {
+        Self {
+            request,
+            decoded: None,
+        }
+    }
+}
+
+/// Removes a request from the queue when its produce is dropped before a flush took the request,
+/// so that an abandoned request does not hold its bytes, or its share of the decoded budget,
+/// until a later flush of its queue. A flush ([`ProduceRequestBatcher::send_queued`]) and this
+/// guard are the only two ways out of the queue.
+///
+/// A produce that is dropped after a flush took its request but before the flush answered still
+/// leaves one unclaimed response behind, as it did before the guard.
+struct QueueGuard<G> {
+    batcher: ProduceRequestBatcher<G>,
+    key: TopitionProducerId,
+    id: Uuid,
+
+    /// Set when the produce got its response, so that the drop has nothing to clean up.
+    answered: bool,
+}
+
+impl<G> Drop for QueueGuard<G> {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+
+        if let Ok(mut requests) = self.batcher.requests.lock()
+            && let Some(queue) = requests.get_mut(&self.key)
+        {
+            queue.retain(|queued| queued.request.id != self.id);
+
+            if queue.is_empty() {
+                _ = requests.remove(&self.key);
+            }
+        }
+
+        if let Ok(mut responses) = self.batcher.responses.lock() {
+            _ = responses.remove(&self.id);
+        }
+    }
+}
+
 /// One write of a flush: the batch that [`combine`] merged from consecutive queued requests, and
 /// those requests, in queue order.
 #[derive(Clone, Debug)]
@@ -202,11 +300,20 @@ pub struct ProduceRequestBatcher<G> {
     /// The largest decoded size of a merged batch, [`MAX_DECODED_BATCH_BYTES`] outside tests.
     decoded_limit: usize,
 
+    /// The decoded size of the batches that queued requests hold, at most `decoded_limit`.
+    ///
+    /// This bounds the memory that waiting for `maximum_delay` adds: the queues hold at most
+    /// `decoded_limit` of decoded batches, and a request over the bound is queued as bytes only.
+    /// Each flush in progress adds its open run and the batch that it is merging, as it did before
+    /// this field. A produce that is dropped leaves the queue and returns its share (see
+    /// [`QueueGuard`]).
+    decoded_held: DecodedHeld,
+
     /// The error that a test makes every merge fail with, after [`combine`] has run.
     #[cfg(test)]
     merge_error: Option<Error>,
 
-    requests: Arc<Mutex<BTreeMap<TopitionProducerId, Vec<BatchRequest>>>>,
+    requests: Arc<Mutex<BTreeMap<TopitionProducerId, Vec<Queued>>>>,
     responses: Arc<Mutex<BTreeMap<Uuid, BatchResponse>>>,
 }
 
@@ -237,6 +344,7 @@ where
             minimum_size: Default::default(),
             maximum_delay: Default::default(),
             decoded_limit: MAX_DECODED_BATCH_BYTES,
+            decoded_held: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             merge_error: None,
 
@@ -321,7 +429,7 @@ where
         {
             let batches = queued
                 .iter()
-                .map(|queued| &queued.batch)
+                .map(|queued| &queued.request.batch)
                 .collect::<Vec<_>>();
 
             if !shares_one_codec(&batches)
@@ -338,7 +446,10 @@ where
 
         // A clone of a batch shares its record bytes, so keeping the requests as sent costs no
         // copy.
-        let queued_as_sent = queued.clone();
+        let queued_as_sent = queued
+            .iter()
+            .map(|queued| queued.request.clone())
+            .collect::<Vec<_>>();
         let decoded_limit = self.decoded_limit;
 
         let Combined { runs, rejected } =
@@ -382,7 +493,12 @@ where
             // batch as sent, and each one may be valid, so we write each one on its own.
             Err(Error::SansIo(nisshi_sans_io::Error::OffsetDeltaOverflow(_))) => {
                 let responses_by_owner = self
-                    .write_each_as_sent(transaction_id, topition, queued_as_sent, &attributes)
+                    .write_each_as_sent(
+                        transaction_id,
+                        topition,
+                        queued_as_sent.into_iter().map(Queued::from).collect(),
+                        &attributes,
+                    )
                     .await;
 
                 return self.respond(responses_by_owner, &attributes);
@@ -411,8 +527,13 @@ where
                     // The merged batch is over `max.message.bytes`. Kafka checks and stores each batch
                     // as sent, and each one may be valid, so we write each one on its own.
                     Err(Error::MessageTooLarge { .. }) => {
-                        self.write_each_as_sent(transaction_id, topition, owners, &attributes)
-                            .await
+                        self.write_each_as_sent(
+                            transaction_id,
+                            topition,
+                            owners.into_iter().map(Queued::from).collect(),
+                            &attributes,
+                        )
+                        .await
                     }
 
                     outcome => {
@@ -449,28 +570,40 @@ where
     }
 
     /// Writes the batch of each of `owners` on its own, in queue order, and returns each owner's
-    /// result.
+    /// result. An owner that holds its decoded batch passes it on, so that the storage does not
+    /// decode the batch again: the default producer is idempotent, and every batch of an
+    /// idempotent producer is written as sent.
     async fn write_each_as_sent(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
-        owners: Vec<BatchRequest>,
+        owners: Vec<Queued>,
         attributes: &[KeyValue],
     ) -> Vec<(Uuid, Result<i64>)> {
         let mut responses_by_owner = Vec::with_capacity(owners.len());
 
         for owner in owners {
-            let count = owner.record_count();
-            let response = self
-                .storage
-                .produce(transaction_id, topition, owner.batch)
-                .await;
+            let Queued { request, decoded } = owner;
+            let count = request.record_count();
+            let response = match decoded {
+                Some(Decoded { batch, .. }) => {
+                    self.storage
+                        .produce_inflated(transaction_id, topition, request.batch, batch)
+                        .await
+                }
+
+                None => {
+                    self.storage
+                        .produce(transaction_id, topition, request.batch)
+                        .await
+                }
+            };
 
             if response.is_ok() {
                 SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(count as u64, attributes);
             }
 
-            responses_by_owner.push((owner.id, response));
+            responses_by_owner.push((request.id, response));
         }
 
         responses_by_owner
@@ -495,6 +628,131 @@ where
         })?;
 
         Ok(())
+    }
+}
+
+impl<G> ProduceRequestBatcher<G>
+where
+    G: Storage + Clone,
+{
+    /// Queues `deflated` until a flush writes it, and waits for the flush. `decoded` is the batch
+    /// that the caller decoded, held with the request.
+    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_with(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        decoded: Option<Decoded>,
+    ) -> Result<i64> {
+        let Some(maximum_delay) = self.maximum_delay else {
+            return self
+                .storage
+                .produce(transaction_id, topition, deflated)
+                .await;
+        };
+
+        let start = SystemTime::now();
+
+        let attributes = [KeyValue::new("topic", topition.topic.clone())];
+
+        let producer_id = deflated.producer_id;
+
+        let topition_producer_id = TopitionProducerId {
+            topition: topition.to_owned(),
+            producer_id,
+        };
+
+        let ticket = self.requests.lock().map(|mut requests| {
+            let ticket = Ticket::new(self.clone());
+
+            let queue = requests.entry(topition_producer_id.clone()).or_default();
+
+            queue.push(Queued {
+                request: BatchRequest {
+                    id: ticket.id,
+                    batch: deflated,
+                },
+                decoded,
+            });
+
+            PRODUCE_REQUEST_QUEUED_COUNTER.add(1, &attributes);
+            debug!(queue_len = queue.len());
+
+            ticket
+        })?;
+
+        debug!(ticket = %ticket.id);
+
+        // Takes the request back out of the queue if this produce is dropped before a flush
+        // writes it.
+        let mut guard = QueueGuard {
+            batcher: self.clone(),
+            key: topition_producer_id.clone(),
+            id: ticket.id,
+            answered: false,
+        };
+
+        let mut iteration = -1;
+
+        loop {
+            self.update_metrics()?;
+
+            let ticket = ticket.clone();
+            let id = ticket.id;
+
+            iteration += 1;
+
+            let queued_bytes = self
+                .requests
+                .lock()
+                .map(|requests| {
+                    requests
+                        .get(&topition_producer_id)
+                        .map(|queue| {
+                            queue
+                                .iter()
+                                .map(|queued| queued.request.batch.record_data.len())
+                                .sum::<usize>()
+                        })
+                        .unwrap_or_default()
+                })
+                .inspect(|queued_bytes| debug!(queued_bytes))?;
+
+            if self
+                .minimum_size
+                .inspect(|minimum_size| debug!(minimum_size, queued_bytes))
+                .is_some_and(|minimum_size| queued_bytes > minimum_size)
+            {
+                PRODUCE_REQUEST_MINIMUM_SIZE_TRIGGER.add(1, &attributes);
+
+                self.send_queued(&id, transaction_id, topition, producer_id)
+                    .await?;
+            }
+
+            let patience = sleep(maximum_delay);
+
+            tokio::select! {
+                response = ticket  => {
+                    let elapsed = start.elapsed().map_or(0, |duration| duration.as_millis() as u64);
+                    debug!(ready = %id, elapsed, iteration);
+                    PRODUCE_REQUEST_YOUR_TICKET_IS_READY.add(1, &attributes);
+                    PRODUCE_DURATION.record(elapsed, &attributes);
+                    guard.answered = true;
+                    self.update_metrics()?;
+                    return response;
+                }
+
+                _ = patience => {
+                    if iteration > 1 {
+                        warn!(ticket = %id, iteration);
+                    }
+
+                    PRODUCE_REQUEST_TIMEOUT_EXPIRED_TRIGGER.add(1, &attributes);
+                    self.send_queued(&id, transaction_id, topition, producer_id).await?;
+                }
+            }
+        }
     }
 }
 
@@ -538,8 +796,11 @@ where
     }
 
     /// Without a `maximum_delay` the batcher queues nothing, so the decoded batch goes straight
-    /// to the storage. With one, the batch joins a queue and is combined with others, which
-    /// decodes it again: the default drops the decoded batch.
+    /// to the storage. With one, the batch joins a queue until a flush, and the queue holds the
+    /// decoded batch with it, so that the flush does not decode the bytes again, as long as the
+    /// decoded batches that the queues hold stay within the decoded limit. A batch that would
+    /// take the queues over the limit is dropped, and the flush decodes its bytes, as it did before
+    /// this method kept the decoded batch.
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -554,113 +815,35 @@ where
                 .await;
         }
 
-        drop(inflated);
+        let decoded = BatchAttribute::try_from(deflated.attributes)
+            .and_then(|attributes| inflated.decoded_size(&attributes.compression))
+            .ok()
+            .and_then(|size| Reservation::take(&self.decoded_held, size, self.decoded_limit))
+            .map(|reservation| {
+                produce_path::direct();
 
-        self.produce(transaction_id, topition, deflated).await
+                Decoded {
+                    batch: inflated,
+                    _reservation: reservation,
+                }
+            });
+
+        if decoded.is_none() {
+            produce_path::fallback();
+        }
+
+        self.produce_with(transaction_id, topition, deflated, decoded)
+            .await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let Some(maximum_delay) = self.maximum_delay else {
-            return self
-                .storage
-                .produce(transaction_id, topition, deflated)
-                .await;
-        };
-
-        let start = SystemTime::now();
-
-        let attributes = [KeyValue::new("topic", topition.topic.clone())];
-
-        let producer_id = deflated.producer_id;
-
-        let topition_producer_id = TopitionProducerId {
-            topition: topition.to_owned(),
-            producer_id,
-        };
-
-        let ticket = self.requests.lock().map(|mut requests| {
-            let ticket = Ticket::new(self.clone());
-
-            let queue = requests.entry(topition_producer_id.clone()).or_default();
-
-            queue.push(BatchRequest {
-                id: ticket.id,
-                batch: deflated,
-            });
-
-            PRODUCE_REQUEST_QUEUED_COUNTER.add(1, &attributes);
-            debug!(queue_len = queue.len());
-
-            ticket
-        })?;
-
-        debug!(ticket = %ticket.id);
-
-        let mut iteration = -1;
-
-        loop {
-            self.update_metrics()?;
-
-            let ticket = ticket.clone();
-            let id = ticket.id;
-
-            iteration += 1;
-
-            let queued_bytes = self
-                .requests
-                .lock()
-                .map(|requests| {
-                    requests
-                        .get(&topition_producer_id)
-                        .map(|queue| {
-                            queue
-                                .iter()
-                                .map(|batch_request| batch_request.batch.record_data.len())
-                                .sum::<usize>()
-                        })
-                        .unwrap_or_default()
-                })
-                .inspect(|queued_bytes| debug!(queued_bytes))?;
-
-            if self
-                .minimum_size
-                .inspect(|minimum_size| debug!(minimum_size, queued_bytes))
-                .is_some_and(|minimum_size| queued_bytes > minimum_size)
-            {
-                PRODUCE_REQUEST_MINIMUM_SIZE_TRIGGER.add(1, &attributes);
-
-                self.send_queued(&id, transaction_id, topition, producer_id)
-                    .await?;
-            }
-
-            let patience = sleep(maximum_delay);
-
-            tokio::select! {
-                response = ticket  => {
-                    let elapsed = start.elapsed().map_or(0, |duration| duration.as_millis() as u64);
-                    debug!(ready = %id, elapsed, iteration);
-                    PRODUCE_REQUEST_YOUR_TICKET_IS_READY.add(1, &attributes);
-                    PRODUCE_DURATION.record(elapsed, &attributes);
-                    self.update_metrics()?;
-                    return response;
-                }
-
-                _ = patience => {
-                    if iteration > 1 {
-                        warn!(ticket = %id, iteration);
-                    }
-
-                    PRODUCE_REQUEST_TIMEOUT_EXPIRED_TRIGGER.add(1, &attributes);
-                    self.send_queued(&id, transaction_id, topition, producer_id).await?;
-                }
-            }
-        }
+        self.produce_with(transaction_id, topition, deflated, None)
+            .await
     }
 
     async fn fetch(
@@ -967,7 +1150,7 @@ struct Combined {
 ///
 /// [`UnifiedLog.analyzeAndValidateRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1181-L1187
 #[instrument(skip_all)]
-fn combine(queued: Vec<BatchRequest>, limit: usize) -> Combined {
+fn combine(queued: Vec<Queued>, limit: usize) -> Combined {
     debug!(len = queued.len(), limit);
 
     let mut rejected = Vec::new();
@@ -977,27 +1160,35 @@ fn combine(queued: Vec<BatchRequest>, limit: usize) -> Combined {
     // A merge that fails stops before the end of the queue. We still decode the rest of the queue,
     // one batch at a time, so that each batch that does not decode gets its own error and none of
     // them reaches the storage.
-    for request in remaining {
-        if let Err(error) = decode(&request) {
-            rejected.push((request.id, error));
+    for mut queued in remaining {
+        if let Err(error) = decode(&mut queued) {
+            rejected.push((queued.request.id, error));
         }
     }
 
     Combined { runs, rejected }
 }
 
-/// Decodes the batch of `request`, and returns it with its codec.
-fn decode(request: &BatchRequest) -> Result<(Compression, inflated::Batch)> {
-    let compression = BatchAttribute::try_from(request.batch.attributes)?.compression;
+/// Returns the decoded batch of `queued`, with its codec: the batch that the caller decoded when
+/// the queue held it, and otherwise the bytes decoded here. The held batch is what
+/// [`inflate_produced`] returns for the bytes, which [`Storage::produce_inflated`] requires. The
+/// share of the decoded budget that it took goes back when it leaves the queue, because the run
+/// that takes it is bounded by the decoded limit from then on.
+fn decode(queued: &mut Queued) -> Result<(Compression, inflated::Batch)> {
+    let compression = BatchAttribute::try_from(queued.request.batch.attributes)?.compression;
 
-    inflate_produced(request.batch.clone()).map(|batch| (compression, batch))
+    match queued.decoded.take() {
+        Some(Decoded { batch, .. }) => Ok((compression, batch)),
+
+        None => inflate_produced(queued.request.batch.clone()).map(|batch| (compression, batch)),
+    }
 }
 
 /// Merges the batches that `queued` yields into runs, as [`combine`] does, and adds each batch that
 /// does not decode to `rejected`. The merge stops at the first error of its own, and leaves the
 /// batches after it in `queued`.
 fn merge_runs(
-    queued: &mut impl Iterator<Item = BatchRequest>,
+    queued: &mut impl Iterator<Item = Queued>,
     limit: usize,
     rejected: &mut Vec<(Uuid, Error)>,
 ) -> Result<Vec<Run>> {
@@ -1008,15 +1199,17 @@ fn merge_runs(
     // and compress each run the same way.
     let mut compression: Option<Compression> = None;
 
-    for request in queued {
-        let (codec, batch) = match decode(&request) {
+    for mut queued in queued {
+        let (codec, batch) = match decode(&mut queued) {
             Ok(decoded) => decoded,
 
             Err(error) => {
-                rejected.push((request.id, error));
+                rejected.push((queued.request.id, error));
                 continue;
             }
         };
+
+        let request = queued.request;
 
         let compression = compression.get_or_insert(codec);
 
@@ -1116,9 +1309,11 @@ mod tests {
     fn combine_into_one(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
         let queued = batches
             .into_iter()
-            .map(|batch| BatchRequest {
-                id: Uuid::now_v7(),
-                batch,
+            .map(|batch| {
+                Queued::from(BatchRequest {
+                    id: Uuid::now_v7(),
+                    batch,
+                })
             })
             .collect();
 
@@ -1136,6 +1331,9 @@ mod tests {
         produced: Arc<Mutex<BTreeMap<Topition, Vec<deflated::Batch>>>>,
         fail_next_produce: Arc<std::sync::atomic::AtomicBool>,
         max_message_bytes: Option<usize>,
+
+        /// The number of batches that arrived with `produce_inflated`.
+        inflated_produces: Arc<AtomicUsize>,
     }
 
     impl FlightRecorder {
@@ -1144,6 +1342,7 @@ mod tests {
                 produced: Arc::new(Mutex::new(BTreeMap::new())),
                 fail_next_produce: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 max_message_bytes: None,
+                inflated_produces: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1158,8 +1357,7 @@ mod tests {
         /// Cause the *next* call to `produce` to fail, simulating a storage
         /// write failure for whichever coalesced batch is in flight.
         fn fail_next_produce(&self) {
-            self.fail_next_produce
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.fail_next_produce.store(true, Ordering::SeqCst);
         }
 
         fn produced(&self, topition: &Topition) -> Result<Option<Vec<inflated::Batch>>> {
@@ -1224,10 +1422,7 @@ mod tests {
             topition: &Topition,
             deflated: deflated::Batch,
         ) -> Result<i64> {
-            if self
-                .fail_next_produce
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.fail_next_produce.swap(false, Ordering::SeqCst) {
                 return Err(Error::Message("simulated storage failure".to_string()));
             }
 
@@ -1250,6 +1445,18 @@ mod tests {
                     base_offset
                 })
                 .map_err(Into::into)
+        }
+
+        async fn produce_inflated(
+            &self,
+            transaction_id: Option<&str>,
+            topition: &Topition,
+            deflated: deflated::Batch,
+            _inflated: inflated::Batch,
+        ) -> Result<i64> {
+            _ = self.inflated_produces.fetch_add(1, Ordering::SeqCst);
+
+            self.produce(transaction_id, topition, deflated).await
         }
 
         async fn fetch(
@@ -2625,12 +2832,17 @@ mod tests {
 
         let queued = batches
             .into_iter()
-            .map(|batch| BatchRequest {
-                id: Uuid::now_v7(),
-                batch,
+            .map(|batch| {
+                Queued::from(BatchRequest {
+                    id: Uuid::now_v7(),
+                    batch,
+                })
             })
             .collect::<Vec<_>>();
-        let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
+        let ids = queued
+            .iter()
+            .map(|queued| queued.request.id)
+            .collect::<Vec<_>>();
 
         let Combined { runs, rejected } = combine(queued, MAX_DECODED_BATCH_BYTES);
 
@@ -2997,12 +3209,14 @@ mod tests {
         vec![Bytes::from(vec![byte; len]); count]
     }
 
-    fn queued(batches: &[&deflated::Batch]) -> Vec<BatchRequest> {
+    fn queued(batches: &[&deflated::Batch]) -> Vec<Queued> {
         batches
             .iter()
-            .map(|&batch| BatchRequest {
-                id: Uuid::now_v7(),
-                batch: batch.clone(),
+            .map(|&batch| {
+                Queued::from(BatchRequest {
+                    id: Uuid::now_v7(),
+                    batch: batch.clone(),
+                })
             })
             .collect()
     }
@@ -3048,7 +3262,10 @@ mod tests {
         );
 
         let queued = queued(&[&first, &second, &third]);
-        let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
+        let ids = queued
+            .iter()
+            .map(|queued| queued.request.id)
+            .collect::<Vec<_>>();
 
         let runs = combine(queued, limit).runs?;
 
@@ -3101,7 +3318,10 @@ mod tests {
         assert!(decoded_size_of(&over_the_limit)? > limit);
 
         let queued = queued(&[&before, &over_the_limit, &after]);
-        let ids = queued.iter().map(|owner| owner.id).collect::<Vec<_>>();
+        let ids = queued
+            .iter()
+            .map(|queued| queued.request.id)
+            .collect::<Vec<_>>();
 
         let runs = combine(queued, limit).runs?;
 
@@ -3288,6 +3508,197 @@ mod tests {
                 .map(|batch| batch.records[0].value())
                 .collect::<Vec<_>>()
         );
+
+        Ok(())
+    }
+
+    /// A batch whose bytes do not decode, and the batch that the caller decoded from the bytes
+    /// before they were damaged. Any decode of the bytes fails with `INVALID_RECORD`, so a produce
+    /// that succeeds decoded nothing, as `produce_inflated.rs` does in the broker's tests.
+    fn decoded_by_the_caller(
+        producer_id: i64,
+        base_sequence: i32,
+        values: &[Bytes],
+    ) -> Result<(deflated::Batch, inflated::Batch)> {
+        let mut batch = inflated::Batch::builder()
+            .producer_id(producer_id)
+            .producer_epoch(0)
+            .base_sequence(base_sequence)
+            .last_offset_delta(values.len() as i32 - 1);
+
+        for (offset_delta, value) in values.iter().enumerate() {
+            batch = batch.record(
+                Record::builder()
+                    .value(value.clone().into())
+                    .offset_delta(offset_delta as i32),
+            );
+        }
+
+        let mut deflated = deflated::Batch::try_from(batch.build()?)?;
+        let inflated = inflated::Batch::try_from(deflated.clone())?;
+        deflated.record_data = Bytes::from_static(b"\xff\xff\xff");
+
+        Ok((deflated, inflated))
+    }
+
+    fn spawn_produce_inflated(
+        batcher: &ProduceRequestBatcher<FlightRecorder>,
+        topition: &Topition,
+        (deflated, inflated): (deflated::Batch, inflated::Batch),
+    ) -> tokio::task::JoinHandle<Result<i64>> {
+        let batcher = batcher.clone();
+        let topition = topition.clone();
+
+        tokio::spawn(async move {
+            batcher
+                .produce_inflated(None, &topition, deflated, inflated)
+                .await
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_batch_is_decoded_once() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)));
+        let topition = Topition::new("abc", 0);
+
+        let first = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(
+                -1,
+                -1,
+                &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            )?,
+        );
+        yield_now().await;
+        let second = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"c")])?,
+        );
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, first.await.expect("join_handle")?);
+        assert_eq!(2, second.await.expect("join_handle")?);
+
+        let sent = recorder.produced(&topition)?.unwrap();
+        assert_eq!(1, sent.len(), "the two batches are one write");
+        assert_eq!(3, sent[0].records.len());
+
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// Batches that the decoded limit has no room for are queued as bytes, which the flush decodes.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_over_the_decoded_limit_is_decoded_by_the_flush() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let first = decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"a")])?;
+        let second = decoded_by_the_caller(-1, -1, &[Bytes::from_static(b"b")])?;
+
+        let limit = first
+            .1
+            .decoded_size(&Compression::None)
+            .map_err(Error::from)?;
+
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)))
+            .with_decoded_limit(limit);
+        let topition = Topition::new("abc", 0);
+
+        let first = spawn_produce_inflated(&batcher, &topition, first);
+        yield_now().await;
+
+        assert_eq!(
+            limit,
+            batcher.decoded_held.load(Ordering::SeqCst),
+            "the first batch fills the limit"
+        );
+
+        let second = spawn_produce_inflated(&batcher, &topition, second);
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, first.await.expect("join_handle")?);
+
+        // The second batch's bytes were decoded by the flush, which rejects them.
+        assert_matches!(
+            second.await.expect("join_handle"),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// An idempotent producer's batches are written as sent, and keep the decode that they hold.
+    #[tokio::test(start_paused = true)]
+    async fn an_idempotent_queue_written_as_sent_keeps_the_decoded_batches() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)));
+        let topition = Topition::new("abc", 0);
+
+        let first = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(54345, 0, &[Bytes::from_static(b"a")])?,
+        );
+        yield_now().await;
+        let second = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(54345, 1, &[Bytes::from_static(b"b")])?,
+        );
+
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        assert_eq!(0, first.await.expect("join_handle")?);
+        assert_eq!(1, second.await.expect("join_handle")?);
+
+        // The recorder cannot decode what it stored, because the bytes do not decode.
+        assert_eq!(
+            Some(2),
+            recorder.produced.lock()?.get(&topition).map(Vec::len)
+        );
+        assert_eq!(2, recorder.inflated_produces.load(Ordering::SeqCst));
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// A produce that is dropped while it waits leaves the queue, and gives back its share of the
+    /// decoded budget, so that abandoned requests cannot use the budget up.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_produce_leaves_the_queue_and_frees_its_decoded_budget() -> Result<()> {
+        let recorder = FlightRecorder::new();
+        let batcher = ProduceRequestBatcher::new(recorder.clone())
+            .with_maximum_delay(Some(Duration::from_secs(1)));
+        let topition = Topition::new("abc", 0);
+
+        let produce = spawn_produce_inflated(
+            &batcher,
+            &topition,
+            decoded_by_the_caller(54345, 0, &[Bytes::from_static(b"a")])?,
+        );
+        yield_now().await;
+
+        assert!(batcher.decoded_held.load(Ordering::SeqCst) > 0);
+        assert_eq!(1, batcher.requests.lock()?.len());
+
+        produce.abort();
+        _ = produce.await;
+
+        assert_eq!(0, batcher.decoded_held.load(Ordering::SeqCst));
+        assert!(batcher.requests.lock()?.is_empty());
 
         Ok(())
     }
