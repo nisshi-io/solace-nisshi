@@ -300,12 +300,15 @@ jobs:
       - run: echo "## franz-go compatibility report card (s3)" >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
-  # The same build as macos-release below, for Windows.
+  # The same build as macos-release below, for Windows. It also runs the
+  # quickstart's steps against the exe, because Windows has code that no other
+  # job runs, and the merge queue only checks the Windows build.
   windows-release:
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
-    # The same timeout as the `windows` job in ci.yml, which builds the same release.
-    timeout-minutes: 75
+    # Shorter than the 120 minutes of the `windows` job in ci.yml, which builds
+    # the same release, so this job fails before a tag build would time out.
+    timeout-minutes: 100
     env:
       TARGET: x86_64-pc-windows-msvc
     steps:
@@ -330,6 +333,7 @@ jobs:
           bin=target/"${TARGET}"/release/nisshi.exe
           [ -f "$bin" ] || { echo "::error::$bin does not exist"; exit 1; }
           ! grep -a -q -i vcruntime140 "$bin" || { echo "::error::$bin imports the Visual C++ runtime DLL"; exit 1; }
+      - run: .github/scripts/windows-smoke.ps1 -Exe "target/$env:TARGET/release/nisshi.exe"
   # The release profile, the linker and cargo-auditable, which the `macos`
   # and `windows` jobs in ci.yml skip off a tag. It uploads nothing.
   macos-release:

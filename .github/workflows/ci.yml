@@ -1067,8 +1067,9 @@ jobs:
     if: *tier_b
     needs: [changes, typos]
     runs-on: windows-latest
-    # The same timeout as macos, for the same reason.
-    timeout-minutes: 75
+    # The cold release build takes about an hour on the Windows runner, about
+    # twice as long as on macOS, and a timeout on a tag cancels the release.
+    timeout-minutes: 120
     # The runner's default shell is PowerShell, whose `>` writes UTF-16, and
     # THIRD-PARTY-LICENSE.html must stay UTF-8.
     defaults:
@@ -1124,6 +1125,15 @@ jobs:
           Copy-Item compose.yaml, example.env, LICENSE, NOTICE, THIRD-PARTY-LICENSE.html, README.md $dist
           Copy-Item etc $dist -Recurse
           Compress-Archive -Path (Join-Path $dist '*') -DestinationPath "nisshi-$env:TARGET.zip"
+      # Extracts the zip with the tar that the quickstart uses, and runs the
+      # quickstart's steps against the extracted exe.
+      - if: ${{github.ref_type == 'tag'}}
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP nisshi-extract)
+          & "$env:SystemRoot\System32\tar.exe" -xf "nisshi-$env:TARGET.zip" -C $out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .github/scripts/windows-smoke.ps1 -Exe (Join-Path $out bin\nisshi.exe)
       - if: ${{github.ref_type == 'tag'}}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
