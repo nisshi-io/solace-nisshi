@@ -800,6 +800,18 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
 smoke engine *nextest_args:
     nisshi-smoke-test/run.sh "$@"
 
+# print the instructions that one pass over the nisshi-sans-io bench fixtures executes, per API key (needs valgrind, so Linux only); ci.yml compares the head with its base the same way
+bench-instructions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p nisshi-sans-io --bin bench
+    keys=$(target/release/bench --list-api-keys)
+    out=$(mktemp)
+    # shellcheck disable=SC2086
+    .github/scripts/bench-instructions.sh measure target/release/bench "$out" $keys
+    cat "$out"
+    rm -f "$out"
+
 compat-franz-go-test tests timeout="600s" count="1":
     #!/usr/bin/env bash
     cd target/compat/franz-go/pkg/kgo

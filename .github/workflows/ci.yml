@@ -28,7 +28,8 @@ name: ci
 #   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
 #   postgres and sqlite compat legs (S3 compat runs nightly),
 #   cargo-publish-dry-run, src, release,
-#   macos, smoke, smoke-oldest-client, smoke-report.
+#   macos, smoke, smoke-oldest-client, smoke-report, and bench-instructions
+#   (report-only: ci-gate does not need it).
 #
 # Only `typos` runs ahead of `release`, and only `release` runs ahead of
 # `smoke`, so the release -> smoke chain starts with the rest of the run.
@@ -603,6 +604,68 @@ jobs:
       - run: sudo apt-get update
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo publish --dry-run --locked --workspace
+  # Compares the instructions that nisshi-sans-io's `bench` binary executes on
+  # the head and on its base, per API key, under callgrind. Wall-clock time on a
+  # shared runner is too noisy for that, and the instruction count is not.
+  #
+  # Report-only: ci-gate does not need this job, and the compare step continues
+  # on error, so a regression writes a warning and a table to the step summary
+  # and fails nothing. To enforce it, add the job to ci-gate's `needs` and its
+  # TIER_B list, and remove `continue-on-error` from the compare step.
+  bench-instructions:
+    if: *tier_b_off_main
+    needs: [changes]
+    runs-on: ubuntu-latest
+    # Both builds are cold: this job restores no cache, like build-storage.
+    timeout-minutes: 45
+    steps:
+      # The head is the merge commit that GitHub or the queue built, so its
+      # first parent is the base branch tip that the change merges onto.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: base
+        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ steps.base.outputs.sha }}
+          path: base
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y valgrind
+      - name: Build the bench binary on the head
+        run: cargo build --release --locked -p nisshi-sans-io --bin bench
+      - name: Build the bench binary on the base
+        working-directory: base
+        run: cargo build --release --locked -p nisshi-sans-io --bin bench
+      - name: Measure the instructions
+        run: |
+          set -euo pipefail
+          # The head's binary lists the keys, because the base's may not have the flag.
+          mapfile -t keys < <(target/release/bench --list-api-keys)
+          bash .github/scripts/bench-instructions.sh measure target/release/bench "$RUNNER_TEMP/head.tsv" "${keys[@]}"
+          bash .github/scripts/bench-instructions.sh measure base/target/release/bench "$RUNNER_TEMP/base.tsv" "${keys[@]}"
+      - name: Compare the head with the base
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          status=0
+          bash .github/scripts/bench-instructions.sh compare "$RUNNER_TEMP/base.tsv" "$RUNNER_TEMP/head.tsv" > "$RUNNER_TEMP/table.md" || status=$?
+          {
+            echo '### Instructions per pass over the bench fixtures'
+            echo
+            # A changed fixture list moves a row without a change in the decoder.
+            if ! diff -q base/nisshi-sans-io/src/bin/bench.rs nisshi-sans-io/src/bin/bench.rs > /dev/null; then
+              echo '> This change edits `bench.rs`, so a row can differ because the fixtures differ.'
+              echo
+            fi
+            cat "$RUNNER_TEMP/table.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
   typos:
     runs-on: ubuntu-latest
     timeout-minutes: 10
