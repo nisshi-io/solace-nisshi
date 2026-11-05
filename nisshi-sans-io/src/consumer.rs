@@ -958,39 +958,10 @@ impl GroupConsumer {
             // Heartbeat
             //
             (
-                MemberState::Leader {
-                    generation_id,
-                    member_id,
-                    ..
-                }
-                | MemberState::Follower {
-                    generation_id,
-                    member_id,
-                    ..
-                },
+                MemberState::Leader { .. } | MemberState::Follower { .. },
                 Some(Body::HeartbeatResponse(HeartbeatResponse { error_code, .. })),
             ) if error_code == i16::from(ErrorCode::UnknownMemberId) => {
-                self.errors.lock().map(|mut errors| {
-                    *errors.entry(ErrorCode::UnknownMemberId).or_default() += 1
-                })?;
-
-                let generation_id = None;
-                let member_id = None;
-                let member_assignment = None;
-
-                self.member_state = MemberState::Outsider {
-                    generation_id,
-                    member_id: member_id.clone(),
-                    member_assignment: member_assignment.clone(),
-                };
-
-                self.join_request(
-                    generation_id,
-                    member_id,
-                    member_assignment,
-                    "join after unknown member id",
-                )
-                .map(Into::into)
+                self.rejoin(ErrorCode::UnknownMemberId, "join after unknown member id")
             }
 
             (

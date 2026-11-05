@@ -1016,3 +1016,41 @@ fn join_unknown_member_id_after_illegal_generation_rejoins_without_member_id() -
 
     Ok(())
 }
+
+#[test]
+fn heartbeat_unknown_member_id_rejoins_without_member_id_and_drops_assignment() -> Result<(), Error>
+{
+    let _guard = init_tracing()?;
+
+    for leader_id in LEADER_IDS {
+        let mut consumer = assigned(leader_id)?;
+
+        // The rejoin must give up an assignment that the consumer holds, so the setup must
+        // hold one.
+        assert!(
+            consumer.member_assignment().is_some(),
+            "leader: {leader_id}"
+        );
+
+        let Body::JoinGroupRequest(req) = consumer.next_action(Some(Body::HeartbeatResponse(
+            HeartbeatResponse::default().error_code(i16::from(ErrorCode::UnknownMemberId)),
+        )))?
+        else {
+            panic!("expected JoinGroupRequest, leader: {leader_id}");
+        };
+
+        assert_eq!(NO_MEMBER_ID, req.member_id, "leader: {leader_id}");
+        assert_joins_owning_nothing(&req)?;
+        assert!(consumer.is_outsider(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.generation_id(), "leader: {leader_id}");
+        assert_eq!(None, consumer.member_assignment(), "leader: {leader_id}");
+        assert_eq!(
+            Some(&1),
+            consumer.errors()?.get(&ErrorCode::UnknownMemberId),
+            "leader: {leader_id}"
+        );
+    }
+
+    Ok(())
+}
