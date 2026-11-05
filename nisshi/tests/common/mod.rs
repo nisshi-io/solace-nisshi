@@ -209,6 +209,20 @@ pub(crate) fn run(args: &[&str]) -> Output {
     )
 }
 
+/// Runs `nisshi` as [`run`] does, with `env` as its environment.
+pub(crate) fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    finish(
+        nisshi()
+            .envs(env.iter().copied())
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("command starts"),
+    )
+}
+
 /// The `nisshi` binary, with an empty environment, run from a directory without a `.env`, so
 /// that neither the caller's environment nor a developer's `.env` changes the broker or the
 /// command output.
