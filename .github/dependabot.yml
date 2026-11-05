@@ -44,11 +44,9 @@ updates:
       actions-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-  # fuzz/ is a workspace of its own with its own Cargo.lock.
   - package-ecosystem: "cargo"
     directories:
       - "/"
-      - "/fuzz"
     schedule:
       interval: "weekly"
       day: "sunday"
@@ -110,15 +108,6 @@ updates:
       default-days: 7
       semver-major-days: 14
     groups:
-      # fuzz/Cargo.toml repeats these requirements from the root Cargo.toml,
-      # and the fuzz targets pass their types into the workspace crates, so a
-      # minor or major bump moves both directories in one PR. Patch bumps
-      # aren't grouped, so keep those equal by hand. Both manifests name this
-      # group next to the four requirements; keep the list equal to theirs.
-      fuzz-shared:
-        patterns: ["bytes", "rama", "tokio", "url"]
-        update-types: ["minor", "major"]
-        group-by: dependency-name
       # deltalake, datafusion and the iceberg crates each build against one
       # arrow, parquet and object_store release, so the stack builds only
       # when every crate in it moves to a matching set.
@@ -152,6 +141,32 @@ updates:
       cargo-patch:
         patterns: ["*"]
         update-types: ["patch"]
+  # fuzz/ is a Cargo workspace of its own, with its own Cargo.lock. Its path
+  # dependencies inherit requirements from the root Cargo.toml's
+  # [workspace.dependencies], and Dependabot reads and edits that file from
+  # this directory too. Without `allow`, each bump of such a requirement
+  # would change the root Cargo.toml with only fuzz/Cargo.lock to match it,
+  # which fails `--locked` builds of the root workspace, and would conflict
+  # with the root entry's PR for the same line. So this entry updates only
+  # libfuzzer-sys, which only fuzz/Cargo.toml declares, and the rest of
+  # fuzz/Cargo.lock falls behind the root lock between releases. `allow`
+  # limits security updates too, so none is raised for the rest of it.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "America/Toronto"
+    target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    allow:
+      - dependency-name: "libfuzzer-sys"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
   # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
   # exact digests. A digest pin only stays current if something deliberately
   # bumps it, so both get the same Dependabot coverage the other ecosystems
