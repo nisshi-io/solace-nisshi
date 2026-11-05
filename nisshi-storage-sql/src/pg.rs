@@ -273,7 +273,7 @@ impl PoolParts {
         pool_max_size: usize,
     ) -> std::result::Result<Pool, deadpool_postgres::BuildError> {
         let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
+            recycling_method: RecyclingMethod::Custom(RECYCLE_QUERY.into()),
         };
 
         Pool::builder(Manager::from_config(config, tls, mgr_config))
@@ -281,6 +281,7 @@ impl PoolParts {
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
             .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
+            .recycle_timeout(Some(DEFAULT_POOL_RECYCLE_TIMEOUT))
             .build()
     }
 
@@ -643,6 +644,34 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
 
     name
 }
+
+/// How long checking an idle pooled connection with [`RECYCLE_QUERY`] may take. A connection
+/// whose peer vanished without a reset passes the pool's `is_closed` check, and without a bound
+/// the query would wait for TCP to give up. On a timeout the pool drops the connection and
+/// opens a new one.
+const DEFAULT_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run on each idle pooled connection before the pool hands it out. It fails when the session
+/// is read-only, which makes the pool drop the connection and open a new one.
+///
+/// After a failover, the old primary can stay up and turn read-only. A connection to it still
+/// looks open, so [`RecyclingMethod::Fast`] and [`RecyclingMethod::Verified`] keep it, and
+/// every write on it fails with SQLSTATE 25006 until the broker restarts. The check costs one
+/// round trip, as `Verified` does.
+///
+/// The failure is a failed integer cast, not `RAISE` in a `DO` block, so the check needs no
+/// privilege on a procedural language: a role without `USAGE` on plpgsql would otherwise
+/// fail every check and open a connection for every checkout. The message is concatenated
+/// with a stable function so the planner doesn't fold the cast into an error for every
+/// session. The pool logs the message when it drops the connection.
+///
+/// A new connection isn't checked, so one opened to a server that is still read-only is
+/// dropped at its next checkout. Add `target_session_attrs=read-write` to the storage URL to
+/// refuse such a server when connecting, see `docs/storage.md`.
+const RECYCLE_QUERY: &str = "SELECT CASE WHEN pg_is_in_recovery() \
+    OR current_setting('transaction_read_only')::bool \
+    THEN ('connection is read-only, transaction_read_only=' \
+    || current_setting('transaction_read_only'))::int END";
 
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
@@ -1173,8 +1202,8 @@ where
 /// A pooled object that goes back to its pool only through
 /// [`Abandonable::release`].
 ///
-/// The pool recycles a connection after checking only that it is open
-/// ([`RecyclingMethod::Fast`]). A connection dropped while a statement runs
+/// The pool recycles a connection after checking only that it is open and
+/// writable ([`RECYCLE_QUERY`]), not that it is idle. A connection dropped while a statement runs
 /// on the server would go back to the pool still busy, and the next caller
 /// would wait behind that statement. Dropping this guard instead passes the
 /// object, still checked out of its pool, to `abandon`, which decides when
@@ -6431,6 +6460,7 @@ mod tests {
         let timeouts = builder.pool.pool.timeouts();
         assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
         assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
+        assert_eq!(timeouts.recycle, Some(DEFAULT_POOL_RECYCLE_TIMEOUT));
 
         Ok(())
     }
@@ -8122,6 +8152,61 @@ mod tests {
         lock.rollback().await?;
 
         Ok(backend)
+    }
+
+    /// A pooled connection that turns read-only, as one to a demoted primary does, is dropped
+    /// at its next checkout and replaced, while a connection that stays writable is kept.
+    #[tokio::test]
+    async fn read_only_pooled_connection_is_replaced() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        storage.pool.resize(1);
+
+        let Some(_probe) = storage_with_schema(
+            "read_only_pooled_connection_is_replaced",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        async fn pid_and_read_only(storage: &Postgres) -> Result<(i32, String)> {
+            let connection = storage.connection().await?;
+            let row = connection
+                .query_one(
+                    "SELECT pg_backend_pid(), current_setting('transaction_read_only')",
+                    &[],
+                )
+                .await?;
+            Ok((row.get(0), row.get(1)))
+        }
+
+        let (pid, read_only) = pid_and_read_only(&storage).await?;
+        assert_eq!("off", read_only);
+
+        // The control: a writable connection is reused.
+        assert_eq!(
+            (pid, String::from("off")),
+            pid_and_read_only(&storage).await?
+        );
+
+        storage
+            .connection()
+            .await?
+            .batch_execute("SET default_transaction_read_only = on")
+            .await?;
+
+        let (replacement, read_only) = pid_and_read_only(&storage).await?;
+        assert_ne!(pid, replacement);
+        assert_eq!("off", read_only);
+        assert_eq!(1, storage.pool.status().size);
+
+        Ok(())
     }
 
     /// Returns storage on a pool of one connection that connects with a
