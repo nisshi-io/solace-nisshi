@@ -180,6 +180,8 @@ A broker opens at most 16 connections to PostgreSQL. Set `pool_max_size` in the 
 nisshi broker --storage-engine "postgres://nisshi:secret@db.example.com/nisshi?pool_max_size=32"
 ```
 
+Every connection a broker opens to PostgreSQL has the `application_name` `nisshi-<host>-<cluster>`, for example `nisshi-broker-7d9f6-3f9a1c`, so `pg_stat_activity` shows which connections belong to a broker, for example to find the one that holds a lock. `application_name LIKE 'nisshi%'` finds all of them. The host is the name of the machine that the broker runs on, read from the `HOSTNAME` environment variable or from `/etc/hostname`. On Kubernetes it is the name of the pod, so a connection that holds a lock leads to its pod even where a pooler or proxy hides `client_addr`. Where the host is not known, the name has the node instead, `nisshi-<node>-<cluster>`, and every broker has node 111 today. Set `application_name` in the storage URL, or `-c application_name=...` in its `options`, to use your own name. A name that you set is used as it is. In the name that Nisshi sets, a character of the host or the cluster that is not an ASCII letter, digit, `.`, `_` or `-` becomes `_`, and the name is cut at 63 bytes, the most that PostgreSQL keeps. The cut takes the end of the cluster first. With the 7 bytes of `nisshi-` and the `-` after the host, the cluster is gone from a host of about 55 bytes, and the host itself is cut once it is longer than 56 bytes.
+
 Bring Nisshi back up:
 
 ```shell
