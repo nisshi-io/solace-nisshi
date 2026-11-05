@@ -243,6 +243,13 @@ const MAX_RECLAIM_BACKOFF_PASSES: u32 = 16;
 /// [`MAX_RECLAIM_BACKOFF_PASSES`] at most. A success, or a pass that finds nothing to reclaim,
 /// removes the entry.
 ///
+/// The entry keeps the cut (the partition's `low`) that failed, and only that cut waits. A
+/// `DeleteRecords` that moves `low` past it is tried on the next pass, so a cut made after the
+/// bucket was fixed does not wait behind the schedule of an older one. A pass that cannot read the
+/// partition's watermark records no failure and skips nothing: the read is paid on every pass, and
+/// a store outage must not put every partition into backoff. Cleanup of an old cut can lag a fix
+/// of the bucket by up to [`MAX_RECLAIM_BACKOFF_PASSES`] passes, and a restart tries at once.
+///
 /// This lives in the broker's memory and not in the partition's [`Watermark`]. A write to the
 /// bucket that refuses deletes can fail as well, and every broker would then have to write on each
 /// failure. A restart forgets it, and costs one retry, and `Watermark::reclaimed` still decides
@@ -256,11 +263,14 @@ struct ReclaimBackoff {
 
     /// The passes that remain to skip.
     skip: u32,
+
+    /// The `low` whose reclaim failed last. Only a pass with this `low` is skipped.
+    cut: Offset,
 }
 
 impl ReclaimBackoff {
-    /// Records one more failure, and sets the passes to skip.
-    fn failed(self) -> Self {
+    /// Records one more failure of the reclaim of `cut`, and sets the passes to skip.
+    fn failed(self, cut: Offset) -> Self {
         let failures = self.failures.saturating_add(1);
 
         let skip = match failures {
@@ -272,7 +282,11 @@ impl ReclaimBackoff {
                 }),
         };
 
-        Self { failures, skip }
+        Self {
+            failures,
+            skip,
+            cut,
+        }
     }
 }
 
@@ -1551,39 +1565,28 @@ impl DynoStore {
 
         stream::iter(partitions)
             .for_each_concurrent(CONCURRENT_RECLAIMS, |(topition, topic_id)| async move {
-                if self.skip_backed_off(&topic_id, &topition) {
-                    self.count_reclaim("backed_off");
-                    return;
+                if let Err(error) = self.reclaim_partition(&topition, &topic_id, deletes).await {
+                    error!(
+                        ?error,
+                        ?topition,
+                        "reading the watermark of a partition failed, maintain tries again on its next pass"
+                    );
+                    self.count_reclaim("state_failed");
                 }
-
-                let settled = match self.reclaim_partition(&topition, &topic_id, deletes).await {
-                    Ok(settled) => settled,
-
-                    Err(error) => {
-                        error!(
-                            ?error,
-                            ?topition,
-                            "reading or recording the cut of a partition failed, maintain tries again later"
-                        );
-                        self.count_reclaim("state_failed");
-                        false
-                    }
-                };
-
-                self.record_reclaim(&topic_id, &topition, settled);
             })
             .await;
     }
 
-    /// Whether this pass skips `topition`, because its reclaim failed on earlier passes
-    /// (see [`ReclaimBackoff`]). A skip uses up one of the passes to skip.
-    fn skip_backed_off(&self, topic_id: &Uuid, topition: &Topition) -> bool {
+    /// Whether this pass skips `topition`, because its reclaim of `cut` failed on earlier
+    /// passes (see [`ReclaimBackoff`]). A cut past the one that failed is not skipped. A skip
+    /// uses up one of the passes to skip.
+    fn skip_backed_off(&self, topic_id: &Uuid, topition: &Topition, cut: Offset) -> bool {
         let Ok(mut backoff) = self.reclaim_backoff.lock() else {
             return false;
         };
 
         match backoff.get_mut(&(*topic_id, topition.partition())) {
-            Some(entry) if entry.skip > 0 => {
+            Some(entry) if entry.skip > 0 && cut <= entry.cut => {
                 entry.skip -= 1;
                 true
             }
@@ -1591,9 +1594,16 @@ impl DynoStore {
         }
     }
 
-    /// Records the outcome of one reclaim of `topition`: `settled` removes its backoff,
-    /// and a failure extends it.
-    fn record_reclaim(&self, topic_id: &Uuid, topition: &Topition, settled: bool) {
+    /// Removes the backoff of `topition`, when it has nothing to reclaim.
+    fn record_reclaim_settled(&self, topic_id: &Uuid, topition: &Topition) {
+        if let Ok(mut backoff) = self.reclaim_backoff.lock() {
+            _ = backoff.remove(&(*topic_id, topition.partition()));
+        }
+    }
+
+    /// Records the outcome of one reclaim of `topition` up to `cut`: `settled` removes its
+    /// backoff, and a failure extends it.
+    fn record_reclaim(&self, topic_id: &Uuid, topition: &Topition, cut: Offset, settled: bool) {
         let Ok(mut backoff) = self.reclaim_backoff.lock() else {
             return;
         };
@@ -1604,22 +1614,29 @@ impl DynoStore {
             let entry = backoff
                 .entry((*topic_id, topition.partition()))
                 .or_default();
-            *entry = entry.failed();
+            *entry = entry.failed(cut);
 
-            debug!(?topition, ?entry, "reclaim failed, the partition backs off");
+            warn!(
+                ?topition,
+                failures = entry.failures,
+                passes_to_skip = entry.skip,
+                cut,
+                "reclaim failed, the partition's cut waits that many passes"
+            );
         }
     }
 
     /// Reclaims one partition (see [`Self::reclaim_records`]), once it holds a permit of
-    /// `deletes` for its listing and deletes. The result is `true` when the partition has
-    /// nothing left to reclaim, and `false` when its objects or its cut could not be
-    /// handled, which is logged and counted, and leaves the retry to the backoff.
+    /// `deletes` for its listing and deletes. A failure to read the watermark is the
+    /// error: nothing is known about the partition then, so it records no backoff. A failure
+    /// to handle the objects or the cut is logged, counted and recorded in the backoff, and
+    /// the pass skips a cut that failed on earlier passes, after it reads the watermark.
     async fn reclaim_partition(
         &self,
         topition: &Topition,
         topic_id: &Uuid,
         deletes: &Semaphore,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let watermark = self.watermark_without_caching(topition)?;
 
         // The high watermark is read before the listing, as the cut check in
@@ -1635,14 +1652,60 @@ impl DynoStore {
 
         let Some(low) = low.filter(|&low| low > 0 && reclaimed.is_none_or(|done| done < low))
         else {
-            return Ok(true);
+            self.record_reclaim_settled(topic_id, topition);
+            return Ok(());
         };
 
+        if self.skip_backed_off(topic_id, topition, low) {
+            self.count_reclaim("backed_off");
+            return Ok(());
+        }
+
+        let settled = match self
+            .reclaim_cut(
+                topition,
+                topic_id,
+                &watermark,
+                low,
+                high.unwrap_or(0),
+                deletes,
+            )
+            .await
+        {
+            Ok(settled) => settled,
+
+            Err(error) => {
+                error!(
+                    ?error,
+                    ?topition,
+                    "recording the cut of a partition failed, maintain tries again later"
+                );
+                self.count_reclaim("state_failed");
+                false
+            }
+        };
+
+        self.record_reclaim(topic_id, topition, low, settled);
+
+        Ok(())
+    }
+
+    /// Deletes the batch objects of `topition` below `low` and records the cut. The result
+    /// is `true` when the partition has nothing left to reclaim, and `false` when its
+    /// objects could not be deleted.
+    async fn reclaim_cut(
+        &self,
+        topition: &Topition,
+        topic_id: &Uuid,
+        watermark: &OptiCon<Watermark>,
+        low: Offset,
+        high: Offset,
+        deletes: &Semaphore,
+    ) -> Result<bool> {
         let deleted = {
             let _permit = deletes.acquire().await.ok();
 
-            self.delete_records_batches(topition, low, high.unwrap_or(0))
-                .await
+            self.delete_records_batches(topition, low, high).await
         };
 
         if !deleted {
