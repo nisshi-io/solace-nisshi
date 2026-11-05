@@ -83,7 +83,7 @@ private_intra_doc_links = "deny"
 # by hand.
 [workspace.dependencies]
 anyhow = "1.0.94"
-apache-avro = "0.21.0"
+apache-avro = "0.22.0"
 arbitrary = { version = "1", features = ["derive"] }
 arrow = { version = "58" }
 async-trait = "0.1.86"
