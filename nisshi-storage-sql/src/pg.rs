@@ -5931,6 +5931,10 @@ const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
 /// <https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L583-L602>
 ///
 /// Returns an error for a timestamp that PostgreSQL cannot hold.
+///
+/// Only this write side is checked. The read side of a timestamp before 1601 is unchecked: the
+/// `postgres-types` `FromSql<SystemTime>` conversion and the fetch paths can panic a Windows
+/// broker on a row that a Linux broker wrote (SOL-157415).
 fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
     if timestamp >= 0 {
         to_system_time(timestamp).map_err(Into::into)
@@ -5979,6 +5983,7 @@ mod tests {
     use std::assert_matches;
     use tokio::task::JoinHandle;
 
+    #[cfg(not(windows))]
     #[test]
     fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
         for timestamp in [
@@ -5996,6 +6001,26 @@ mod tests {
                 "{timestamp}"
             );
         }
+
+        Ok(())
+    }
+
+    /// A Windows `SystemTime` cannot be earlier than 1601, so the earliest timestamp that
+    /// PostgreSQL holds is an error there, where it round-trips on other platforms.
+    #[cfg(windows)]
+    #[test]
+    fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
+        for timestamp in [-1, -2, -86_400_000, 0, 1, 1_700_000_000_000] {
+            assert_eq!(
+                timestamp,
+                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
+                "{timestamp}"
+            );
+        }
+        assert_matches!(
+            to_sql_timestamp(MIN_SQL_TIMESTAMP_MS),
+            Err(Error::Message(_))
+        );
 
         Ok(())
     }
