@@ -28,7 +28,7 @@ use crate::{
     Error, ListOffsetResponse, Result, Storage, StorageOperation, Topition,
     service::{
         read_deadline::{LIST_OFFSETS_READ_DEADLINE, ReadDeadline},
-        read_share::ListOffsetsReadShare,
+        read_share::{ClientIdentity, ListOffsetsReadShare},
         storage_error_code,
     },
 };
@@ -241,7 +241,13 @@ where
                     .count()
             };
 
+            // A client at its share is named in the log, not in the metric, because a client
+            // chooses its `client_id`. See the same line in `fetch.rs`.
+            let client = ClientIdentity::current();
+
             warn!(
+                client_id = ?client.as_ref().and_then(ClientIdentity::client_id),
+                principal = ?client.as_ref().and_then(ClientIdentity::principal),
                 deadline = ?LIST_OFFSETS_READ_DEADLINE,
                 elapsed = ?started_at.elapsed(),
                 timed_out = timed_out.len(),

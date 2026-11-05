@@ -76,7 +76,10 @@ use nisshi_storage::{
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
     read_deadline::{Missed, QueueWait as _, ReadDeadline, ReadWait},
-    read_share::{FetchReadShare, ListOffsetsReadShare},
+    read_share::{
+        ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare,
+        warn_miss_at_client_share,
+    },
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -146,6 +149,20 @@ pub struct Postgres {
     /// `delete_records_writes`, see
     /// [`Storage::delete_records_concurrency`].
     delete_records_per_request: usize,
+    /// The shares of `list_offsets_reads` that clients hold, see
+    /// [`ReadLimits::list_offsets_per_client`].
+    list_offsets_client_shares: ClientReadShares,
+    /// The shares of `fetch_reads` that clients hold, see
+    /// [`ReadLimits::fetch_per_client`].
+    fetch_client_shares: ClientReadShares,
+    /// How many of `list_offsets_reads` one client may hold, over all its
+    /// connections, while another client waits for them, see
+    /// [`ReadLimits::list_offsets_per_client`].
+    list_offsets_reads_per_client: usize,
+    /// How many of `fetch_reads` one client may hold, over all its
+    /// connections, while another client waits for them, see
+    /// [`ReadLimits::fetch_per_client`].
+    fetch_reads_per_client: usize,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -314,6 +331,10 @@ impl Builder<String, i32, Url, PoolParts> {
             fetch_reads_per_connection: self.read_limits.fetch_per_connection(),
             delete_records_writes: Arc::new(Semaphore::new(delete_records_limit)),
             delete_records_per_request: DELETE_RECORDS_CONCURRENCY.min(delete_records_limit),
+            list_offsets_client_shares: ClientReadShares::default(),
+            fetch_client_shares: ClientReadShares::default(),
+            list_offsets_reads_per_client: self.read_limits.list_offsets_per_client(),
+            fetch_reads_per_client: self.read_limits.fetch_per_client(),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -339,6 +360,18 @@ const POOL_MAX_SIZE_RANGE: RangeInclusive<usize> = 2..=262_143;
 
 /// The values that [`POOL_MAX_SIZE`] takes, as an error message gives them.
 const POOL_MAX_SIZE_EXPECTED: &str = "a whole number from 2 to 262143";
+
+/// The storage URL option that sets how many of each read limit one client may
+/// hold while another client waits for it, as a percentage, see
+/// [`ReadLimits::list_offsets_per_client`].
+const CLIENT_READ_SHARE: &str = "client_read_share";
+
+/// The range of [`CLIENT_READ_SHARE`]: a percentage.
+const CLIENT_READ_SHARE_RANGE: RangeInclusive<usize> = 1..=100;
+
+/// The values that [`CLIENT_READ_SHARE`] takes, as an error message gives
+/// them.
+const CLIENT_READ_SHARE_EXPECTED: &str = "a whole number from 1 to 100";
 
 /// How many partition reads of each kind this engine has in flight at once,
 /// across every request, counting an abandoned read until its statement has
@@ -372,6 +405,12 @@ struct ReadLimits {
     /// deadline. One connection holds at most
     /// [`ReadLimits::fetch_per_connection`] of these permits.
     fetch: usize,
+
+    /// The percentage of each limit that one client may hold while another
+    /// client waits for it, from [`CLIENT_READ_SHARE`], or `None` for the
+    /// default, which leaves a newcomer a full connection's share. A client
+    /// that is alone may hold the whole limit.
+    client_percent: Option<usize>,
 }
 
 impl ReadLimits {
@@ -381,6 +420,7 @@ impl ReadLimits {
         let limits = Self {
             list_offsets: max_size / 2,
             fetch: max_size / 2,
+            client_percent: None,
         };
         debug_assert!(limits.list_offsets + limits.fetch <= max_size);
         limits
@@ -398,6 +438,34 @@ impl ReadLimits {
     /// limit when the pool is too small for that.
     fn fetch_per_connection(self) -> usize {
         FETCH_READS_PER_CONNECTION.min(self.fetch)
+    }
+
+    /// Returns how many of the [`ReadLimits::list_offsets`] permits one
+    /// client holds at once, over all its connections, while another client
+    /// waits for them.
+    fn list_offsets_per_client(self) -> usize {
+        self.per_client(self.list_offsets, self.list_offsets_per_connection())
+    }
+
+    /// Returns how many of the [`ReadLimits::fetch`] permits one client holds
+    /// at once, over all its connections, while another client waits for
+    /// them.
+    fn fetch_per_client(self) -> usize {
+        self.per_client(self.fetch, self.fetch_per_connection())
+    }
+
+    /// Returns how many of `limit` one client holds: [`CLIENT_READ_SHARE`]
+    /// percent of it, or by default all but a connection's share, so another
+    /// client's connection always finds `per_connection` permits left. The
+    /// result is never below `per_connection`, so a lone client's single
+    /// request is not slowed, and never above `limit`.
+    fn per_client(self, limit: usize, per_connection: usize) -> usize {
+        self.client_percent
+            .map_or_else(
+                || limit.saturating_sub(per_connection),
+                |percent| limit * percent / 100,
+            )
+            .clamp(per_connection, limit)
     }
 }
 
@@ -660,27 +728,58 @@ fn statement_timeout_value(value: &str) -> Option<Duration> {
 /// number in [`POOL_MAX_SIZE_RANGE`], as [`parse_storage_option`] does for
 /// every storage option.
 fn take_pool_max_size(config: &mut String) -> Result<usize> {
-    // A key/value connection string, such as `host=db user=nisshi`, is not a
-    // URL, and sets no storage URL options.
-    let Ok(storage) = Url::parse(config) else {
-        return Ok(DEFAULT_POOL_MAX_SIZE);
-    };
+    take_option(config, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
+    })
+    .map(|size| size.unwrap_or(DEFAULT_POOL_MAX_SIZE))
+}
 
-    let Some(pool_max_size) =
-        parse_storage_option(&storage, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+/// Removes every [`CLIENT_READ_SHARE`] option from `config`, a connection
+/// URL, and returns the percentage that the last one sets, or `None` when the
+/// URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a
+/// number in [`CLIENT_READ_SHARE_RANGE`].
+fn take_client_read_share(config: &mut String) -> Result<Option<usize>> {
+    take_option(
+        config,
+        CLIENT_READ_SHARE,
+        CLIENT_READ_SHARE_EXPECTED,
+        |value| {
             value
                 .parse()
                 .ok()
-                .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
-        })?
-    else {
-        return Ok(DEFAULT_POOL_MAX_SIZE);
+                .filter(|percent| CLIENT_READ_SHARE_RANGE.contains(percent))
+        },
+    )
+}
+
+/// Removes every `option` from `config`, a connection URL, and returns what
+/// `parse` makes of the last one's value, or `None` when the URL sets none.
+///
+/// tokio-postgres rejects an option that it does not read, so a storage
+/// option must be removed before it parses the URL.
+fn take_option<T>(
+    config: &mut String,
+    option: &str,
+    expected: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>> {
+    // A key/value connection string, such as `host=db user=nisshi`, is not a
+    // URL, and sets no storage URL options.
+    let Ok(storage) = Url::parse(config) else {
+        return Ok(None);
     };
 
-    // tokio-postgres rejects an option that it does not read, so this option
-    // must go before it parses the URL.
+    let Some(value) = parse_storage_option(&storage, option, expected, parse)? else {
+        return Ok(None);
+    };
+
     let Some((base, query)) = config.split_once('?') else {
-        return Ok(pool_max_size);
+        return Ok(Some(value));
     };
 
     // The retained options keep their bytes, instead of going through
@@ -688,10 +787,10 @@ fn take_pool_max_size(config: &mut String) -> Result<usize> {
     // tokio-postgres reads a `+` as itself.
     let retained = query
         .split('&')
-        .filter(|option| {
-            form_urlencoded::parse(option.as_bytes())
+        .filter(|candidate| {
+            form_urlencoded::parse(candidate.as_bytes())
                 .next()
-                .is_none_or(|(key, _)| key != POOL_MAX_SIZE)
+                .is_none_or(|(key, _)| key != option)
         })
         .collect::<Vec<_>>();
 
@@ -701,7 +800,7 @@ fn take_pool_max_size(config: &mut String) -> Result<usize> {
         format!("{base}?{}", retained.join("&"))
     };
 
-    Ok(pool_max_size)
+    Ok(Some(value))
 }
 
 impl<C, N> FromStr for Builder<C, N, Url, PoolParts>
@@ -714,11 +813,17 @@ where
     fn from_str(config: &str) -> Result<Self, Self::Err> {
         let mut config = config.to_owned();
         let pool_max_size = take_pool_max_size(&mut config)?;
-        let read_limits = ReadLimits::for_pool(pool_max_size);
+        let client_percent = take_client_read_share(&mut config)?;
+        let read_limits = ReadLimits {
+            client_percent,
+            ..ReadLimits::for_pool(pool_max_size)
+        };
         info!(
             pool_max_size,
             list_offsets_reads = read_limits.list_offsets,
-            fetch_reads = read_limits.fetch
+            fetch_reads = read_limits.fetch,
+            list_offsets_reads_per_client = read_limits.list_offsets_per_client(),
+            fetch_reads_per_client = read_limits.fetch_per_client(),
         );
 
         let mut pg_config = Config::from_str(&config).inspect(|pg_config| debug!(?pg_config))?;
@@ -1155,11 +1260,11 @@ where
 const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
 
 /// The permits that a read holds while it is in flight: one from its
-/// connection's share, see [`read_share`](nisshi_storage::read_share), and
-/// one from the engine's limit on reads in flight ([`ReadLimits::list_offsets`]
-/// or [`ReadLimits::fetch`]).
+/// connection's share, see [`read_share`](nisshi_storage::read_share), and the
+/// ones from its client's share and the engine's limit on reads in flight
+/// ([`ReadLimits::list_offsets`] or [`ReadLimits::fetch`]).
 ///
-/// An abandoned read keeps both until its statement ends, see
+/// An abandoned read keeps them until its statement ends, see
 /// [`cancel_and_return`].
 #[derive(Debug)]
 // Nothing reads the permits: holding them is the point, and dropping
@@ -1168,30 +1273,37 @@ const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp
 struct ReadPermits {
     /// `None` for a read that runs outside a connection's read share.
     connection_share: Option<OwnedSemaphorePermit>,
-    limit: OwnedSemaphorePermit,
+    /// The permit of the limit, and the one of the client's share. A read
+    /// that runs outside a client's read share holds only the first, and still
+    /// returns it through the client shares, which wake a read that waits for
+    /// a permit of the limit.
+    engine: ClientAdmission,
 }
 
 impl ReadPermits {
     /// Waits for `connection_share`, a permit from the connection's share,
-    /// and then for a permit from `limit`.
+    /// then for a permit from `limit`, and from the share of its client, with
+    /// `client_share` permits, when the read has one, see
+    /// [`ClientReadShares::acquire`].
     ///
-    /// The share comes first, so a connection never waits on `limit` for
-    /// more reads than its share. `limit` is a FIFO queue, and those reads
-    /// would hold places in it ahead of other connections' reads.
+    /// The connection's share comes first, so a connection never waits on
+    /// `limit` for more reads than its share. `limit` is a FIFO queue, and
+    /// those reads would hold places in it ahead of other clients' reads. A
+    /// client's reads beyond its share do not queue for `limit` either, and
+    /// the order is the same for every read, so reads cannot wait on each
+    /// other in a cycle. A permit is returned when it is dropped.
     async fn acquire(
         connection_share: impl Future<Output = Result<Option<OwnedSemaphorePermit>, AcquireError>>,
+        client_shares: &ClientReadShares,
+        client_share: usize,
         limit: &Arc<Semaphore>,
     ) -> Result<Self> {
         let connection_share = connection_share.await?;
-        let limit = limit
-            .clone()
-            .acquire_owned()
-            .queued_for(ReadWait::EngineReadLimit)
-            .await?;
+        let engine = client_shares.acquire(client_share, limit).await?;
 
         Ok(Self {
             connection_share,
-            limit,
+            engine,
         })
     }
 }
@@ -1487,6 +1599,8 @@ impl Postgres {
     async fn fetch_read_permits(&self) -> Result<ReadPermits> {
         ReadPermits::acquire(
             FetchReadShare::acquire(self.fetch_reads_per_connection),
+            &self.fetch_client_shares,
+            self.fetch_reads_per_client,
             &self.fetch_reads,
         )
         .await
@@ -1497,6 +1611,8 @@ impl Postgres {
     async fn list_offsets_read_permits(&self) -> Result<ReadPermits> {
         ReadPermits::acquire(
             ListOffsetsReadShare::acquire(self.list_offsets_reads_per_connection),
+            &self.list_offsets_client_shares,
+            self.list_offsets_reads_per_client,
             &self.list_offsets_reads,
         )
         .await
@@ -4362,6 +4478,7 @@ impl Storage for Postgres {
         isolation_level: IsolationLevel,
         deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
+        let started_at = Instant::now();
         let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         // A `/` in the name checks out a connection of its own, so this
@@ -4382,8 +4499,22 @@ impl Storage for Postgres {
                 .await
         };
 
-        let Ok(connection) = read_deadline.timeout(connection).await else {
-            return Ok(vec![]);
+        let connection = match read_deadline.timeout(connection).await {
+            Ok(connection) => connection,
+            Err(missed) => {
+                // The Fetch service sees only an answer with no records here, so the engine names
+                // the client when its wait for the client's share missed the deadline.
+                if missed == Missed::Queued(ReadWait::ClientReadLimit) {
+                    warn_miss_at_client_share(
+                        topition,
+                        StorageOperation::Fetch,
+                        offset,
+                        started_at,
+                    );
+                }
+
+                return Ok(vec![]);
+            }
         };
 
         let mut connection = connection?;
@@ -5927,6 +6058,7 @@ mod tests {
     use super::*;
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_storage::read_share::ClientIdentity;
     use nisshi_storage::{
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
@@ -6418,6 +6550,28 @@ mod tests {
         Ok(())
     }
 
+    /// `client_read_share` in the storage URL reaches the storage's client
+    /// shares. Without the option, a client holds 6 of 8 Fetch reads and 4 of 8
+    /// ListOffsets reads.
+    #[test]
+    fn client_read_share_sets_the_client_shares_of_the_storage() -> Result<()> {
+        for (percent, fetch, list_offsets) in [(50, 4, 4), (100, 8, 8)] {
+            let storage =
+                Postgres::builder(&format!("{}?client_read_share={percent}", *CONNECTION))?
+                    .cluster("shared")
+                    .node(0)
+                    .build();
+
+            assert_eq!(fetch, storage.fetch_reads_per_client, "{percent}%");
+            assert_eq!(
+                list_offsets, storage.list_offsets_reads_per_client,
+                "{percent}%"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Each connection's share of each kind of read is at least one read and
     /// at most the engine's limit, whatever `pool_max_size` is. A pool too
     /// small for the usual share gives each connection the whole limit, and
@@ -6848,6 +7002,137 @@ mod tests {
         Ok(())
     }
 
+    /// One client's reads, over many connections, may hold the whole of
+    /// `ReadLimits::fetch` while no other client waits for it, and the next
+    /// read waits for a permit of its own client's share, not in the limit's
+    /// queue.
+    #[tokio::test]
+    async fn a_lone_client_may_hold_the_whole_fetch_limit() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("greedy"));
+
+        // Each read has a connection of its own, and no connection's share
+        // is used up.
+        let reads = (0..limits.fetch + 1)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(
+                    client.clone().scope(
+                        FetchReadShare::default()
+                            .scope(async move { storage.offset_stage(&topition).await }),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(limits.fetch_per_client() < limits.fetch);
+        assert_eq!(
+            limits.fetch,
+            reads_waiting_in_the_pool(&storage, limits.fetch).await
+        );
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        abort_reads(reads).await;
+        assert_eq!(limits.fetch, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// The same, for ListOffsets reads: `ReadLimits::list_offsets`.
+    #[tokio::test]
+    async fn a_lone_client_may_hold_the_whole_list_offsets_limit() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(None, Some("greedy"));
+
+        let reads = (0..limits.list_offsets + 1)
+            .map(|_| {
+                let storage = storage.clone();
+                let offsets = [(topition.clone(), ListOffset::Latest)];
+
+                tokio::spawn(client.clone().scope(ListOffsetsReadShare::default().scope(
+                    async move {
+                        storage
+                            .list_offsets(IsolationLevel::ReadUncommitted, &offsets)
+                            .await
+                    },
+                )))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(limits.list_offsets_per_client() < limits.list_offsets);
+        assert_eq!(
+            limits.list_offsets,
+            reads_waiting_in_the_pool(&storage, limits.list_offsets).await
+        );
+        assert_eq!(0, storage.list_offsets_reads.available_permits());
+
+        abort_reads(reads).await;
+        assert_eq!(
+            limits.list_offsets,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// A client's share is all of a limit but a connection's share by
+    /// default, never less than a connection's share, and `client_read_share`
+    /// sets a percentage of the limit, clamped the same way.
+    #[test]
+    fn client_share_follows_the_limit_and_the_setting() {
+        let default = ReadLimits::default();
+        assert_eq!(6, default.fetch_per_client());
+        assert_eq!(
+            default.list_offsets - LIST_OFFSETS_CONCURRENCY,
+            default.list_offsets_per_client()
+        );
+
+        // A pool too small for a spare connection share gives a client the
+        // whole limit.
+        assert_eq!(1, ReadLimits::for_pool(2).fetch_per_client());
+        assert_eq!(4, ReadLimits::for_pool(8).list_offsets_per_client());
+
+        for (percent, fetch) in [(1, 2), (25, 2), (50, 4), (75, 6), (100, 8)] {
+            let limits = ReadLimits {
+                client_percent: Some(percent),
+                ..ReadLimits::default()
+            };
+            assert_eq!(fetch, limits.fetch_per_client(), "{percent}%");
+            assert!(limits.list_offsets_per_client() >= LIST_OFFSETS_CONCURRENCY);
+            assert!(limits.list_offsets_per_client() <= limits.list_offsets);
+        }
+    }
+
+    /// `client_read_share` is removed from the URL like `pool_max_size`, and
+    /// only a percentage is accepted.
+    #[test]
+    fn client_read_share_is_taken_from_the_url() -> Result<()> {
+        let mut config =
+            "postgres://localhost/db?options=a&client_read_share=25&pool_max_size=4".to_owned();
+        assert_eq!(Some(25), take_client_read_share(&mut config)?);
+        assert_eq!("postgres://localhost/db?options=a&pool_max_size=4", config);
+
+        let mut config = "postgres://localhost/db".to_owned();
+        assert_eq!(None, take_client_read_share(&mut config)?);
+
+        for value in ["0", "101", "banana", ""] {
+            let mut config = format!("postgres://localhost/db?client_read_share={value}");
+            assert_matches!(
+                take_client_read_share(&mut config),
+                Err(Error::InvalidStorageOptionValue { option, .. }) if option == CLIENT_READ_SHARE,
+                "{value}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// A connection's abandoned Fetch reads keep their permits from its
     /// share, as well as from `ReadLimits::fetch`, until their statements end. The
     /// connection's next read waits meanwhile, and another connection's
@@ -6922,6 +7207,204 @@ mod tests {
         )
         .await
         .map_err(|_| Error::Message("the connection's share did not come back".into()))??;
+
+        Ok(())
+    }
+
+    /// A client's abandoned Fetch reads keep their permits, from the client's
+    /// share and from `ReadLimits::fetch`, until their statements end, and a
+    /// client past its share waits for it, behind another client that waits
+    /// for the limit. This is the reconnect that the client share exists for:
+    /// a client that is alone may use the whole limit, but once another
+    /// client waits, a permit that frees goes to that client and not to the
+    /// next read of the one that abandons its reads.
+    #[tokio::test]
+    async fn abandoned_fetch_reads_of_a_client_give_way_to_a_waiting_client() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_fetch_reads_of_a_client_give_way_to_a_waiting_client: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("reconnecting"));
+        let share_marker = alphanumeric_string(15);
+        let first_extra_marker = alphanumeric_string(15);
+        let second_extra_marker = alphanumeric_string(15);
+
+        // Each read comes from a new connection, so that no connection's share
+        // is used up, only the client's. The reads past the client's share take
+        // the rest of the limit, because nobody waits for it.
+        let abandoned = [
+            (limits.fetch_per_client(), &share_marker),
+            (1, &first_extra_marker),
+            (
+                limits.fetch - limits.fetch_per_client() - 1,
+                &second_extra_marker,
+            ),
+        ];
+        for (reads, marker) in abandoned {
+            for _ in 0..reads {
+                let permits = client
+                    .clone()
+                    .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                    .await?;
+                abandon_sleeping_statement(&storage, permits, marker).await?;
+            }
+        }
+
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        // The client's next read waits for its share, and then another
+        // client's read waits for the limit.
+        let next = tokio::spawn({
+            let storage = storage.clone();
+
+            client.clone().scope(
+                FetchReadShare::default()
+                    .scope(async move { storage.fetch_read_permits().await.map(drop) }),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!next.is_finished(), "the read went ahead of a full limit");
+
+        let other = tokio::spawn({
+            let storage = storage.clone();
+
+            ClientIdentity::new(Some("bob"), Some("polite")).scope(
+                FetchReadShare::default().scope(async move { storage.fetch_read_permits().await }),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!other.is_finished(), "the read went ahead of a full limit");
+
+        // One permit frees. It goes to the client that waits for the limit, and
+        // the read of the client past its share does not take it.
+        assert_eq!(1, cancel_backends(&monitor, &first_extra_marker).await?);
+        // It keeps the permit, so that the limit stays used up.
+        let other_permits = timeout(Duration::from_secs(5), other)
+            .await
+            .map_err(|_| Error::Message("the waiting client did not get the permit".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+        assert!(
+            !next.is_finished(),
+            "the read of the client past its share took the permit that freed"
+        );
+
+        // The rest frees, and so the reads of the client go ahead again.
+        assert_eq!(
+            limits.fetch_per_client(),
+            cancel_backends(&monitor, &share_marker).await?
+        );
+        assert_eq!(
+            limits.fetch - limits.fetch_per_client() - 1,
+            cancel_backends(&monitor, &second_extra_marker).await?
+        );
+        timeout(Duration::from_secs(5), next)
+            .await
+            .map_err(|_| Error::Message("the client's read did not go ahead".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+
+        drop(other_permits);
+        wait_until(&storage, |storage| {
+            storage.fetch_reads.available_permits() == limits.fetch
+        })
+        .await;
+
+        Ok(())
+    }
+
+    /// A Fetch that reaches its deadline while it waits for its client's share answers with no
+    /// records, and the engine logs a warning that names the client, because the Fetch service
+    /// sees nothing but the empty answer.
+    #[tokio::test]
+    async fn fetch_missing_its_deadline_at_the_client_share_names_the_client() -> Result<()> {
+        use std::io::{self, Write};
+
+        #[derive(Clone, Default)]
+        struct WarnLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for WarnLog {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping fetch_missing_its_deadline_at_the_client_share_names_the_client: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("reporting"));
+        let marker = alphanumeric_string(15);
+
+        // The client abandons as many reads as the limit allows, each from a new connection, so
+        // that its share and the limit are used up.
+        for _ in 0..limits.fetch {
+            let permits = client
+                .clone()
+                .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        let log = WarnLog::default();
+        let writer = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        let batches = client
+            .scope(FetchReadShare::default().scope(storage.fetch(
+                &Topition::new("orders", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_millis(300),
+            )))
+            .await?;
+
+        assert!(batches.is_empty(), "{batches:?}");
+
+        let log = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(log.contains("alice"), "{log:?}");
+        assert!(log.contains("reporting"), "{log:?}");
+        assert!(log.contains("client_read_limit"), "{log:?}");
+
+        _ = cancel_backends(&monitor, &marker).await?;
 
         Ok(())
     }

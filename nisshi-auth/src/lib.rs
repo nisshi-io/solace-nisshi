@@ -115,6 +115,18 @@ impl AuthenticationExtension {
             .unwrap_or_default()
     }
 
+    /// The name that the connection authenticated as, or `None` while it has
+    /// not authenticated.
+    pub fn principal(&self) -> Option<String> {
+        self.stage
+            .lock()
+            .ok()
+            .and_then(|guard| match guard.as_ref() {
+                Some(Stage::Finished(Some(success))) => Some(success.auth_id().to_owned()),
+                _ => None,
+            })
+    }
+
     /// Build a fresh `Stage::Server` from the stored config. Used by
     /// the SASL handshake handler to support re-authentication
     /// (KIP-368): a client periodically issues a new SaslHandshake on
@@ -161,6 +173,13 @@ impl fmt::Display for AuthError {
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Success {
     auth_id: String,
+}
+
+impl Success {
+    /// The name that the client authenticated as.
+    pub fn auth_id(&self) -> &str {
+        &self.auth_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -325,6 +344,37 @@ mod tests {
     fn authentication() {
         is_send::<AuthenticationExtension>();
         is_sync::<AuthenticationExtension>();
+    }
+
+    /// Returns an extension whose stage is `stage`, on a configuration that no
+    /// test exchange uses.
+    fn extension_at(stage: Stage) -> AuthenticationExtension {
+        let config = SASLConfig::with_credentials(None, "unused".into(), "unused".into())
+            .expect("a client configuration with credentials is valid");
+        let extension = AuthenticationExtension::server(config);
+        *extension
+            .stage
+            .lock()
+            .expect("no other thread holds the lock") = Some(stage);
+        extension
+    }
+
+    /// A connection has a principal only after it authenticated.
+    #[test]
+    fn principal_is_none_until_authentication_succeeds() {
+        let config = SASLConfig::with_credentials(None, "unused".into(), "unused".into())
+            .expect("a client configuration with credentials is valid");
+
+        // Before any exchange, and after one that finished without a success, as SCRAM
+        // does for a bad proof.
+        assert_eq!(None, AuthenticationExtension::server(config).principal());
+        assert_eq!(None, extension_at(Stage::Finished(None)).principal());
+
+        let authenticated = extension_at(Stage::Finished(Some(Success {
+            auth_id: "alice".to_owned(),
+        })));
+        assert_eq!(Some("alice".to_owned()), authenticated.principal());
+        assert!(authenticated.is_authenticated());
     }
 
     /// The broker enables exactly the SCRAM mechanisms that it can look up a

@@ -29,8 +29,8 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
     service::{
-        read_deadline::{Missed, ReadDeadline},
-        read_share::FetchReadShare,
+        read_deadline::{Missed, ReadDeadline, ReadWait},
+        read_share::{FetchReadShare, warn_miss_at_client_share},
     },
 };
 use validation::ValidatedFetchRequest;
@@ -117,6 +117,12 @@ fn missed(
                 elapsed = ?started_at.elapsed(),
                 "fetch read not started"
             )
+        }
+        // The log names the client, see `warn_miss_at_client_share`. A storage engine logs it
+        // itself when its read misses the deadline during the wait for the share, so this arm
+        // covers the reads that the service makes, such as the offset stage.
+        Missed::Queued(ReadWait::ClientReadLimit) => {
+            warn_miss_at_client_share(tp, operation, offset, started_at)
         }
         Missed::Queued(_) | Missed::Reading => {
             warn!(
@@ -1154,13 +1160,14 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
-    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, fetch_deadline};
+    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, Missed, ReadWait, fetch_deadline};
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
         ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+        ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
         TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version, read_share::FetchReadShare,
+        Version,
+        read_share::{ClientIdentity, FetchReadShare},
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -2609,6 +2616,67 @@ mod tests {
                 .collect(),
             elapsed,
         ))
+    }
+
+    /// The log lines written at `warn` or above.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WarnLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Returns what `missed` logs at `warn` or above for a read of a request from `identity`.
+    async fn warning_for(identity: ClientIdentity, stage: Missed) -> String {
+        let log = WarnLog::default();
+        let writer = log.clone();
+
+        identity
+            .scope(async {
+                tracing::subscriber::with_default(
+                    tracing_subscriber::fmt()
+                        .with_max_level(tracing::Level::WARN)
+                        .with_ansi(false)
+                        .with_writer(move || writer.clone())
+                        .finish(),
+                    || {
+                        super::missed(
+                            &Topition::new("orders", 0),
+                            StorageOperation::Fetch,
+                            0,
+                            stage,
+                            Instant::now(),
+                        );
+                    },
+                );
+            })
+            .await;
+
+        String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8")
+    }
+
+    /// A read that missed its deadline waiting for its client's share names the client in the
+    /// log, and not in the metric, so that an operator can tell a client that abandons reads from
+    /// a consumer group that shares one `client_id`. A miss at another stage does not blame the
+    /// client.
+    #[tokio::test]
+    async fn a_miss_at_the_client_share_names_the_client() {
+        let identity = ClientIdentity::new(Some("alice"), Some("reporting"));
+
+        let log = warning_for(identity.clone(), Missed::Queued(ReadWait::ClientReadLimit)).await;
+        assert!(log.contains("reporting"), "{log:?}");
+        assert!(log.contains("alice"), "{log:?}");
+
+        let log = warning_for(identity, Missed::Queued(ReadWait::ConnectionReadLimit)).await;
+        assert!(!log.contains("reporting"), "{log:?}");
+        assert!(log.contains("fetch read deadline exceeded"), "{log:?}");
     }
 
     /// A Fetch's reads take their permits from the read share of the request's connection. A

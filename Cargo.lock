@@ -6242,6 +6242,7 @@ dependencies = [
  "nanoid",
  "nisshi-auth",
  "nisshi-sans-io",
+ "nisshi-storage",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "rama",
