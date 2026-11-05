@@ -20,7 +20,7 @@ To move a target between tiers, change its budget, or stop running it in CI, edi
 
 The PR job has a 50 minute timeout and each nightly job 75 minutes. The six `pr` budgets add up to 6 minutes of fuzzing, after the build. If the budgets outgrow the timeouts, raise `timeout-minutes` in `.github/workflows/fuzz.yml` too.
 
-The fuzz recipes in the `justfile` build with `CARGO_PROFILE_RELEASE_LTO=false`, which turns off the workspace's cross-crate LTO (`lto = "thin"` in `Cargo.toml`) for fuzz builds only. With LTO, every target generates the machine code for its whole dependency graph when it links, which takes minutes per target, and the targets run fewer inputs per second. Without it, the dependencies compile once, and each further target compiles only its own code.
+`fuzz/` is a Cargo workspace of its own, so the release profile of the root `Cargo.toml` doesn't apply to it, and `fuzz/Cargo.toml` sets its own: one codegen unit and no cross-crate LTO. With LTO, every target generates the machine code for its whole dependency graph when it links, which takes minutes per target, and the targets run fewer inputs per second. Without it, the dependencies compile once, and each further target compiles only its own code.
 
 The `fuzz_<api>_storage` targets run in `nightly` only, 15 minutes each. `just fuzz-ci pr` builds only the targets of the `pr` tier, because a storage target links the whole storage stack and takes several minutes to build, which the `pr` job's timeout can't afford for all of them.
 

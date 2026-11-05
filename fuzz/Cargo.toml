@@ -1,24 +1,32 @@
 [package]
 name = "fuzz"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "Apache-2.0"
 publish = false
-version.workspace = true
+version = "0.0.0"
 
 [package.metadata]
 cargo-fuzz = true
 
+# A workspace of its own rather than a member of the root one, so the root's
+# `cargo metadata`, which FOSSA and cargo-deny read, leaves out libfuzzer-sys.
+# It has its own Cargo.lock, which Dependabot updates with the root one.
+[workspace]
+
+# bytes, rama, tokio and url repeat the requirements in the root Cargo.toml's
+# [workspace.dependencies]; change both together.
+
 [dependencies]
-bytes.workspace = true
-libfuzzer-sys.workspace = true
-nisshi-fuzz-harness.workspace = true
-nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
-nisshi-service.workspace = true
-nisshi-storage-dynostore.workspace = true
-nisshi-storage.workspace = true
-rama.workspace = true
-tokio.workspace = true
-url.workspace = true
+bytes = { version = "1", features = ["serde"] }
+libfuzzer-sys = "0.4"
+nisshi-fuzz-harness = { path = "../nisshi-fuzz-harness", default-features = false }
+nisshi-sans-io = { path = "../nisshi-sans-io", default-features = false, features = ["arbitrary"] }
+nisshi-service = { path = "../nisshi-service", default-features = false }
+nisshi-storage-dynostore = { path = "../nisshi-storage-dynostore", default-features = false }
+nisshi-storage = { path = "../nisshi-storage", default-features = false }
+rama = { version = "0.4.0", features = ["http", "tcp"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+url = { version = "2.5.4", features = ["serde"] }
 
 [[bin]]
 name = "generate_seeds"
@@ -228,3 +236,13 @@ doc = false
 bench = false
 
 [lints]
+
+# Cargo reads profiles from the workspace root only, so the root Cargo.toml's
+# release profile doesn't reach this workspace. One codegen unit, as there:
+# with more, nightly rustc segfaults on typenum with the sanitizer. No LTO:
+# with it every target generates the machine code for its whole dependency
+# graph when it links, which takes minutes per target, and the targets run
+# fewer inputs per second.
+[profile.release]
+codegen-units = 1
+lto = false

@@ -4115,22 +4115,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fuzz"
-version = "0.8.2"
-dependencies = [
- "bytes",
- "libfuzzer-sys",
- "nisshi-fuzz-harness",
- "nisshi-sans-io",
- "nisshi-service",
- "nisshi-storage",
- "nisshi-storage-dynostore",
- "rama",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "genawaiter"
 version = "0.99.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5364,16 +5348,6 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libfuzzer-sys"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
-dependencies = [
- "arbitrary",
- "cc",
-]
 
 [[package]]
 name = "libloading"

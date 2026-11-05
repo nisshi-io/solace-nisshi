@@ -44,8 +44,11 @@ updates:
       actions-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+  # fuzz/ is a workspace of its own with its own Cargo.lock.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/fuzz"
     schedule:
       interval: "weekly"
       day: "sunday"
@@ -107,6 +110,13 @@ updates:
       default-days: 7
       semver-major-days: 14
     groups:
+      # fuzz/Cargo.toml repeats these requirements from the root Cargo.toml,
+      # and the fuzz targets pass their types into the workspace crates, so a
+      # minor or major bump moves both directories in one PR.
+      fuzz-shared:
+        patterns: ["bytes", "rama", "tokio", "url"]
+        update-types: ["minor", "major"]
+        group-by: dependency-name
       # deltalake, datafusion and the iceberg crates each build against one
       # arrow, parquet and object_store release, so the stack builds only
       # when every crate in it moves to a matching set.

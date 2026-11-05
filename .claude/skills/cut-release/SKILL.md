@@ -109,8 +109,8 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 - In `Cargo.toml`, set `[workspace.package] version` to `VERSION`, and set the `version =` of every internal entry in `[workspace.dependencies]` to `VERSION`: `nisshi` and each `nisshi-*`. Other files that name a version (the README, comments) are examples or history. Leave them.
 - `grep -E '^nisshi(-[a-z-]+)? = \{ version = ' Cargo.toml | grep -v -F 'version = "VERSION"'` must print nothing.
-- Run `cargo update --workspace`, then `cargo metadata --locked --format-version 1 > /dev/null` to check that `Cargo.lock` matches.
-- `git diff --text -U0 Cargo.lock | grep '^[-+][^-+]' | grep -v '^[-+]version = '` must print nothing: the lock file changes only the workspace crates' own versions. `--text` is required, because `.gitattributes` marks `Cargo.lock` as `-diff`, and without it `git diff` prints only "Binary files differ", so the check passes whatever changed.
+- Run `cargo update --workspace`, then `cargo metadata --locked --format-version 1 > /dev/null` to check that `Cargo.lock` matches. Run `cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null` too: `fuzz/` is a workspace of its own, and its `Cargo.lock` names the workspace crates it builds.
+- `git diff --text -U0 Cargo.lock fuzz/Cargo.lock | grep '^[-+][^-+]' | grep -v '^[-+]version = '` must print nothing: the lock files change only the workspace crates' own versions. `--text` is required, because `.gitattributes` marks `Cargo.lock` as `-diff`, and without it `git diff` prints only "Binary files differ", so the check passes whatever changed.
 
 ### Self-check
 
@@ -121,7 +121,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 ## 5. Open the PR
 
-- Commit only `Cargo.toml`, `Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
+- Commit only `Cargo.toml`, `Cargo.lock`, `fuzz/Cargo.lock` and (stable) `CHANGELOG.md`, as `chore(release): prepare TAG`, signed off (`git commit -s`), ending with the session's `Co-Authored-By` trailer.
 - Push with `git push -u origin release/TAG` and open the PR against `main` with the title `chore(release): prepare TAG` and the three sections of `.github/PULL_REQUEST_TEMPLATE.md`, as in [#1004](https://github.com/nisshi-io/solace-nisshi/pull/1004):
   - **What changes, and why?** The version bump from the old to the new version, and (stable) the section: which range it covers, and the upgrade notes that no commit body mentioned. Say that after the merge, `/cut-release` tags the squash commit on `main`, which publishes the image, the GitHub release and the crates. Stable only: end the section with the line `Drafted from <DRAFT_BASE>.`, using the full SHA.
   - **Upgrade impact:** none from the PR itself. For a stable release, the changelog describes the impact of upgrading.

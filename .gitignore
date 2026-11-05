@@ -16,6 +16,7 @@
 .vscode
 .zed
 Cargo.lock
+!/fuzz/Cargo.lock
 cargo-flamegraph.trace
 /dist
 debug
