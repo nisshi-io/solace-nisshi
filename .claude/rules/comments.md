@@ -214,6 +214,13 @@ Form is not enough on its own. The failure below survives every rule above, and 
 - No: `// That flag ignores quiet, which marks a failure the caller expects; nobody expects the command to be absent.`
 - Yes: `// quiet does not ignore a missing command, because that is a critical failure.`
 
+**Write a condition as a clause of its own, not as a relative clause on the subject.** When a sentence says what happens to a thing under a condition, put the condition in an "if" or "when" clause, with its own subject, verb and object. A relative clause in which the noun before it is not the subject, such as "whose first step the deadline stops" or "that the deadline stops", makes the reader hold the noun, the inner subject and the inner object before any verb arrives.
+
+- No: `// A read whose first step the deadline keeps from starting counts as not_started.`
+- Yes: `// If the deadline keeps the first step of a read from starting, the read counts as not_started.`
+
+The test: find each "that", "which" or "whose" between a sentence's subject and its main verb. If the subject is not also the subject of that inner clause, rewrite the sentence. The same clause on an object, as in "returns the batches that it read", is fine, because the main verb has already arrived.
+
 **State the fact. Do not invent a condition that the code has already decided.** When the code sets a value, say what the value does. A conditional word implies a choice that the reader does not have.
 
 - No: `// The retry loop stops unless this flag allows another attempt.` The flag is set, and it does allow another attempt, so "unless" describes nothing.
@@ -294,6 +301,7 @@ Writing a comment and checking it are two steps. After you write or change comme
 - The comment describes the contract, not the cases, helpers or steps that the code already shows.
 - Each comment makes one point, and sits above the line that it explains.
 - The comment does not name the item's callers or describe another file's internals.
+- Each condition is an "if" or "when" clause, not a relative clause such as "a read that the deadline stops".
 - Every noun is a thing that the code names. A noun pile such as "the offset stage read" becomes "the read of the offset stage".
 - Every line fits the file's width. rustfmt does not wrap comments, or the arguments of a macro such as `debug!`, so check those lines yourself.
 
