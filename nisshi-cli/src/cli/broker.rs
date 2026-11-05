@@ -108,8 +108,9 @@ pub(super) struct Arg {
     /// `nisshi topic list`. `build` parses it, so only the broker pays for a bad value.
     ///
     /// This is a workaround for the flatten, not a pattern for the other typed options. It stays
-    /// until `Cli` no longer flattens this struct: then the field can be an `EnvVarExp<Url>`
-    /// again, and the other typed, env-backed options need no workaround of their own.
+    /// until `Cli` no longer flattens this struct (SOL-157709): then the field can be an
+    /// `EnvVarExp<Url>` again, and the other typed, env-backed options need no workaround of
+    /// their own.
     #[arg(long, env = "SCHEMA_REGISTRY")]
     schema_registry: Option<String>,
 
@@ -337,7 +338,8 @@ fn server_config(
 /// copy that read it too would beat an explicit `broker --schema-registry x iceberg`.
 ///
 /// This type exists because `Arg::schema_registry` is a `String` that `build` parses. It is a
-/// workaround until `Cli` no longer flattens `Arg`; do not copy it for another option.
+/// workaround until `Cli` no longer flattens `Arg` (SOL-157709); do not copy it for another
+/// option.
 #[derive(Clone, Debug, Default, clap::Args)]
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 pub(super) struct LakeRegistry {

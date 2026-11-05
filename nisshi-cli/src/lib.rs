@@ -47,8 +47,8 @@ pub enum Error {
     /// The broker's `--schema-registry`, or the `SCHEMA_REGISTRY` variable, is not a URL.
     ///
     /// The broker reports this at startup, where clap would otherwise report it. That is a
-    /// workaround until `Cli` no longer flattens the broker's arguments; do not add a variant
-    /// like it for another option.
+    /// workaround until `Cli` no longer flattens the broker's arguments (SOL-157709); do not add
+    /// a variant like it for another option.
     #[error("invalid value '{value}' for '--schema-registry <SCHEMA_REGISTRY>': {cause}")]
     SchemaRegistry { value: String, cause: String },
     #[error(transparent)]
