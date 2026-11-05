@@ -664,8 +664,9 @@ fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
 /// without a reset passes the pool's `is_closed` check, and without a bound the query would wait
 /// for TCP to give up. On a timeout the pool drops that connection and tries the next idle one,
 /// which gets its own timeout, so the pool opens a new connection only when no idle one is left. A
-/// checkout can take up to this timeout for each idle connection, plus
-/// [`DEFAULT_POOL_CREATE_TIMEOUT`], and `connection()` puts no other bound around the checkout.
+/// checkout can therefore take up to this timeout for each idle connection, plus
+/// [`DEFAULT_POOL_CREATE_TIMEOUT`] for a new connection, plus up to this timeout again for the
+/// check of that new connection, and `connection()` puts no other bound around the checkout.
 ///
 /// The pool applies the same value to its own recycle step, which only checks that the socket is
 /// open.
@@ -815,6 +816,12 @@ impl ReadOnlyCheck {
         client: &deadpool_postgres::ClientWrapper,
     ) -> std::result::Result<(), CheckFailure> {
         let failure = if client.is_closed() {
+            warn!(
+                cluster = self.cluster,
+                stage = stage.as_str(),
+                reason = CheckFailure::Closed.as_str(),
+                "a pooled connection failed its check and is dropped"
+            );
             CheckFailure::Closed
         } else {
             match timeout(
@@ -8816,6 +8823,147 @@ mod tests {
         Ok(())
     }
 
+    /// A `Write` that appends to a buffer that the test reads back.
+    #[derive(Clone, Default)]
+    struct LoggedBytes(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for LoggedBytes {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An idle connection that the server ended is replaced at its checkout,
+    /// counted under the recycle stage with the reason `closed`, and the broker
+    /// logs it, because the pool no longer logs a closed connection.
+    #[tokio::test]
+    async fn closed_idle_connection_is_replaced_counted_and_logged() -> Result<()> {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(_probe) =
+            storage_with_schema("closed_idle_connection_is_replaced", &CONNECTION, &cluster)
+                .await?
+        else {
+            return Ok(());
+        };
+
+        let logged = LoggedBytes::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer({
+                    let logged = logged.clone();
+                    move || logged.clone()
+                })
+                .with_ansi(false)
+                .finish(),
+        );
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let counter = provider
+            .meter("test")
+            .u64_counter("nisshi_sql_pool_replaced")
+            .build();
+        let check = ReadOnlyCheck::counting(1, &cluster, counter);
+
+        let writable = Postgres::builder(&CONNECTION)?;
+        let pool = PoolParts::open(
+            writable.pool.config.clone(),
+            writable.pool.tls.clone(),
+            1,
+            &check,
+        )?;
+
+        let pid = {
+            let connection = pool.get().await?;
+            connection
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get::<_, i32>(0)
+        };
+
+        // The server ends the idle connection, as a restart or a failover does.
+        let monitor = Postgres::builder(&CONNECTION)?
+            .cluster(&cluster)
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+        _ = monitor
+            .connection()
+            .await?
+            .query("SELECT pg_terminate_backend($1)", &[&pid])
+            .await?;
+
+        // The connection task needs a moment to see the end of the socket.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let replacement = pool.get().await?;
+        let replacement_pid = replacement
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get::<_, i32>(0);
+
+        assert_ne!(pid, replacement_pid);
+
+        provider.force_flush().expect("flush");
+        let counted = exporter
+            .get_finished_metrics()
+            .expect("finished metrics")
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter_map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+                _ => None,
+            })
+            .flat_map(|sum| sum.data_points())
+            .filter(|point| {
+                let has = |key: &str, value: &str| {
+                    point
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == key && kv.value.as_str() == value)
+                };
+
+                has("stage", "recycle") && has("reason", "closed")
+            })
+            .map(|point| point.value())
+            .sum::<u64>();
+        assert_eq!(1, counted);
+
+        let log = String::from_utf8(
+            logged
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("utf8 log");
+        assert!(
+            log.lines().any(|line| line.contains("WARN")
+                && line.contains("a pooled connection failed its check and is dropped")
+                && line.contains("recycle")
+                && line.contains("closed")),
+            "{log}"
+        );
+
+        Ok(())
+    }
+
     /// [`CheckFailure::of`] tells a read-only session from any other server
     /// error.
     #[tokio::test]
@@ -8852,7 +9000,8 @@ mod tests {
         Ok(())
     }
 
-    /// Without `read_only_check_every`, the check runs on every checkout, and
+    /// Without `read_only_check_every`, the check runs on every
+    /// [`DEFAULT_READ_ONLY_CHECK_EVERY`]-th checkout of an idle connection, and
     /// the option takes the numbers in [`READ_ONLY_CHECK_EVERY_RANGE`]. The
     /// other options in the URL still reach tokio-postgres.
     #[test]
