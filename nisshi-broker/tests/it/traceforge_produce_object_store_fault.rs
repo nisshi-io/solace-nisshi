@@ -64,7 +64,7 @@
 
 #![cfg(feature = "dynostore")]
 
-use crate::common::alphanumeric_string;
+use crate::common::{alphanumeric_string, block_on_tokio};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -406,7 +406,9 @@ fn record_write_failure_never_causes_silent_data_loss() {
         }
 
         let topition = Topition::new(topic.clone(), index);
-        let fetched = future::block_on(storage.fetch(
+        // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+        // finished, so traceforge does not schedule it.
+        let fetched = block_on_tokio(storage.fetch(
             &topition,
             0,
             0,
@@ -615,7 +617,9 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
         // otherwise a `read_committed` consumer of that partition can
         // never learn the transaction concluded.
         for topition in [&topition0, &topition1] {
-            let fetched = future::block_on(storage.fetch(
+            // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+            // finished, so traceforge does not schedule it.
+            let fetched = block_on_tokio(storage.fetch(
                 topition,
                 0,
                 0,

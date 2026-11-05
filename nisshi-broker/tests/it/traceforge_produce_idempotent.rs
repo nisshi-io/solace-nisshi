@@ -68,7 +68,7 @@
 
 #![cfg(feature = "dynostore")]
 
-use crate::common::{alphanumeric_string, memory_storage};
+use crate::common::{alphanumeric_string, block_on_tokio, memory_storage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -289,7 +289,9 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
         // dropped accept or a silently applied reject shows up here as a
         // record-count mismatch, not just a wrong response code above.
         let topition = Topition::new(topic.clone(), index);
-        let fetched = future::block_on(storage.fetch(
+        // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+        // finished, so traceforge does not schedule it.
+        let fetched = block_on_tokio(storage.fetch(
             &topition,
             0,
             0,
@@ -818,7 +820,9 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
         // write duplicated by a careless retry) and no fewer (a dropped
         // write never actually retried).
         let topition = Topition::new(topic.clone(), index);
-        let fetched = future::block_on(real_storage.fetch(
+        // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+        // finished, so traceforge does not schedule it.
+        let fetched = block_on_tokio(real_storage.fetch(
             &topition,
             0,
             0,
