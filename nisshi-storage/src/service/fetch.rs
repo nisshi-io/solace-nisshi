@@ -1171,7 +1171,7 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
-    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, fetch_deadline};
+    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, Missed, ReadWait, fetch_deadline};
     use crate::{
         BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
         ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
@@ -2681,11 +2681,11 @@ mod tests {
     async fn a_miss_at_the_client_share_names_the_client() {
         let identity = ClientIdentity::new(Some("alice"), Some("reporting"));
 
-        let log = warning_for(identity.clone(), Missed::QueuedForClientShare).await;
+        let log = warning_for(identity.clone(), Missed::Queued(ReadWait::ClientReadLimit)).await;
         assert!(log.contains("reporting"), "{log:?}");
         assert!(log.contains("alice"), "{log:?}");
 
-        let log = warning_for(identity, Missed::QueuedForConnectionShare).await;
+        let log = warning_for(identity, Missed::Queued(ReadWait::ConnectionReadLimit)).await;
         assert!(!log.contains("reporting"), "{log:?}");
         assert!(log.contains("fetch read deadline exceeded"), "{log:?}");
     }

@@ -79,15 +79,15 @@
 //! ## What a client sees at the bound
 //!
 //! Nothing but a wait. A read of a client that already holds its share waits
-//! for a permit in the broker while the limit is used up, and `limit` is
-//! `client` in the metric below, whether or not another client waits. With
-//! the share set to the whole limit, a read waits with `limit` set to `client`
+//! for a permit in the broker while the limit is used up, and `wait` is
+//! `client_read_limit` in the metric below, whether or not another client waits. With
+//! the share set to the whole limit, a read waits with `wait` set to `client_read_limit`
 //! only when its client holds every permit of the limit. The
 //! connection stays open, the response carries no error and
 //! `throttle_time_ms` stays 0. If the request's deadline passes first, a Fetch
 //! answers the partition with no records, and a ListOffsets answers
 //! `REQUEST_TIMED_OUT` for it, and the `nisshi_storage_read_deadline_exceeded`
-//! metric rises with `stage` set to `queued` and `limit` set to `client`.
+//! metric rises with `stage` set to `queued` and `wait` set to `client_read_limit`.
 //!
 //! ## Kafka
 //!
@@ -960,8 +960,10 @@ mod tests {
         let limit = limit(1);
         let deadline = Instant::now() + Duration::from_secs(1);
 
+        let mut deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+
         let outcome = identity(None, "one")
-            .scope(bounded(deadline, async {
+            .scope(deadline.timeout(async {
                 let held = shares.acquire(1, &limit).await;
                 assert!(held.is_ok(), "{held:?}");
 
