@@ -211,6 +211,9 @@ zstd = "0.14.0"
 
 # Line tables keep file:line in workspace backtraces; full debug info costs
 # disk and link time. Build with `--profile debugging` for a debugger.
+#
+# fuzz/Cargo.toml repeats [profile.dev] and [profile.dev.package."*"]; change
+# them there too.
 [profile.dev]
 debug = "line-tables-only"
 

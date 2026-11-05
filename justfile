@@ -218,8 +218,9 @@ fuzz-ci-matrix tier:
 check:
     cargo check --workspace --all-features --all-targets
 
-# fuzz/ is a workspace of its own; its build shares target/ so the
-# dependencies it has in common with the root workspace compile once
+# fuzz/ is a workspace of its own. Its pass shares target/ and the root's dev
+# profile, so it reuses each dependency that the root workspace built with the
+# same features.
 clippy:
     cargo clippy --workspace --all-features --all-targets -- -D warnings
     cargo clippy --manifest-path fuzz/Cargo.toml --target-dir target --all-targets -- -D warnings
