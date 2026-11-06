@@ -78,9 +78,8 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
 # fuzz/Cargo.toml's [dependencies] repeats the bytes, rama, tokio and url
-# requirements; change them there too. .github/dependabot.yml's fuzz-shared
-# group moves both for minor and major bumps only, so keep patch bumps equal
-# by hand.
+# requirements; change them there too. Dependabot bumps them only here, so its
+# PR for one of them needs the same change there by hand.
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"

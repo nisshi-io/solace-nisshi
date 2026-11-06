@@ -11,13 +11,12 @@ cargo-fuzz = true
 # A workspace of its own rather than a member of the root one, so the root's
 # `cargo metadata`, which FOSSA and cargo-deny read, leaves out libfuzzer-sys.
 # It has its own Cargo.lock, which can fall behind the root one between
-# releases, because Dependabot bumps only this manifest's direct dependencies.
+# releases, because Dependabot updates only libfuzzer-sys in it.
 [workspace]
 
 # bytes, rama, tokio and url repeat the requirements in the root Cargo.toml's
-# [workspace.dependencies]; change both together. .github/dependabot.yml's
-# fuzz-shared group moves both for minor and major bumps only, so keep patch
-# bumps equal by hand.
+# [workspace.dependencies]; change both together. Dependabot bumps them only
+# in the root one.
 [dependencies]
 bytes = { version = "1", features = ["serde"] }
 libfuzzer-sys = "0.4"
