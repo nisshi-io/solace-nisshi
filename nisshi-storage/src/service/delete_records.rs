@@ -28,7 +28,9 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, Result, Storage, StorageOperation, Topition,
     service::{
-        read_deadline::{DELETE_RECORDS_DEADLINE, Missed, QueueWait as _, ReadDeadline, ReadWait},
+        read_deadline::{
+            DELETE_RECORDS_DEADLINE, QueueWait as _, ReadDeadline, ReadWait, TimedOut,
+        },
         storage_error_code,
     },
 };
@@ -117,7 +119,7 @@ impl<G> DeleteRecordsService<G>
 where
     G: Storage,
 {
-    /// Makes one storage call for `request`, and answers [`Missed`] when the
+    /// Makes one storage call for `request`, and answers [`TimedOut`] when the
     /// deadline passes before the call starts.
     ///
     /// The wait for a permit that the engine shares across requests ends at
@@ -128,11 +130,11 @@ where
         deadline: Instant,
         permits: Option<Arc<Semaphore>>,
         request: &DeleteRecordsTopic,
-    ) -> Result<Result<Vec<DeleteRecordsTopicResult>>, Missed> {
+    ) -> Result<Result<Vec<DeleteRecordsTopicResult>>, TimedOut> {
         let _permit = match permits {
             Some(permits) => {
                 match ReadDeadline::new(StorageOperation::DeleteRecords, deadline)
-                    .timeout(
+                    .run_until_deadline(
                         permits
                             .acquire_owned()
                             .queued_for(ReadWait::EngineWriteLimit),
@@ -141,7 +143,7 @@ where
                 {
                     Ok(Ok(permit)) => Some(permit),
                     Ok(Err(closed)) => return Ok(Err(closed.into())),
-                    Err(missed) => return Err(missed),
+                    Err(timed_out) => return Err(timed_out),
                 }
             }
 
@@ -543,8 +545,8 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            _fetched: crate::FetchedSender,
+        ) -> Result<()> {
             unimplemented!()
         }
 

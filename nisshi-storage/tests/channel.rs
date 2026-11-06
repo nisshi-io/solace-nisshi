@@ -29,10 +29,10 @@ use std::{
 use nisshi_sans_io::{ErrorCode, IsolationLevel};
 use nisshi_storage::{
     ChannelRequest, ChannelRequestLayer, Error, Request, RequestChannelService, Response, Storage,
-    Topition, bounded_channel,
+    Topition, bounded_channel, fetched,
 };
 use rama::{Layer, Service};
-use tokio::{sync::oneshot, task::JoinSet, time::Instant};
+use tokio::{sync::oneshot, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -350,9 +350,10 @@ async fn panicked_request_reaches_the_caller_as_a_permanent_error() -> Result<()
     Ok(())
 }
 
-/// The supervisor answers a fetch whose deadline has passed with no batches, without serving it.
+/// The supervisor answers a fetch whose requester has stopped reading with no batches, without
+/// serving it.
 #[tokio::test]
-async fn expired_fetch_is_answered_without_being_served() -> Result<(), TestError> {
+async fn fetch_whose_reader_stopped_is_answered_without_being_served() -> Result<(), TestError> {
     let _guard = init_tracing()?;
 
     let (sender, receiver) = bounded_channel(10);
@@ -373,10 +374,14 @@ async fn expired_fetch_is_answered_without_being_served() -> Result<(), TestErro
         });
     }
 
-    // The test sends on the raw channel, because `RequestChannelService` does not send a fetch
-    // whose deadline has passed.
+    // The test sends on the raw channel, because a read whose requester has stopped reading never
+    // sends its request.
+    let (fetched_sender, fetched_receiver) = fetched::channel();
+    // The requester has stopped reading.
+    drop(fetched_receiver);
+
     let (response, answered) = oneshot::channel();
-    let (started, _) = oneshot::channel();
+    let (started, started_receiver) = oneshot::channel();
     sender
         .send(ChannelRequest {
             request: Request::Fetch {
@@ -385,7 +390,7 @@ async fn expired_fetch_is_answered_without_being_served() -> Result<(), TestErro
                 min_bytes: 1,
                 max_bytes: 1024,
                 isolation: IsolationLevel::ReadUncommitted,
-                deadline: Instant::now(),
+                fetched_sender,
             },
             response,
             started,
@@ -397,7 +402,10 @@ async fn expired_fetch_is_answered_without_being_served() -> Result<(), TestErro
         .await
         .map_err(|_| TestError::Message(String::from("no response")))?;
 
-    assert_matches!(&answer, Ok(Response::Fetch(Ok(batches))) if batches.is_empty());
+    assert_matches!(&answer, Ok(Response::Fetch(Ok(()))));
+    // The supervisor signals the start of each request that it serves, so a closed channel
+    // without a signal shows that the fetch was never served.
+    assert_matches!(started_receiver.await, Err(_));
 
     cancellation.cancel();
     let joined = join.join_all().await;

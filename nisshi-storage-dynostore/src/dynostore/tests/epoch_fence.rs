@@ -20,6 +20,7 @@
 //!
 //! [KIP-360]: https://cwiki.apache.org/confluence/display/KAFKA/KIP-360%3A+Improve+reliability+of+idempotent%2Ftransactional+producer
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, time::Duration};
 use tokio::time::Instant;
 
@@ -129,7 +130,7 @@ async fn stored_batches(
 
     loop {
         let batches = storage
-            .fetch(
+            .fetch_until_deadline(
                 topition,
                 offset,
                 1,
@@ -137,7 +138,8 @@ async fn stored_batches(
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         let Some(last) = batches.last() else {
             return Ok(stored);

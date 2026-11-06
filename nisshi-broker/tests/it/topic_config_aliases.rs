@@ -19,6 +19,7 @@
 //! The `tansu.*` alias warning is process-wide and a test checks the log of the whole process,
 //! so each test needs a process of its own, as `cargo nextest` gives it.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{
     io,
     sync::{Arc, Mutex, OnceLock},
@@ -256,7 +257,7 @@ async fn records_of_virtual_topic(
     }
 
     let Ok(batches) = storage
-        .fetch(
+        .fetch_until_deadline(
             &Topition::new(format!("{topic}/key-a"), 0),
             0,
             1,
@@ -265,6 +266,7 @@ async fn records_of_virtual_topic(
             Instant::now() + Duration::from_millis(500),
         )
         .await
+        .map(|read| read.batches)
     else {
         return Ok(None);
     };

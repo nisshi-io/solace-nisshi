@@ -20,6 +20,7 @@
 //! reads the bytes. The tests run against the backends that decode a produced batch: Postgres,
 //! libSQL, and the object store when a schema registry is configured.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, time::Duration};
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};
@@ -104,7 +105,7 @@ async fn assert_stores_the_decoded_batch(storage: impl Storage, reads_back: bool
     }
 
     let records = storage
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             0,
             1,
@@ -112,7 +113,8 @@ async fn assert_stores_the_decoded_batch(storage: impl Storage, reads_back: bool
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_secs(1),
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
         .into_iter()
         .map(inflated::Batch::try_from)
         .collect::<Result<Vec<_>, _>>()?
