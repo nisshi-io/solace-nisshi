@@ -42,7 +42,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use tracing::{debug, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -52,7 +52,7 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version, inflate_produced, offload,
+    Version, fetched::FetchedSender, inflate_produced, offload,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -670,10 +670,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -1259,8 +1266,8 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            _fetched: FetchedSender,
+        ) -> Result<()> {
             unimplemented!()
         }
 

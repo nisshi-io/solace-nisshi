@@ -125,7 +125,14 @@ Selected at compile time via feature flags, dispatched at runtime through a `Sto
 - `sqlite://` - libSQL/SQLite (`nisshi-storage-sql`, feature: `libsql`)
 - `slatedb://` - SlateDB KV store (`nisshi-storage-slatedb`, feature: `slatedb`). **Deprecated.** Only security fixes are accepted. When writing code, reviewing a PR or running a sweep, do not suggest or make bug fixes, refactors or feature changes for it, and do not flag non-security issues in it. Leave its tests and backend coverage as they are. Changes needed to keep it compiling and its tests passing after a workspace-wide change (a `Storage` or `StorageFactory` trait change, a shared dependency bump) are still expected, and so are routine Dependabot bumps of its dependencies.
 
-`RequestChannelService`'s `Storage` trait impl (`nisshi-storage/src/service.rs`) sends a `Request` over a channel and extracts the matching `Response` variant; every method does this via the `serve_and_extract!(self, request_expr, ResponseVariant)` macro rather than repeating the match/unwrap boilerplate - add new methods the same way. `fetch` is the one exception. It stops waiting at the read's deadline only while the read hasn't started: while it waits for room on the channel, and for the service to start the read. Once the read has started, `fetch` waits for the response, because the response holds the batches the read finished, and the engine stops the read at the deadline itself. The macro makes all of its waits in one call, so `fetch` makes them separately.
+`RequestChannelService`'s `Storage` trait impl (`nisshi-storage/src/service.rs`) sends a `Request` over a channel and extracts the matching `Response` variant; every method does this via the `serve_and_extract!(self, request_expr, ResponseVariant)` macro rather than repeating the match/unwrap boilerplate - add new methods the same way. `fetch` is the one exception, because a fetch read sends its records to the caller while it runs, instead of returning them at the end. `Request::Fetch` carries the read's `FetchedSender` for that, and the response only says whether the read failed.
+
+The caller (`FetchUntilDeadline::fetch_until_deadline` in `nisshi-storage/src/fetched.rs`) stops reading at the deadline. The channel sees this through the `FetchedSender`, and then:
+
+- skips the read if it hasn't started;
+- drops the read if it's running.
+
+A read stuck in a blocking call can't be dropped, and the channel waits for it to end before it serves the next request, because mpsc mode serves one request at a time.
 
 ### Broker Specifics
 

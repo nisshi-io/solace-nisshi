@@ -24,6 +24,7 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, inflated},
 };
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use nisshi_storage::{
     DeleteRecordsService, FetchService, FetchValidationLayer, ListOffsetResponse, Storage, Topition,
 };
@@ -337,7 +338,7 @@ where
     // *starts* (at 0) before the cutoff, which would leave only the
     // standalone record at offset 4 -- a gap this loop catches.
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             cutoff,
             1,
@@ -345,7 +346,8 @@ where
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_millis(500),
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
         .into_iter()
         .try_fold(Vec::new(), |mut acc, batch| {
             inflated::Batch::try_from(batch)

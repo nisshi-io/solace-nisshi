@@ -146,7 +146,7 @@ where
             .enumerate()
             .map(|(index, offset)| async move {
                 let answer = ReadDeadline::new(StorageOperation::ListOffsets, deadline)
-                    .timeout(
+                    .run_until_deadline(
                         self.storage
                             .list_offsets(isolation_level, slice::from_ref(offset)),
                     )
@@ -218,8 +218,8 @@ where
                 //
                 // [OffsetFetcherUtils.java#L170-L174]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/OffsetFetcherUtils.java#L170-L174
                 // [DelayedRemoteListOffsets.scala]: https://github.com/apache/kafka/blob/4.0.0/core/src/main/scala/kafka/server/DelayedRemoteListOffsets.scala#L144-L149
-                Err(missed) => {
-                    timed_out.push((topition, missed));
+                Err(reason) => {
+                    timed_out.push((topition, reason));
 
                     vec![(
                         topition.clone(),
@@ -237,7 +237,7 @@ where
             let count = |stage: &str| {
                 timed_out
                     .iter()
-                    .filter(|(_, missed)| missed.stage() == stage)
+                    .filter(|(_, reason)| reason.stage() == stage)
                     .count()
             };
 
@@ -502,7 +502,7 @@ mod tests {
         Version,
         service::{
             RequestChannelService, bounded_channel,
-            read_deadline::{LIST_OFFSETS_READ_DEADLINE, Missed, ReadDeadline, ReadWait},
+            read_deadline::{LIST_OFFSETS_READ_DEADLINE, ReadDeadline, ReadWait, TimedOut},
             read_share::ListOffsetsReadShare,
         },
     };
@@ -585,8 +585,8 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            _fetched: crate::FetchedSender,
+        ) -> Result<()> {
             unimplemented!()
         }
 
@@ -1154,8 +1154,8 @@ mod tests {
         Ok(())
     }
 
-    /// A read abandoned while it waits for the storage proxy's permit is a
-    /// queued miss, so a libSQL engine in `semaphore` mode whose permit
+    /// A read abandoned while it waits for the storage proxy's permit times
+    /// out as queued, so a libSQL engine in `semaphore` mode whose permit
     /// Produce and Fetch hold shows as queued, not as a slow engine.
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_the_proxy_permit_is_queued() -> Result<()> {
@@ -1181,7 +1181,7 @@ mod tests {
             StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
         )
-        .timeout(proxy.list_offsets(
+        .run_until_deadline(proxy.list_offsets(
             IsolationLevel::ReadUncommitted,
             &[(Topition::new(TOPIC, 1), ListOffset::Latest)],
         ))
@@ -1189,7 +1189,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                Err(Missed::Queued(ReadWait::ExclusiveEngineAccess))
+                Err(TimedOut::Queued(ReadWait::ExclusiveEngineAccess))
             ),
             "{outcome:?}"
         );
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     /// A read abandoned while it waits for room on the storage request
-    /// channel is a queued miss, so a libSQL engine in `mpsc` mode behind
+    /// channel times out as queued, so a libSQL engine in `mpsc` mode behind
     /// other requests shows as queued, not as a slow engine.
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_the_request_channel_is_queued() -> Result<()> {
@@ -1213,7 +1213,7 @@ mod tests {
             StorageOperation::ListOffsets,
             Instant::now() + Duration::from_secs(1),
         )
-        .timeout(service.list_offsets(
+        .run_until_deadline(service.list_offsets(
             IsolationLevel::ReadUncommitted,
             &[(Topition::new(TOPIC, 0), ListOffset::Latest)],
         ))
@@ -1221,7 +1221,7 @@ mod tests {
         assert!(
             matches!(
                 outcome,
-                Err(Missed::Queued(ReadWait::ExclusiveEngineAccess))
+                Err(TimedOut::Queued(ReadWait::ExclusiveEngineAccess))
             ),
             "{outcome:?}"
         );

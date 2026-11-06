@@ -380,8 +380,8 @@ impl Storage for FailingOffsets {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _deadline: tokio::time::Instant,
-    ) -> nisshi_storage::Result<Vec<Batch>> {
+        _fetched: nisshi_storage::FetchedSender,
+    ) -> nisshi_storage::Result<()> {
         unimplemented!()
     }
 

@@ -185,9 +185,9 @@ impl Storage for Engine {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _deadline: tokio::time::Instant,
-    ) -> Result<Vec<Batch>> {
-        Ok([].into())
+        _fetched_sender: nisshi_storage::FetchedSender,
+    ) -> Result<()> {
+        Ok(())
     }
 
     #[instrument(skip_all)]

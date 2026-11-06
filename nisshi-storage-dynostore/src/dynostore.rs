@@ -65,12 +65,12 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    FirstSequence, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    FetchedDataSender, FetchedSender, FirstSequence, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage,
+    ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate_produced, max_message_bytes, offload, producer_claim, read_deadline::ReadDeadline,
+    inflate_produced, max_message_bytes, offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -192,18 +192,16 @@ const CONCURRENT_RECLAIMS: usize = 16;
 /// measured: any small bound keeps the burst and the memory low.
 const CONCURRENT_RECLAIM_DELETES: usize = 4;
 
-/// How far below the fetch offset a Fetch starts its second listing, when
-/// its first listing, which starts at the fetch offset, finds no batch at or
-/// below the fetch offset.
+/// How far below the fetch offset a Fetch starts its first listing, when no batch starts at the
+/// fetch offset.
 ///
-/// The fetch offset is then inside a batch that starts below it. Each later
-/// listing starts [`FETCH_LISTING_GROWTH`] times further below, so a batch
-/// of `n` records takes about `log₈ n` listings to find, however large the
-/// partition is.
+/// The fetch offset is then inside a batch that starts below it. Each later listing starts
+/// [`FETCH_LISTING_GROWTH`] times further below, so a batch of `n` records takes about `log₈ n`
+/// listings to find, however large the partition is.
 const FETCH_LISTING_FIRST_WINDOW: i64 = 512;
 
-/// How many times further below the fetch offset each listing after the
-/// second starts (see [`FETCH_LISTING_FIRST_WINDOW`]).
+/// How many times further below the fetch offset each listing after the first starts (see
+/// [`FETCH_LISTING_FIRST_WINDOW`]).
 const FETCH_LISTING_GROWTH: i64 = 8;
 
 /// The batches that a fetch reads from a partition: each batch below
@@ -215,15 +213,14 @@ struct FetchBounds {
     high_watermark: i64,
 }
 
-/// Counts the fetches that list the whole partition, because the listing
-/// near the fetch offset was not a contiguous run of batches from the batch
-/// that holds it.
+/// Counts the fetches that list the whole partition, because no listing near the fetch offset
+/// found the batch that holds it.
 static FETCH_FULL_LISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_fetch_full_listing")
         .with_description(
-            "Fetches that listed the whole partition, because the listing near the fetch \
-             offset was out of key order or had a gap",
+            "Fetches that listed every batch of a partition, because the listing near the fetch \
+             offset did not find the batch that holds it",
         )
         .build()
 });
@@ -309,9 +306,9 @@ static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Whether this process has logged a warning for a fetch that listed the
-/// whole partition. Each later one logs at debug, because a store that lists
-/// out of key order makes every fetch list the whole partition.
+/// Whether this process has logged a warning for a fetch that listed the whole partition. Each
+/// later one logs at debug, because a store that lists out of key order makes every fetch that
+/// starts inside a batch list the whole partition.
 static FETCH_FULL_LISTING_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// A backfill of one partition's time index in progress (see
@@ -2012,17 +2009,35 @@ impl DynoStore {
             .await
     }
 
-    /// Reads and decodes the batch object at `base_offset`, or returns
+    /// Reads and decodes a batch object that a LIST returned, at `base_offset`, or returns
     /// `Ok(None)` when the object does not exist.
     ///
-    /// A missing object is a batch that was deleted after a LIST returned
-    /// it, so a caller can skip it. Every other failure is an error, because
-    /// a caller that skips a batch after a transient GET failure answers
-    /// from an incomplete log and gives no sign of it. The error is
-    /// `KAFKA_STORAGE_ERROR`, the code Kafka answers for a log it cannot
-    /// read, which a client retries; `UNKNOWN_SERVER_ERROR` would make it
-    /// give up.
+    /// A missing object is a batch that was deleted after the LIST returned it, so a caller can
+    /// skip it. The errors are those of [`DynoStore::batch_at`].
     async fn read_batch(
+        &self,
+        topition: &Topition,
+        base_offset: i64,
+    ) -> Result<Option<deflated::Batch>> {
+        let batch = self.batch_at(topition, base_offset).await?;
+
+        if batch.is_none() {
+            warn!(
+                ?topition,
+                base_offset, "skipping a batch deleted after listing"
+            );
+        }
+
+        Ok(batch)
+    }
+
+    /// Reads and decodes the batch object at `base_offset`, or returns `Ok(None)` when the object
+    /// does not exist.
+    ///
+    /// Any other failure, such as a transient GET error, returns `KAFKA_STORAGE_ERROR`, as Kafka
+    /// does when it cannot read a log. A caller that skipped the batch instead would answer as if
+    /// the log had no records there, and the client could not tell.
+    async fn batch_at(
         &self,
         topition: &Topition,
         base_offset: i64,
@@ -2031,13 +2046,7 @@ impl DynoStore {
 
         let encoded = match self.object_store.get(&path).await {
             Ok(get_result) => get_result.bytes().await,
-            Err(object_store::Error::NotFound { .. }) => {
-                warn!(
-                    ?topition,
-                    base_offset, "skipping a batch deleted after listing"
-                );
-                return Ok(None);
-            }
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(error) => Err(error),
         };
 
@@ -2049,35 +2058,28 @@ impl DynoStore {
             .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))
     }
 
-    /// Streams the base offsets of `topition`'s batches from the batch that
-    /// holds `offset`: the last batch at or below `offset`. Returns
-    /// `Ok(None)` when a listing descends, or when no batch is at or below
-    /// `offset`.
+    /// Returns the base offset of the last batch of `topition` at or below `offset`, from listings
+    /// that start below `offset`. Returns `None` when a listing descends, or when a listing from
+    /// offset 0 finds no batch at or below `offset`.
     ///
-    /// Each listing starts further below `offset` than the one before,
-    /// until one finds a batch at or below it (see
-    /// [`FETCH_LISTING_FIRST_WINDOW`]), so the cost depends on the size of
-    /// the batch that holds `offset`, and not on the size of the partition.
-    async fn batch_stream_holding(
+    /// Each listing starts further below `offset` than the one before, until one finds a batch at
+    /// or below it (see [`FETCH_LISTING_FIRST_WINDOW`]), so the cost depends on the size of the
+    /// batch that holds `offset`, and not on the size of the partition.
+    async fn listed_holding_base_offset(
         &self,
         topition: &Topition,
         offset: i64,
-    ) -> Result<Option<BoxStream<'static, Result<i64>>>> {
-        let mut window = 0;
+    ) -> Result<Option<i64>> {
+        let mut window = FETCH_LISTING_FIRST_WINDOW;
 
         loop {
             let start_offset = offset.saturating_sub(window).max(0);
 
-            // The listing can end inside the loop below and then go on
-            // behind the batches it found. An S3 listing panics when it is
-            // polled after it ends, so the listing is fused.
             let mut listing = self
                 .batch_stream(topition, start_offset)
-                .map_ok(|(base_offset, _)| base_offset)
-                .fuse();
+                .map_ok(|(base_offset, _)| base_offset);
 
             let mut holding = None;
-            let mut after_holding = None;
 
             while let Some(base_offset) = listing.try_next().await? {
                 if holding.is_some_and(|holding| base_offset <= holding) {
@@ -2085,7 +2087,6 @@ impl DynoStore {
                 }
 
                 if base_offset > offset {
-                    after_holding = Some(base_offset);
                     break;
                 }
 
@@ -2093,11 +2094,7 @@ impl DynoStore {
             }
 
             if holding.is_some() {
-                return Ok(Some(
-                    stream::iter(holding.into_iter().chain(after_holding).map(Ok))
-                        .chain(listing)
-                        .boxed(),
-                ));
+                return Ok(holding);
             }
 
             // From the log start up, each offset has a batch at or below it,
@@ -2108,82 +2105,91 @@ impl DynoStore {
                 return Ok(None);
             }
 
-            window = if window == 0 {
-                FETCH_LISTING_FIRST_WINDOW
-            } else {
-                window.saturating_mul(FETCH_LISTING_GROWTH)
-            };
+            window = window.saturating_mul(FETCH_LISTING_GROWTH);
         }
     }
 
-    /// Reads the batches of `topition` within `bounds`, from `base_offsets`
-    /// in offset order.
-    ///
-    /// With `requires_contiguous`, returns `Ok(None)` at the first batch that
-    /// does not start at the offset after the previous batch's last offset.
-    /// A produce gives each batch the offsets right after the previous
-    /// batch's, so such a batch shows that the listing is out of key order,
-    /// or that it skips a gap that a failed produce left. Either way the
-    /// batches read so far may not be the ones that the fetch must return.
-    ///
-    /// The batch that fills `max_bytes` is returned whole, wherever it is.
-    /// Kafka returns a first batch larger than `max_bytes` whole, so that a
-    /// consumer always gets a record ([`ReplicaManager.readFromLog`]), and
-    /// cuts a later batch at `max_bytes`, which leaves the client a partial
-    /// batch to drop.
-    ///
-    /// The read stops when `read_deadline` passes, and returns the batches
-    /// that it has read.
-    ///
-    /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
-    async fn read_fetched_batches(
+    /// Returns the base offset of the batch of `topition` that holds the fetch offset of `bounds`,
+    /// or of the first batch after it, or `None` when the partition has no such batch below its
+    /// high watermark.
+    async fn holding_base_offset(
         &self,
         topition: &Topition,
         bounds: FetchBounds,
-        mut base_offsets: BoxStream<'static, Result<i64>>,
-        requires_contiguous: bool,
-        read_deadline: &mut ReadDeadline,
-    ) -> Result<Option<Vec<deflated::Batch>>> {
-        let mut batches = vec![];
-        let mut bytes_left = u64::from(bounds.max_bytes);
-        let mut next_base_offset = None;
-
-        while let Ok(listed) = read_deadline.timeout(base_offsets.try_next()).await
-            && let Some(base_offset) = listed?
+    ) -> Result<Option<i64>> {
+        if let Some(holding) = self
+            .listed_holding_base_offset(topition, bounds.offset)
+            .await?
         {
-            if requires_contiguous && next_base_offset.is_some_and(|next| base_offset != next) {
-                return Ok(None);
-            }
+            return Ok(Some(holding));
+        }
 
-            if base_offset >= bounds.high_watermark {
-                break;
-            }
+        let base_offsets = self
+            .full_listing(topition, bounds.offset, bounds.high_watermark)
+            .await?;
 
-            let Ok(read) = read_deadline
-                .timeout(self.read_batch(topition, base_offset))
-                .await
-            else {
-                break;
+        Ok(base_offsets
+            .range(..=bounds.offset)
+            .next_back()
+            .or_else(|| base_offsets.range(bounds.offset..).next())
+            .copied())
+    }
+
+    /// Sends the batches of `topition` within `bounds` through `data`, in offset order, from the
+    /// batch at `base_offset`. `first_batch` is that batch, if the caller has read it already.
+    ///
+    /// The read takes each batch after the first by its key. A produce gives each batch the offsets
+    /// right after the previous batch's, so the next batch's base offset is the previous batch's
+    /// last offset plus one, and each batch that this sends follows the one before it, whatever
+    /// order the store lists keys in. The read lists the partition only when no batch has that key,
+    /// because a produce that failed left a gap, or because the batch was deleted.
+    ///
+    /// The batch that fills `max_bytes` is sent whole, wherever it is. Kafka returns a first batch
+    /// larger than `max_bytes` whole, so that a consumer always gets a record
+    /// ([`ReplicaManager.readFromLog`]), and cuts a later batch at `max_bytes`, which leaves the
+    /// client a partial batch to drop.
+    ///
+    /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
+    async fn send_batches_from(
+        &self,
+        topition: &Topition,
+        bounds: FetchBounds,
+        mut base_offset: i64,
+        mut first_batch: Option<deflated::Batch>,
+        data: &mut FetchedDataSender,
+    ) -> Result<()> {
+        let mut bytes_left = u64::from(bounds.max_bytes);
+
+        while base_offset < bounds.high_watermark {
+            let batch = match first_batch.take() {
+                Some(batch) => Some(batch),
+                None => self.batch_at(topition, base_offset).await?,
             };
 
-            // A batch deleted after the listing leaves no last offset, so the
-            // batch after it is not checked.
-            let Some(mut batch) = read? else {
-                next_base_offset = None;
-                continue;
+            let Some(mut batch) = batch else {
+                match self
+                    .base_offset_after_gap(topition, base_offset, bounds.high_watermark)
+                    .await?
+                {
+                    Some(next) => {
+                        base_offset = next;
+                        continue;
+                    }
+                    None => break,
+                }
             };
 
             batch.base_offset = base_offset;
 
             let last_offset = base_offset + i64::from(batch.last_offset_delta);
-            next_base_offset = Some(last_offset + 1);
+            base_offset = last_offset + 1;
 
             if last_offset < bounds.offset {
                 continue;
             }
 
             let size = u64::try_from(batch.size_in_bytes()?)?;
-            batches.push(batch);
+            data.send_batch(batch).await?;
 
             if size > bytes_left {
                 break;
@@ -2192,46 +2198,75 @@ impl DynoStore {
             bytes_left -= size;
         }
 
-        Ok(Some(batches))
+        Ok(())
     }
 
-    /// Reads the batches of `topition` within `bounds`, from a listing of the
-    /// whole partition that this function sorts.
-    async fn fetch_from_full_listing(
+    /// Returns the base offset of the first batch of `topition` after `gap_start_offset`, a base
+    /// offset that has no batch object, or `None` when no batch lies after it below
+    /// `high_watermark`.
+    ///
+    /// This lists the keys after `gap_start_offset`, ignores each key at or above
+    /// `high_watermark`, which a produce wrote after this read took its high watermark, and takes
+    /// the lowest key that is left. It reads the whole listing instead of taking its first key,
+    /// because a store can list keys out of order. A gap is usually at the end of the partition,
+    /// while a produce writes its batch object, so the listing usually holds only a few keys.
+    async fn base_offset_after_gap(
         &self,
         topition: &Topition,
-        bounds: FetchBounds,
-        read_deadline: &mut ReadDeadline,
-    ) -> Result<Vec<deflated::Batch>> {
-        let listing = self
-            .batch_stream(topition, 0)
+        gap_start_offset: i64,
+        high_watermark: i64,
+    ) -> Result<Option<i64>> {
+        let next = self
+            .batch_stream(topition, gap_start_offset + 1)
             .map_ok(|(base_offset, _)| base_offset)
-            .try_filter(|&base_offset| ready(base_offset < bounds.high_watermark))
-            .try_collect::<BTreeSet<_>>();
+            .try_filter(|&base_offset| ready(base_offset < high_watermark))
+            .try_fold(None, |lowest: Option<i64>, base_offset| {
+                ready(Ok(Some(
+                    lowest.map_or(base_offset, |lowest| lowest.min(base_offset)),
+                )))
+            })
+            .await?;
 
-        let Ok(base_offsets) = read_deadline.timeout(listing).await else {
-            return Ok(vec![]);
-        };
+        if let Some(next) = next {
+            debug!(
+                ?topition,
+                gap_start_offset, next, "fetch skips base offsets that have no batch object"
+            );
+        }
 
-        let mut base_offsets = base_offsets?;
+        Ok(next)
+    }
 
-        let holding = base_offsets
-            .range(..=bounds.offset)
-            .next_back()
-            .copied()
-            .unwrap_or(bounds.offset);
+    /// Returns the base offsets of `topition`'s batches below `high_watermark`, from a listing of
+    /// the whole partition, in order, for a fetch at `offset`.
+    async fn full_listing(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        high_watermark: i64,
+    ) -> Result<BTreeSet<i64>> {
+        FETCH_FULL_LISTING.add(1, &[KeyValue::new("cluster", self.cluster.clone())]);
 
-        let wanted = base_offsets.split_off(&holding);
+        if FETCH_FULL_LISTING_WARNED.swap(true, Ordering::Relaxed) {
+            debug!(
+                ?topition,
+                offset, "fetch lists the whole partition to find the batch that holds the offset"
+            );
+        } else {
+            warn!(
+                ?topition,
+                offset,
+                "fetch lists the whole partition to find the batch that holds the fetch offset; \
+                 a store that lists keys out of order makes every fetch inside a batch do this; \
+                 later ones log at debug and count in nisshi_fetch_full_listing"
+            );
+        }
 
-        self.read_fetched_batches(
-            topition,
-            bounds,
-            stream::iter(wanted.into_iter().map(Ok)).boxed(),
-            false,
-            read_deadline,
-        )
-        .await
-        .map(Option::unwrap_or_default)
+        self.batch_stream(topition, 0)
+            .map_ok(|(base_offset, _)| base_offset)
+            .try_filter(|&base_offset| ready(base_offset < high_watermark))
+            .try_collect::<BTreeSet<_>>()
+            .await
     }
 
     /// Marks a backfill of `topition`'s time index in progress, with a CAS
@@ -3958,27 +3993,23 @@ impl Storage for DynoStore {
         _min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
-        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
+        let offset_stage = self.offset_stage(topition).await?;
 
-        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
-            return Ok(vec![]);
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            offset_stage.last_stable
+        } else {
+            offset_stage.high_watermark
         };
-
-        let high_watermark = offset_stage.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
 
         debug!(high_watermark);
 
         if offset >= high_watermark {
-            return Ok(vec![]);
+            return Ok(());
         }
+
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
         let bounds = FetchBounds {
             offset,
@@ -3986,45 +4017,18 @@ impl Storage for DynoStore {
             high_watermark,
         };
 
-        let Ok(holding) = read_deadline
-            .timeout(self.batch_stream_holding(topition, offset))
-            .await
-        else {
-            return Ok(vec![]);
+        // A consumer that reads in order fetches from the offset after the last batch that it
+        // received, which is the base offset of the next batch, so the fetch reads that batch by
+        // its key, without a listing. Only a fetch offset inside a batch needs a listing.
+        let (base_offset, first_batch) = match self.batch_at(topition, offset).await? {
+            Some(batch) => (offset, Some(batch)),
+            None => match self.holding_base_offset(topition, bounds).await? {
+                Some(base_offset) => (base_offset, None),
+                None => return Ok(()),
+            },
         };
 
-        // A batch key zero-pads its base offset, so key order is offset
-        // order. A listing that starts near `offset` finds the batch that
-        // holds it only on a store that lists keys in ascending key order.
-        // This fetch takes the listing only when it is a contiguous run of
-        // batches from that batch, which a store that lists out of key order
-        // cannot give without listing in key order. Otherwise the fetch lists
-        // the whole partition and sorts it, at a cost that grows with the
-        // partition (#684).
-        if let Some(base_offsets) = holding?
-            && let Some(batches) = self
-                .read_fetched_batches(topition, bounds, base_offsets, true, &mut read_deadline)
-                .await?
-        {
-            return Ok(batches);
-        }
-
-        FETCH_FULL_LISTING.add(1, &[KeyValue::new("cluster", self.cluster.clone())]);
-
-        if FETCH_FULL_LISTING_WARNED.swap(true, Ordering::Relaxed) {
-            debug!(?topition, offset, "fetch lists the whole partition");
-        } else {
-            warn!(
-                ?topition,
-                offset,
-                "fetch lists the whole partition, because the listing near the fetch offset was \
-                 out of key order or had a gap; an object store that does not list keys in \
-                 ascending order makes every fetch do this, at a cost that grows with the \
-                 partition; later occurrences log at debug and count in nisshi_fetch_full_listing"
-            );
-        }
-
-        self.fetch_from_full_listing(topition, bounds, &mut read_deadline)
+        self.send_batches_from(topition, bounds, base_offset, first_batch, &mut data)
             .await
     }
 

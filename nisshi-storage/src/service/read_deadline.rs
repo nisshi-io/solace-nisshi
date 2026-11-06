@@ -104,10 +104,10 @@ impl ReadWait {
     }
 }
 
-/// What a read, or one step of a read, was doing when its deadline stopped it. The deadline either
-/// kept it from starting, or stopped it while it ran.
+/// How a read, or one step of a read, timed out: what it was doing when its deadline stopped it.
+/// A read that timed out can still have sent data before its deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Missed {
+pub enum TimedOut {
     /// The deadline had passed before it started, so it made no storage call.
     NotStarted,
     /// It was waiting for a resource before storage, such as a permit or a connection.
@@ -116,7 +116,7 @@ pub enum Missed {
     Reading,
 }
 
-impl Missed {
+impl TimedOut {
     /// Returns the value of the `stage` attribute for this read.
     pub(crate) fn stage(self) -> &'static str {
         match self {
@@ -146,9 +146,9 @@ impl Missed {
 
 /// The deadline of a storage read, with a timer that fires at it.
 ///
-/// One `ReadDeadline` can run several futures, such as the steps of a [`Storage::fetch`] read, and
-/// they share its deadline and its timer. When the deadline stops a future, the
-/// `nisshi_storage_read_deadline_exceeded` counter counts it once.
+/// One `ReadDeadline` can run several futures, such as the waits for each item of a
+/// [`Storage::fetch`] read, and they share its deadline and its timer. When the deadline stops a
+/// future, the `nisshi_storage_read_deadline_exceeded` counter counts it once.
 ///
 /// [`Storage::fetch`]: crate::Storage::fetch
 #[derive(Debug)]
@@ -158,7 +158,7 @@ pub struct ReadDeadline {
     timer: Pin<Box<Sleep>>,
     /// Whether a future has started under this deadline.
     started: bool,
-    /// Whether this deadline has counted a miss. A read counts at most one.
+    /// Whether this deadline has counted a timeout. A read counts at most one.
     counted: bool,
 }
 
@@ -182,20 +182,6 @@ impl ReadDeadline {
         Instant::now() >= self.deadline
     }
 
-    /// Returns whether the read may continue. Before the deadline, it returns `Ok`. Once the
-    /// deadline has passed, it counts a [`Missed::Reading`] miss and returns it.
-    ///
-    /// An engine checks this between steps that the timer can't interrupt, such as a statement
-    /// that runs synchronously, and stops the read at the first miss.
-    pub fn continue_reading(&mut self) -> Result<(), Missed> {
-        if !self.has_passed() {
-            return Ok(());
-        }
-
-        self.count(Missed::Reading);
-        Err(Missed::Reading)
-    }
-
     /// Runs `future` until the deadline, and returns what it was doing if the deadline passes
     /// first.
     ///
@@ -205,7 +191,7 @@ impl ReadDeadline {
     /// The deadline limits how long the caller waits, not how long the storage engine works. A
     /// future dropped at the deadline can leave a database server still running a statement that it
     /// sent.
-    pub async fn timeout<F>(&mut self, future: F) -> Result<F::Output, Missed>
+    pub async fn run_until_deadline<F>(&mut self, future: F) -> Result<F::Output, TimedOut>
     where
         F: Future,
     {
@@ -218,7 +204,7 @@ impl ReadDeadline {
 
         // The future is polled before the timer, so that a future that finishes in the poll in
         // which the timer fires keeps its output.
-        let missed = tokio::select! {
+        let timed_out = tokio::select! {
             biased;
             output = future.as_mut() => return Ok(output),
             () = self.timer.as_mut() => future
@@ -226,19 +212,16 @@ impl ReadDeadline {
                 .take_value()
                 .and_then(Cell::into_inner)
                 // A future that isn't in a marked wait when the timer fires is reading.
-                .map_or(Missed::Reading, Missed::Queued),
+                .map_or(TimedOut::Reading, TimedOut::Queued),
         };
 
-        self.count(missed);
-        Err(missed)
+        self.count(timed_out);
+        Err(timed_out)
     }
 
-    /// Runs `future` to its end if it starts before the deadline, and returns
-    /// [`Missed::NotStarted`] otherwise. This never drops `future`, so the caller passes one that
-    /// stops at the deadline by itself, such as a [`Storage::fetch`] read.
-    ///
-    /// [`Storage::fetch`]: crate::Storage::fetch
-    pub(crate) async fn start<F>(&mut self, future: F) -> Result<F::Output, Missed>
+    /// Runs `future` to its end if it starts before the deadline, and returns the timeout otherwise.
+    /// This never drops `future`, so a write that has started runs to its end.
+    pub(crate) async fn start<F>(&mut self, future: F) -> Result<F::Output, TimedOut>
     where
         F: Future,
     {
@@ -246,30 +229,31 @@ impl ReadDeadline {
         Ok(future.await)
     }
 
-    /// Returns [`Missed::NotStarted`] if the deadline has passed. If the deadline keeps the first
-    /// step of a read from starting, the read counts as `not_started`. If the deadline stops a read
-    /// before a later step, the read counts as `reading`, because it was under way.
-    fn check_start(&mut self) -> Result<(), Missed> {
+    /// Returns the timeout if the deadline has passed. If the deadline keeps the first step of a
+    /// read from starting, the read timed out as [`TimedOut::NotStarted`]. If the deadline stops a
+    /// read before a later step, the read timed out as [`TimedOut::Reading`].
+    fn check_start(&mut self) -> Result<(), TimedOut> {
         if !self.has_passed() {
             self.started = true;
             return Ok(());
         }
 
-        self.count(if self.started {
-            Missed::Reading
+        let timed_out = if self.started {
+            TimedOut::Reading
         } else {
-            Missed::NotStarted
-        });
+            TimedOut::NotStarted
+        };
 
-        Err(Missed::NotStarted)
+        self.count(timed_out);
+        Err(timed_out)
     }
 
-    /// Counts `missed` in the `nisshi_storage_read_deadline_exceeded` counter, unless this deadline
-    /// has counted a miss already.
-    fn count(&mut self, missed: Missed) {
+    /// Counts `timed_out` in the `nisshi_storage_read_deadline_exceeded` counter, unless this
+    /// deadline has counted a timeout already.
+    fn count(&mut self, timed_out: TimedOut) {
         if !self.counted {
             self.counted = true;
-            READ_DEADLINE_EXCEEDED.add(1, &missed.attributes(self.operation));
+            READ_DEADLINE_EXCEEDED.add(1, &timed_out.attributes(self.operation));
         }
     }
 }
@@ -281,8 +265,8 @@ tokio::task_local! {
 
 /// Marks a future that a read awaits as one of the read's waits before storage.
 ///
-/// The mark reaches `timeout` through a task-local, so a wait that runs on a spawned task is not
-/// marked, and counts as reading.
+/// The mark reaches [`ReadDeadline::run_until_deadline`] through a task-local, so a wait that runs
+/// on a spawned task is not marked, and counts as reading.
 pub trait QueueWait: Future + Sized {
     /// Marks this future as a wait for `read_wait`.
     fn queued_for(self, read_wait: ReadWait) -> impl Future<Output = Self::Output>;
@@ -319,6 +303,7 @@ mod tests {
         InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
         data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint},
     };
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -330,7 +315,7 @@ mod tests {
     async fn finishes_before_the_deadline() {
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
-        assert_eq!(Ok(7), deadline.timeout(async { 7 }).await);
+        assert_eq!(Ok(7), deadline.run_until_deadline(async { 7 }).await);
     }
 
     #[test]
@@ -345,8 +330,8 @@ mod tests {
         let mut deadline = fetch_deadline(started_at + Duration::from_secs(1));
 
         assert_eq!(
-            Err(Missed::Reading),
-            deadline.timeout(pending::<()>()).await
+            Err(TimedOut::Reading),
+            deadline.run_until_deadline(pending::<()>()).await
         );
         assert_eq!(Duration::from_secs(1), started_at.elapsed());
     }
@@ -357,10 +342,13 @@ mod tests {
         let started_at = Instant::now();
         let mut deadline = fetch_deadline(started_at + Duration::from_secs(1));
 
-        let step = || async { tokio::time::sleep(Duration::from_millis(600)).await };
+        let step = || async { sleep(Duration::from_millis(600)).await };
 
-        assert_eq!(Ok(()), deadline.timeout(step()).await);
-        assert_eq!(Err(Missed::Reading), deadline.timeout(step()).await);
+        assert_eq!(Ok(()), deadline.run_until_deadline(step()).await);
+        assert_eq!(
+            Err(TimedOut::Reading),
+            deadline.run_until_deadline(step()).await
+        );
         assert_eq!(Duration::from_secs(1), started_at.elapsed());
     }
 
@@ -373,7 +361,7 @@ mod tests {
         assert_eq!(
             Ok(7),
             deadline
-                .timeout(async {
+                .run_until_deadline(async {
                     sleep_until(at).await;
                     7
                 })
@@ -395,7 +383,10 @@ mod tests {
         };
 
         assert!(deadline.has_passed());
-        assert_eq!(Err(Missed::NotStarted), deadline.timeout(read).await);
+        assert_eq!(
+            Err(TimedOut::NotStarted),
+            deadline.run_until_deadline(read).await
+        );
         assert!(!polled.load(Ordering::SeqCst));
     }
 
@@ -409,13 +400,13 @@ mod tests {
             Ok(7),
             deadline
                 .start(async {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    sleep(Duration::from_secs(2)).await;
                     7
                 })
                 .await
         );
         assert_eq!(Duration::from_secs(2), started_at.elapsed());
-        assert_eq!(Err(Missed::NotStarted), deadline.start(async { 7 }).await);
+        assert_eq!(Err(TimedOut::Reading), deadline.start(async { 7 }).await);
     }
 
     /// A read stopped during a marked wait reports that wait. A read stopped after its wait
@@ -425,18 +416,18 @@ mod tests {
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
         assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
             deadline
-                .timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
                 .await
         );
 
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
         assert_eq!(
-            Err(Missed::Reading),
+            Err(TimedOut::Reading),
             deadline
-                .timeout(async {
+                .run_until_deadline(async {
                     async {}.queued_for(ReadWait::EngineConnectionPool).await;
                     pending::<()>().await
                 })
@@ -450,9 +441,9 @@ mod tests {
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
         assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
             deadline
-                .timeout(
+                .run_until_deadline(
                     async {
                         async {}.queued_for(ReadWait::ConnectionReadLimit).await;
                         pending::<()>().await
@@ -470,15 +461,16 @@ mod tests {
         let (mut queued_deadline, mut reading_deadline) = (fetch_deadline(at), fetch_deadline(at));
 
         let (queued_read, reading) = tokio::join!(
-            queued_deadline.timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool)),
-            reading_deadline.timeout(pending::<()>())
+            queued_deadline
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::EngineConnectionPool)),
+            reading_deadline.run_until_deadline(pending::<()>())
         );
 
         assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
             queued_read
         );
-        assert_eq!(Err(Missed::Reading), reading);
+        assert_eq!(Err(TimedOut::Reading), reading);
     }
 
     /// Installs a process-wide meter provider that exports to the returned exporter. It must run
@@ -534,26 +526,32 @@ mod tests {
         assert_eq!(
             Ok(7),
             ReadDeadline::new(StorageOperation::ListOffsets, in_a_second())
-                .timeout(async { 7 })
+                .run_until_deadline(async { 7 })
                 .await
         );
         assert_eq!(
-            Err(Missed::Reading),
-            fetch_deadline(in_a_second()).timeout(pending::<()>()).await
-        );
-        assert_eq!(
-            Err(Missed::Reading),
-            fetch_deadline(in_a_second()).timeout(pending::<()>()).await
-        );
-        assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Reading),
             fetch_deadline(in_a_second())
-                .timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
+                .run_until_deadline(pending::<()>())
                 .await
         );
         assert_eq!(
-            Err(Missed::NotStarted),
-            fetch_deadline(Instant::now()).timeout(async {}).await
+            Err(TimedOut::Reading),
+            fetch_deadline(in_a_second())
+                .run_until_deadline(pending::<()>())
+                .await
+        );
+        assert_eq!(
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
+            fetch_deadline(in_a_second())
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
+                .await
+        );
+        assert_eq!(
+            Err(TimedOut::NotStarted),
+            fetch_deadline(Instant::now())
+                .run_until_deadline(async {})
+                .await
         );
 
         provider.force_flush().expect("flush");
@@ -590,42 +588,23 @@ mod tests {
 
         let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
 
-        assert_eq!(Ok(()), deadline.timeout(async {}).await);
+        assert_eq!(Ok(()), deadline.run_until_deadline(async {}).await);
 
         tokio::time::advance(Duration::from_secs(1)).await;
 
-        assert_eq!(Err(Missed::NotStarted), deadline.timeout(async {}).await);
-        assert_eq!(Err(Missed::NotStarted), deadline.timeout(async {}).await);
+        assert_eq!(
+            Err(TimedOut::Reading),
+            deadline.run_until_deadline(async {}).await
+        );
+        assert_eq!(
+            Err(TimedOut::Reading),
+            deadline.run_until_deadline(async {}).await
+        );
 
         provider.force_flush().expect("flush");
 
         assert_eq!(1, exceeded(&exporter, &[("stage", "reading")]));
         assert_eq!(0, exceeded(&exporter, &[("stage", "not_started")]));
-    }
-
-    /// If an engine stops a read between steps after its deadline has passed, the read counts
-    /// once, as `reading`.
-    #[tokio::test(start_paused = true)]
-    async fn counts_a_read_stopped_between_steps() {
-        let (provider, exporter) = install_exporter();
-
-        let mut deadline = fetch_deadline(Instant::now() + Duration::from_secs(1));
-
-        assert_eq!(Ok(()), deadline.continue_reading());
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-
-        assert_eq!(Err(Missed::Reading), deadline.continue_reading());
-        assert_eq!(Err(Missed::Reading), deadline.continue_reading());
-
-        provider.force_flush().expect("flush");
-
-        let fetch = StorageOperation::Fetch.as_str();
-
-        assert_eq!(
-            1,
-            exceeded(&exporter, &[("operation", fetch), ("stage", "reading")])
-        );
     }
 
     /// Reads stopped during any marked wait count under the `queued` stage, and the `wait`
@@ -637,27 +616,27 @@ mod tests {
         let in_a_second = || Instant::now() + Duration::from_secs(1);
 
         assert_eq!(
-            Err(Missed::Queued(ReadWait::ConnectionReadLimit)),
+            Err(TimedOut::Queued(ReadWait::ConnectionReadLimit)),
             fetch_deadline(in_a_second())
-                .timeout(pending::<()>().queued_for(ReadWait::ConnectionReadLimit))
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::ConnectionReadLimit))
                 .await
         );
         assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
             fetch_deadline(in_a_second())
-                .timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
                 .await
         );
         assert_eq!(
-            Err(Missed::Queued(ReadWait::ClientReadLimit)),
+            Err(TimedOut::Queued(ReadWait::ClientReadLimit)),
             fetch_deadline(in_a_second())
-                .timeout(pending::<()>().queued_for(ReadWait::ClientReadLimit))
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::ClientReadLimit))
                 .await
         );
         assert_eq!(
-            Err(Missed::Queued(ReadWait::EngineConnectionPool)),
+            Err(TimedOut::Queued(ReadWait::EngineConnectionPool)),
             fetch_deadline(in_a_second())
-                .timeout(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
+                .run_until_deadline(pending::<()>().queued_for(ReadWait::EngineConnectionPool))
                 .await
         );
 

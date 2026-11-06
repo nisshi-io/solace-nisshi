@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests for how much of a partition's listing a Fetch reads: it lists from
-//! near the fetch offset, and stops at `max_bytes`, so its cost does not
-//! grow with the partition.
+//! Tests for how much of a partition's listing a Fetch reads: it lists nothing when a batch
+//! starts at the fetch offset, and otherwise lists from near the fetch offset, so its cost does
+//! not grow with the partition.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{
     assert_matches,
     fmt::Display,
@@ -46,7 +47,7 @@ use object_store::{
 };
 
 use crate::dynostore::{
-    DynoStore, batch_path,
+    DynoStore, FETCH_LISTING_FIRST_WINDOW, batch_path,
     tests::{failing_object_store::FailingObjectStore, init_tracing},
 };
 
@@ -341,7 +342,7 @@ async fn fetch_base_offsets(
     read_time: Duration,
 ) -> Result<Vec<i64>> {
     Ok(storage
-        .fetch(
+        .fetch_until_deadline(
             topition,
             offset,
             1,
@@ -349,7 +350,8 @@ async fn fetch_base_offsets(
             IsolationLevel::ReadUncommitted,
             Instant::now() + read_time,
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
         .iter()
         .map(|batch| batch.base_offset)
         .collect())
@@ -359,13 +361,13 @@ const MAX_BYTES: u32 = 50 * 1024 * 1024;
 
 const READ_TIME: Duration = Duration::from_secs(60);
 
-/// A fetch at a batch's base offset lists from that batch, with a
-/// start-after LIST, instead of from the first batch of the partition.
+/// A fetch at a batch's base offset reads that batch by its key, and lists nothing.
 #[tokio::test]
-async fn head_fetch_lists_after_the_fetch_offset() -> Result<(), Error> {
+async fn fetch_at_a_batch_base_offset_lists_nothing() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let (storage, listing, topition) = partition("head_fetch_lists_after_the_fetch_offset").await?;
+    let (storage, listing, topition) =
+        partition("fetch_at_a_batch_base_offset_lists_nothing").await?;
     produce(&storage, &topition, 20, 1).await?;
     listing.reset_counts();
 
@@ -373,15 +375,12 @@ async fn head_fetch_lists_after_the_fetch_offset() -> Result<(), Error> {
 
     assert_eq!((10..20).collect::<Vec<_>>(), base_offsets);
     assert_eq!(0, listing.full_lists());
-    assert_eq!(
-        vec![batch_path(&storage.cluster, &topition, 9)],
-        listing.start_after()
-    );
+    assert_eq!(Vec::<Path>::new(), listing.start_after());
 
     Ok(())
 }
 
-/// A fetch near the end of a partition lists as many batch objects in a
+/// A fetch inside a batch near the end of a partition lists as many batch objects in a
 /// partition of 500 batches as in one of 50.
 #[tokio::test]
 async fn head_fetch_listing_does_not_grow_with_the_partition() -> Result<(), Error> {
@@ -391,19 +390,21 @@ async fn head_fetch_listing_does_not_grow_with_the_partition() -> Result<(), Err
 
     for batches in [50, 500] {
         let (storage, listing, topition) = partition(&format!("head_fetch_{batches}")).await?;
-        produce(&storage, &topition, batches, 1).await?;
+        produce(&storage, &topition, batches, 100).await?;
         listing.reset_counts();
 
-        let last = i64::try_from(batches)? - 1;
+        // The last offset is inside the last batch, so the fetch lists to find that batch.
+        let last = i64::try_from(batches)? * 100 - 1;
         let base_offsets =
             fetch_base_offsets(&storage, &topition, last, MAX_BYTES, READ_TIME).await?;
 
-        assert_eq!(vec![last], base_offsets);
+        assert_eq!(vec![last - 99], base_offsets);
         listed.push(listing.listed_batches());
     }
 
+    assert!(listed[0] > 0, "{listed:?}");
     assert_eq!(listed[0], listed[1], "{listed:?}");
-    assert!(listed[1] <= 2, "{listed:?}");
+    assert!(listed[1] <= 6, "{listed:?}");
 
     Ok(())
 }
@@ -462,25 +463,36 @@ async fn fetch_stops_listing_at_max_bytes() -> Result<(), Error> {
     Ok(())
 }
 
-/// If its listing is slow, a fetch stops at its deadline, and returns the batches that it read by
-/// then, from the batch at the fetch offset.
+/// A slow listing slows only the first step of a fetch: finding the batch that holds the fetch
+/// offset. The fetch then reads each later batch straight from its object key, which it builds
+/// from the previous batch's last offset, so it does not list those batches. It reads all 15
+/// batches from the one that holds offset 1,550 before its deadline.
 #[tokio::test(start_paused = true)]
-async fn slow_listing_returns_the_batches_read_by_the_deadline() -> Result<(), Error> {
+async fn slow_listing_delays_only_the_first_batch() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let (storage, listing, topition) =
-        partition("slow_listing_returns_the_batches_read_by_the_deadline").await?;
-    produce(&storage, &topition, 200, 1).await?;
+        partition("slow_listing_delays_only_the_first_batch").await?;
+    produce(&storage, &topition, 30, 100).await?;
 
-    // Listing each batch takes 50ms, so the fetch reads only some of the 120 batches from the
-    // fetch offset by its deadline.
-    listing.delay_each_listed_object(Duration::from_millis(50));
+    // Listing each batch takes 100ms. To find the batch that holds 1,550, the fetch lists the 6
+    // batches from 1,100 to 1,600, in 600ms. Listing the 15 batches from 1,500 on would take
+    // another 1.5s, past the deadline.
+    listing.delay_each_listed_object(Duration::from_millis(100));
 
-    let base_offsets =
-        fetch_base_offsets(&storage, &topition, 80, MAX_BYTES, Duration::from_secs(1)).await?;
+    let base_offsets = fetch_base_offsets(
+        &storage,
+        &topition,
+        1_550,
+        MAX_BYTES,
+        Duration::from_secs(1),
+    )
+    .await?;
 
-    assert_eq!(Some(&80), base_offsets.first(), "{base_offsets:?}");
-    assert!(base_offsets.len() < 120, "{base_offsets:?}");
+    assert_eq!(
+        (1_500..3_000).step_by(100).collect::<Vec<_>>(),
+        base_offsets
+    );
 
     Ok(())
 }
@@ -517,7 +529,7 @@ async fn slower_listing_than_the_deadline_answers_empty_at_the_deadline() -> Res
 
     let (storage, listing, topition) =
         partition("slower_listing_than_the_deadline_answers_empty_at_the_deadline").await?;
-    produce(&storage, &topition, 100, 1).await?;
+    produce(&storage, &topition, 10, 10).await?;
 
     // Listing one batch takes longer than the read time, so the listing does not reach the batch
     // at the fetch offset by the deadline.
@@ -526,7 +538,8 @@ async fn slower_listing_than_the_deadline_answers_empty_at_the_deadline() -> Res
     let read_time = Duration::from_secs(1);
     let started_at = Instant::now();
 
-    let base_offsets = fetch_base_offsets(&storage, &topition, 80, MAX_BYTES, read_time).await?;
+    // 85 is inside a batch, so the fetch lists to find that batch.
+    let base_offsets = fetch_base_offsets(&storage, &topition, 85, MAX_BYTES, read_time).await?;
 
     assert_eq!(Vec::<i64>::new(), base_offsets);
     assert_eq!(read_time, started_at.elapsed());
@@ -584,6 +597,36 @@ async fn ascending_but_out_of_order_listing_falls_back_to_a_full_listing() -> Re
     Ok(())
 }
 
+/// A fetch uses the listing only to find its first batch, and then reads each later batch by its
+/// key. So if the listing is out of order after that first batch, the fetch still returns the
+/// batches in offset order, without listing the whole partition.
+#[tokio::test]
+async fn out_of_order_listing_after_the_holding_batch_lists_nothing_more() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("out_of_order_listing_after_the_holding_batch_lists_nothing_more").await?;
+    produce(&storage, &topition, 2, 10).await?;
+    produce(&storage, &topition, 1, 1).await?;
+    // The store lists the batches at 0, 20 and 10, in that order.
+    listing.list_last_two_swapped();
+    listing.reset_counts();
+
+    assert_eq!(
+        vec![0, 10, 20],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+    // The search for the batch at offset 0 lists that batch and the one after it, and nothing
+    // more. A full listing would list all three batches, after that search.
+    assert!(
+        listing.listed_batches() <= 2,
+        "{}",
+        listing.listed_batches()
+    );
+
+    Ok(())
+}
+
 /// A fetch below the first batch of the partition, such as one whose batch
 /// was deleted after the fetch read the log start, returns from the first
 /// batch.
@@ -608,16 +651,14 @@ async fn fetch_below_the_first_batch_returns_from_the_first_batch() -> Result<()
     Ok(())
 }
 
-/// A gap in a listing in key order, such as one that a failed produce
-/// leaves, makes the fetch list the whole partition, and the fetch still
-/// returns the batches around the gap: the batch that holds the fetch
-/// offset, or the first batch after the gap for an offset inside it.
+/// A fetch skips a gap, such as one that a failed produce leaves, and returns the batches around
+/// it: the batch that holds the fetch offset, or the first batch after the gap for an offset
+/// inside it.
 #[tokio::test]
-async fn gap_in_an_in_order_listing_falls_back_to_a_full_listing() -> Result<(), Error> {
+async fn fetch_skips_a_gap_to_the_batch_after_it() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let (storage, listing, topition) =
-        partition("gap_in_an_in_order_listing_falls_back_to_a_full_listing").await?;
+    let (storage, _, topition) = partition("fetch_skips_a_gap_to_the_batch_after_it").await?;
     produce(&storage, &topition, 3, 10).await?;
     produce(&storage, &topition, 1, 1).await?;
 
@@ -626,13 +667,10 @@ async fn gap_in_an_in_order_listing_falls_back_to_a_full_listing() -> Result<(),
         .delete(&batch_path(&storage.cluster, &topition, 10))
         .await?;
 
-    listing.reset_counts();
-
     assert_eq!(
         vec![0, 20, 30],
         fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, READ_TIME).await?
     );
-    assert!(listing.full_lists() > 0, "{}", listing.full_lists());
 
     assert_eq!(
         vec![0],
@@ -642,6 +680,71 @@ async fn gap_in_an_in_order_listing_falls_back_to_a_full_listing() -> Result<(),
         vec![20, 30],
         fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, READ_TIME).await?
     );
+
+    Ok(())
+}
+
+/// A fetch that crosses a gap on a store that lists keys out of order goes on from the first
+/// batch after the gap, not from the first batch that the store lists.
+#[tokio::test]
+async fn gap_in_an_out_of_order_listing_goes_on_from_the_next_batch() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("gap_in_an_out_of_order_listing_goes_on_from_the_next_batch").await?;
+    produce(&storage, &topition, 4, 10).await?;
+
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 10))
+        .await?;
+
+    // The listing after the gap returns the batch at 30 before the batch at 20.
+    listing.list_in_descending_order();
+
+    assert_eq!(
+        vec![0, 20, 30],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A fetch that reaches a base offset without a batch object at the end of the partition, such
+/// as while a produce writes its batch, stops there without listing the whole partition.
+#[tokio::test]
+async fn gap_at_the_end_of_the_partition_lists_only_after_the_gap() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("gap_at_the_end_of_the_partition_lists_only_after_the_gap").await?;
+
+    // The partition holds more offsets than the first listing window below a fetch offset, so
+    // the search for the batch that holds the fetch offset never lists from offset 0, which the
+    // store counts as a full listing.
+    let batches = usize::try_from(FETCH_LISTING_FIRST_WINDOW)? + 100;
+    produce(&storage, &topition, batches, 1).await?;
+    let last = i64::try_from(batches)? - 1;
+
+    // The high watermark stays past `last`, so `last` is taken but holds no batch object, as it
+    // does while the produce that took it writes its batch.
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, last))
+        .await?;
+
+    listing.reset_counts();
+
+    assert_eq!(
+        vec![last - 1],
+        fetch_base_offsets(&storage, &topition, last - 1, MAX_BYTES, READ_TIME).await?
+    );
+    assert!(
+        fetch_base_offsets(&storage, &topition, last, MAX_BYTES, READ_TIME)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(0, listing.full_lists());
 
     Ok(())
 }
@@ -713,13 +816,14 @@ async fn failed_listing_answers_kafka_storage_error() -> Result<(), Error> {
         )
         .await?;
 
-    produce(&writer, &topition, 3, 1).await?;
+    produce(&writer, &topition, 1, 3).await?;
 
     let reader = DynoStore::new("nisshi", 111, FailingObjectStore::failing_list(bucket))?;
 
+    // Offset 1 is inside the batch, so the fetch lists to find that batch.
     assert_matches!(
         reader
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 1,
                 1,
@@ -727,7 +831,8 @@ async fn failed_listing_answers_kafka_storage_error() -> Result<(), Error> {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + READ_TIME,
             )
-            .await,
+            .await
+            .map(|read| read.batches),
         Err(Error::Api(ErrorCode::KafkaStorageError))
     );
 

@@ -40,7 +40,7 @@ use futures::pin_mut;
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -67,19 +67,17 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
-    LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
+    FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
-    read_deadline::{Missed, QueueWait as _, ReadDeadline, ReadWait},
-    read_share::{
-        ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare,
-        warn_miss_at_client_share,
-    },
+    read_deadline::{QueueWait as _, ReadWait},
+    read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -1619,11 +1617,11 @@ impl Postgres {
     }
 
     /// Reads the records of `topition` from `offset` on `c`, in one transaction, up to the
-    /// partition's high watermark or, for `ReadCommitted`, its last stable offset.
+    /// partition's high watermark or, for `ReadCommitted`, its last stable offset, and returns
+    /// them with the offset stage that bounds them.
     ///
-    /// Returns the batches that it read, and how `read_deadline` stopped the read, if it did.
-    /// `read_deadline` can stop the read during a statement. A read stopped before its commit
-    /// returns no batches. A read stopped at its commit keeps the batches that it assembled.
+    /// The read reads the stage before the records, and a stage only grows, so the records end
+    /// at or below it.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_on(
         &self,
@@ -1635,23 +1633,16 @@ impl Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        read_deadline: &mut ReadDeadline,
-    ) -> Result<(Vec<deflated::Batch>, Option<Missed>)> {
-        let offset_stage = match read_deadline
-            .timeout(self.offset_stage_on(c, base_topic, topition.partition()))
-            .await
-        {
-            Ok(offset_stage) => offset_stage,
-            Err(stopped) => return Ok((vec![], Some(stopped))),
-        };
+    ) -> Result<(OffsetStage, Vec<FetchedRecord>)> {
+        let offset_stage = self
+            .offset_stage_on(c, base_topic, topition.partition())
+            .await?;
 
-        let high_watermark = offset_stage.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            offset_stage.last_stable
+        } else {
+            offset_stage.high_watermark
+        };
 
         debug!(
             cluster = self.cluster,
@@ -1663,248 +1654,143 @@ impl Postgres {
             max_bytes
         );
 
-        let tx = match read_deadline.timeout(c.transaction()).await {
-            Ok(tx) => tx?,
-            Err(stopped) => return Ok((vec![], Some(stopped))),
-        };
+        let tx = c.transaction().await?;
 
-        match read_deadline
-            .timeout(tx.batch_execute(FETCH_PLAN_SETTINGS))
+        tx.batch_execute(FETCH_PLAN_SETTINGS)
             .await
-        {
-            Ok(settings) => settings.inspect_err(|err| error!(?err))?,
-            Err(stopped) => return Ok((vec![], Some(stopped))),
+            .inspect_err(|err| error!(?err))?;
+
+        let records = if let Some(key) = key_filter {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg_keyed.sql",
+                &[
+                    &self.cluster,
+                    &base_topic,
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                    &key,
+                    &ROWS_PER_FETCH,
+                ],
+            )
+            .await
+        } else {
+            self.tx_prepare_query(
+                &tx,
+                "record_fetch_pg.sql",
+                &[
+                    &self.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &offset,
+                    &(max_bytes as i64),
+                    &high_watermark,
+                    &ROWS_PER_FETCH,
+                ],
+            )
+            .await
         }
+        .inspect_err(|err| error!(?err))?;
 
-        let records = async {
-            if let Some(key) = key_filter {
-                self.tx_prepare_query(
-                    &tx,
-                    "record_fetch_pg_keyed.sql",
-                    &[
-                        &self.cluster,
-                        &base_topic,
-                        &topition.partition(),
-                        &offset,
-                        &(max_bytes as i64),
-                        &high_watermark,
-                        &key,
-                        &ROWS_PER_FETCH,
-                    ],
-                )
-                .await
-            } else {
-                self.tx_prepare_query(
-                    &tx,
-                    "record_fetch_pg.sql",
-                    &[
-                        &self.cluster,
-                        &topition.topic(),
-                        &topition.partition(),
-                        &offset,
-                        &(max_bytes as i64),
-                        &high_watermark,
-                        &ROWS_PER_FETCH,
-                    ],
-                )
-                .await
-            }
-        };
+        // One query for the headers of the returned records. A query per record costs a round
+        // trip each, which capped a consumer at a few thousand records a second. The topic is the
+        // base topic: a keyed fetch has a name that is not a topic.
+        let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
 
-        let records = match read_deadline.timeout(records).await {
-            Ok(records) => records.inspect_err(|err| error!(?err))?,
-            Err(stopped) => return Ok((vec![], Some(stopped))),
-        };
-
-        let mut batches = vec![];
-
-        if let Some(first) = records.first() {
-            let mut batch_builder = Batch::builder()
-                .base_offset(
-                    first
-                        .try_get::<_, i64>(0)
-                        .inspect(|base_offset| debug!(base_offset))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .attributes(
-                    first
-                        .try_get::<_, Option<i16>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .base_timestamp(
-                    first
-                        .try_get::<_, SystemTime>(2)
-                        .map_err(Error::from)
-                        .and_then(|system_time| from_sql_timestamp(&system_time))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    first
-                        .try_get::<_, Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(
-                    first
-                        .try_get::<_, Option<i16>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                );
-
-            // One query for the headers of the returned records. A query per record costs a
-            // round trip each, which capped a consumer at a few thousand records a second.
-            // The topic is the base topic: a keyed fetch has a name that is not a topic.
-            let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
+        if !records.is_empty() {
             let offsets = records
                 .iter()
                 .map(|record| record.try_get::<_, i64>(0))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            let header_rows = match read_deadline
-                .timeout(self.tx_prepare_query(
+            for header in self
+                .tx_prepare_query(
                     &tx,
                     "header_fetch_range.sql",
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
-                ))
+                )
                 .await
+                .inspect_err(|err| error!(?err))?
             {
-                Ok(header_rows) => header_rows.inspect_err(|err| error!(?err))?,
-                Err(stopped) => return Ok((vec![], Some(stopped))),
-            };
-
-            for header in header_rows {
                 headers
                     .entry(header.try_get::<_, i64>(0)?)
                     .or_default()
                     .push(header);
             }
+        }
 
-            for record in records.iter() {
-                let attributes = record
-                    .try_get::<_, Option<i16>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
+        let mut fetched = Vec::with_capacity(records.len());
 
-                let producer_id = record
-                    .try_get::<_, Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = record
-                    .try_get::<_, Option<i16>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
+        // The loop consumes the rows instead of borrowing them, so that each row is freed once
+        // its record is built, and the read does not hold every row and every record at once.
+        for record in records {
+            let offset = record
+                .try_get::<_, i64>(0)
+                .inspect(|offset| debug!(offset))
+                .inspect_err(|err| error!(?err))?;
 
-                let timestamp = record
+            let mut record_headers = vec![];
+
+            for header in headers.remove(&offset).unwrap_or_default() {
+                let mut header_builder = Header::builder();
+
+                if let Some(k) = header
+                    .try_get::<_, Option<&[u8]>>(1)
+                    .inspect_err(|err| error!(?err))?
+                {
+                    header_builder = header_builder.key(Bytes::copy_from_slice(k));
+                }
+
+                if let Some(v) = header
+                    .try_get::<_, Option<&[u8]>>(2)
+                    .inspect_err(|err| error!(?err))?
+                {
+                    header_builder = header_builder.value(Bytes::copy_from_slice(v));
+                }
+
+                record_headers.push(header_builder);
+            }
+
+            fetched.push(FetchedRecord {
+                offset,
+                timestamp: record
                     .try_get::<_, SystemTime>(2)
                     .map_err(Error::from)
                     .and_then(|system_time| from_sql_timestamp(&system_time))
                     .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
-                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
-                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
-                // produce request, so one batch cannot hold two such times.
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
-                        && timestamp != batch_builder.base_timestamp)
-                {
-                    batches.push(
-                        batch_builder
-                            .max_timestamp_of_records()
-                            .build()
-                            .and_then(TryInto::try_into)?,
-                    );
-
-                    batch_builder = Batch::builder()
-                        .base_offset(
-                            record
-                                .try_get::<_, i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(timestamp)
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = record
-                    .try_get::<_, i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = timestamp - batch_builder.base_timestamp;
-
-                let k = record
+                    .inspect_err(|err| error!(?err))?,
+                attributes: record
+                    .try_get::<_, Option<i16>>(1)
+                    .map(|attributes| attributes.unwrap_or(0))
+                    .inspect_err(|err| error!(?err))?,
+                producer_id: record
+                    .try_get::<_, Option<i64>>(6)
+                    .map(|producer_id| producer_id.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?,
+                producer_epoch: record
+                    .try_get::<_, Option<i16>>(7)
+                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?,
+                key: record
                     .try_get::<_, Option<&[u8]>>(3)
                     .map(|o| o.map(Bytes::copy_from_slice))
                     .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let v = record
+                    .inspect_err(|err| error!(?err))?,
+                value: record
                     .try_get::<_, Option<&[u8]>>(4)
                     .map(|o| o.map(Bytes::copy_from_slice))
                     .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?;
-
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(k)
-                    .value(v);
-
-                for header in headers.remove(&offset).unwrap_or_default() {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .try_get::<_, Option<&[u8]>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::copy_from_slice(k));
-                    }
-
-                    if let Some(v) = header
-                        .try_get::<_, Option<&[u8]>>(2)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::copy_from_slice(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
-            }
-
-            batches.push(
-                batch_builder
-                    .max_timestamp_of_records()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
-        } else {
-            batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
+                    .inspect_err(|err| error!(?err))?,
+                headers: record_headers,
+            });
         }
 
-        debug!(batches_len = batches.len());
+        // The transaction only reads, so a rollback has the same effect as a commit.
+        tx.commit().await?;
 
-        // The transaction only reads, so a rollback has the same effect as a commit. When the
-        // deadline stops the commit before it starts, dropping the transaction rolls it back.
-        match read_deadline.timeout(tx.commit()).await {
-            Ok(committed) => {
-                committed?;
-                Ok((batches, None))
-            }
-            Err(stopped) => Ok((batches, Some(stopped))),
-        }
+        Ok((offset_stage, fetched))
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -4479,50 +4365,20 @@ impl Storage for Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
-        let started_at = Instant::now();
-        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
-
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
-        let Ok(topic) = read_deadline
-            .timeout(self.topic_with_key(topition.topic()))
-            .await
-        else {
-            return Ok(vec![]);
-        };
+        let (base_topic, key_filter): (&str, Option<&str>) =
+            self.topic_with_key(topition.topic()).await?;
 
-        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
+        let permits = self.fetch_read_permits().await?;
+        let mut connection = self
+            .abandonable_connection(permits)
+            .queued_for(ReadWait::EngineConnectionPool)
+            .await?;
 
-        let connection = async {
-            let permits = self.fetch_read_permits().await?;
-            self.abandonable_connection(permits)
-                .queued_for(ReadWait::EngineConnectionPool)
-                .await
-        };
-
-        let connection = match read_deadline.timeout(connection).await {
-            Ok(connection) => connection,
-            Err(missed) => {
-                // The Fetch service sees only an answer with no records here, so the engine names
-                // the client when its wait for the client's share missed the deadline.
-                if missed == Missed::Queued(ReadWait::ClientReadLimit) {
-                    warn_miss_at_client_share(
-                        topition,
-                        StorageOperation::Fetch,
-                        offset,
-                        started_at,
-                    );
-                }
-
-                return Ok(vec![]);
-            }
-        };
-
-        let mut connection = connection?;
-
-        let fetched = self
+        let read = self
             .fetch_on(
                 connection.object_mut()?,
                 topition,
@@ -4532,20 +4388,30 @@ impl Storage for Postgres {
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                &mut read_deadline,
             )
             .await;
 
-        match &fetched {
-            // The deadline stopped the read during one of its steps, so a statement may still be
-            // running on the connection. Dropping the connection cancels the statement, and
-            // returns the connection to the pool once the statement has ended.
-            Ok((_, Some(Missed::Queued(_) | Missed::Reading))) => drop(connection),
-            // No statement is running, so the connection goes straight back to the pool.
-            Ok((_, Some(Missed::NotStarted) | None)) | Err(_) => connection.release(),
+        // The query has ended, so no statement is running, and the connection goes straight back
+        // to the pool. If the receiver of `fetched_sender` drops this read at its deadline during
+        // the query instead, dropping the connection cancels the running statement, and returns
+        // the connection to the pool once the statement has ended.
+        connection.release();
+
+        // This function sends the records into `fetched_sender` only after it returns the
+        // connection and the permits. Each send can wait until the receiver of `fetched_sender`
+        // takes the record, and the receiver can drop this read at its deadline during that wait.
+        // If the read still held the connection then, the drop would send Postgres a cancel
+        // request for a query that has already finished. A receiver that takes the records slowly
+        // would also keep the connection and the permits from other reads.
+        let (offset_stage, records) = read?;
+
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+
+        for record in records {
+            data.send_record(record).await?;
         }
 
-        fetched.map(|(batches, _)| batches)
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -6123,8 +5989,13 @@ mod tests {
     use nisshi_storage::{
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
+    use nisshi_storage::{
+        fetched::{self, FetchUntilDeadline as _},
+        read_deadline::TimedOut,
+    };
     use rand::distr::Alphanumeric;
     use std::assert_matches;
+    use std::pin::pin;
     use tokio::task::JoinHandle;
 
     #[cfg(not(windows))]
@@ -7437,26 +7308,9 @@ mod tests {
     }
 
     /// A Fetch that reaches its deadline while it waits for its client's share answers with no
-    /// records, and the engine logs a warning that names the client, because the Fetch service
-    /// sees nothing but the empty answer.
+    /// records, and reports that wait, so that the Fetch service can name the client.
     #[tokio::test]
-    async fn fetch_missing_its_deadline_at_the_client_share_names_the_client() -> Result<()> {
-        use std::io::{self, Write};
-
-        #[derive(Clone, Default)]
-        struct WarnLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl Write for WarnLog {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().expect("log").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
+    async fn fetch_timing_out_at_the_client_share_reports_that_wait() -> Result<()> {
         let storage = Postgres::builder(&CONNECTION)?
             .cluster(alphanumeric_string(15).as_str())
             .node(rng().random_range(0..i32::MAX))
@@ -7466,7 +7320,8 @@ mod tests {
             Ok(monitor) => monitor,
             Err(err) => {
                 eprintln!(
-                    "skipping fetch_missing_its_deadline_at_the_client_share_names_the_client: {err:?}"
+                    "skipping fetch_timing_out_at_the_client_share_reports_that_wait: \
+                     {err:?}"
                 );
                 return Ok(());
             }
@@ -7488,35 +7343,111 @@ mod tests {
         }
         assert_eq!(0, storage.fetch_reads.available_permits());
 
-        let log = WarnLog::default();
-        let writer = log.clone();
-        let _subscriber = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
-        );
-
-        let batches = client
-            .scope(FetchReadShare::default().scope(storage.fetch(
-                &Topition::new("orders", 0),
-                0,
-                1,
-                1024,
-                IsolationLevel::ReadUncommitted,
-                Instant::now() + Duration::from_millis(300),
-            )))
+        let read = client
+            .scope(
+                FetchReadShare::default().scope(storage.fetch_until_deadline(
+                    &Topition::new("orders", 0),
+                    0,
+                    1,
+                    1024,
+                    IsolationLevel::ReadUncommitted,
+                    Instant::now() + Duration::from_millis(300),
+                )),
+            )
             .await?;
 
-        assert!(batches.is_empty(), "{batches:?}");
-
-        let log = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
-        assert!(log.contains("alice"), "{log:?}");
-        assert!(log.contains("reporting"), "{log:?}");
-        assert!(log.contains("client_read_limit"), "{log:?}");
+        assert!(read.batches.is_empty(), "{read:?}");
+        assert_eq!(
+            Some(TimedOut::Queued(ReadWait::ClientReadLimit)),
+            read.timed_out
+        );
 
         _ = cancel_backends(&monitor, &marker).await?;
+
+        Ok(())
+    }
+
+    /// A Fetch returns its read permits, with its connection, before it sends its records, so a
+    /// reader that takes the records slowly keeps neither from other reads.
+    #[tokio::test]
+    async fn fetch_returns_its_permits_before_it_sends() -> Result<()> {
+        const RECORDS: i32 = 200;
+
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "fetch_returns_its_permits_before_it_sends",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic_name, 0);
+
+        let batch = (0..RECORDS)
+            .fold(Batch::builder(), |batch, offset_delta| {
+                batch.record(
+                    Record::builder()
+                        .value(Bytes::from_static(b"v").into())
+                        .offset_delta(offset_delta),
+                )
+            })
+            .last_offset_delta(RECORDS - 1)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        // The test keeps the receiving end and never reads it. The read has more records than the
+        // channel holds, so it fills the channel and then waits for room that never comes.
+        let (fetched_sender, _fetched_receiver) = fetched::channel();
+
+        let mut read = pin!(storage.fetch(
+            &topition,
+            0,
+            1,
+            1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            fetched_sender,
+        ));
+
+        // The query of a local database ends well within this time, so the read is then waiting
+        // to send, not querying.
+        assert!(
+            timeout(Duration::from_secs(2), &mut read).await.is_err(),
+            "the read ended without waiting to send"
+        );
+
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
 
         Ok(())
     }
@@ -7921,7 +7852,7 @@ mod tests {
                 tokio::spawn(async move {
                     if read % 2 == 0 {
                         storage
-                            .fetch(
+                            .fetch_until_deadline(
                                 &topition,
                                 0,
                                 1,
@@ -7930,6 +7861,7 @@ mod tests {
                                 Instant::now() + Duration::from_secs(5),
                             )
                             .await
+                            .map(|read| read.batches)
                             .map(drop)
                     } else {
                         storage.offset_stage(&topition).await.map(drop)
@@ -8093,7 +8025,7 @@ mod tests {
     /// Reads `topition` from offset 0 with a 5 second budget.
     async fn fetch_from_start(storage: &Postgres, topition: &Topition) -> Result<()> {
         storage
-            .fetch(
+            .fetch_until_deadline(
                 topition,
                 0,
                 1,
@@ -8102,6 +8034,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(5),
             )
             .await
+            .map(|read| read.batches)
             .map(drop)
     }
 
@@ -8369,7 +8302,7 @@ mod tests {
         let started_at = Instant::now();
 
         let fetched = storage
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 1,
@@ -8377,7 +8310,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 started_at + read_time,
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         assert!(fetched.is_empty(), "{fetched:?}");
 
@@ -11852,7 +11786,7 @@ mod tests {
         _ = storage.produce(None, &topition, batch).await?;
 
         let batches = storage
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 1,
@@ -11860,7 +11794,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         held.rollback().await?;
 
@@ -12011,7 +11946,7 @@ mod tests {
         );
 
         let batches = storage
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 1,
@@ -12019,7 +11954,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
             Batch::try_from(batch).map(|inflated| {
@@ -12119,7 +12055,7 @@ mod tests {
         _ = storage.produce(None, &topition, batch).await?;
 
         let batches = storage
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 1,
@@ -12127,7 +12063,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         let records = batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
             Batch::try_from(batch).map(|inflated| {
@@ -12243,7 +12180,7 @@ mod tests {
         _ = storage.produce(None, &topition, batch).await?;
 
         let fetch_from = |offset| {
-            storage.fetch(
+            storage.fetch_until_deadline(
                 &topition,
                 offset,
                 1,
@@ -12253,7 +12190,7 @@ mod tests {
             )
         };
 
-        let first = records_with_offsets(fetch_from(0).await?)?;
+        let first = records_with_offsets(fetch_from(0).await?.batches)?;
 
         assert_eq!(
             (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
@@ -12261,7 +12198,7 @@ mod tests {
             "one fetch must stop at the row limit",
         );
 
-        let rest = records_with_offsets(fetch_from(ROWS_PER_FETCH).await?)?;
+        let rest = records_with_offsets(fetch_from(ROWS_PER_FETCH).await?.batches)?;
 
         assert_eq!(
             (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
@@ -12307,7 +12244,7 @@ mod tests {
 
         let batches = timeout(
             READ_BOUND,
-            storage.fetch(
+            storage.fetch_until_deadline(
                 &topition,
                 0,
                 1,
@@ -12323,7 +12260,7 @@ mod tests {
 
         assert_eq!(
             (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
-            records_with_offsets(batches)?
+            records_with_offsets(batches.batches)?
                 .iter()
                 .map(|(offset, _)| *offset)
                 .collect::<Vec<_>>(),
@@ -12757,7 +12694,7 @@ mod tests {
 
         let records = records_with_offsets(
             storage
-                .fetch(
+                .fetch_until_deadline(
                     &Topition::new(format!("{}/key-a", topition.topic()), 0),
                     0,
                     1,
@@ -12765,7 +12702,8 @@ mod tests {
                     IsolationLevel::ReadUncommitted,
                     Instant::now() + Duration::from_secs(5),
                 )
-                .await?,
+                .await
+                .map(|read| read.batches)?,
         )?;
 
         let fetched = records
@@ -12834,7 +12772,7 @@ mod tests {
 
         let records = records_with_offsets(
             storage
-                .fetch(
+                .fetch_until_deadline(
                     &topition,
                     0,
                     1,
@@ -12842,7 +12780,8 @@ mod tests {
                     IsolationLevel::ReadUncommitted,
                     Instant::now() + Duration::from_secs(5),
                 )
-                .await?,
+                .await
+                .map(|read| read.batches)?,
         )?;
 
         let fetched = records

@@ -251,8 +251,8 @@ impl Storage for CountingStorage {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _deadline: tokio::time::Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        _fetched: crate::FetchedSender,
+    ) -> Result<()> {
         unimplemented!()
     }
 

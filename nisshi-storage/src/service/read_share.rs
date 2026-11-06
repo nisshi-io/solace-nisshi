@@ -195,9 +195,9 @@ pub struct ClientIdentity {
 /// The log names the client of the enclosing [`ClientIdentity::scope`], and the metric does not,
 /// because a client chooses its `client_id`. It tells a client that abandons its reads from a
 /// consumer group whose instances share one `client_id`, and those need different fixes. A
-/// storage engine calls this when its own wait for the share misses the deadline, because the
+/// storage engine calls this when its own wait for the share times out, because the
 /// Fetch service sees only an answer with no records then.
-pub fn warn_miss_at_client_share(
+pub fn warn_timeout_at_client_share(
     topition: &Topition,
     operation: StorageOperation,
     offset: i64,
@@ -646,7 +646,7 @@ mod tests {
     use super::*;
     use crate::{
         StorageOperation,
-        service::read_deadline::{Missed, ReadDeadline},
+        service::read_deadline::{ReadDeadline, TimedOut},
     };
 
     #[tokio::test]
@@ -676,8 +676,8 @@ mod tests {
     }
 
     /// A read waits for a permit while the share's permits are held, and
-    /// one abandoned during that wait is a miss queued for its connection's
-    /// share.
+    /// one abandoned during that wait times out as queued for its
+    /// connection's share.
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_its_share_is_abandoned_as_queued() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -685,7 +685,7 @@ mod tests {
         let mut deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         let outcome = FetchReadShare::default()
-            .scope(deadline.timeout(async {
+            .scope(deadline.run_until_deadline(async {
                 let held = FetchReadShare::acquire(1).await;
                 assert!(held.is_ok(), "{held:?}");
 
@@ -694,7 +694,10 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(Err(Missed::Queued(ReadWait::ConnectionReadLimit)), outcome);
+        assert_eq!(
+            Err(TimedOut::Queued(ReadWait::ConnectionReadLimit)),
+            outcome
+        );
     }
 
     /// A permit taken in one scope counts against every scope with a clone
@@ -984,7 +987,7 @@ mod tests {
         );
     }
 
-    /// A read abandoned while it waits for its client's share is a miss
+    /// A read abandoned while it waits for its client's share times out as
     /// queued for that share.
     #[tokio::test(start_paused = true)]
     async fn read_waiting_for_its_client_share_is_abandoned_as_queued() {
@@ -995,7 +998,7 @@ mod tests {
         let mut deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         let outcome = identity(None, "one")
-            .scope(deadline.timeout(async {
+            .scope(deadline.run_until_deadline(async {
                 let held = shares.acquire(1, &limit).await;
                 assert!(held.is_ok(), "{held:?}");
 
@@ -1004,7 +1007,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(Err(Missed::Queued(ReadWait::ClientReadLimit)), outcome);
+        assert_eq!(Err(TimedOut::Queued(ReadWait::ClientReadLimit)), outcome);
     }
 
     /// The registry drops the shares that nothing holds when it fills, and

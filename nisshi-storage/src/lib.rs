@@ -192,7 +192,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::{sync::AcquireError, task::JoinError, time::Instant};
+use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
@@ -206,6 +206,7 @@ pub mod config;
 #[cfg(test)]
 mod decoded_batch_probe;
 mod decoded_budget;
+pub mod fetched;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
@@ -216,6 +217,8 @@ mod produce_path;
 mod producer;
 mod proxy;
 mod service;
+#[cfg(test)]
+mod storage_double;
 mod topic_creation;
 mod topic_defaults;
 
@@ -224,6 +227,7 @@ pub use batch::ProduceRequestBatcher;
 pub use decoded_budget::{
     configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
 };
+pub use fetched::{FetchedDataSender, FetchedRecord, FetchedSender};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
@@ -2114,22 +2118,22 @@ pub trait Storage: Debug + Send + Sync + 'static {
         self.produce(transaction_id, topition, deflated).await
     }
 
-    /// Fetch deflated batches from storage.
+    /// Reads the records of `topition` from `offset`, and sends them as it reads them through
+    /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
-    /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
+    /// The read first sends the offset stage that bounds it, and then its records, or its whole
+    /// stored batches, in offset order from the batch that holds `offset`, with no gap. A read
+    /// that finds nothing to read may send nothing at all.
+    ///
+    /// The records hold at most `max_bytes`, except that a read can exceed it by one batch. A read
     /// returns the first batch at or after `offset` even when that batch alone is larger than
     /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
     /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
-    /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
-    /// for the read without a time limit of their own, so a read that overruns its deadline holds
-    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
-    /// that a read finished.
-    ///
-    /// The batches run in offset order from the batch that holds `offset`, with no gap between
-    /// them, also when the deadline stops the read. An answer with no batches is always valid.
+    /// The caller drops the read at its deadline, and keeps what the read sent before it, so an
+    /// engine doesn't stop the read itself.
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2137,8 +2141,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>>;
+        fetched_sender: FetchedSender,
+    ) -> Result<()>;
 
     /// Query the offset stage for a topic partition.
     ///
@@ -2453,10 +2457,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -2754,10 +2765,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 

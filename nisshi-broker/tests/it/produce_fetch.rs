@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;
 
@@ -110,7 +111,7 @@ where
     let max_wait = Duration::from_millis(500);
 
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             offset,
             min_bytes,
@@ -119,6 +120,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| {
             batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
                 inflated::Batch::try_from(batch)
@@ -338,7 +340,7 @@ where
     let max_wait = Duration::from_millis(500);
 
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             offset,
             min_bytes,
@@ -347,6 +349,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| {
             batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
                 inflated::Batch::try_from(batch)
@@ -568,7 +571,7 @@ where
     let max_wait = Duration::from_millis(500);
 
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             offset,
             min_bytes,
@@ -577,6 +580,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| {
             batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
                 inflated::Batch::try_from(batch)
@@ -712,7 +716,7 @@ where
 
     // Fetch the base topic — all six records
     let all_records = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             offset,
             min_bytes,
@@ -721,6 +725,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?all_records);
     assert_eq!(6, all_records.len());
@@ -728,7 +733,7 @@ where
     // Fetch virtual keyed topic for KEY_A — three records
     let keyed_topition_a = Topition::new(format!("{topic_name}/CC54 RYD"), partition);
     let key_a_records = sc
-        .fetch(
+        .fetch_until_deadline(
             &keyed_topition_a,
             offset,
             min_bytes,
@@ -737,6 +742,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?key_a_records);
     assert_eq!(3, key_a_records.len());
@@ -747,7 +753,7 @@ where
     // Fetch virtual keyed topic for KEY_B — three records
     let keyed_topition_b = Topition::new(format!("{topic_name}/NN03 RYB"), partition);
     let key_b_records = sc
-        .fetch(
+        .fetch_until_deadline(
             &keyed_topition_b,
             offset,
             min_bytes,
@@ -756,6 +762,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?key_b_records);
     assert_eq!(3, key_b_records.len());
@@ -829,7 +836,7 @@ where
         let mut offsets = vec![];
 
         for batch in sc
-            .fetch(
+            .fetch_until_deadline(
                 &keyed_topition,
                 offset,
                 1,
@@ -837,7 +844,8 @@ where
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_millis(500),
             )
-            .await?
+            .await
+            .map(|read| read.batches)?
         {
             let batch = inflated::Batch::try_from(batch)?;
             offsets.extend(
@@ -935,7 +943,7 @@ where
     // All six records are returned — nisshi.virtual is not set so the "/" is
     // treated as part of the topic name with no key filtering applied.
     let all_records = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             offset,
             min_bytes,
@@ -944,6 +952,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?all_records);
     assert_eq!(6, all_records.len());
