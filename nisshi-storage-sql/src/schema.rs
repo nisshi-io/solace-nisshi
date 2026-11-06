@@ -49,6 +49,13 @@ pub(crate) struct Migration {
     /// splits the change into an expand step, which those brokers still work with, and a contract
     /// step in a later release.
     pub(crate) breaks_previous_release: bool,
+    /// The tables that this step rebuilds, or whose rows it changes in another way that can leave
+    /// a row that refers to a missing row. After the last step, the libSQL engine checks the
+    /// foreign keys of these tables and of the tables that refer to them, and skips every other
+    /// table. A declared table must exist after the last step, so a step that drops or renames a
+    /// table also removes it from the list of each earlier step. PostgreSQL enforces foreign keys
+    /// as each statement runs, so it does not read this list.
+    pub(crate) rebuilt_tables: &'static [&'static str],
     /// The statements that change the schema.
     pub(crate) sql: &'static str,
 }
@@ -262,12 +269,14 @@ mod tests {
         to_version: 2,
         oldest_compatible_version: 1,
         breaks_previous_release: false,
+        rebuilt_tables: &[],
         sql: "select 2",
     };
     const STEP_3: Migration = Migration {
         to_version: 3,
         oldest_compatible_version: 2,
         breaks_previous_release: true,
+        rebuilt_tables: &[],
         sql: "select 3",
     };
     static STEPS: [Migration; 2] = [STEP_2, STEP_3];
@@ -407,12 +416,14 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 2,
                 breaks_previous_release: true,
+                rebuilt_tables: &[],
                 sql: "select 2",
             },
             Migration {
                 to_version: 3,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "select 3",
             },
         ];
@@ -429,6 +440,7 @@ mod tests {
             to_version: 2,
             oldest_compatible_version: 3,
             breaks_previous_release: false,
+            rebuilt_tables: &[],
             sql: "select 2",
         }];
         assert!(
@@ -472,10 +484,12 @@ mod tests {
             to_version: 2,
             oldest_compatible_version: 2,
             breaks_previous_release: true,
+            rebuilt_tables: &[],
             sql: "select 2",
         };
         const UNDECLARED: Migration = Migration {
             breaks_previous_release: false,
+            rebuilt_tables: &[],
             ..BREAKS
         };
         const FALSE_ALARM: Migration = Migration {
@@ -510,16 +524,19 @@ mod tests {
             to_version: 2,
             oldest_compatible_version: 1,
             breaks_previous_release: false,
+            rebuilt_tables: &[],
             sql: "select 2",
         };
         const RAISES: Migration = Migration {
             to_version: 3,
             oldest_compatible_version: 2,
             breaks_previous_release: true,
+            rebuilt_tables: &[],
             sql: "select 3",
         };
         const UNDECLARED: Migration = Migration {
             breaks_previous_release: false,
+            rebuilt_tables: &[],
             ..RAISES
         };
 

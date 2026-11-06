@@ -1820,8 +1820,12 @@ const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
 /// the tables that refer to it. For the same reason, a step's own `delete` does not fire `on
 /// delete cascade`, unlike on PostgreSQL, so a step deletes the rows of the child tables itself.
 /// After the last step, the upgrade runs `PRAGMA foreign_key_check` and fails when a row breaks a
-/// foreign key. The check reads every row of every child table, so each upgrade takes time in
-/// proportion to the stored data, and a row that broke a key before the upgrade fails it too.
+/// foreign key. The check covers the tables that the steps list in `rebuilt_tables` and the tables
+/// that refer to them. A step must therefore list each table that it rebuilds, and each table
+/// whose rows it changes in a way that can break a key. If no step lists a table, the check skips
+/// every table, and a step that changes rows without listing their table can commit a row that
+/// breaks a key. A row that broke a key in a table that the steps leave alone does not fail the
+/// upgrade.
 ///
 /// A change to `ddl/` also changes what the Turso engine creates in a new database, because
 /// `limbo.rs` runs the same files with `create table if not exists` and ignores their errors. An
@@ -2046,24 +2050,52 @@ async fn upgrade_schema(
     }
 
     // The steps ran with foreign keys off, so a row that breaks a key stays unnoticed until this
-    // check. It is the last check of SQLite's procedure for rebuilding a table.
-    let mut broken_keys = tx.query("PRAGMA foreign_key_check", ()).await?;
-    if let Some(row) = broken_keys.next().await? {
-        // The columns of the first row of the check: the child table, the rowid of the child row
-        // (null for a table without rowid), and the parent table that the row refers to.
-        let table = row.get::<String>(0)?;
-        let rowid = row.get::<Option<i64>>(1)?;
-        let parent = row.get::<String>(2)?;
-        error!(
-            from_version = recorded.version,
-            table,
-            ?rowid,
-            parent,
-            "after the upgrade steps, a row breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
-        );
-        return Err(Error::Message(format!(
-            "after the upgrade steps, a row of `{table}` refers to a missing row of `{parent}`"
-        )));
+    // check. It is the last check of SQLite's procedure for rebuilding a table. The check covers
+    // only the tables that the steps declare and the tables that refer to them, because a check
+    // of every table reads every row of every child table while this transaction holds the write
+    // lock.
+    let tables_to_check = tables_to_check(tx, &declared_rebuilt_tables(steps))
+        .await
+        .inspect_err(|err| {
+            error!(
+                from_version = recorded.version,
+                ?err,
+                "listing the tables whose foreign keys the upgrade checks failed, so the upgrade is rolled back and the file stays at its earlier version"
+            );
+        })?;
+
+    for table_to_check in tables_to_check {
+        let mut broken_keys = tx
+            .query(
+                "select \"table\", \"rowid\", \"parent\" from pragma_foreign_key_check(?1) limit 1",
+                [table_to_check.as_str()],
+            )
+            .await
+            .inspect_err(|err| {
+                error!(
+                    from_version = recorded.version,
+                    table_to_check,
+                    ?err,
+                    "the foreign-key check of a table failed, so the upgrade is rolled back and the file stays at its earlier version"
+                );
+            })?;
+        if let Some(row) = broken_keys.next().await? {
+            // The columns of the first row of the check: the child table, the rowid of the child
+            // row (null for a table without rowid), and the parent table that the row refers to.
+            let table = row.get::<String>(0)?;
+            let rowid = row.get::<Option<i64>>(1)?;
+            let parent = row.get::<String>(2)?;
+            error!(
+                from_version = recorded.version,
+                table,
+                ?rowid,
+                parent,
+                "after the upgrade steps, a row breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
+            );
+            return Err(Error::Message(format!(
+                "after the upgrade steps, a row of `{table}` refers to a missing row of `{parent}`"
+            )));
+        }
     }
 
     let Some(last) = steps.last() else {
@@ -2077,6 +2109,43 @@ async fn upgrade_schema(
         )
         .await?;
     Ok(())
+}
+
+/// Returns the tables that `steps` declare in [`Migration::rebuilt_tables`], once each.
+fn declared_rebuilt_tables(steps: &[Migration]) -> BTreeSet<&'static str> {
+    steps
+        .iter()
+        .flat_map(|step| step.rebuilt_tables.iter().copied())
+        .collect()
+}
+
+/// Returns the tables whose foreign keys the upgrade must check: each of `declared`, and each
+/// table with a foreign key that refers to one of them.
+///
+/// `PRAGMA foreign_key_check(<table>)` examines only the foreign keys of that table. A step that
+/// rebuilds a parent table can leave rows of a child table without a parent, so the check must
+/// also cover the children of each rebuilt table.
+async fn tables_to_check(tx: &Transaction, declared: &BTreeSet<&str>) -> Result<BTreeSet<String>> {
+    let mut tables = declared
+        .iter()
+        .map(|table| (*table).to_owned())
+        .collect::<BTreeSet<_>>();
+
+    for rebuilt in declared {
+        let mut referring = tx
+            .query(
+                "select m.name as referring_table \
+                 from sqlite_schema m, pragma_foreign_key_list(m.name) f \
+                 where m.type = 'table' and f.\"table\" = ?1 collate nocase",
+                [*rebuilt],
+            )
+            .await?;
+        while let Some(row) = referring.next().await? {
+            _ = tables.insert(row.get::<String>(0)?);
+        }
+    }
+
+    Ok(tables)
 }
 
 pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
@@ -7768,6 +7837,7 @@ mod tests {
         to_version: 2,
         oldest_compatible_version: 1,
         breaks_previous_release: false,
+        rebuilt_tables: &[],
         sql: MARKER_SQL,
     };
 
@@ -7777,6 +7847,7 @@ mod tests {
         to_version: 3,
         oldest_compatible_version: 1,
         breaks_previous_release: false,
+        rebuilt_tables: &[],
         sql: "create table upgrade_marker_child \
               (id integer primary key references upgrade_marker (id)); \
               insert into upgrade_marker_child (id) select id from upgrade_marker;",
@@ -7906,6 +7977,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "create table upgrade_marker (id integer primary key); \
                       insert into no_such_table (id) values (1);",
             }],
@@ -7969,6 +8041,7 @@ mod tests {
                     to_version: 2,
                     oldest_compatible_version: 1,
                     breaks_previous_release: false,
+                    rebuilt_tables: &[],
                     sql: "create table rebuilt_parent (id integer primary key); \
                           create table rebuilt_child (id integer primary key, \
                               parent_id integer not null references rebuilt_parent (id) \
@@ -7980,6 +8053,7 @@ mod tests {
                     to_version: 3,
                     oldest_compatible_version: 1,
                     breaks_previous_release: false,
+                    rebuilt_tables: &["rebuilt_parent"],
                     sql: "create table rebuilt_parent_new (id integer primary key, note text); \
                           insert into rebuilt_parent_new (id) select id from rebuilt_parent; \
                           drop table rebuilt_parent; \
@@ -8014,6 +8088,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &["checked_child"],
                 sql: "create table checked_parent (id integer primary key); \
                       create table checked_child (parent_id integer references checked_parent (id)); \
                       insert into checked_child (parent_id) values (7);",
@@ -8034,6 +8109,193 @@ mod tests {
 
         assert_eq!(recorded_version(&db).await?, Some(1));
         assert_matches!(count(&db, "checked_child").await, Err(_));
+        Ok(())
+    }
+
+    #[test]
+    fn declared_rebuilt_tables_lists_each_table_that_the_steps_declare_once() {
+        const DECLARES: [Migration; 2] = [
+            Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                rebuilt_tables: &["header", "record"],
+                sql: "select 2",
+            },
+            Migration {
+                to_version: 3,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                rebuilt_tables: &["record", "topic"],
+                sql: "select 3",
+            },
+        ];
+
+        assert_eq!(
+            declared_rebuilt_tables(&DECLARES),
+            BTreeSet::from(["header", "record", "topic"])
+        );
+    }
+
+    #[test]
+    fn declared_rebuilt_tables_is_empty_when_no_step_declares_a_table() {
+        assert!(declared_rebuilt_tables(&[STEP_TO_2, STEP_TO_3]).is_empty());
+    }
+
+    /// A step that declares no table must not fail on a row that breaks a foreign key in a table
+    /// that no step declares: the upgrade checks only the tables that its steps declare.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_ignores_a_broken_key_in_a_table_that_no_step_declares()
+    -> Result<()> {
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        // With foreign keys off, the insert leaves a row that refers to a missing row, as a hand
+        // repair in the `sqlite3` shell can.
+        let connection = db.connect()?;
+        _ = connection.execute("PRAGMA foreign_keys = OFF", ()).await?;
+        _ = connection
+            .execute_batch(
+                "create table unrelated_parent (id integer primary key); \
+                 create table unrelated_child (parent_id integer references unrelated_parent (id)); \
+                 insert into unrelated_child (parent_id) values (7);",
+            )
+            .await?;
+
+        upgrade_to_2(&db).await?;
+
+        assert_eq!(recorded_version(&db).await?, Some(2));
+        Ok(())
+    }
+
+    /// A step that rebuilds a parent table and drops a row that a child table refers to must fail
+    /// the upgrade, although the step declares only the parent: the check also covers the tables
+    /// that refer to a declared table.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_checks_the_tables_that_refer_to_a_rebuilt_table() -> Result<()> {
+        const DROPS_A_PARENT_ROW: Schema = Schema {
+            version: 3,
+            oldest_compatible_version: 1,
+            migrations: &[
+                Migration {
+                    to_version: 2,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    rebuilt_tables: &[],
+                    sql: "create table rebuilt_parent (id integer primary key); \
+                          create table referring_child (id integer primary key, \
+                              parent_id integer not null references rebuilt_parent (id)); \
+                          insert into rebuilt_parent (id) values (1); \
+                          insert into referring_child (id, parent_id) values (1, 1);",
+                },
+                Migration {
+                    to_version: 3,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    rebuilt_tables: &["rebuilt_parent"],
+                    sql: "create table rebuilt_parent_new (id integer primary key); \
+                          drop table rebuilt_parent; \
+                          alter table rebuilt_parent_new rename to rebuilt_parent;",
+                },
+            ],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_matches!(
+            ensure_schema_of(&db, Duration::from_secs(5), &DROPS_A_PARENT_ROW, &DDL).await,
+            Err(Error::Message(message))
+                if message.contains("`referring_child`") && message.contains("`rebuilt_parent`")
+        );
+
+        assert_eq!(recorded_version(&db).await?, Some(1));
+        assert_matches!(count(&db, "referring_child").await, Err(_));
+        Ok(())
+    }
+
+    /// The upgrade must check the tables that every step declares, not only those of the last one.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_checks_the_tables_that_each_step_declares() -> Result<()> {
+        const BREAKS_A_KEY_IN_THE_FIRST_STEP: Schema = Schema {
+            version: 3,
+            oldest_compatible_version: 1,
+            migrations: &[
+                Migration {
+                    to_version: 2,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    rebuilt_tables: &["first_child"],
+                    sql: "create table first_parent (id integer primary key); \
+                          create table first_child (parent_id integer references first_parent (id)); \
+                          insert into first_child (parent_id) values (7);",
+                },
+                Migration {
+                    to_version: 3,
+                    oldest_compatible_version: 1,
+                    breaks_previous_release: false,
+                    rebuilt_tables: &["second_parent"],
+                    sql: "create table second_parent (id integer primary key);",
+                },
+            ],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_matches!(
+            ensure_schema_of(
+                &db,
+                Duration::from_secs(5),
+                &BREAKS_A_KEY_IN_THE_FIRST_STEP,
+                &DDL
+            )
+            .await,
+            Err(Error::Message(message)) if message.contains("`first_child`")
+        );
+
+        assert_eq!(recorded_version(&db).await?, Some(1));
+        Ok(())
+    }
+
+    /// A step that declares a table that does not exist after the last step must fail the upgrade
+    /// and leave the file at version 1, so a mistyped name does not turn the check off.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_an_upgrade_that_declares_a_missing_table() -> Result<()> {
+        const DECLARES_A_MISSING_TABLE: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                rebuilt_tables: &["upgrade_markr"],
+                sql: MARKER_SQL,
+            }],
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+
+        assert_matches!(
+            ensure_schema_of(&db, Duration::from_secs(5), &DECLARES_A_MISSING_TABLE, &DDL).await,
+            Err(error) if error.to_string().contains("upgrade_markr")
+        );
+
+        assert_eq!(recorded_version(&db).await?, Some(1));
+        assert_matches!(count(&db, "upgrade_marker").await, Err(_));
         Ok(())
     }
 
@@ -8096,6 +8358,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 2,
                 breaks_previous_release: true,
+                rebuilt_tables: &[],
                 sql: MARKER_SQL,
             }],
         };

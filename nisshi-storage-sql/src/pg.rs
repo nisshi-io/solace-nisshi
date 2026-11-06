@@ -13355,6 +13355,7 @@ mod tests {
         to_version: 2,
         oldest_compatible_version: 1,
         breaks_previous_release: false,
+        rebuilt_tables: &[],
         sql: MARKER_SQL,
     };
 
@@ -13364,6 +13365,7 @@ mod tests {
         to_version: 3,
         oldest_compatible_version: 1,
         breaks_previous_release: false,
+        rebuilt_tables: &[],
         sql: "create table upgrade_marker_child \
               (id int primary key references upgrade_marker (id)); \
               insert into upgrade_marker_child (id) select id from upgrade_marker;",
@@ -13503,6 +13505,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "create table upgrade_marker (id int primary key); \
                       insert into no_such_table (id) values (1);",
             }],
@@ -13641,6 +13644,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 2,
                 breaks_previous_release: true,
+                rebuilt_tables: &[],
                 sql: MARKER_SQL,
             }],
         };
@@ -13860,6 +13864,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "alter table cluster add column upgrade_column int",
             }],
         };
@@ -13921,6 +13926,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "create unique index step_rows_value on step_rows (value)",
             }],
         };
@@ -13974,6 +13980,7 @@ mod tests {
                 to_version: 2,
                 oldest_compatible_version: 1,
                 breaks_previous_release: false,
+                rebuilt_tables: &[],
                 sql: "alter table step_rows alter column value type integer using value::integer",
             }],
         };
@@ -14014,6 +14021,7 @@ mod tests {
             to_version: 2,
             oldest_compatible_version: 1,
             breaks_previous_release: false,
+            rebuilt_tables: &[],
             sql: "create table step_settings as select \
                   current_setting('statement_timeout') as statement_timeout, \
                   current_setting('lock_timeout') as lock_timeout",
