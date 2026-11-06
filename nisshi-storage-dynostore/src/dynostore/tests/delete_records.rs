@@ -42,7 +42,9 @@ use object_store::{
 };
 use tokio::{sync::Notify, time::timeout};
 
-use crate::dynostore::{CONCURRENT_RECLAIM_DELETES, DynoStore, tests::init_tracing};
+use crate::dynostore::{
+    CONCURRENT_RECLAIM_DELETES, DynoStore, MAX_RECLAIM_BACKOFF_PASSES, tests::init_tracing,
+};
 
 /// Returns the base offsets of the batch objects stored under one partition's
 /// `records/` prefix, in ascending order.
@@ -127,13 +129,14 @@ impl DeleteHold {
 }
 
 /// An object store that counts the listings of batch objects, can fail
-/// every delete and every listing of batch objects, can hold the next
+/// every write of a watermark document, can fail every delete and every listing of batch objects, can hold the next
 /// delete, and can slow every delete and record how many deletes overlap.
 #[derive(Clone, Debug, Default)]
 struct Counting {
     inner: Arc<InMemory>,
     batch_lists: Arc<AtomicUsize>,
     deletes_fail: Arc<AtomicBool>,
+    watermark_puts_fail: Arc<AtomicBool>,
     lists_fail: Arc<AtomicBool>,
     held_delete: Arc<Mutex<Option<DeleteHold>>>,
     deletes_are_slow: Arc<AtomicBool>,
@@ -170,6 +173,15 @@ impl ObjectStore for Counting {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if self.watermark_puts_fail.load(Ordering::SeqCst)
+            && location.as_ref().ends_with("watermark.json")
+        {
+            return Err(object_store::Error::Generic {
+                store: "test",
+                source: "forced failure".into(),
+            });
+        }
+
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -408,6 +420,382 @@ async fn maintain_retries_a_failed_listing() -> Result<(), Error> {
 
     // The failed listing must not record the cut as reclaimed.
     counting.lists_fail.store(false, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A partition whose reclaim keeps failing is listed on the first failing pass,
+/// again on the pass after it, and then after 1, 2, 4, 8 and 16 skipped passes,
+/// which is the cap. The first success reclaims the objects and resets the backoff,
+/// so that the next failure retries on the next pass again.
+///
+/// The schedule counts `maintain` passes, and nothing reads the clock. The paused
+/// clock only keeps the test from waiting in real time if that changes.
+#[tokio::test(start_paused = true)]
+async fn maintain_backs_off_a_partition_that_keeps_failing() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "backoff";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    // The passes (counted from 1) that list the partition: the skips after the
+    // failures are 0, 1, 2, 4, 8, 16 and then 16 again, the cap.
+    let listed_on = [1, 2, 4, 7, 12, 21, 38, 55];
+    assert_eq!(16, MAX_RECLAIM_BACKOFF_PASSES);
+
+    let mut lists = 0;
+
+    for pass in 1..=listed_on[listed_on.len() - 1] {
+        tokio::time::advance(Duration::from_mins(10)).await;
+        counting.batch_lists.store(0, Ordering::SeqCst);
+        storage.maintain(SystemTime::now()).await?;
+
+        let listed = listed_on.contains(&pass);
+        lists += usize::from(listed);
+
+        assert_eq!(
+            usize::from(listed),
+            counting.batch_lists(),
+            "pass {pass} should {}list the partition",
+            if listed { "" } else { "not " }
+        );
+    }
+
+    assert_eq!(listed_on.len(), lists);
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    // The bucket accepts deletes again. The pass after the last retry is
+    // skipped, and the one after the cap's passes cleans up.
+    counting.deletes_fail.store(false, Ordering::SeqCst);
+
+    for pass in 1..=MAX_RECLAIM_BACKOFF_PASSES + 1 {
+        storage.maintain(SystemTime::now()).await?;
+
+        let remaining = stored_base_offsets(&counting.inner, &topition).await?;
+
+        if pass <= MAX_RECLAIM_BACKOFF_PASSES {
+            assert_eq!(vec![0, 1, 2, 3], remaining, "pass {pass} is skipped");
+        } else {
+            assert_eq!(vec![3], remaining);
+        }
+    }
+
+    // A success resets the backoff: the next failure retries on the next pass.
+    for _ in 0..2 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 5),
+        delete_records_partition(&storage, name, 5).await?
+    );
+
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    for _ in 0..2 {
+        counting.batch_lists.store(0, Ordering::SeqCst);
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(1, counting.batch_lists());
+    }
+
+    // The third pass is skipped.
+    counting.batch_lists.store(0, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(0, counting.batch_lists());
+
+    Ok(())
+}
+
+/// A cut that `DeleteRecords` makes after an older cut failed does not wait behind the older
+/// cut's backoff: the next pass reclaims it, even though the older cut still has passes to skip.
+#[tokio::test(start_paused = true)]
+async fn a_new_cut_does_not_wait_behind_an_old_backoff() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "newcut";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    // Passes 1 and 2 list, pass 3 is skipped, pass 4 lists and leaves 2 to skip.
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    for _ in 0..4 {
+        storage.maintain(SystemTime::now()).await?;
+    }
+
+    counting.deletes_fail.store(false, Ordering::SeqCst);
+
+    // The old cut keeps waiting.
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    // A new cut is reclaimed on the next pass, with one pass still to skip.
+    for _ in 0..2 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 5),
+        delete_records_partition(&storage, name, 5).await?
+    );
+
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![5],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+
+    Ok(())
+}
+
+/// A cut that cannot be recorded backs off like a delete that fails, and the listing comes
+/// back once the writes recover.
+#[tokio::test(start_paused = true)]
+async fn maintain_backs_off_a_cut_that_cannot_be_recorded() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "putfail";
+    create_topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    counting.watermark_puts_fail.store(true, Ordering::SeqCst);
+
+    // Passes 1 and 2 list, and pass 3 is skipped.
+    for (pass, lists) in [(1, 1), (2, 1), (3, 0)] {
+        counting.batch_lists.store(0, Ordering::SeqCst);
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(lists, counting.batch_lists(), "pass {pass}");
+    }
+
+    counting.watermark_puts_fail.store(false, Ordering::SeqCst);
+
+    // Pass 4 lists and records the cut, and pass 5 has nothing to list.
+    counting.batch_lists.store(0, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(1, counting.batch_lists());
+
+    counting.batch_lists.store(0, Ordering::SeqCst);
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(0, counting.batch_lists());
+
+    Ok(())
+}
+
+/// A pass that finds nothing to reclaim removes the partition's backoff, for a cut that another
+/// broker reclaimed: the failures start again from none.
+#[tokio::test(start_paused = true)]
+async fn a_pass_with_nothing_to_reclaim_resets_the_backoff() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    // `storage` only maintains, so it caches no watermark and sees what `other` records at once.
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+    let other = DynoStore::new("nisshi", 1, counting.inner.clone())?;
+
+    let name = "idle";
+    create_topic(&other, name).await?;
+    let topition = Topition::new(name, 0);
+
+    for _ in 0..4 {
+        _ = produce_batch(&other, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&other, name, 3).await?
+    );
+
+    // Passes 1 and 2 fail, which leaves 1 pass to skip.
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    for _ in 0..2 {
+        storage.maintain(SystemTime::now()).await?;
+    }
+
+    // Another broker reclaims the cut, and this one finds nothing to reclaim.
+    other.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![3],
+        stored_base_offsets(&counting.inner, &topition).await?
+    );
+    storage.maintain(SystemTime::now()).await?;
+
+    // The next cut fails afresh: it lists on 2 passes in a row, where the earlier failures
+    // would have it skip the pass after the first.
+    for _ in 0..2 {
+        _ = produce_batch(&other, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 5),
+        delete_records_partition(&other, name, 5).await?
+    );
+
+    for pass in 1..=2 {
+        counting.batch_lists.store(0, Ordering::SeqCst);
+        storage.maintain(SystemTime::now()).await?;
+        assert_eq!(1, counting.batch_lists(), "pass {pass}");
+    }
+
+    Ok(())
+}
+
+/// Backing off one partition leaves the others alone: a partition whose reclaim
+/// succeeds is reclaimed on every pass, while a failing one is skipped.
+#[tokio::test(start_paused = true)]
+async fn backoff_applies_to_the_failing_partition_only() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let bad = Topition::new("bad", 0);
+    create_topic(&storage, "bad").await?;
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &bad, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, "bad", 3).await?
+    );
+
+    // Pass 1 and 2 list, pass 3 is skipped, pass 4 lists and leaves 2 to skip.
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    for _ in 0..4 {
+        storage.maintain(SystemTime::now()).await?;
+    }
+
+    counting.deletes_fail.store(false, Ordering::SeqCst);
+
+    let good = Topition::new("good", 0);
+    create_topic(&storage, "good").await?;
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &good, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, "good", 3).await?
+    );
+
+    // Pass 5 skips the bad partition, and reclaims the good one.
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &bad).await?
+    );
+    assert_eq!(vec![3], stored_base_offsets(&counting.inner, &good).await?);
+
+    // Pass 6 skips it again, and pass 7 reclaims it.
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        stored_base_offsets(&counting.inner, &bad).await?
+    );
+
+    storage.maintain(SystemTime::now()).await?;
+    assert_eq!(vec![3], stored_base_offsets(&counting.inner, &bad).await?);
+
+    Ok(())
+}
+
+/// A topic that is created again under the name of a backed-off topic does not
+/// inherit its backoff: its first cut is reclaimed on the next pass.
+#[tokio::test(start_paused = true)]
+async fn recreated_topic_does_not_inherit_the_backoff() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counting = Counting::default();
+    let storage = DynoStore::new("nisshi", 1, counting.clone())?;
+
+    let name = "reborn";
+    let topition = Topition::new(name, 0);
+    create_topic(&storage, name).await?;
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
+    // After 4 failing passes, the partition has 2 passes left to skip.
+    counting.deletes_fail.store(true, Ordering::SeqCst);
+
+    for _ in 0..4 {
+        storage.maintain(SystemTime::now()).await?;
+    }
+
+    counting.deletes_fail.store(false, Ordering::SeqCst);
+
+    _ = storage.delete_topic(&TopicId::Name(name.into())).await?;
+    create_topic(&storage, name).await?;
+
+    for _ in 0..4 {
+        _ = produce_batch(&storage, &topition, 1).await?;
+    }
+
+    assert_eq!(
+        (ErrorCode::None, 3),
+        delete_records_partition(&storage, name, 3).await?
+    );
+
     storage.maintain(SystemTime::now()).await?;
     assert_eq!(
         vec![3],
