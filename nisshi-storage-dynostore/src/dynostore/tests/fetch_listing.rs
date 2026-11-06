@@ -612,17 +612,14 @@ async fn out_of_order_listing_after_the_holding_batch_lists_nothing_more() -> Re
     listing.list_last_two_swapped();
     listing.reset_counts();
 
+    // The fetch offset is inside the first batch, so the fetch lists to find that batch.
     assert_eq!(
         vec![0, 10, 20],
-        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+        fetch_base_offsets(&storage, &topition, 5, MAX_BYTES, READ_TIME).await?
     );
-    // The search for the batch at offset 0 lists that batch and the one after it, and nothing
-    // more. A full listing would list all three batches, after that search.
-    assert!(
-        listing.listed_batches() <= 2,
-        "{}",
-        listing.listed_batches()
-    );
+    // The search for the batch that holds offset 5 lists that batch and the one after it, and
+    // nothing more. A full listing would list all three batches, after that search.
+    assert_eq!(2, listing.listed_batches());
 
     Ok(())
 }
@@ -713,11 +710,11 @@ async fn gap_in_an_out_of_order_listing_goes_on_from_the_next_batch() -> Result<
 /// A fetch that reaches a base offset without a batch object at the end of the partition, such
 /// as while a produce writes its batch, stops there without listing the whole partition.
 #[tokio::test]
-async fn gap_at_the_end_of_the_partition_lists_only_after_the_gap() -> Result<(), Error> {
+async fn gap_at_the_end_of_the_partition_does_not_list_the_whole_partition() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let (storage, listing, topition) =
-        partition("gap_at_the_end_of_the_partition_lists_only_after_the_gap").await?;
+        partition("gap_at_the_end_of_the_partition_does_not_list_the_whole_partition").await?;
 
     // The partition holds more offsets than the first listing window below a fetch offset, so
     // the search for the batch that holds the fetch offset never lists from offset 0, which the

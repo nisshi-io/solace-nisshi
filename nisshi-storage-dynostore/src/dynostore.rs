@@ -311,6 +311,22 @@ static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// starts inside a batch list the whole partition.
 static FETCH_FULL_LISTING_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Counts the fetches that skip base offsets that have no batch object, to the next batch below
+/// the high watermark.
+static FETCH_GAP_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_gap_skipped")
+        .with_description(
+            "Fetches that skipped base offsets with no batch object, which a failed produce \
+             leaves; each one listed the partition after the gap",
+        )
+        .build()
+});
+
+/// Whether this process has logged a warning for a fetch that skipped a gap. Each later one logs
+/// at debug, because every fetch that crosses a gap skips it again.
+static FETCH_GAP_SKIPPED_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// A backfill of one partition's time index in progress (see
 /// [`DynoStore::begin_time_index_backfill`]).
 #[derive(Clone, Copy, Debug)]
@@ -2205,11 +2221,13 @@ impl DynoStore {
     /// offset that has no batch object, or `None` when no batch lies after it below
     /// `high_watermark`.
     ///
-    /// This lists the keys after `gap_start_offset`, ignores each key at or above
-    /// `high_watermark`, which a produce wrote after this read took its high watermark, and takes
-    /// the lowest key that is left. It reads the whole listing instead of taking its first key,
-    /// because a store can list keys out of order. A gap is usually at the end of the partition,
-    /// while a produce writes its batch object, so the listing usually holds only a few keys.
+    /// This lists the keys after `gap_start_offset` and takes the lowest one below
+    /// `high_watermark`: a key at or above it is a batch that a produce wrote after this read took
+    /// its high watermark. It reads the whole listing instead of taking its first key, because a
+    /// store can list keys out of order. A gap at the end of the partition, while a produce writes
+    /// its batch object, costs only the few keys after it. A gap that a failed produce left in the
+    /// middle of the partition stays, and costs a listing of the rest of the partition on every
+    /// fetch that crosses it.
     async fn base_offset_after_gap(
         &self,
         topition: &Topition,
@@ -2228,10 +2246,29 @@ impl DynoStore {
             .await?;
 
         if let Some(next) = next {
-            debug!(
-                ?topition,
-                gap_start_offset, next, "fetch skips base offsets that have no batch object"
+            FETCH_GAP_SKIPPED.add(
+                1,
+                &[
+                    KeyValue::new("cluster", self.cluster.clone()),
+                    KeyValue::new("topic", topition.topic().to_owned()),
+                ],
             );
+
+            if FETCH_GAP_SKIPPED_WARNED.swap(true, Ordering::Relaxed) {
+                debug!(
+                    ?topition,
+                    gap_start_offset, next, "fetch skips base offsets that have no batch object"
+                );
+            } else {
+                warn!(
+                    ?topition,
+                    gap_start_offset,
+                    next,
+                    "fetch skips base offsets that have no batch object, which a failed produce \
+                     leaves; every fetch that crosses this gap lists the partition after it; later \
+                     ones log at debug and count in nisshi_fetch_gap_skipped"
+                );
+            }
         }
 
         Ok(next)
@@ -2257,8 +2294,9 @@ impl DynoStore {
                 ?topition,
                 offset,
                 "fetch lists the whole partition to find the batch that holds the fetch offset; \
-                 a store that lists keys out of order makes every fetch inside a batch do this; \
-                 later ones log at debug and count in nisshi_fetch_full_listing"
+                 a store that lists keys out of order makes every fetch inside a batch do this, \
+                 and so does a fetch below the first batch; later ones log at debug and count in \
+                 nisshi_fetch_full_listing"
             );
         }
 
