@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant, SystemTime},
@@ -722,7 +723,7 @@ where
 
     for fetch_offset in 0..=high_watermark {
         let batches = sc
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 fetch_offset,
                 min_bytes,
@@ -731,6 +732,7 @@ where
                 tokio::time::Instant::now() + max_wait,
             )
             .await
+            .map(|read| read.batches)
             .inspect_err(|err| error!(?err, fetch_offset))?
             .into_iter()
             .try_fold(Vec::new(), |mut acc, batch| {
@@ -858,7 +860,7 @@ where
     // a generous max_wait: the pg and lite engines stop assembling at the
     // deadline, and nothing here depends on timing
     let fetched = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             0,
             1,
@@ -867,6 +869,7 @@ where
             tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
+        .map(|read| read.batches)
         .inspect_err(|err| error!(?err))?
         .into_iter()
         // the pg and lite engines return an empty placeholder batch when

@@ -16,6 +16,7 @@
 //! `s3://` and `gs://` engines put in front of `DynoStore` when
 //! `batch_max_delay` is set.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -102,7 +103,7 @@ async fn batches_that_would_merge_past_the_decoded_limit_are_stored_so_they_deco
     // A fetch can answer one batch at a time, so each offset is fetched on its own.
     for (offset, value) in [(0, b'a'), (1, b'b')] {
         let stored = storage
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 offset,
                 1,
@@ -110,7 +111,8 @@ async fn batches_that_would_merge_past_the_decoded_limit_are_stored_so_they_deco
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
 
         let inflated = inflated::Batch::try_from(&stored[0])?;
 

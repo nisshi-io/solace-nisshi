@@ -34,7 +34,7 @@ use libsql::{
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -62,16 +62,16 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService, RequestStorageService,
-    Result, ScramCredential, SemaphoreProxy, StartupFailure, Storage, StorageOperation,
-    StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
+    FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
+    RequestStorageService, Result, ScramCredential, SemaphoreProxy, StartupFailure, Storage,
+    StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    bounded_channel, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
-    read_deadline::ReadDeadline,
 };
 use opentelemetry::{
     KeyValue,
@@ -93,7 +93,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
-use tokio::{fs::rename, sync::Semaphore, task::JoinSet, time::Instant};
+use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -2106,8 +2106,8 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         let start = SystemTime::now();
         self.inner
             .fetch(
@@ -2116,7 +2116,7 @@ impl Storage for Engine {
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                deadline,
+                fetched_sender,
             )
             .await
             .inspect(|_| {
@@ -3290,41 +3290,22 @@ impl Storage for Delegate {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         let started_at = SystemTime::now();
 
-        debug!(
-            ?topition,
-            offset,
-            min_bytes,
-            max_bytes,
-            ?isolation_level,
-            ?deadline
-        );
+        debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
-        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+        let (base_topic, key_filter): (&str, Option<&str>) =
+            self.topic_with_key(topition.topic()).await?;
 
-        let Ok(topic) = read_deadline
-            .timeout(self.topic_with_key(topition.topic()))
-            .await
-        else {
-            return Ok(vec![]);
+        let offset_stage = self.offset_stage(topition).await?;
+
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            offset_stage.last_stable
+        } else {
+            offset_stage.high_watermark
         };
-
-        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
-
-        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
-            return Ok(vec![]);
-        };
-
-        let high_watermark = offset_stage.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
 
         debug!(
             cluster = self.cluster,
@@ -3336,290 +3317,135 @@ impl Storage for Delegate {
             max_bytes
         );
 
-        let Ok(c) = read_deadline.timeout(self.connection()).await else {
-            return Ok(vec![]);
-        };
+        let c = self.connection().await?;
 
-        let c = c?;
+        let mut records = if let Some(key) = key_filter {
+            let key_bytes = key.as_bytes().to_vec();
+            c.query(
+                "record_fetch_keyed.sql",
+                (
+                    self.cluster.as_str(),
+                    base_topic,
+                    topition.partition(),
+                    offset,
+                    (max_bytes as i64),
+                    high_watermark,
+                    key_bytes,
+                ),
+            )
+            .await
+        } else {
+            c.query(
+                "record_fetch.sql",
+                (
+                    self.cluster.as_str(),
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                    (max_bytes as i64),
+                    high_watermark,
+                ),
+            )
+            .await
+        }
+        .inspect_err(|err| error!(?err))?;
 
-        let records = async {
-            if let Some(key) = key_filter {
-                let key_bytes = key.as_bytes().to_vec();
-                c.query(
-                    "record_fetch_keyed.sql",
-                    (
-                        self.cluster.as_str(),
-                        base_topic,
-                        topition.partition(),
-                        offset,
-                        (max_bytes as i64),
-                        high_watermark,
-                        key_bytes,
-                    ),
-                )
-                .await
-                .inspect_err(|err| error!(?err))
-            } else {
-                c.query(
-                    "record_fetch.sql",
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+
+        // This loop can run past the read's deadline by the time that it takes to read one full
+        // channel of records, with the header query of each. The caller stops the read at its
+        // deadline only while the read waits. libSQL reads each row synchronously inside `next`,
+        // without waiting, so the read waits only when its channel is full.
+        //
+        // A step that waits for a lock blocks for up to the connection's busy timeout, so the
+        // read can overrun its deadline by that much. In WAL mode a read waits for a lock only
+        // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
+        // configured instead of shrinking to the time left, because it applies to each wait and
+        // is shared with every later user of the pooled connection.
+        while let Some(row) = records.next().await? {
+            let offset = row
+                .get::<i64>(0)
+                .inspect(|offset| debug!(offset))
+                .inspect_err(|err| error!(?err))?;
+
+            let mut headers = vec![];
+
+            let mut header_rows = c
+                .query(
+                    "header_fetch.sql",
                     (
                         self.cluster.as_str(),
                         topition.topic(),
                         topition.partition(),
                         offset,
-                        (max_bytes as i64),
-                        high_watermark,
                     ),
                 )
-                .await
-                .inspect_err(|err| error!(?err))
-            }
-        };
+                .await?;
 
-        let Ok(records) = read_deadline.timeout(records).await else {
-            return Ok(vec![]);
-        };
+            while let Some(header) = header_rows.next().await? {
+                let mut header_builder = Header::builder();
 
-        let mut records = records?;
-
-        let mut batches = vec![];
-
-        if let Some(row) = records.next().await? {
-            let offset_delta = 0;
-            let timestamp_delta = 0;
-
-            let base_offset = row
-                .get::<i64>(0)
-                .inspect(|base_offset| debug!(base_offset))
-                .inspect_err(|err| error!(?err))?;
-
-            let record_builder = {
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(
-                        row.get::<Option<Vec<u8>>>(3)
-                            .map(|o| o.map(Bytes::from))
-                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    )
-                    .value(
-                        row.get::<Option<Vec<u8>>>(4)
-                            .map(|o| o.map(Bytes::from))
-                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    );
-
-                let mut headers = c
-                    .query(
-                        "header_fetch.sql",
-                        (
-                            self.cluster.as_str(),
-                            topition.topic(),
-                            topition.partition(),
-                            base_offset,
-                        ),
-                    )
-                    .await?;
-
-                while let Some(header) = headers.next().await? {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .get::<Option<Vec<u8>>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
-                    }
-
-                    if let Some(v) = header
-                        .get::<Option<Vec<u8>>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
+                if let Some(k) = header
+                    .get::<Option<Vec<u8>>>(0)
+                    .inspect_err(|err| error!(?err))?
+                {
+                    header_builder = header_builder.key(Bytes::from(k));
                 }
 
-                record_builder
-            };
+                if let Some(v) = header
+                    .get::<Option<Vec<u8>>>(1)
+                    .inspect_err(|err| error!(?err))?
+                {
+                    header_builder = header_builder.value(Bytes::from(v));
+                }
 
-            let mut batch_builder = inflated::Batch::builder()
-                .base_offset(base_offset)
-                .attributes(
-                    row.get::<Option<i32>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))? as i16,
-                )
-                .base_timestamp(
-                    row.get_value(2)
-                        .map_err(Error::from)
-                        .and_then(LiteTimestamp::millis)
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    row.get::<Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(i16::try_from(
-                    row.get::<Option<i32>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?)
-                .record(record_builder)
-                .last_offset_delta(offset_delta);
+                headers.push(header_builder);
+            }
 
-            // libSQL steps the statement synchronously inside `next`, so the timer of
-            // `read_deadline` can't interrupt a row. The loop checks the deadline after each row.
-            //
-            // A step that waits for a lock blocks for up to the connection's busy timeout, so
-            // the read can overrun its deadline by that much. In WAL mode a read waits for a
-            // lock only rarely, such as while a checkpoint restarts the log. The busy timeout
-            // stays as configured instead of shrinking to the time left, because it applies
-            // to each wait and is shared with every later user of the pooled connection.
-            while let Some(row) = records.next().await?
-                && read_deadline.continue_reading().is_ok()
-            {
-                let attributes = row
-                    .get::<Option<i32>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))? as i16;
-
-                let producer_id = row
-                    .get::<Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = i16::try_from(
-                    row.get::<Option<i32>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?;
-
-                let timestamp = row
+            data.send_record(FetchedRecord {
+                offset,
+                timestamp: row
                     .get_value(2)
                     .map_err(Error::from)
                     .and_then(LiteTimestamp::millis)
                     .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
-                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
-                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
-                // produce request, so one batch cannot hold two such times.
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
-                        && timestamp != batch_builder.base_timestamp)
-                {
-                    batches.push(
-                        batch_builder
-                            .max_timestamp_of_records()
-                            .build()
-                            .and_then(TryInto::try_into)?,
-                    );
-
-                    batch_builder = inflated::Batch::builder()
-                        .base_offset(
-                            row.get::<i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(timestamp)
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = row
-                    .get::<i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = timestamp - batch_builder.base_timestamp;
-
-                let record_builder = {
-                    let mut record_builder = Record::builder()
-                        .offset_delta(offset_delta)
-                        .timestamp_delta(timestamp_delta)
-                        .key(
-                            row.get::<Option<Vec<u8>>>(3)
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .value(
-                            row.get::<Option<Vec<u8>>>(4)
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        );
-
-                    let mut headers = c
-                        .query(
-                            "header_fetch.sql",
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
-                        let mut header_builder = Header::builder();
-
-                        if let Some(k) = header
-                            .get::<Option<Vec<u8>>>(0)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(Bytes::from(k));
-                        }
-
-                        if let Some(v) = header
-                            .get::<Option<Vec<u8>>>(1)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(Bytes::from(v));
-                        }
-
-                        record_builder = record_builder.header(header_builder);
-                    }
-
-                    record_builder
-                };
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
-            }
-
-            batches.push(
-                batch_builder
-                    .max_timestamp_of_records()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
-        } else {
-            batches.push(
-                inflated::Batch::builder()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
+                    .inspect_err(|err| error!(?err))?,
+                attributes: row
+                    .get::<Option<i32>>(1)
+                    .map(|attributes| attributes.unwrap_or(0))
+                    .inspect_err(|err| error!(?err))? as i16,
+                producer_id: row
+                    .get::<Option<i64>>(6)
+                    .map(|producer_id| producer_id.unwrap_or(-1))
+                    .inspect_err(|err| error!(?err))?,
+                producer_epoch: i16::try_from(
+                    row.get::<Option<i32>>(7)
+                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                )?,
+                key: row
+                    .get::<Option<Vec<u8>>>(3)
+                    .map(|o| o.map(Bytes::from))
+                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?,
+                value: row
+                    .get::<Option<Vec<u8>>>(4)
+                    .map(|o| o.map(Bytes::from))
+                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?,
+                headers,
+            })
+            .await?;
         }
 
-        Ok(batches).inspect(|_| {
-            if let Ok(elapsed) = started_at.elapsed() {
-                DELEGATE_REQUEST_DURATION.record(
-                    elapsed.as_millis() as u64,
-                    &[StorageOperation::Fetch.attribute()],
-                )
-            }
-        })
+        if let Ok(elapsed) = started_at.elapsed() {
+            DELEGATE_REQUEST_DURATION.record(
+                elapsed.as_millis() as u64,
+                &[StorageOperation::Fetch.attribute()],
+            )
+        }
+
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -5856,11 +5682,12 @@ mod tests {
     use nisshi_sans_io::Compression;
     use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
-    use tokio::{fs::remove_file, task::yield_now};
+    use tokio::{fs::remove_file, task::yield_now, time::Instant};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+    use nisshi_storage::fetched::FetchUntilDeadline as _;
 
     #[test]
     fn timestamp_from_null_is_an_error() {
@@ -6435,7 +6262,7 @@ mod tests {
         assert_eq!(0, offset);
 
         let fetched = engine
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6444,6 +6271,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
             )
             .await
+            .map(|read| read.batches)
             .inspect(|fetched| debug!(?fetched))?;
 
         assert_eq!(1, fetched.len());
@@ -6511,7 +6339,7 @@ mod tests {
         _ = engine.produce(None, &topition, batch).await?;
 
         let fetch = |deadline| {
-            engine.fetch(
+            engine.fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6521,12 +6349,15 @@ mod tests {
             )
         };
 
-        assert!(fetch(Instant::now()).await?.is_empty());
+        assert!(fetch(Instant::now()).await?.batches.is_empty());
 
         // The record is there, so the empty fetch above comes from its deadline.
         assert_eq!(
             1,
-            fetch(Instant::now() + Duration::from_secs(1)).await?.len()
+            fetch(Instant::now() + Duration::from_secs(1))
+                .await?
+                .batches
+                .len()
         );
 
         Ok(())
@@ -6540,7 +6371,7 @@ mod tests {
         deadline: Instant,
     ) -> Result<u32> {
         storage
-            .fetch(
+            .fetch_until_deadline(
                 topition,
                 0,
                 0,
@@ -6549,6 +6380,7 @@ mod tests {
                 deadline,
             )
             .await
+            .map(|read| read.batches)
             .map(|fetched| fetched.iter().map(|batch| batch.record_count).sum())
     }
 
@@ -6721,7 +6553,7 @@ mod tests {
         );
 
         let fetched = engine
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6729,7 +6561,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(1),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
         let records: Vec<_> = fetched
             .into_iter()
             .map(inflated::Batch::try_from)
