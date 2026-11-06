@@ -38,6 +38,8 @@ mod list_partition_reassignments;
 mod metadata;
 mod produce;
 #[cfg(test)]
+mod produce_budget;
+#[cfg(test)]
 mod produce_inflated_forwarding;
 pub mod read_deadline;
 pub mod read_share;

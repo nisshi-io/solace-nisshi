@@ -26,6 +26,28 @@ PostgreSQL can stream transaction logs to an archive with
 
 Nisshi OSS is provided as-is, with [community support][nisshi-community] only.
 
+## Memory held by Produce requests
+
+The broker decodes every batch in a Produce request before it hands it to the storage engine, to validate it. A compressed batch can decode to much more than it was sent as: a few KB of repeated records decode to up to 100 MiB, the limit on one decoded batch. The engine may then wait, for a PostgreSQL or libSQL connection, for the partition's write lock, or for the object store, while it holds the decoded batch. So the broker limits the bytes of decoded batches that Produce requests hold at once. This covers every storage engine.
+
+`--produce-decoded-bytes` (`PRODUCE_DECODED_BYTES`) sets that limit in bytes. The default is 1 GiB, or 100 MiB for each runtime worker thread when that is more, so that the limit never allows fewer decodes at once than the broker has workers. A Produce request reserves bytes before it decodes a batch, and keeps them until the storage engine returns. A compressed batch reserves 100 MiB, because nothing in it says how large it decodes, and returns what it did not use as soon as the decode ends. An uncompressed batch reserves at most 32 times its record data. Because of that reservation, a broker holds fewer decoded batches than the limit when the batches are compressed: the next decode starts only when 100 MiB of the limit are free. A limit below 100 MiB lets one compressed batch at a time decode.
+
+A request that cannot get its bytes waits, holding only the batch as it was sent. This is back-pressure, as in Kafka when its request queue is full: the producer sees a slow response and nothing else. A request waits at most 10 seconds in total, for all its partitions. Only the time that it waits for the budget counts: the time that an earlier partition spends decoding or in the storage engine does not use up the wait of a later one. After the wait is spent, each partition that has not started answers `REQUEST_TIMED_OUT`, which Kafka producers retry, with the message `the broker is holding too many decoded produce batches, retry the request`, and the broker logs a warning with the topic, the partition and the bytes it asked for. With `acks=0` a failed partition closes the connection, as for every Produce error. Requests are served in the order they arrive, so a small batch that arrives behind a compressed batch that is waiting for its 100 MiB also waits, until that batch has its bytes. A batch that decodes to more than the whole limit gets the whole limit and runs alone.
+
+The limit counts the bytes that the decoder charges to a batch, which is a lower bound of its memory. The decoder's own working memory, such as a zstd window of up to 128 MiB, is not counted, so the memory of the decoded batches is at most the limit plus that working memory for each concurrent decode.
+
+The metrics are `nisshi_produce_decoded_bytes_in_use` (bytes held now), `nisshi_produce_decoded_budget_wait_duration` (milliseconds a request waited) and `nisshi_produce_decoded_budget_exhausted` (partitions answered `REQUEST_TIMED_OUT`). A rising `nisshi_produce_decoded_budget_exhausted` means the engine is slower than the producers, and a larger limit only helps if the broker has the memory for it. Look at the engine first: for PostgreSQL, see `pool_max_size` below.
+
+A request holds its bytes until the engine returns, also when the engine has dropped the decoded batch earlier. The memory and object store engines drop it before their first round trip unless a schema or a lake needs the records, so a slow object store keeps the limit used up for longer than the memory it protects.
+
+Kafka 3.9.1 limits requests, not bytes. It stops reading requests from the network when `queued.max.requests` (500) requests wait for a handler thread ([SocketServerConfigs.java#L168-L169], [RequestChannel.scala#L366]), counted as they were sent, and `queued.max.request.bytes` has no limit by default ([SocketServerConfigs.java#L172-L173]). It validates a compressed batch inside the partition's log lock, on a request handler thread ([UnifiedLog.scala#L790-L813]), and with the default `compression.type=producer` streams the records through the decompressor instead of keeping them ([LogValidator.java#L309-L351]). So a produce that waits for the log lock holds only the compressed batch, and at most `num.io.threads` (8) batches are being decompressed. Nisshi decodes before the engine's lock, so that a decode does not hold a connection or the lock, and its engines, the schema registry and the lake read the decoded records, so it limits bytes instead.
+
+[SocketServerConfigs.java#L168-L169]: https://github.com/apache/kafka/blob/3.9.1/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java#L168-L169
+[SocketServerConfigs.java#L172-L173]: https://github.com/apache/kafka/blob/3.9.1/server/src/main/java/org/apache/kafka/network/SocketServerConfigs.java#L172-L173
+[RequestChannel.scala#L366]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/RequestChannel.scala#L366
+[UnifiedLog.scala#L790-L813]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L790-L813
+[LogValidator.java#L309-L351]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L309-L351
+
 ## Running Docker Compose with S3 (MinIO)
 
 The following will configure a S3 storage engine
