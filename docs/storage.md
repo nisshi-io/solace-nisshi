@@ -218,6 +218,20 @@ where l.relation = 'record'::regclass;
 
 A session whose `state` is `idle in transaction` holds its locks until its transaction ends. Another broker's maintenance sweep can also hold a lock for a short time. `pg_blocking_pids(pid)` lists the sessions that block a given session.
 
+A broker that finds another broker setting up or upgrading the schema waits for that broker, and serves no request meanwhile. It waits for 5 minutes, then stops with an error that names the wait and leaves the database as it was. Start the broker again to retry. Set `schema_lock_timeout` in the storage URL to change the wait, to a duration from 1ms to 24d, such as `30s` or `10m`. The wait ignores any `lock_timeout` and `statement_timeout` that the storage URL sets, and the setup that follows uses them again. Raise it when an upgrade can take longer than 5 minutes, so that the other brokers wait for it instead of stopping. To find the session that holds the schema lock, run this query:
+
+```sql
+select a.pid, a.state, a.query_start, a.query
+from pg_locks l join pg_stat_activity a using (pid)
+where l.locktype = 'advisory' and l.granted;
+```
+
+This storage URL raises the wait to 10 minutes:
+
+```shell
+nisshi broker --storage-engine "postgres://nisshi:secret@db.example.com/nisshi?schema_lock_timeout=10m"
+```
+
 Nisshi is tested on PostgreSQL 16 and later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
 
 A broker opens at most 16 connections to PostgreSQL. Set `pool_max_size` in the storage URL to change that, to a number from 2 to 262143. ListOffsets and Fetch requests can each use at most half of them, so a larger pool lets more consumers read at once. Together they can hold every connection, and then other requests wait for one, so a pool smaller than 16 makes slow reads more likely to hold up produce and group requests. When the `nisshi_storage_read_deadline_exceeded` metric rises with `wait` set to `engine_connection_pool` or `engine_read_limit`, reads are waiting for a connection or for the half of the pool that their kind of read may use, and a larger pool can help. With `wait` set to `connection_read_limit`, one client connection has more reads in flight than it may hold at once, and a larger pool does not help. The server's `max_connections` must allow `pool_max_size` connections for each broker, plus every other client's. The broker does not check this at startup, so a pool that is too large fails requests under load instead. The broker also reserves memory for every connection the pool may open, so a very large `pool_max_size` costs memory even when the connections are not open:

@@ -262,11 +262,17 @@ fn schema_version_message(
                 .map(|constraint| format!(", constraint {constraint}"))
                 .unwrap_or_default(),
         )),
+        nisshi_storage::Error::SchemaLockTimeout { timeout } => Some(format!(
+            "storage {storage} could not set up its schema: it waited {timeout:?} for the schema \
+                lock, and another broker still held it. That broker is probably running a schema \
+                upgrade. The database is unchanged. Start the broker again after the upgrade \
+                finishes, or raise schema_lock_timeout in the storage URL. To find the session \
+                that holds the lock, see docs/storage.md."
+        )),
         nisshi_storage::Error::Api(ErrorCode::RequestTimedOut) => Some(format!(
             "storage {storage} failed its schema setup because a statement or a wait passed its \
-                time limit: a schema upgrade step, the wait for another broker's upgrade, or the \
-                wait for a database connection. The setup rolled back and the database is \
-                unchanged. Start the broker again to retry."
+                time limit: a schema upgrade step or the wait for a database connection. The \
+                setup rolled back and the database is unchanged. Start the broker again to retry."
         )),
         _ => None,
     }
@@ -709,9 +715,31 @@ mod tests {
         .unwrap();
 
         assert!(message.contains("a schema upgrade step"));
-        assert!(message.contains("the wait for another broker's upgrade"));
+        assert!(message.contains("the wait for a database connection"));
         assert!(message.contains("the database is unchanged"));
         assert!(message.contains("Start the broker again to retry"));
+    }
+
+    /// A wait for the schema lock that reaches its budget names the wait, the option that sets it
+    /// and where to find the broker that holds the lock.
+    #[test]
+    fn schema_version_message_names_the_option_that_bounds_the_wait_for_the_schema_lock() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::SchemaLockTimeout {
+                timeout: Duration::from_secs(300),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            "storage postgres://db/nisshi could not set up its schema: it waited 300s for the \
+                schema lock, and another broker still held it. That broker is probably running a \
+                schema upgrade. The database is unchanged. Start the broker again after the \
+                upgrade finishes, or raise schema_lock_timeout in the storage URL. To find the \
+                session that holds the lock, see docs/storage.md.",
+            message
+        );
     }
 
     /// A step that the role isn't allowed to run keeps the advice about the role that owns the

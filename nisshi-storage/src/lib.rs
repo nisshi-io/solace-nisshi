@@ -369,6 +369,12 @@ pub enum Error {
         constraint: Option<Box<str>>,
     },
 
+    /// A broker waited `timeout` for the schema lock, which another broker holds while it sets up
+    /// or upgrades the schema, and stopped waiting. The database is unchanged.
+    SchemaLockTimeout {
+        timeout: Duration,
+    },
+
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
 
@@ -618,6 +624,7 @@ impl Error {
             | Self::UnversionedSchema { .. }
             | Self::MissingClusterTable { .. }
             | Self::SchemaStepFailed { .. }
+            | Self::SchemaLockTimeout { .. }
             | Self::InsufficientCapacity(_)
             | Self::LessThanBaseOffset { .. }
             | Self::LessThanLastOffset { .. }

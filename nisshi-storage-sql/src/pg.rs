@@ -169,6 +169,9 @@ pub struct Postgres {
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
+    /// How long [`Postgres::ensure_schema`] waits for the schema lock that another broker holds,
+    /// see [`SCHEMA_LOCK_TIMEOUT`].
+    schema_lock_timeout: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -183,6 +186,7 @@ pub struct Builder<C, N, L, P> {
     read_limits: ReadLimits,
     cancel: Option<CancelRequests>,
     abandoned_statement_bound: Duration,
+    schema_lock_timeout: Duration,
     schemas: Option<Registry>,
     lake: Option<House>,
 }
@@ -197,6 +201,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
+            schema_lock_timeout: self.schema_lock_timeout,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -211,6 +216,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
+            schema_lock_timeout: self.schema_lock_timeout,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -225,6 +231,7 @@ impl<C, N, L, P> Builder<C, N, L, P> {
             read_limits: self.read_limits,
             cancel: self.cancel,
             abandoned_statement_bound: self.abandoned_statement_bound,
+            schema_lock_timeout: self.schema_lock_timeout,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -339,6 +346,7 @@ impl Builder<String, i32, Url, PoolParts> {
             list_offsets_reads_per_client: self.read_limits.list_offsets_per_client(),
             fetch_reads_per_client: self.read_limits.fetch_per_client(),
             abandoned_statement_bound: self.abandoned_statement_bound,
+            schema_lock_timeout: self.schema_lock_timeout,
             schemas: self.schemas,
             lake: self.lake,
         }
@@ -589,6 +597,23 @@ const _: () = assert!(RELEASE_SCHEMA.is_consistent());
 /// application's key.
 const SCHEMA_LOCK: i64 = i64::from_be_bytes(*b"\0\0nisshi");
 
+/// The storage URL option that sets how long [`Postgres::ensure_schema`] waits for the schema lock
+/// that another broker holds.
+const SCHEMA_LOCK_TIMEOUT: &str = "schema_lock_timeout";
+
+/// How long a broker waits for the schema lock when the storage URL does not set
+/// [`SCHEMA_LOCK_TIMEOUT`].
+const DEFAULT_SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// The range of [`SCHEMA_LOCK_TIMEOUT`]. A `lock_timeout` of 0 never expires, so the range starts
+/// above 0. The server keeps `lock_timeout` as milliseconds in an `i32`, which is a little under
+/// 25 days, so the range ends at 24 days.
+const SCHEMA_LOCK_TIMEOUT_RANGE: RangeInclusive<Duration> =
+    Duration::from_millis(1)..=Duration::from_hours(24 * 24);
+
+/// What [`SCHEMA_LOCK_TIMEOUT`] takes. Every example here must parse (see the tests).
+const SCHEMA_LOCK_TIMEOUT_EXPECTED: &str = "a duration from 1ms to 24d, such as 30s or 5m";
+
 /// Postgres statement timeout applied to every connection by default, so a stalled query
 /// (e.g. a lock wait) is aborted server-side instead of holding a pooled connection open
 /// indefinitely. An operator's own `?options=-c%20statement_timeout%3D...` in the connection
@@ -718,6 +743,18 @@ fn schema_step_failure(from_version: i32, to_version: i32, error: tokio_postgres
     }
 }
 
+/// Returns the error for a wait for the schema lock that failed with `error`.
+///
+/// A wait that reached its `lock_timeout` of `timeout` becomes [`Error::SchemaLockTimeout`], and
+/// any other failure keeps the conversion of [`Error::from`].
+fn schema_lock_wait_failure(error: tokio_postgres::Error, timeout: Duration) -> Error {
+    if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
+        return Error::SchemaLockTimeout { timeout };
+    }
+
+    Error::from(error)
+}
+
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
 /// Postgres applies `-c name=value` startup options in order with last-one-wins semantics,
@@ -831,6 +868,26 @@ fn take_client_read_share(config: &mut String) -> Result<Option<usize>> {
     )
 }
 
+/// Removes every [`SCHEMA_LOCK_TIMEOUT`] option from `config`, a connection URL, and returns the
+/// wait that the last one sets, or [`DEFAULT_SCHEMA_LOCK_TIMEOUT`] when the URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a duration in
+/// [`SCHEMA_LOCK_TIMEOUT_RANGE`], as [`parse_storage_option`] does for every storage option.
+fn take_schema_lock_timeout(config: &mut String) -> Result<Duration> {
+    take_option(
+        config,
+        SCHEMA_LOCK_TIMEOUT,
+        SCHEMA_LOCK_TIMEOUT_EXPECTED,
+        |value| {
+            human_units::Duration::from_str(value)
+                .ok()
+                .map(|duration| duration.0)
+                .filter(|duration| SCHEMA_LOCK_TIMEOUT_RANGE.contains(duration))
+        },
+    )
+    .map(|timeout| timeout.unwrap_or(DEFAULT_SCHEMA_LOCK_TIMEOUT))
+}
+
 /// Removes every `option` from `config`, a connection URL, and returns what
 /// `parse` makes of the last one's value, or `None` when the URL sets none.
 ///
@@ -892,6 +949,7 @@ where
             client_percent,
             ..ReadLimits::for_pool(pool_max_size)
         };
+        let schema_lock_timeout = take_schema_lock_timeout(&mut config)?;
         info!(
             pool_max_size,
             list_offsets_reads = read_limits.list_offsets,
@@ -962,6 +1020,7 @@ where
             read_limits,
             cancel,
             abandoned_statement_bound,
+            schema_lock_timeout,
             advertised_listener,
             node: N::default(),
             cluster: C::default(),
@@ -2137,6 +2196,9 @@ impl Postgres {
     /// This function runs no DDL on a database that records a version that it can use as it is.
     /// A database user that cannot create or alter tables can therefore start a broker on such a
     /// database.
+    ///
+    /// Returns [`Error::SchemaLockTimeout`] when another broker holds the schema lock for longer
+    /// than the `schema_lock_timeout` of the storage URL.
     pub(crate) async fn ensure_schema(&self) -> Result<()> {
         self.ensure_schema_of(&RELEASE_SCHEMA, SCHEMA).await
     }
@@ -2169,13 +2231,6 @@ impl Postgres {
             .start()
             .await?;
 
-        // This transaction sets its own `statement_timeout`, because an operator's short timeout
-        // bounds a request and can abort this setup. The setup can wait for another broker's lock
-        // below. A broker whose lock wait reaches 5 minutes exits. Its orchestrator then restarts
-        // it.
-        tx.batch_execute("SET LOCAL statement_timeout = '5min'")
-            .await?;
-
         // The server ends this session when the session stays idle in this transaction for a
         // minute. The lock of a broker that stops answering is then released after a minute,
         // instead of when TCP keepalive notices that the broker is gone.
@@ -2194,10 +2249,30 @@ impl Postgres {
             .await?
             .try_get::<_, bool>(0)?;
         if !locked_at_once {
-            info!("waiting for another broker to set up the schema");
+            info!(
+                timeout = ?self.schema_lock_timeout,
+                "waiting for another broker to set up the schema"
+            );
+
+            // The wait ends at its `lock_timeout`, which applies to an advisory lock as well. The
+            // `statement_timeout` is off for the wait, because the operator's own timeout bounds a
+            // request and would end the wait before `schema_lock_timeout` does.
+            tx.batch_execute(&format!(
+                "SET LOCAL lock_timeout = '{}ms'; SET LOCAL statement_timeout = 0",
+                self.schema_lock_timeout.as_millis()
+            ))
+            .await?;
             tx.batch_execute(&format!("select pg_advisory_xact_lock({SCHEMA_LOCK})"))
+                .await
+                .map_err(|err| schema_lock_wait_failure(err, self.schema_lock_timeout))?;
+            tx.batch_execute("SET LOCAL lock_timeout TO DEFAULT")
                 .await?;
         }
+
+        // This transaction sets its own `statement_timeout`, because an operator's short timeout
+        // bounds a request and can abort the creation of the schema.
+        tx.batch_execute("SET LOCAL statement_timeout = '5min'")
+            .await?;
 
         // The search path is pinned before the version is read, so that the version, the steps and
         // the version update all resolve to the namespace that holds the tables. A stale
@@ -2272,8 +2347,7 @@ impl Postgres {
         // locks that the steps take. The statement timeout drops from the setup's 5 minutes to
         // the timeout of a request, because a step that holds a table lock stalls every request on
         // that table. `DEFAULT` resets it to the value that the connection started with, which is
-        // the operator's own timeout from the URL or [`DEFAULT_STATEMENT_TIMEOUT_MS`]. The
-        // brokers that wait for the schema lock keep the 5 minutes in their own sessions.
+        // the operator's own timeout from the URL or [`DEFAULT_STATEMENT_TIMEOUT_MS`].
         tx.batch_execute(&format!(
             "SET LOCAL lock_timeout = '{STEP_LOCK_TIMEOUT}'; \
              SET LOCAL statement_timeout TO DEFAULT"
@@ -6996,6 +7070,94 @@ mod tests {
         for size in [*POOL_MAX_SIZE_RANGE.start(), *POOL_MAX_SIZE_RANGE.end()] {
             let mut config = format!("postgres://h/db?pool_max_size={size}");
             assert_eq!(size, take_pool_max_size(&mut config)?);
+        }
+
+        Ok(())
+    }
+
+    /// A `schema_lock_timeout` that is not a duration in [`SCHEMA_LOCK_TIMEOUT_RANGE`] stops the
+    /// build before any connection, and the error names the option and its value.
+    #[test]
+    fn schema_lock_timeout_rejects_invalid_values() {
+        for value in ["banana", "", "0", "0s", "500us", "25d", "-1s"] {
+            let error = Postgres::builder(&format!("{}?schema_lock_timeout={value}", *CONNECTION))
+                .expect_err(value);
+
+            assert_matches!(
+                &error,
+                Error::InvalidStorageOptionValue { scheme, option, value: rejected, expected }
+                    if scheme == "postgres"
+                        && option == SCHEMA_LOCK_TIMEOUT
+                        && rejected == value
+                        && *expected == SCHEMA_LOCK_TIMEOUT_EXPECTED,
+                "{value}"
+            );
+        }
+    }
+
+    /// [`take_schema_lock_timeout`] removes every `schema_lock_timeout` from the URL and keeps the
+    /// bytes of every other option, including `pool_max_size`. The last `schema_lock_timeout` wins.
+    #[test]
+    fn take_schema_lock_timeout_removes_only_its_option() -> Result<()> {
+        for (config, expected) in [
+            ("postgres://h/db?schema_lock_timeout=30s", "postgres://h/db"),
+            (
+                "postgres://h/db?pool_max_size=4&schema_lock_timeout=30s",
+                "postgres://h/db?pool_max_size=4",
+            ),
+            (
+                "postgres://h/db?options=-c%20search_path%3Dfoo&schema_lock_timeout=30s&sslmode=require",
+                "postgres://h/db?options=-c%20search_path%3Dfoo&sslmode=require",
+            ),
+            (
+                "postgres://h/db?schema_lock_timeout=1h&sslmode=require&schema_lock_timeout=30s",
+                "postgres://h/db?sslmode=require",
+            ),
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(
+                Duration::from_secs(30),
+                take_schema_lock_timeout(&mut stripped)?,
+                "{config}"
+            );
+            assert_eq!(expected, stripped, "{config}");
+        }
+
+        Ok(())
+    }
+
+    /// A URL without `schema_lock_timeout` keeps every byte, and the wait gets
+    /// [`DEFAULT_SCHEMA_LOCK_TIMEOUT`].
+    #[test]
+    fn take_schema_lock_timeout_defaults_without_its_option() -> Result<()> {
+        for config in [
+            "postgres://h/db",
+            "postgres://h/db?pool_max_size=4&options=-c%20search_path%3Dfoo",
+        ] {
+            let mut stripped = config.to_owned();
+            assert_eq!(
+                DEFAULT_SCHEMA_LOCK_TIMEOUT,
+                take_schema_lock_timeout(&mut stripped)?,
+                "{config}"
+            );
+            assert_eq!(config, stripped);
+        }
+
+        Ok(())
+    }
+
+    /// Both ends of [`SCHEMA_LOCK_TIMEOUT_RANGE`] are accepted, and so is every example in
+    /// [`SCHEMA_LOCK_TIMEOUT_EXPECTED`].
+    #[test]
+    fn take_schema_lock_timeout_accepts_its_range_and_its_examples() -> Result<()> {
+        for (value, expected) in [
+            ("1ms", *SCHEMA_LOCK_TIMEOUT_RANGE.start()),
+            ("24d", *SCHEMA_LOCK_TIMEOUT_RANGE.end()),
+            ("30s", Duration::from_secs(30)),
+            ("5m", Duration::from_mins(5)),
+        ] {
+            let mut config = format!("postgres://h/db?schema_lock_timeout={value}");
+            assert_eq!(expected, take_schema_lock_timeout(&mut config)?, "{value}");
         }
 
         Ok(())
@@ -14111,6 +14273,159 @@ mod tests {
                     recorded_version(&database.storage()?).await?,
                     Some(SCHEMA_VERSION)
                 );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A broker that waits for the schema lock must stop at its `schema_lock_timeout` with
+    /// [`Error::SchemaLockTimeout`], leave the database unchanged, and set up the schema when it
+    /// starts again after the other broker has released the lock.
+    #[tokio::test]
+    async fn ensure_schema_stops_waiting_for_the_schema_lock_at_its_schema_lock_timeout()
+    -> Result<()> {
+        with_empty_database(
+            "ensure_schema_stops_waiting_for_the_schema_lock_at_its_schema_lock_timeout",
+            async |database| {
+                let holder_storage = database.storage()?;
+                let holder = holder_storage.connection().await?;
+                holder
+                    .batch_execute(&format!("select pg_advisory_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("schema_lock_timeout=500ms"));
+                let storage = database.storage_at(&url)?;
+
+                // Without a lock timeout of its own, the wait would last 5 minutes, so this timeout
+                // fails the test instead.
+                let started = Instant::now();
+                let outcome = timeout(Duration::from_secs(30), storage.ensure_schema())
+                    .await
+                    .map_err(|_| {
+                        Error::Message("the wait for the schema lock never ended".into())
+                    })?;
+                assert_matches!(
+                    outcome,
+                    Err(Error::SchemaLockTimeout { timeout })
+                        if timeout == Duration::from_millis(500)
+                );
+                assert!(started.elapsed() >= Duration::from_millis(500));
+
+                holder
+                    .batch_execute(&format!("select pg_advisory_unlock({SCHEMA_LOCK})"))
+                    .await?;
+                // The failed setup created nothing, so the version table does not exist.
+                assert!(recorded_version(&storage).await.is_err());
+
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The wait for the schema lock must outlast the operator's own `statement_timeout`, which
+    /// bounds a request, and ends only at `schema_lock_timeout`.
+    #[tokio::test]
+    async fn ensure_schema_waits_for_the_schema_lock_longer_than_the_statement_timeout_of_the_url()
+    -> Result<()> {
+        with_empty_database(
+            "ensure_schema_waits_for_the_schema_lock_longer_than_the_statement_timeout_of_the_url",
+            async |database| {
+                let holder_storage = database.storage()?;
+                let holder = holder_storage.connection().await?;
+                holder
+                    .batch_execute(&format!("select pg_advisory_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some(
+                    "options=-c%20statement_timeout%3D100&schema_lock_timeout=30s",
+                ));
+                let storage = database.storage_at(&url)?;
+                let setup = tokio::spawn({
+                    let storage = storage.clone();
+                    async move { storage.ensure_schema().await }
+                });
+
+                // The wait passes the 100ms of the URL's `statement_timeout`.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                assert!(!setup.is_finished());
+
+                holder
+                    .batch_execute(&format!("select pg_advisory_unlock({SCHEMA_LOCK})"))
+                    .await?;
+                setup.await??;
+
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A setup that waited for the schema lock must create the schema with the setup's own
+    /// `statement_timeout` and with the `lock_timeout` that the connection started with, and not
+    /// with the settings of the wait.
+    #[tokio::test]
+    async fn ensure_schema_creates_the_schema_with_its_own_timeouts_after_it_waited_for_the_lock()
+    -> Result<()> {
+        const RECORDS_CREATE_SETTINGS: &str = "create table create_settings as select \
+             current_setting('statement_timeout') as statement_timeout, \
+             current_setting('lock_timeout') as lock_timeout";
+
+        with_empty_database(
+            "ensure_schema_creates_the_schema_with_its_own_timeouts_after_it_waited_for_the_lock",
+            async |database| {
+                let holder_storage = database.storage()?;
+                let holder = holder_storage.connection().await?;
+                holder
+                    .batch_execute(&format!("select pg_advisory_lock({SCHEMA_LOCK})"))
+                    .await?;
+
+                let mut url = database.url()?;
+                // The operator's own `lock_timeout` must outlast the wait.
+                url.set_query(Some(
+                    "schema_lock_timeout=30s&options=-c%20lock_timeout%3D2s",
+                ));
+                let storage = database.storage_at(&url)?;
+                let setup = tokio::spawn({
+                    let storage = storage.clone();
+                    async move {
+                        storage
+                            .ensure_schema_of(&RELEASE_SCHEMA, RECORDS_CREATE_SETTINGS)
+                            .await
+                    }
+                });
+
+                // The setup must be waiting before the lock is released.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                assert!(!setup.is_finished());
+
+                holder
+                    .batch_execute(&format!("select pg_advisory_unlock({SCHEMA_LOCK})"))
+                    .await?;
+                setup.await??;
+
+                let connection = storage.connection().await?;
+                let started_with = connection
+                    .query_one("select current_setting('lock_timeout')", &[])
+                    .await?
+                    .try_get::<_, String>(0)?;
+                let row = connection
+                    .query_one(
+                        "select statement_timeout, lock_timeout from create_settings",
+                        &[],
+                    )
+                    .await?;
+                assert_eq!(
+                    (row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?),
+                    ("5min".to_string(), started_with.clone())
+                );
+                assert_eq!("2s", started_with);
                 Ok(())
             },
         )
