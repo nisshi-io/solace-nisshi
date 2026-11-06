@@ -1736,7 +1736,7 @@ impl Postgres {
                     first
                         .try_get::<_, SystemTime>(2)
                         .map_err(Error::from)
-                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                        .and_then(|system_time| from_sql_timestamp(&system_time))
                         .inspect_err(|err| error!(?err))?,
                 )
                 .producer_id(
@@ -1798,7 +1798,7 @@ impl Postgres {
                 let timestamp = record
                     .try_get::<_, SystemTime>(2)
                     .map_err(Error::from)
-                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                    .and_then(|system_time| from_sql_timestamp(&system_time))
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
@@ -2025,6 +2025,9 @@ impl Postgres {
                     debug!(?row);
 
                     row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
+                        // A record without a timestamp is stored before the epoch, which
+                        // `ListOffsetResponse::timestamp` cannot convert. The service answers -1
+                        // for Earliest and Latest, as Kafka does, so that is harmless here.
                         row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
                             debug!(
                                 cluster = self.cluster,
@@ -3048,7 +3051,7 @@ impl Postgres {
 
                     let producer_id = transaction_id.and(Some(inflated.producer_id));
                     let producer_epoch = transaction_id.and(Some(inflated.producer_epoch));
-                    let ts = to_system_time(inflated.record_timestamp(record))?;
+                    let ts = to_sql_timestamp(inflated.record_timestamp(record))?;
 
                     let mut row: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(record_column_types.len());
@@ -6053,9 +6056,67 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The earliest Kafka timestamp, in milliseconds since the epoch, that a PostgreSQL `timestamp`
+/// can hold: 4713 BC.
+const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
+
+/// Returns the instant that the record `timestamp`, in milliseconds since the epoch, is stored as.
+///
+/// A producer can send a record with no timestamp, Kafka's `NO_TIMESTAMP`, -1, and Kafka's broker
+/// accepts it: `LogValidator` skips the range check for it, and a `TimestampBeforeMaxMs` of
+/// `Long.MAX_VALUE` leaves no lower bound for any other negative value either. [`to_system_time`]
+/// rejects a negative timestamp, so a negative one is stored as the instant before the epoch that
+/// it names, which a `timestamp` column and a [`SystemTime`] both hold. It is not stored as null,
+/// though the column allows null, because retention tests the timestamp of each record: a null
+/// never expires, while an instant in 1969 expires with the record's append time, as Kafka's does
+/// by the segment's modification time when it has no timestamp.
+///
+/// <https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L583-L602>
+///
+/// Returns an error for a timestamp that PostgreSQL cannot hold.
+///
+/// Only this write side is checked. The read side of a timestamp before 1601 is unchecked: the
+/// `postgres-types` `FromSql<SystemTime>` conversion and the fetch paths can panic a Windows
+/// broker on a row that a Linux broker wrote (SOL-157762).
+fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
+    if timestamp >= 0 {
+        to_system_time(timestamp).map_err(Into::into)
+    } else if timestamp < MIN_SQL_TIMESTAMP_MS {
+        Err(Error::Message(format!(
+            "timestamp {timestamp} is before the earliest that PostgreSQL stores"
+        )))
+    } else {
+        // `SystemTime - Duration` panics on overflow, and on Windows a `SystemTime` cannot be
+        // earlier than 1601, so a timestamp between `MIN_SQL_TIMESTAMP_MS` and that year must
+        // be an error there. Kafka 3.9.1 accepts such a timestamp on a CreateTime topic with
+        // the default `message.timestamp.before.max.ms`; this broker answers
+        // UNKNOWN_SERVER_ERROR for it, a deliberate difference on Windows only.
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_millis(timestamp.unsigned_abs()))
+            .ok_or_else(|| {
+                Error::Message(format!(
+                    "timestamp {timestamp} is before the earliest that this broker stores"
+                ))
+            })
+    }
+}
+
+/// Returns the Kafka timestamp, in milliseconds since the epoch, of a stored `system_time`.
+/// The inverse of [`to_sql_timestamp`]: an instant before the epoch is a negative timestamp, as
+/// -1 is for a record that was produced without one.
+fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
+    match system_time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(_) => to_timestamp(system_time).map_err(Into::into),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .map(|millis| -millis)
+            .map_err(Into::into),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
     use nisshi_storage::read_share::ClientIdentity;
@@ -6065,6 +6126,57 @@ mod tests {
     use rand::distr::Alphanumeric;
     use std::assert_matches;
     use tokio::task::JoinHandle;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
+        for timestamp in [
+            -1,
+            -2,
+            -86_400_000,
+            0,
+            1,
+            1_700_000_000_000,
+            MIN_SQL_TIMESTAMP_MS,
+        ] {
+            assert_eq!(
+                timestamp,
+                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
+                "{timestamp}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A Windows `SystemTime` cannot be earlier than 1601, so the earliest timestamp that
+    /// PostgreSQL holds is an error there, where it round-trips on other platforms.
+    #[cfg(windows)]
+    #[test]
+    fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
+        for timestamp in [-1, -2, -86_400_000, 0, 1, 1_700_000_000_000] {
+            assert_eq!(
+                timestamp,
+                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
+                "{timestamp}"
+            );
+        }
+        assert_matches!(
+            to_sql_timestamp(MIN_SQL_TIMESTAMP_MS),
+            Err(Error::Message(_))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sql_timestamp_refuses_what_postgres_cannot_hold() {
+        assert_matches!(
+            to_sql_timestamp(MIN_SQL_TIMESTAMP_MS - 1),
+            Err(Error::Message(_))
+        );
+        assert_matches!(to_sql_timestamp(i64::MIN), Err(Error::Message(_)));
+    }
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
     /// service of compose.yaml on its default port.
@@ -12537,6 +12649,64 @@ mod tests {
             (EXPIRED..RECORDS).collect::<Vec<_>>(),
             stored_offsets(&storage, &topition).await?
         );
+
+        Ok(())
+    }
+
+    /// A record produced without a timestamp stores NO_TIMESTAMP, -1, which is an instant before
+    /// the epoch. Retention reads the append time first, so the record is kept while that has not
+    /// expired, and deleted when it has, as a record with any other old timestamp is.
+    #[tokio::test]
+    async fn retention_keeps_a_record_without_a_timestamp_until_its_append_time_expires()
+    -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        produce_at(&storage, &topition, &[-1, -1]).await?;
+        append_times(&storage, &topition, 0, &[now, now]).await?;
+
+        assert_eq!(0, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(vec![0, 1], stored_offsets(&storage, &topition).await?);
+
+        append_times(&storage, &topition, 0, &[now - 600_000, now - 600_000]).await?;
+
+        assert_eq!(2, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            Vec::<i64>::new(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A lookup by timestamp never answers a record without one: Kafka's time index holds no entry
+    /// for it either.
+    #[tokio::test]
+    async fn list_offsets_by_timestamp_skips_a_record_without_a_timestamp() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let now = now_ms()?;
+
+        produce_at(&storage, &topition, &[-1, now]).await?;
+
+        let responses = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(
+                    topition.clone(),
+                    ListOffset::Timestamp(SystemTime::UNIX_EPOCH),
+                )],
+            )
+            .await?;
+
+        assert_eq!(Some(1), responses[0].1.offset);
 
         Ok(())
     }
