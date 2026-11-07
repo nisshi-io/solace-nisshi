@@ -135,6 +135,10 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
                 .map_err(|source| nisshi_storage::Error::NoCredentials(Arc::new(source)))?;
         }
 
+        // DynoStore reads a decoded batch only for a schema registry or a lake.
+        let reads_decoded =
+            configuration.schema_registry.is_some() || configuration.lake_house.is_some();
+
         let storage = DynoStore::new(
             configuration.cluster.as_str(),
             configuration.node_id,
@@ -147,7 +151,8 @@ impl StorageFactory for S3OptimisticConcurrencyEngineFactory {
 
         let storage = ProduceRequestBatcher::new(storage)
             .with_minimum_size(minimum_size)
-            .with_maximum_delay(maximum_delay);
+            .with_maximum_delay(maximum_delay)
+            .with_hold_decoded(reads_decoded);
 
         Ok(Arc::new(Box::new(storage)) as ArcDynStorage)
     }
@@ -198,6 +203,10 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
             maximum_delay,
         } = BatchOptions::parse(&configuration.storage)?;
 
+        // DynoStore reads a decoded batch only for a schema registry or a lake.
+        let reads_decoded =
+            configuration.schema_registry.is_some() || configuration.lake_house.is_some();
+
         GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket_name)
             .build()
@@ -227,6 +236,7 @@ impl StorageFactory for GoogleCloudStorageEngineFactory {
                 ProduceRequestBatcher::new(storage)
                     .with_minimum_size(minimum_size)
                     .with_maximum_delay(maximum_delay)
+                    .with_hold_decoded(reads_decoded)
             })
             .map(Box::new)
             .map(|storage| Arc::new(storage) as ArcDynStorage)

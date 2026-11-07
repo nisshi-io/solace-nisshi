@@ -202,12 +202,12 @@ where
         let start = SystemTime::now();
         let Ok(_permit) = self.semaphore.try_acquire() else {
             drop(inflated);
-            produce_path::fallback();
+            produce_path::fallback(produce_path::Stage::Semaphore);
 
             return self.produce(transaction_id, topition, deflated).await;
         };
 
-        produce_path::direct();
+        produce_path::direct(produce_path::Stage::Semaphore);
         SEMAPHORE_ACQUIRE_DURATION.record(
             elapsed_millis(start),
             &[StorageOperation::Produce.attribute()],
