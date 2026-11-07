@@ -120,7 +120,7 @@ services:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
   lakehouse-catalog:
-    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.15.0@sha256:b02a882df48042020c473a79b980a643fcc883a6f9c21b74c5b7cc8eabeec9fe}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
@@ -150,7 +150,7 @@ services:
     ports:
       - ${NISSHI_LAKEHOUSE_PORTS:-127.0.0.1:8181:8181}
   lakehouse-migrate:
-    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.8.5@sha256:5b0475fff37e47fbef48f36ea2c91daf7035f04b38187b37a5f17639ecbe9cb4}
+    image: ${LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.15.0@sha256:b02a882df48042020c473a79b980a643fcc883a6f9c21b74c5b7cc8eabeec9fe}
     environment:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
