@@ -142,6 +142,9 @@ pub trait FetchUntilDeadline: Storage {
     /// its channel. A read that never waits for I/O stops at the deadline too, because it waits
     /// for room once its channel is full. Everything that the read sent before the deadline,
     /// including the batch that it was building, stays in the returned [`FetchRead`].
+    ///
+    /// A read that fails after it has sent a record also returns what it sent, with its error in
+    /// [`FetchRead::failed`]. A read that fails before it sends a record returns its error.
     fn fetch_until_deadline(
         &self,
         topition: &Topition,
@@ -163,6 +166,8 @@ pub struct FetchRead {
     pub batches: Vec<deflated::Batch>,
     /// Why the read stopped before its end, if its deadline stopped it.
     pub timed_out: Option<TimedOut>,
+    /// The error that ended the read, if the read failed after it had sent a record.
+    pub failed: Option<Error>,
 }
 
 impl<G> FetchUntilDeadline for G
@@ -224,7 +229,22 @@ where
                     add_item(item, &mut fetched, &mut batches)?;
                 }
             }
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => {
+                // The read keeps the records that the engine sent before it failed, instead of
+                // returning only the error. The caller's next read then starts after them. A read
+                // that returned only the error would make its caller read the same records again,
+                // and a read that fails each time at the same point would never move past them.
+                while let Ok(item) = receiver.0.try_recv() {
+                    add_item(item, &mut fetched, &mut batches)?;
+                }
+
+                if !batches.has_records() {
+                    return Err(error);
+                }
+
+                fetched.failed = Some(error);
+                break;
+            }
             Err(timed_out) => {
                 fetched.timed_out = Some(timed_out);
 
@@ -356,6 +376,11 @@ impl FetchedBatches {
         self.close()?;
         self.closed.push(batch);
         Ok(())
+    }
+
+    /// Returns whether a record or a whole batch has been added.
+    pub(crate) fn has_records(&self) -> bool {
+        self.open.is_some() || !self.closed.is_empty()
     }
 
     /// Returns the batches, with the open batch last.
@@ -713,12 +738,12 @@ mod tests {
         Ok(())
     }
 
-    /// A storage double whose read sends one record, closes its channel, and fails later.
+    /// A storage double whose read sends its offsets, closes its channel, and fails later.
     #[derive(Debug)]
     struct ClosesThenFails;
 
     storage_double!(ClosesThenFails, async fn fetch(&self, fetched_sender) {
-        drop(send_records(fetched_sender, 1, Duration::ZERO).await?);
+        drop(send_records(fetched_sender, 0, Duration::ZERO).await?);
 
         // The caller sees the channel close before the read fails.
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -733,5 +758,45 @@ mod tests {
             fetch_from_start(&ClosesThenFails, Instant::now() + Duration::from_secs(1)).await;
 
         assert_matches!(read, Err(Error::Api(ErrorCode::UnknownTopicOrPartition)));
+    }
+
+    /// A storage double whose read sends `records` records, and then fails while it holds its
+    /// sender.
+    #[derive(Debug)]
+    struct SendsThenFails {
+        records: i64,
+    }
+
+    storage_double!(SendsThenFails, async fn fetch(&self, fetched_sender) {
+        let _data = send_records(fetched_sender, self.records, Duration::ZERO).await?;
+        Err(Error::Message("the read failed".into()))
+    });
+
+    /// A read that fails after it has sent records answers with its offsets, every record that it
+    /// sent, and its error.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_it_sent_records_answers_with_them() -> Result<()> {
+        // More records than the channel holds, so that some are still in the channel when the
+        // read fails, and the caller takes them after the failure.
+        let records = i64::try_from(CHANNEL_CAPACITY * 2)?;
+
+        let read = fetch_from_start(
+            &SendsThenFails { records },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await?;
+
+        assert_matches!(read.failed, Some(Error::Message(_)));
+        assert_eq!(None, read.timed_out);
+        assert_eq!(
+            Some(records),
+            read.offsets.map(|offsets| offsets.high_watermark)
+        );
+        assert_eq!(
+            (0..records).collect::<Vec<_>>(),
+            record_offsets(&read.batches)?.concat()
+        );
+
+        Ok(())
     }
 }
