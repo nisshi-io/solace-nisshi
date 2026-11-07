@@ -27,9 +27,10 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
         txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -1867,6 +1868,7 @@ impl Storage for Engine {
                     offset,
                     (max_bytes as i64),
                     high_watermark,
+                    ROWS_PER_FETCH,
                 ),
             )
             .await
@@ -4526,8 +4528,8 @@ mod tests {
     }
 
     /// The fetch statements count a record's headers toward `max_bytes`: three records with a
-    /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
-    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
+    /// one byte key, no value and a 100 byte header each cost 110 bytes (the 7 bytes of every
+    /// record, the header's 2 bytes of framing, 100 of its own, and the key). The statements run here, on the Turso engine,
     /// because it rejects some SQL that SQLite takes.
     #[tokio::test]
     async fn fetch_counts_header_bytes() -> Result<()> {
@@ -4558,9 +4560,9 @@ mod tests {
     }
 
     /// Each header costs 2 bytes of framing, even when its key is empty and its value is null: 50
-    /// such headers and a one byte key cost a record 101 bytes, so a budget of 150 bytes returns
+    /// such headers and a one byte key cost a record 108 bytes, so a budget of 150 bytes returns
     /// one record. A fetch that dropped the framing, or that took the largest header of a record
-    /// instead of the sum of its headers, would count 1 to 3 bytes for a record and return all
+    /// instead of the sum of its headers, would count 8 to 10 bytes for a record and return all
     /// three.
     #[tokio::test]
     async fn fetch_counts_the_framing_of_every_header() -> Result<()> {
@@ -4586,9 +4588,9 @@ mod tests {
 
     /// A header costs the length of its key and the length of its value. Each record has one
     /// header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
-    /// and so costs 85 bytes with its own key, and a budget of 100 bytes returns one record. A
+    /// and so costs 92 bytes with its own key, and a budget of 100 bytes returns one record. A
     /// fetch that left out the key, or the value, or took the larger header of the two, would
-    /// count 43 to 45 bytes and return two.
+    /// count 50 to 52 bytes and return two.
     #[tokio::test]
     async fn fetch_counts_the_key_and_the_value_of_every_header() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4698,15 +4700,29 @@ mod tests {
         key: Option<&[u8]>,
         max_bytes: i64,
     ) -> Result<Vec<i64>> {
+        fetched_offsets_limited(connection, statement, key, max_bytes, 3, i64::MAX).await
+    }
+
+    /// Returns the offsets that `statement` selects when it reads partition 0 from offset 0
+    /// within `max_bytes`, up to `high_watermark`, and reads at most `limit` rows.
+    async fn fetched_offsets_limited(
+        connection: &Connection,
+        statement: &str,
+        key: Option<&[u8]>,
+        max_bytes: i64,
+        high_watermark: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>> {
         let mut params = vec![
             Value::from("c"),
             Value::from("t"),
             Value::from(0),
             Value::from(0),
             Value::from(max_bytes),
-            Value::from(3),
+            Value::from(high_watermark),
         ];
         params.extend(key.map(|key| Value::Blob(key.to_vec())));
+        params.push(Value::from(limit));
 
         let sql = sql_lookup(statement)?;
         let mut rows = connection.prepare(&sql).await?.query(params).await?;
@@ -4716,6 +4732,113 @@ mod tests {
         }
 
         Ok(offsets)
+    }
+
+    /// Stores `count` records at offsets 0 and up in partition 0, each with the key `k`, and no
+    /// value and no headers.
+    async fn insert_empty_records(connection: &Connection, count: i64) -> Result<()> {
+        for offset in 0..count {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// A record with no value and no headers still costs the 7 bytes of the smallest record, and
+    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 4 records whose running
+    /// total stays under it, where a statement that counts 1 byte for each returns all 10.
+    #[tokio::test]
+    async fn fetch_counts_a_fixed_cost_for_every_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_empty_records(&connection, 10).await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0, 1, 2, 3],
+                fetched_offsets_limited(&connection, statement, key, 40, 10, i64::MAX).await?,
+                "{statement}"
+            );
+
+            // the first record is returned whatever its size (KIP-74)
+            assert_eq!(
+                vec![0],
+                fetched_offsets_limited(&connection, statement, key, 1, 10, i64::MAX).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A read takes at most its row limit, whatever the budget, and reading on from the last
+    /// offset takes the rest.
+    #[tokio::test]
+    async fn fetch_reads_at_most_its_row_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_empty_records(&connection, 10).await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0, 1, 2, 3],
+                fetched_offsets_limited(&connection, statement, key, 1 << 20, 10, 4).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The keyed statement limits the rows that match the key, not the rows that it passes over.
+    /// A limit on the rows passed over could return an empty read while matching records remain,
+    /// and the fetch service takes an empty read as caught up. With 10 records under another key
+    /// and then 5 under `k`, a limit of 4 returns the first 4 records under `k`.
+    #[tokio::test]
+    async fn fetch_keyed_limit_counts_only_matching_rows() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        for offset in 0..15 {
+            let key: &[u8] = if offset < 10 { b"x" } else { b"k" };
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, ?2)",
+                    (offset, Value::Blob(key.to_vec())),
+                )
+                .await?;
+        }
+
+        assert_eq!(
+            vec![10, 11, 12, 13],
+            fetched_offsets_limited(
+                &connection,
+                "record_fetch_keyed.sql",
+                Some(b"k"),
+                1 << 20,
+                15,
+                4
+            )
+            .await?
+        );
+
+        Ok(())
     }
 
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
