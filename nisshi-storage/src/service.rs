@@ -2082,10 +2082,10 @@ mod tests {
         Ok(())
     }
 
-    /// A read behind the storage channel that fails after it sent data returns its error, not
-    /// the data that it sent.
+    /// A read behind the storage channel that fails after it sent data returns the data that it
+    /// sent, with its error.
     #[tokio::test(start_paused = true)]
-    async fn a_read_behind_the_channel_that_fails_returns_its_error() {
+    async fn a_read_behind_the_channel_that_fails_returns_its_data_and_error() -> Result<()> {
         let storage = channel_to(SendsThenReturns {
             outcome: Err(Error::Api(ErrorCode::UnknownTopicOrPartition)),
         });
@@ -2099,8 +2099,14 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(1),
             )
-            .await;
+            .await?;
 
-        assert_matches!(read, Err(Error::Api(ErrorCode::UnknownTopicOrPartition)));
+        assert_matches!(
+            read.failed,
+            Some(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        );
+        assert_eq!(1, read.batches.len());
+
+        Ok(())
     }
 }
