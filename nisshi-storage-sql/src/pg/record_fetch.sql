@@ -14,28 +14,20 @@
 -- limitations under the License.
 
 -- prepare record_fetch (text, text, integer, integer, integer, integer, bigint) as
--- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH in pg.rs, 10000). The running byte total below is
--- computed over every row that this query reads, so without the limit, one fetch costs as much
--- as the whole backlog between the fetch offset and the high watermark, however few rows the
--- client can take. The fetch service reads again from the last offset that it received, so a
--- limit that ends a read early costs one more query.
+-- Each row holds one record with all of its headers, so that a read stopped after any row keeps
+-- only complete records.
 --
--- The record table is read directly, with the topition id looked up in a scalar subquery. A join
--- between the two hides from the planner that the rows come out in offset order, and it then sorts
--- all of them, which for 10000 rows of 1 KiB spills to a temp file. Without the join, the limit
--- stops an ordered walk of the primary key, and the running byte total reads that order as it is.
---
--- The fetch runs with the settings in FETCH_PLAN_SETTINGS (pg.rs), which turn off bitmap and
--- sequential scans, so that this query keeps the ordered scan that the limit relies on. Run it
--- with them to see the plan that a fetch uses: `run.sh explain` does.
+-- The fetch runs with FETCH_PLAN_SETTINGS (pg.rs), which make PostgreSQL read the record and
+-- header tables in offset order and merge-join the records with their headers. The merge join
+-- sends its first row as soon as the first record is read, and stops reading headers one row past
+-- the last record. The test fetch_query_plans_stream_records_with_headers (pg.rs) checks that
+-- plan, and `benchmark/openmessaging/run.sh explain` shows it.
 --
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
 -- The header table is probed by its primary key for each candidate, so a record that holds only
 -- headers still spends the budget. The rows that the read returns stop at $5 bytes, but the
 -- read still covers up to $7 rows, and probes the header table once for each.
--- The headers of the rows that the read returns are fetched afterwards, so their memory follows
--- the same bound.
 with candidates as (
 select
 
@@ -54,17 +46,25 @@ record r
 
 where
 
+-- The query looks up the topition id in scalar subqueries, not in a join. The planner then knows
+-- that the scan reads one topition from the primary key (topition, offset_id), so the rows come
+-- out in offset order and the limit stops the scan early. With a join, the planner sorts every
+-- row in the offset range first, and FETCH_PLAN_SETTINGS also forces any join into a merge join.
 r.topition = (
     select tp.id
-    from cluster c
-    join topic t on t.cluster = c.id
-    join topition tp on tp.topic = t.id
-    where c.name = $1
-    and t.name = $2
+    from topition tp
+    where tp.topic = (
+        select t.id
+        from topic t
+        where t.cluster = (select c.id from cluster c where c.name = $1)
+        and t.name = $2)
     and tp.partition = $3)
 and r.offset_id >= $4
 and r.offset_id < $6
 
+-- The limit stops the scan after $7 rows (ROWS_PER_FETCH in pg.rs). The byte limit at the end of
+-- the query does not stop it, because PostgreSQL does not know that the running total only grows,
+-- so without this limit the scan reads every row up to the high watermark.
 order by r.offset_id
 limit $7),
 
@@ -90,7 +90,35 @@ producer_epoch
 
 from
 
-candidates)
+candidates),
+
+-- The headers of each record, in produce order. A record without headers has no row here.
+headers as (
+select
+
+h.offset_id,
+array_agg(h.k order by h.ordinal) as header_keys,
+array_agg(h.v order by h.ordinal) as header_values
+
+from
+
+header h
+
+where
+
+h.topition = (
+    select tp.id
+    from topition tp
+    where tp.topic = (
+        select t.id
+        from topic t
+        where t.cluster = (select c.id from cluster c where c.name = $1)
+        and t.name = $2)
+    and tp.partition = $3)
+and h.offset_id >= $4
+and h.offset_id < $6
+
+group by h.offset_id)
 
 -- The query returns the first row even when that row alone is larger than $5, so that a consumer
 -- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
@@ -105,8 +133,26 @@ candidates)
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
-select offset_id, attributes, timestamp, k, v, bytes, producer_id, producer_epoch
-from sized
-where bytes < $5
-or ordinal = 1
-order by offset_id;
+select
+
+s.offset_id,
+s.attributes,
+s.timestamp,
+s.k,
+s.v,
+s.producer_id,
+s.producer_epoch,
+h.header_keys,
+h.header_values
+
+from
+
+sized s
+left join headers h on h.offset_id = s.offset_id
+
+where
+
+s.bytes < $5
+or s.ordinal = 1
+
+order by s.offset_id;

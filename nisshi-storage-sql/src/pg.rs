@@ -24,7 +24,7 @@ use std::{
     ops::RangeInclusive,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     task::{Context, Poll, ready},
     time::{Duration, SystemTime},
 };
@@ -36,7 +36,7 @@ use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
     TimeoutType, Transaction,
 };
-use futures::pin_mut;
+use futures::{StreamExt as _, pin_mut};
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
@@ -57,7 +57,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
-    record::{Header, Record, deflated, inflated::Batch},
+    record::{Record, deflated, inflated::Batch},
     to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
@@ -67,20 +67,17 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
-    FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
-    ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedSender,
+    GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
     read_deadline::{QueueWait as _, ReadWait},
     read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
 };
-use opentelemetry::metrics::Histogram;
-use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
 #[cfg(unix)]
@@ -107,18 +104,20 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
+use self::metrics::FetchStatementMetrics;
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
         consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        topic_configuration_select, topic_configuration_select_keys, topic_select,
-        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, pg_record_fetch,
+        producer_epochs_select, topic_configuration_select, topic_configuration_select_keys,
+        topic_select, txn_offset_commit_tp_select_pending, txn_produce_partition_check,
         txn_produce_partition_select, watermark_select_for_write,
     },
 };
 
 pub mod factory;
+mod metrics;
 
 /// PostgreSQL Storage Engine
 #[derive(Clone, Debug)]
@@ -572,22 +571,36 @@ const SCHEMA_LOCK: i64 = i64::from_be_bytes(*b"\0\0nisshi");
 /// full-table scans can legitimately run longer than a request-path query should.
 const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 
-/// Settings that leave an ordered scan of the `record` primary key as the only plan for a
-/// fetch. The fetch queries read at most 10000 rows because the limit stops that scan. When
-/// the planner estimates that the offset range holds few rows, it instead reads the whole range
-/// with a bitmap scan and sorts it before the limit applies. `record` grows by tens of
-/// megabytes a second and is analyzed after the fact, so the estimate is often wrong, and one
-/// fetch then reads and sorts every record between its offset and the high watermark. A prepared
-/// statement keeps such a plan after it is built, so the plan can outlive the stale statistics
-/// that produced it.
-const FETCH_PLAN_SETTINGS: &str =
-    "SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off";
+/// Settings for PostgreSQL's query planner in the transaction of a fetch. They turn off bitmap
+/// scans, sequential scans, sorts, hash aggregation, nested loop joins and hash joins, so that
+/// PostgreSQL reads `record` and `header` in offset order through their primary keys, and joins
+/// each record to its headers with a merge join.
+const FETCH_PLAN_SETTINGS: &str = "SET LOCAL enable_bitmapscan = off; \
+     SET LOCAL enable_seqscan = off; \
+     SET LOCAL enable_sort = off; \
+     SET LOCAL enable_hashagg = off; \
+     SET LOCAL enable_nestloop = off; \
+     SET LOCAL enable_hashjoin = off";
 
 /// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
 /// fetch service reads again from the last offset it received, so a limit that ends a read early
 /// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
 /// offset and the high watermark.
 const ROWS_PER_FETCH: i64 = 10_000;
+
+/// How the records statement of a fetch ended on its connection.
+///
+/// A read returns an error instead when no statement runs on the connection: it failed before its
+/// records statement started, or the server ended the statement with an error.
+#[derive(Debug)]
+enum RecordsStatement {
+    /// The statement sent all of its rows, and its transaction committed, so no statement runs on
+    /// the connection.
+    Ended,
+    /// The read stopped before its statement ended, because a row failed to decode or the caller
+    /// stopped taking records. The statement can still be running on the connection.
+    Abandoned(Error),
+}
 
 /// How long a caller waits for a free pooled connection before failing fast with a retriable
 /// error, rather than queuing indefinitely while the pool is exhausted.
@@ -1843,13 +1856,7 @@ impl Postgres {
                 // likely means Postgres itself is unreachable or misbehaving.
                 _ => {
                     error!(?err, cluster = ?self.cluster);
-                    SQL_ERROR.add(
-                        1,
-                        &[
-                            KeyValue::new("cluster_id", self.cluster.clone()),
-                            KeyValue::new("kind", "pool"),
-                        ],
-                    );
+                    metrics::pool_failed(&self.cluster);
                 }
             })
             .map_err(Into::into)
@@ -1861,16 +1868,21 @@ impl Postgres {
     /// Dropping the guard before [`Abandonable::release`] asks the server to
     /// cancel the statement, so it stops instead of running until
     /// `statement_timeout`, and keeps the connection and the permits until
-    /// the statement has ended, see [`cancel_and_return`].
+    /// the statement has ended, see [`cancel_and_return`]. The drop counts
+    /// in `nisshi_sql_statements_abandoned` under `operation`.
     async fn abandonable_connection(
         &self,
         permits: ReadPermits,
+        operation: StorageOperation,
     ) -> Result<Abandonable<Manager, impl FnOnce(Object) + use<>>> {
         let cancel = self.cancel.clone();
         let bound = self.abandoned_statement_bound;
+        let cluster = self.cluster.clone();
 
         self.connection().await.map(|connection| {
             Abandonable::new(connection, move |connection: Object| {
+                metrics::abandoned(&cluster, operation);
+
                 match Handle::try_current() {
                     // The task keeps the request's span, so its warnings
                     // name the peer, the correlation id and the partition.
@@ -1914,11 +1926,12 @@ impl Postgres {
     }
 
     /// Reads the records of `topition` from `offset` on `c`, in one transaction, up to the
-    /// partition's high watermark or, for `ReadCommitted`, its last stable offset, and returns
-    /// them with the offset stage that bounds them.
+    /// partition's high watermark or, for `ReadCommitted`, its last stable offset. It sends the
+    /// offset stage through `fetched_sender` first, then each record as its row arrives.
     ///
-    /// The read reads the stage before the records, and a stage only grows, so the records end
-    /// at or below it.
+    /// The stage is read before the records and only grows, so it bounds every record sent. Each
+    /// row holds one complete record, so a caller that drops the read keeps every record that it
+    /// received.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_on(
         &self,
@@ -1930,7 +1943,8 @@ impl Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-    ) -> Result<(OffsetStage, Vec<FetchedRecord>)> {
+        fetched_sender: FetchedSender,
+    ) -> Result<RecordsStatement> {
         let offset_stage = self
             .offset_stage_on(c, base_topic, topition.partition())
             .await?;
@@ -1951,143 +1965,85 @@ impl Postgres {
             max_bytes
         );
 
+        let mut fetched_data = fetched_sender.send_offsets(offset_stage).await?;
+
         let tx = c.transaction().await?;
 
         tx.batch_execute(FETCH_PLAN_SETTINGS)
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg_keyed.sql",
-                &[
-                    &self.cluster,
-                    &base_topic,
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &key,
-                    &ROWS_PER_FETCH,
-                ],
-            )
-            .await
+        let query = if key_filter.is_some() {
+            pg_record_fetch::KEYED_QUERY
         } else {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg.sql",
-                &[
-                    &self.cluster,
-                    &topition.topic(),
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &ROWS_PER_FETCH,
-                ],
-            )
+            pg_record_fetch::QUERY
+        };
+        let sql = self.sql_lookup(query)?;
+
+        let partition = topition.partition();
+        let max_bytes = i64::from(max_bytes);
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![
+            &self.cluster,
+            &base_topic,
+            &partition,
+            &offset,
+            &max_bytes,
+            &high_watermark,
+        ];
+        params.extend(key_filter.as_ref().map(|key| key as &(dyn ToSql + Sync)));
+        params.push(&ROWS_PER_FETCH);
+
+        let prepared = tx
+            .prepare_cached(sql)
             .await
-        }
-        .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| error!(?err))?;
 
-        // One query for the headers of the returned records. A query per record costs a round
-        // trip each, which capped a consumer at a few thousand records a second. The topic is the
-        // base topic: a keyed fetch has a name that is not a topic.
-        let mut headers: BTreeMap<i64, Vec<Row>> = BTreeMap::new();
+        // `query_raw` returns once the server has accepted the statement, and its stream yields
+        // each row as the server sends it, so the read sends each record before the next row
+        // arrives.
+        let started_at = SystemTime::now();
+        let rows = tx
+            .query_raw(&prepared, params.iter().copied())
+            .await
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))?;
+        let statement = FetchStatementMetrics::started(sql, &self.cluster, started_at);
+        pin_mut!(rows);
 
-        if !records.is_empty() {
-            let offsets = records
-                .iter()
-                .map(|record| record.try_get::<_, i64>(0))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+        while let Some(row) = rows.next().await {
+            let row = match row {
+                Ok(row) => row,
+                // An error from the server ends the statement.
+                Err(error) => {
+                    metrics::failed(sql, &self.cluster, &error);
+                    statement.failed();
+                    return Err(error.into());
+                }
+            };
 
-            for header in self
-                .tx_prepare_query(
-                    &tx,
-                    "header_fetch_range.sql",
-                    &[&self.cluster, &base_topic, &topition.partition(), &offsets],
-                )
-                .await
-                .inspect_err(|err| error!(?err))?
-            {
-                headers
-                    .entry(header.try_get::<_, i64>(0)?)
-                    .or_default()
-                    .push(header);
+            let record = match pg_record_fetch::Row::try_from(&row) {
+                Ok(record) => record,
+                Err(error) => {
+                    error!(?error);
+                    metrics::decode_failed(sql, &self.cluster);
+                    statement.failed();
+                    return Ok(RecordsStatement::Abandoned(error));
+                }
+            };
+
+            // A send fails when the caller has stopped taking records, which is a stop like the
+            // drop of the read at its deadline, so the guard counts the statement as stopped.
+            if let Err(error) = fetched_data.send_record(record.into()).await {
+                debug!(?error);
+                drop(statement);
+                return Ok(RecordsStatement::Abandoned(error));
             }
         }
 
-        let mut fetched = Vec::with_capacity(records.len());
-
-        // The loop consumes the rows instead of borrowing them, so that each row is freed once
-        // its record is built, and the read does not hold every row and every record at once.
-        for record in records {
-            let offset = record
-                .try_get::<_, i64>(0)
-                .inspect(|offset| debug!(offset))
-                .inspect_err(|err| error!(?err))?;
-
-            let mut record_headers = vec![];
-
-            for header in headers.remove(&offset).unwrap_or_default() {
-                let mut header_builder = Header::builder();
-
-                if let Some(k) = header
-                    .try_get::<_, Option<&[u8]>>(1)
-                    .inspect_err(|err| error!(?err))?
-                {
-                    header_builder = header_builder.key(Bytes::copy_from_slice(k));
-                }
-
-                if let Some(v) = header
-                    .try_get::<_, Option<&[u8]>>(2)
-                    .inspect_err(|err| error!(?err))?
-                {
-                    header_builder = header_builder.value(Bytes::copy_from_slice(v));
-                }
-
-                record_headers.push(header_builder);
-            }
-
-            fetched.push(FetchedRecord {
-                offset,
-                timestamp: record
-                    .try_get::<_, SystemTime>(2)
-                    .map_err(Error::from)
-                    .and_then(|system_time| from_sql_timestamp(&system_time))
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?,
-                attributes: record
-                    .try_get::<_, Option<i16>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?,
-                producer_id: record
-                    .try_get::<_, Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?,
-                producer_epoch: record
-                    .try_get::<_, Option<i16>>(7)
-                    .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?,
-                key: record
-                    .try_get::<_, Option<&[u8]>>(3)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
-                value: record
-                    .try_get::<_, Option<&[u8]>>(4)
-                    .map(|o| o.map(Bytes::copy_from_slice))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
-                headers: record_headers,
-            });
-        }
+        statement.completed();
 
         // The transaction only reads, so a rollback has the same effect as a commit.
         tx.commit().await?;
-
-        Ok((offset_stage, fetched))
+        Ok(RecordsStatement::Ended)
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -2597,37 +2553,6 @@ impl Postgres {
         Ok(deleted)
     }
 
-    fn attributes_for_error(
-        &self,
-        nickname: &str,
-        error: &tokio_postgres::error::Error,
-    ) -> Vec<KeyValue> {
-        let mut attributes = vec![
-            KeyValue::new("sql", nickname.to_owned()),
-            KeyValue::new("cluster_id", self.cluster.clone()),
-        ];
-
-        if let Some(db_error) = error.as_db_error() {
-            if let Some(schema) = db_error.schema() {
-                attributes.push(KeyValue::new("schema", schema.to_owned()));
-            }
-
-            if let Some(table) = db_error.table() {
-                attributes.push(KeyValue::new("table", table.to_owned()));
-            }
-
-            if let Some(constraint) = db_error.constraint() {
-                attributes.push(KeyValue::new("constraint", constraint.to_owned()));
-            }
-        }
-
-        if let Some(code) = error.code() {
-            attributes.push(KeyValue::new("code", format!("{code:?}")));
-        }
-
-        attributes
-    }
-
     #[instrument(skip(self, c, params))]
     async fn prepare_execute(
         &self,
@@ -2645,28 +2570,8 @@ impl Postgres {
         let execute_start = SystemTime::now();
         c.execute(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -2770,28 +2675,8 @@ impl Postgres {
 
         c.query(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -2813,28 +2698,10 @@ impl Postgres {
 
         c.query_one(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
             .inspect_err(|err| {
                 debug!(?err);
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+                metrics::failed(sql, &self.cluster, err);
             })
             .map_err(Into::into)
     }
@@ -2857,28 +2724,8 @@ impl Postgres {
 
         c.query_opt(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -2900,28 +2747,8 @@ impl Postgres {
 
         tx.execute(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -2942,28 +2769,8 @@ impl Postgres {
         let execute_start = SystemTime::now();
         tx.query(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -2984,28 +2791,8 @@ impl Postgres {
         let execute_start = SystemTime::now();
         tx.query_one(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -3026,28 +2813,8 @@ impl Postgres {
         let execute_start = SystemTime::now();
         tx.query_opt(&prepared, params)
             .await
-            .inspect(|_n| {
-                SQL_DURATION.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-
-                SQL_REQUESTS.add(
-                    1,
-                    &[
-                        KeyValue::new("sql", sql.to_owned()),
-                        KeyValue::new("cluster_id", self.cluster.clone()),
-                    ],
-                );
-            })
-            .inspect_err(|err| {
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })
+            .inspect(|_| metrics::completed(sql, &self.cluster, execute_start))
+            .inspect_err(|err| metrics::failed(sql, &self.cluster, err))
             .map_err(Into::into)
     }
 
@@ -4689,10 +4456,15 @@ impl Storage for Postgres {
 
         let permits = self.fetch_read_permits().await?;
         let mut connection = self
-            .abandonable_connection(permits)
+            .abandonable_connection(permits, StorageOperation::Fetch)
             .queued_for(ReadWait::EngineConnectionPool)
             .await?;
 
+        // The read sends each record while its statement runs, so that a caller that stops the
+        // read at its deadline keeps the records already sent. The read holds the connection and
+        // the permits until it has put the last record in the channel, so when the channel fills
+        // it waits for the caller with both held. A caller that drops the read mid-statement drops
+        // the connection, which cancels the statement.
         let read = self
             .fetch_on(
                 connection.object_mut()?,
@@ -4703,30 +4475,27 @@ impl Storage for Postgres {
                 min_bytes,
                 max_bytes,
                 isolation_level,
+                fetched_sender,
             )
             .await;
 
-        // The query has ended, so no statement is running, and the connection goes straight back
-        // to the pool. If the receiver of `fetched_sender` drops this read at its deadline during
-        // the query instead, dropping the connection cancels the running statement, and returns
-        // the connection to the pool once the statement has ended.
-        connection.release();
-
-        // This function sends the records into `fetched_sender` only after it returns the
-        // connection and the permits. Each send can wait until the receiver of `fetched_sender`
-        // takes the record, and the receiver can drop this read at its deadline during that wait.
-        // If the read still held the connection then, the drop would send Postgres a cancel
-        // request for a query that has already finished. A receiver that takes the records slowly
-        // would also keep the connection and the permits from other reads.
-        let (offset_stage, records) = read?;
-
-        let mut data = fetched_sender.send_offsets(offset_stage).await?;
-
-        for record in records {
-            data.send_record(record).await?;
+        match read {
+            Ok(RecordsStatement::Ended) => {
+                connection.release();
+                Ok(())
+            }
+            // The statement may still be running on the connection. Dropping the connection
+            // cancels it.
+            Ok(RecordsStatement::Abandoned(error)) => {
+                drop(connection);
+                Err(error)
+            }
+            // No statement is running, so the connection goes straight back to the pool.
+            Err(error) => {
+                connection.release();
+                Err(error)
+            }
         }
-
-        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -4737,7 +4506,7 @@ impl Storage for Postgres {
 
         let permits = self.fetch_read_permits().await?;
         let connection = self
-            .abandonable_connection(permits)
+            .abandonable_connection(permits, StorageOperation::OffsetStage)
             .queued_for(ReadWait::EngineConnectionPool)
             .await?;
         let offset_stage = self
@@ -4965,7 +4734,7 @@ impl Storage for Postgres {
 
         let permits = self.list_offsets_read_permits().await?;
         let connection = self
-            .abandonable_connection(permits)
+            .abandonable_connection(permits, StorageOperation::ListOffsets)
             .queued_for(ReadWait::EngineConnectionPool)
             .await?;
         let responses = self
@@ -6215,28 +5984,6 @@ impl Storage for Postgres {
     }
 }
 
-static SQL_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("nisshi_sql_duration")
-        .with_unit("ms")
-        .with_description("The SQL request latencies in milliseconds")
-        .build()
-});
-
-static SQL_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_sql_requests")
-        .with_description("The number of SQL requests made")
-        .build()
-});
-
-static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_sql_error")
-        .with_description("The SQL error count")
-        .build()
-});
-
 /// The earliest Kafka timestamp, in milliseconds since the epoch, that a PostgreSQL `timestamp`
 /// can hold: 4713 BC.
 const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
@@ -6285,7 +6032,7 @@ fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
 /// Returns the Kafka timestamp, in milliseconds since the epoch, of a stored `system_time`.
 /// The inverse of [`to_sql_timestamp`]: an instant before the epoch is a negative timestamp, as
 /// -1 is for a record that was produced without one.
-fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
+pub(crate) fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
     match system_time.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(_) => to_timestamp(system_time).map_err(Into::into),
         Err(before) => i64::try_from(before.duration().as_millis())
@@ -6299,7 +6046,10 @@ mod tests {
     use super::*;
 
     use futures_util::future;
-    use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_sans_io::{
+        add_partitions_to_txn_request::AddPartitionsToTxnTopic,
+        record::{Header, header},
+    };
     use nisshi_storage::read_share::ClientIdentity;
     use nisshi_storage::{
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
@@ -6308,9 +6058,22 @@ mod tests {
         fetched::{self, FetchUntilDeadline as _},
         read_deadline::TimedOut,
     };
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        data::{
+            AggregatedMetrics, HistogramDataPoint, MetricData, ResourceMetrics, ScopeMetrics,
+            SumDataPoint,
+        },
+    };
     use rand::distr::Alphanumeric;
-    use std::assert_matches;
-    use std::pin::pin;
+    use std::{
+        assert_matches,
+        sync::{
+            LazyLock,
+            atomic::{self, AtomicBool},
+        },
+    };
     use tokio::task::JoinHandle;
 
     #[cfg(not(windows))]
@@ -7024,14 +6787,14 @@ mod tests {
     /// Hands out numbered objects, so a test can tell a fresh object from a
     /// recycled one.
     #[derive(Debug, Default)]
-    struct Numbered(std::sync::atomic::AtomicU32);
+    struct Numbered(atomic::AtomicU32);
 
     impl managed::Manager for Numbered {
         type Type = u32;
         type Error = std::convert::Infallible;
 
         async fn create(&self) -> std::result::Result<u32, Self::Error> {
-            Ok(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            Ok(self.0.fetch_add(1, atomic::Ordering::SeqCst))
         }
 
         async fn recycle(
@@ -7683,16 +7446,16 @@ mod tests {
         Ok(())
     }
 
-    /// A Fetch returns its read permits, with its connection, before it sends its records, so a
-    /// reader that takes the records slowly keeps neither from other reads.
+    /// A Fetch holds its read permits while it waits for its caller to take its records, and
+    /// returns them when the caller drops the read.
     #[tokio::test]
-    async fn fetch_returns_its_permits_before_it_sends() -> Result<()> {
+    async fn fetch_dropped_while_it_waits_to_send_returns_its_permits() -> Result<()> {
         const RECORDS: i32 = 200;
 
         let cluster = alphanumeric_string(15);
 
         let Some(storage) = storage_with_schema(
-            "fetch_returns_its_permits_before_it_sends",
+            "fetch_dropped_while_it_waits_to_send_returns_its_permits",
             &CONNECTION,
             &cluster,
         )
@@ -7744,26 +7507,37 @@ mod tests {
         // channel holds, so it fills the channel and then waits for room that never comes.
         let (fetched_sender, _fetched_receiver) = fetched::channel();
 
-        let mut read = pin!(storage.fetch(
+        let mut read = storage.fetch(
             &topition,
             0,
             1,
             1024 * 1024,
             IsolationLevel::ReadUncommitted,
             fetched_sender,
-        ));
+        );
 
-        // The query of a local database ends well within this time, so the read is then waiting
-        // to send, not querying.
         assert!(
             timeout(Duration::from_secs(2), &mut read).await.is_err(),
             "the read ended without waiting to send"
         );
 
         assert_eq!(
-            ReadLimits::default().fetch,
+            ReadLimits::default().fetch - 1,
             storage.fetch_reads.available_permits()
         );
+
+        drop(read);
+
+        // A dropped read cancels its statement before it returns its permits, which takes round
+        // trips to the server.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while storage.fetch_reads.available_permits() < ReadLimits::default().fetch {
+            assert!(
+                Instant::now() < give_up,
+                "the dropped read kept its permits"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         Ok(())
     }
@@ -7851,7 +7625,9 @@ mod tests {
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
         let permits = storage.list_offsets_read_permits().await?;
-        let connection = storage.abandonable_connection(permits).await?;
+        let connection = storage
+            .abandonable_connection(permits, StorageOperation::Fetch)
+            .await?;
         assert_eq!(
             ReadLimits::default().list_offsets - 1,
             storage.list_offsets_reads.available_permits()
@@ -7968,7 +7744,9 @@ mod tests {
     ) -> Result<()> {
         let sleep = format!("SELECT pg_sleep(30) /* {marker} */");
 
-        let connection = storage.abandonable_connection(permits).await?;
+        let connection = storage
+            .abandonable_connection(permits, StorageOperation::Fetch)
+            .await?;
 
         assert!(
             timeout(
@@ -8247,7 +8025,9 @@ mod tests {
 
         for read in [open, failed] {
             let permits = storage.fetch_read_permits().await?;
-            let connection = storage.abandonable_connection(permits).await?;
+            let connection = storage
+                .abandonable_connection(permits, StorageOperation::Fetch)
+                .await?;
             let backend = connection
                 .object()?
                 .query_one("SELECT pg_backend_pid()", &[])
@@ -9055,16 +8835,69 @@ mod tests {
         )
     }
 
+    /// Installs a process-wide meter provider that exports to the returned exporter. nextest runs
+    /// each test in a process of its own, so the provider belongs to the test that installs it.
+    fn install_exporter() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        (provider, exporter)
+    }
+
+    /// Returns the total of the counter `name` for `cluster`, after `provider` exports what it
+    /// holds.
+    ///
+    /// The counters are cumulative, so the total comes from the latest export only. A sum over
+    /// every export would count a value once for each export.
+    fn counter_total(
+        provider: &SdkMeterProvider,
+        exporter: &InMemoryMetricExporter,
+        name: &str,
+        cluster: &str,
+    ) -> Result<u64> {
+        provider
+            .force_flush()
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        let metrics = exporter.get_finished_metrics().unwrap_or_default();
+
+        Ok(metrics
+            .last()
+            .into_iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .filter(|metric| metric.name() == name)
+            .map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                    .data_points()
+                    .filter(|point| {
+                        point.attributes().any(|attribute| {
+                            attribute.key.as_str() == "cluster_id"
+                                && attribute.value.as_str() == cluster
+                        })
+                    })
+                    .map(SumDataPoint::value)
+                    .sum(),
+                _ => 0,
+            })
+            .sum())
+    }
+
     /// A fetch dropped while its statement waits has that statement
     /// cancelled, and its connection goes back to the pool idle and outside
     /// any transaction, while the statement would still be waiting. A fetch
     /// or an offset stage that finishes returns its connection and its
     /// permit before it returns.
     ///
-    /// The fetch waits for a lock on `header`, so it waits in its header
-    /// query, inside its transaction and after its record query.
+    /// The fetch waits for a lock on `header`, so it waits in its records
+    /// statement, inside its transaction.
     #[tokio::test]
     async fn abandoned_fetch_is_cancelled_and_its_connection_returned() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
         let cluster = alphanumeric_string(15);
         let Some((storage, monitor, application_name)) =
             storage_on_one_connection(&cluster).await?
@@ -9074,9 +8907,6 @@ mod tests {
 
         let topition = topic_with_one_record(&storage, &cluster).await?;
 
-        // Nothing awaits between each read and the checks after it, so a
-        // read that returned its connection through the abandon path
-        // instead would not have it back yet.
         fetch_from_start(&storage, &topition).await?;
         assert_eq!(1, storage.pool.status().available);
         assert_eq!(
@@ -9089,6 +8919,15 @@ mod tests {
         assert_eq!(
             ReadLimits::default().fetch,
             storage.fetch_reads.available_permits()
+        );
+        assert_eq!(
+            0,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &cluster
+            )?
         );
 
         let fetching = {
@@ -9106,6 +8945,16 @@ mod tests {
             fetching,
         )
         .await?;
+
+        assert_eq!(
+            1,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &cluster
+            )?
+        );
 
         let mut c = storage.connection().await?;
         assert_eq!(1, storage.pool.status().size);
@@ -9128,10 +8977,13 @@ mod tests {
     /// batches. The engine cancels the statement, so the connection goes back to the pool idle, as
     /// [`SETTLE_QUERY`] shows, while the lock is still held.
     ///
-    /// The fetch waits for a lock on `header`, so it waits in its header query, inside its
-    /// transaction and after its record query.
+    /// The fetch waits for a lock on `header`, so it waits in its records statement, inside its
+    /// transaction.
     #[tokio::test]
     async fn fetch_stopped_at_its_deadline_cancels_its_statement() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
         let cluster = alphanumeric_string(15);
         let Some((storage, monitor, application_name)) =
             storage_on_one_connection(&cluster).await?
@@ -9220,8 +9072,69 @@ mod tests {
             ReadLimits::default().fetch,
             storage.fetch_reads.available_permits()
         );
+        assert_eq!(
+            1,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &cluster
+            )?
+        );
 
         lock.rollback().await?;
+
+        Ok(())
+    }
+
+    /// A fetch that fails before its records statement starts returns its connection to the pool
+    /// at once. The fetch does not cancel a statement, because none runs.
+    #[tokio::test]
+    async fn fetch_failed_before_its_records_statement_releases_its_connection() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
+        let cluster = alphanumeric_string(15);
+        let Some((storage, _, _)) = storage_on_one_connection(&cluster).await? else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        // The topic's only partition is partition 0, so partition 1 has no offset stage, and
+        // the fetch fails before its records statement.
+        let unknown = Topition::new(topition.topic(), 1);
+
+        let fetched = storage
+            .fetch_until_deadline(
+                &unknown,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await;
+        assert_matches!(fetched, Err(_));
+
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        // The setup's statements count in `nisshi_sql_requests`, so the exporter is live, and a
+        // count of 0 abandoned statements is not a missing export.
+        assert!(counter_total(&provider, &exporter, "nisshi_sql_requests", &cluster)? > 0);
+        assert_eq!(
+            0,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &cluster
+            )?
+        );
 
         Ok(())
     }
@@ -13507,9 +13420,8 @@ mod tests {
         Ok(())
     }
 
-    /// A keyed fetch of a virtual topic names the topic as `base/key`, and that name has no row in
-    /// `topic`. Its records still carry their headers, and the headers read are those of the
-    /// records returned, not of the records in between.
+    /// A keyed fetch returns each record with its own headers, and pairs each header key with its
+    /// value.
     #[tokio::test]
     async fn keyed_fetch_attaches_headers_of_the_records_it_returns() -> Result<()> {
         let Some((storage, topition)) = storage_with_empty_topic().await? else {
@@ -13530,18 +13442,15 @@ mod tests {
         let batch = (0..6)
             .fold(Batch::builder(), |builder, delta| {
                 let key = if delta % 2 == 0 { "key-a" } else { "key-b" };
-                let header = format!("header-{delta}");
 
                 builder.record(
-                    Record::builder()
-                        .key(Bytes::copy_from_slice(key.as_bytes()).into())
-                        .value(Bytes::from_static(b"a").into())
-                        .offset_delta(delta)
-                        .header(
-                            Header::builder()
-                                .key(Bytes::copy_from_slice(header.as_bytes()))
-                                .value(Bytes::copy_from_slice(header.as_bytes())),
-                        ),
+                    keyed_record_headers(delta).into_iter().fold(
+                        Record::builder()
+                            .key(Bytes::copy_from_slice(key.as_bytes()).into())
+                            .value(Bytes::from_static(b"a").into())
+                            .offset_delta(delta),
+                        |record, header| record.header(header),
+                    ),
                 )
             })
             .last_offset_delta(5)
@@ -13565,31 +13474,34 @@ mod tests {
                 .map(|read| read.batches)?,
         )?;
 
-        let fetched = records
-            .iter()
-            .map(|(offset, record)| {
-                (
-                    *offset,
-                    record
-                        .headers
-                        .iter()
-                        .filter_map(|header| header.key.as_deref())
-                        .map(|key| String::from_utf8_lossy(key).into_owned())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
-
         assert_eq!(
-            vec![
-                (0, vec!["header-0".to_string()]),
-                (2, vec!["header-2".to_string()]),
-                (4, vec!["header-4".to_string()]),
-            ],
-            fetched
+            [0, 2, 4]
+                .into_iter()
+                .map(|delta| (
+                    i64::from(delta),
+                    keyed_record_headers(delta)
+                        .map(|header| header.build())
+                        .to_vec()
+                ))
+                .collect::<Vec<_>>(),
+            records
+                .into_iter()
+                .map(|(offset, record)| (offset, record.headers))
+                .collect::<Vec<_>>()
         );
 
         Ok(())
+    }
+
+    /// Returns the headers of the record at `offset_delta`: one whose key differs from its value,
+    /// and one with a null value. Both name the record, so a header on the wrong record shows.
+    fn keyed_record_headers(offset_delta: i32) -> [header::Builder; 2] {
+        [
+            Header::builder()
+                .key(Bytes::from(format!("key-{offset_delta}")))
+                .value(Bytes::from(format!("value-{offset_delta}"))),
+            Header::builder().key(Bytes::from(format!("null-value-{offset_delta}"))),
+        ]
     }
 
     /// Headers are read for the whole range of a fetch at once, and each must end up on the
@@ -13666,6 +13578,555 @@ mod tests {
                 .map(|keys| keys.iter().map(|key| key.to_string()).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             fetched,
+        );
+
+        Ok(())
+    }
+
+    /// Under [`FETCH_PLAN_SETTINGS`], each fetch query reads its records in offset order and sends
+    /// its first row before it has read every row: the plain query merge-joins the records with
+    /// their headers, and the keyed query looks up the headers of each returned record. Both the
+    /// generic plan and a custom plan, built for real parameters, keep that shape.
+    #[tokio::test]
+    async fn fetch_query_plans_stream_records_with_headers() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let mut c = storage.connection().await?;
+        let tx = c.transaction().await?;
+
+        // The statistics of a nearly empty table make the planner expect few rows in any offset
+        // range, which is when it would choose a plan that reads every row.
+        tx.batch_execute("ANALYZE record; ANALYZE header;").await?;
+        tx.batch_execute(FETCH_PLAN_SETTINGS).await?;
+
+        let cluster = storage.cluster.as_str();
+        let topic = topition.topic();
+
+        for (query, arguments) in [
+            (
+                pg_record_fetch::QUERY,
+                format!("'{cluster}', '{topic}', 0, 0, 1048576, 100000, {ROWS_PER_FETCH}"),
+            ),
+            (
+                pg_record_fetch::KEYED_QUERY,
+                format!("'{cluster}', '{topic}', 0, 0, 1048576, 100000, 'k', {ROWS_PER_FETCH}"),
+            ),
+        ] {
+            let sql = storage.sql_lookup(query)?;
+
+            // `generic_plan` explains the plan that PostgreSQL builds without the parameters'
+            // values, which a prepared statement can switch to. `explain execute` explains the
+            // custom plan that it builds from the values of its first executions.
+            tx.batch_execute(&format!("prepare fetch_plan as {sql}"))
+                .await?;
+
+            for explain in [
+                format!("explain (costs off, generic_plan) {sql}"),
+                format!("explain (costs off) execute fetch_plan({arguments})"),
+            ] {
+                // The simple query protocol sends the statement without binding its
+                // parameters, which `generic_plan` needs.
+                let plan = tx
+                    .simple_query(&explain)
+                    .await?
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                if query == pg_record_fetch::QUERY {
+                    assert!(plan[0].contains("Merge Left Join"), "{explain}: {plan:#?}");
+                } else {
+                    assert!(
+                        plan.iter().all(|line| !line.contains("Join")),
+                        "{explain}: {plan:#?}"
+                    );
+                    assert!(
+                        plan.iter().any(|line| line.contains("SubPlan")),
+                        "{explain}: {plan:#?}"
+                    );
+                }
+
+                for step in ["Sort", "Materialize", "Nested Loop", "Hash"] {
+                    assert!(
+                        plan.iter().all(|line| !line.contains(step)),
+                        "{explain}: {step} in {plan:#?}"
+                    );
+                }
+            }
+
+            tx.batch_execute("deallocate fetch_plan").await?;
+        }
+
+        _ = tx.rollback().await;
+
+        Ok(())
+    }
+
+    /// Produces `ROWS_PER_FETCH` records of 1 KiB to `topition`, from offset 0, each with one
+    /// header whose key is the record's offset.
+    ///
+    /// Records of 1 KiB make a fetch statement send rows for long enough that a deadline can fall
+    /// inside it.
+    async fn produce_records_with_headers(storage: &Postgres, topition: &Topition) -> Result<()> {
+        // A produce request holds at most 1 MiB, so the records go in batches of 1,000.
+        const RECORDS_PER_BATCH: i64 = 1_000;
+
+        let value = Bytes::from(vec![b'v'; 1024]);
+
+        for base_offset in (0..ROWS_PER_FETCH).step_by(usize::try_from(RECORDS_PER_BATCH)?) {
+            let batch = (0..RECORDS_PER_BATCH)
+                .fold(Batch::builder(), |builder, delta| {
+                    builder.record(
+                        Record::builder()
+                            .value(value.clone().into())
+                            .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX))
+                            .header(
+                                Header::builder()
+                                    .key(Bytes::from((base_offset + delta).to_string()))
+                                    .value(Bytes::from_static(b"h")),
+                            ),
+                    )
+                })
+                .last_offset_delta(i32::try_from(RECORDS_PER_BATCH - 1)?)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = storage.produce(None, topition, batch).await?;
+        }
+
+        Ok(())
+    }
+
+    /// How often `nisshi_sql_requests` counted a statement, and how many durations
+    /// `nisshi_sql_duration` recorded for it.
+    #[derive(Debug)]
+    struct StatementCounts {
+        requests: u64,
+        durations: u64,
+    }
+
+    /// Returns the counts that `exporter` holds for the statement `sql` with the `outcome`
+    /// attribute `outcome`.
+    fn statement_counts(
+        exporter: &InMemoryMetricExporter,
+        sql: &str,
+        outcome: &str,
+    ) -> StatementCounts {
+        let matches = |attributes: &mut dyn Iterator<Item = &KeyValue>| {
+            let attributes = attributes.collect::<Vec<_>>();
+            [("sql", sql), ("outcome", outcome)]
+                .iter()
+                .all(|(key, value)| {
+                    attributes.iter().any(|attribute| {
+                        attribute.key.as_str() == *key && attribute.value.as_str() == *value
+                    })
+                })
+        };
+
+        let mut counts = StatementCounts {
+            requests: 0,
+            durations: 0,
+        };
+
+        let metrics = exporter.get_finished_metrics().unwrap_or_default();
+
+        // The counts are cumulative, so they come from the latest export only.
+        for metric in metrics
+            .last()
+            .into_iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+        {
+            match (metric.name(), metric.data()) {
+                ("nisshi_sql_requests", AggregatedMetrics::U64(MetricData::Sum(sum))) => {
+                    counts.requests += sum
+                        .data_points()
+                        .filter(|point| matches(&mut point.attributes()))
+                        .map(SumDataPoint::value)
+                        .sum::<u64>();
+                }
+                (
+                    "nisshi_sql_duration",
+                    AggregatedMetrics::U64(MetricData::Histogram(histogram)),
+                ) => {
+                    counts.durations += histogram
+                        .data_points()
+                        .filter(|point| matches(&mut point.attributes()))
+                        .map(HistogramDataPoint::count)
+                        .sum::<u64>();
+                }
+                _ => {}
+            }
+        }
+
+        counts
+    }
+
+    /// The records statement of a fetch counts in `nisshi_sql_requests` with the `outcome`
+    /// `completed` when it sends all of its rows, and `stopped` when the caller drops the read
+    /// before then. Only a completed statement records a duration in `nisshi_sql_duration`.
+    #[tokio::test]
+    async fn fetch_statement_counts_its_outcome() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        produce_records_with_headers(&storage, &topition).await?;
+
+        let read = storage
+            .fetch_until_deadline(
+                &topition,
+                0,
+                1,
+                u32::MAX,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await?;
+        assert_eq!(
+            usize::try_from(ROWS_PER_FETCH)?,
+            records_with_offsets(read.batches)?.len()
+        );
+
+        // The test keeps the receiving end and never reads it. The read has more records than the
+        // channel holds, so it never finishes, and it waits in its statement for room in the
+        // channel when the test drops it.
+        let (fetched_sender, _fetched_receiver) = fetched::channel();
+        let mut stopped = storage.fetch(
+            &topition,
+            0,
+            1,
+            u32::MAX,
+            IsolationLevel::ReadUncommitted,
+            fetched_sender,
+        );
+        assert!(timeout(Duration::from_secs(5), &mut stopped).await.is_err());
+        drop(stopped);
+
+        provider
+            .force_flush()
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        let sql = storage.sql_lookup(pg_record_fetch::QUERY)?;
+
+        let completed = statement_counts(&exporter, sql, "completed");
+        assert_eq!((1, 1), (completed.requests, completed.durations));
+
+        let stopped = statement_counts(&exporter, sql, "stopped");
+        assert_eq!((1, 0), (stopped.requests, stopped.durations));
+
+        Ok(())
+    }
+
+    /// A fetch whose caller stops taking records returns an error. It counts its statement as
+    /// stopped and its read as abandoned, and returns its permits once the statement has ended.
+    #[tokio::test]
+    async fn fetch_whose_caller_stops_taking_records_abandons_its_statement() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        produce_records_with_headers(&storage, &topition).await?;
+
+        let (fetched_sender, fetched_receiver) = fetched::channel();
+        let mut read = storage.fetch(
+            &topition,
+            0,
+            1,
+            u32::MAX,
+            IsolationLevel::ReadUncommitted,
+            fetched_sender,
+        );
+
+        // The read has more records than the channel holds, so it waits for room in the channel
+        // until the test drops the receiving end.
+        assert!(timeout(Duration::from_secs(5), &mut read).await.is_err());
+        drop(fetched_receiver);
+        assert_matches!(read.await, Err(Error::UnableToSend));
+
+        // An abandoned read returns its permits only after a cancel request and `SETTLE_QUERY`,
+        // which take round trips to the server.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while storage.fetch_reads.available_permits() < ReadLimits::default().fetch {
+            assert!(
+                Instant::now() < give_up,
+                "the abandoned read kept its permits"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            1,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &storage.cluster
+            )?
+        );
+
+        let sql = storage.sql_lookup(pg_record_fetch::QUERY)?;
+        assert_eq!(1, statement_counts(&exporter, sql, "stopped").requests);
+
+        Ok(())
+    }
+
+    /// A fetch whose rows end in an error from its connection returns the records that arrived
+    /// before the error, with the error. Its connection goes back to the pool without a cancel
+    /// request, because no statement runs on it.
+    #[tokio::test]
+    async fn fetch_whose_rows_end_in_an_error_releases_its_connection() -> Result<()> {
+        // The exporter must be installed before the storage creates its first SQL metric.
+        let (provider, exporter) = install_exporter();
+
+        let mut url = Url::parse(&CONNECTION)?;
+        let upstream = (
+            url.host_str().unwrap_or("localhost").to_owned(),
+            url.port().unwrap_or(5432),
+        );
+        let (port, cut) = proxy_that_cuts(upstream).await?;
+        _ = url.set_host(Some("127.0.0.1"));
+        _ = url.set_port(Some(port));
+
+        let cluster = alphanumeric_string(15);
+        let Some(storage) = storage_with_schema(
+            "fetch_whose_rows_end_in_an_error_releases_its_connection",
+            url.as_str(),
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        storage.pool.resize(1);
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        let topic_name = alphanumeric_string(15);
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic_name.clone())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+        let topition = Topition::new(topic_name, 0);
+
+        produce_records_with_headers(&storage, &topition).await?;
+
+        // The fetch's rows are about 10 MiB, and every statement before them returns far less than
+        // the 1 MiB after which the proxy cuts, so the cut falls partway through the rows.
+        cut.store(true, atomic::Ordering::Relaxed);
+
+        let fetched = storage
+            .fetch_until_deadline(
+                &topition,
+                0,
+                1,
+                u32::MAX,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await?;
+        assert_matches!(fetched.failed, Some(_));
+
+        let offsets = records_with_offsets(fetched.batches)?
+            .into_iter()
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        assert!(!offsets.is_empty(), "the fetch kept no records");
+        assert!(
+            offsets.len() < usize::try_from(ROWS_PER_FETCH)?,
+            "the cut did not fall partway through the rows"
+        );
+        assert_eq!((0..).take(offsets.len()).collect::<Vec<i64>>(), offsets);
+
+        assert_eq!(1, storage.pool.status().available);
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        // The setup's statements count in `nisshi_sql_requests`, so the exporter is live, and a
+        // count of 0 abandoned statements is not a missing export.
+        assert!(counter_total(&provider, &exporter, "nisshi_sql_requests", &cluster)? > 0);
+        assert_eq!(
+            0,
+            counter_total(
+                &provider,
+                &exporter,
+                "nisshi_sql_statements_abandoned",
+                &cluster
+            )?
+        );
+
+        Ok(())
+    }
+
+    /// Starts a TCP proxy to the server at `upstream`, and returns its port and a switch. Once the
+    /// switch is set, the proxy closes each connection after it has forwarded more than 1 MiB from
+    /// the server, which ends a large result partway through its rows.
+    async fn proxy_that_cuts(upstream: (String, u16)) -> Result<(u16, Arc<AtomicBool>)> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const CUT_AFTER: usize = 1024 * 1024;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let cut = Arc::new(AtomicBool::new(false));
+
+        let switch = cut.clone();
+        _ = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                let cut = cut.clone();
+
+                _ = tokio::spawn(async move {
+                    let Ok(server) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+
+                    let to_server = tokio::io::copy(&mut client_read, &mut server_write);
+
+                    let to_client = async {
+                        let mut buffer = vec![0; 64 * 1024];
+                        let mut forwarded_since_cut = 0;
+
+                        loop {
+                            let read = server_read.read(&mut buffer).await?;
+                            if read == 0 {
+                                return Ok::<_, io::Error>(());
+                            }
+
+                            client_write.write_all(&buffer[..read]).await?;
+
+                            if cut.load(atomic::Ordering::Relaxed) {
+                                forwarded_since_cut += read;
+                                if forwarded_since_cut > CUT_AFTER {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    };
+
+                    // Returning drops both halves of each connection, which closes them.
+                    tokio::select! {
+                        _ = to_server => {}
+                        _ = to_client => {}
+                    }
+                });
+            }
+        });
+
+        Ok((port, switch))
+    }
+
+    /// A header with a null key or a null value comes back null, not empty, in its own position.
+    #[tokio::test]
+    async fn fetch_keeps_null_header_keys_and_values() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let headers = [
+            Header::builder()
+                .key(Bytes::from_static(b"key"))
+                .value(Bytes::from_static(b"value")),
+            Header::builder().key(Bytes::from_static(b"null-value")),
+            Header::builder().value(Bytes::from_static(b"null-key")),
+            Header::builder(),
+        ];
+
+        let batch = Batch::builder()
+            .record(
+                headers.iter().cloned().fold(
+                    Record::builder()
+                        .value(Bytes::from_static(b"a").into())
+                        .offset_delta(0),
+                    |record, header| record.header(header),
+                ),
+            )
+            .last_offset_delta(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let read = storage
+            .fetch_until_deadline(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?;
+
+        assert_eq!(
+            vec![headers.map(|header| header.build()).to_vec()],
+            records_with_offsets(read.batches)?
+                .into_iter()
+                .map(|(_, record)| record.headers)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A fetched row whose header arrays differ in length fails to decode, with an error that
+    /// names the record's offset.
+    #[tokio::test]
+    async fn fetched_row_with_unpaired_headers_names_its_offset() -> Result<()> {
+        let Some((storage, _)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let row = storage
+            .connection()
+            .await?
+            .query_one(
+                "SELECT 42::bigint AS offset_id, \
+                 NULL::smallint AS attributes, \
+                 now() AS timestamp, \
+                 NULL::bytea AS k, \
+                 NULL::bytea AS v, \
+                 NULL::bigint AS producer_id, \
+                 NULL::smallint AS producer_epoch, \
+                 ARRAY['\\x01'::bytea] AS header_keys, \
+                 ARRAY[]::bytea[] AS header_values",
+                &[],
+            )
+            .await?;
+
+        assert_matches!(
+            pg_record_fetch::Row::try_from(&row),
+            Err(Error::Message(message)) if message.contains("offset 42")
         );
 
         Ok(())
