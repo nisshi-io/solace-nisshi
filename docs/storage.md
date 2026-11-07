@@ -192,7 +192,31 @@ create role nisshi login password '...';
 create database nisshi owner nisshi;
 ```
 
-A broker changes the schema only when the database doesn't record the broker's schema version: on the first start, and on the first start of a release that changes the schema. To run brokers with a role that can only read and write rows, start one broker once with the credentials of the role that owns the tables, then start every broker with the read/write role. Do the same before you upgrade to a release that changes the schema. A broker whose role can't change the schema refuses to start until that has happened.
+A broker changes the schema only when the database doesn't record the broker's schema version: on the first start, and on the first start of a release that changes the schema. A release that changes the schema upgrades a database of the previous version in place at startup, in one transaction, so a role that runs this start must be able to alter tables, not only create them. Brokers that start together upgrade it once. If a step fails, the database stays as it was and the broker stops. An older release starts on an upgraded database only when the release notes allow it: the database records its schema version and the oldest schema version whose broker can use it, and a release with a lower schema version refuses to start on it. A broker checks this only when it starts, so a broker of an older release that keeps running across such an upgrade fails its queries with SQL errors, and the upgrading broker logs a warning when an upgrade raises the oldest compatible version. Stop brokers of an older release before you upgrade across a change that they can't use. This covers every cluster that shares the database. To run brokers with a role that can only read and write rows, start one broker once with the credentials of the role that owns the tables, then start every broker with the read/write role. Do the same before you upgrade to a release that changes the schema. A broker whose role can't change the schema refuses to start until that has happened.
+
+To see what a database records, for example before a rollback, run this query:
+
+```sql
+select version, oldest_compatible_version from nisshi_schema_version;
+```
+
+A release can use a database when its schema version is at least the recorded `oldest_compatible_version`. The change that adds a schema version adds a row to this table:
+
+| Releases | Schema version | Oldest compatible version |
+|---|---|---|
+| 0.7.0 and later | 1 | 1 |
+
+A database that 0.7.0-pre.3 set up records no version, and the query above fails on it until a release from 0.7.0 on starts on it and records one.
+
+A broker serves no request until its schema setup finishes. Each statement of an upgrade step must finish within the `statement_timeout` that the storage URL sets, or 30 seconds without one, and must get each table lock within 5 seconds. The steps together have no limit. A step that fails, or that waits for a lock until its timeout, rolls the whole upgrade back and leaves the database as it was, and the broker stops. Start the broker again to retry. The error names the failed step's SQLSTATE, table and constraint, and leaves out the rows that the step read. To find the session that holds a lock on `record`, run this query:
+
+```sql
+select a.pid, a.state, a.query_start, a.query
+from pg_locks l join pg_stat_activity a using (pid)
+where l.relation = 'record'::regclass;
+```
+
+A session whose `state` is `idle in transaction` holds its locks until its transaction ends. Another broker's maintenance sweep can also hold a lock for a short time. `pg_blocking_pids(pid)` lists the sessions that block a given session.
 
 Nisshi is tested on PostgreSQL 16 and later. On PostgreSQL 16 or later, an administrator who isn't a superuser, such as the admin user of a managed service, must first run `grant nisshi to <admin>`. Nisshi supports a database that 0.7.0-pre.3 or a later release set up.
 

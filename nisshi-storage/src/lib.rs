@@ -329,11 +329,44 @@ pub enum Error {
         schema_version: i32,
     },
 
-    /// The database records schema `recorded_version`, which is older than `schema_version`. A
-    /// broker of `schema_version` can't upgrade the recorded schema.
+    /// The database records schema `recorded_version`, which is older than `schema_version`, and
+    /// a broker of `schema_version` has no step that upgrades it. Every version from 1 has one, so
+    /// the recorded version is below 1: a row that holds a version that no release records.
     OutdatedSchema {
         recorded_version: i32,
         schema_version: i32,
+    },
+
+    /// The database has tables but records no schema version, and a broker of `schema_version`,
+    /// which is newer than version 1, can't tell which tables it lacks.
+    UnversionedSchema {
+        schema_version: i32,
+    },
+
+    /// The database records schema `schema_version` but has no `cluster` table on the
+    /// `search_path` that the connection uses. Nisshi creates `cluster` before it records a
+    /// version, so the search path changed or someone dropped or moved the tables.
+    MissingClusterTable {
+        schema_version: i32,
+        search_path: String,
+    },
+
+    /// The step that upgrades the schema from `from_version` to `to_version` failed with the
+    /// SQLSTATE `code`, and the upgrade rolled back.
+    ///
+    /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
+    /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
+    /// or `header` holds message payloads. The `message` of a SQLSTATE in class `22`, data
+    /// exception, is a fixed phrase instead of the server's, because that message quotes the value
+    /// that failed. The fields are boxed strings, so that this variant does not make [`Error`]
+    /// larger.
+    SchemaStepFailed {
+        from_version: i32,
+        to_version: i32,
+        code: Box<str>,
+        message: Box<str>,
+        table: Option<Box<str>>,
+        constraint: Option<Box<str>>,
     },
 
     InsufficientCapacity(#[from] InsufficientCapacity),
@@ -512,6 +545,9 @@ impl Error {
     /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
     /// batch took its offset, so a retry can store the batch twice.
     ///
+    /// A failure of the schema setup, such as [`Error::SchemaStepFailed`], is permanent for the
+    /// caller, because a restart of the broker retries the setup, not the caller.
+    ///
     /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
     /// [`Error::error_code`] keeps.
     ///
@@ -579,6 +615,9 @@ impl Error {
             | Self::NoEngineForScheme { .. }
             | Self::IncompatibleSchema { .. }
             | Self::OutdatedSchema { .. }
+            | Self::UnversionedSchema { .. }
+            | Self::MissingClusterTable { .. }
+            | Self::SchemaStepFailed { .. }
             | Self::InsufficientCapacity(_)
             | Self::LessThanBaseOffset { .. }
             | Self::LessThanLastOffset { .. }
