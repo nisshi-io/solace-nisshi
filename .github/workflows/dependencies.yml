@@ -77,7 +77,7 @@ jobs:
       # database, which is not pinned either. An older cargo-deny can fail to
       # parse a newer database format and turn this check red on an unrelated
       # pull request.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-deny
       - run: cargo-deny --all-features --locked check --warn unmaintained
