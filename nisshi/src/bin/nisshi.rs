@@ -339,11 +339,17 @@ fn report_error(err: &nisshi_cli::Error) {
             nisshi_generator::Error::Client(error) => {
                 report_failure!("{}", client_error_message(error, BROKER_OPTION))
             }
+            nisshi_generator::Error::Api(code) => {
+                report_failure!("the broker refused the produce request: {code:?}")
+            }
             _ => report_failure!("Unknown error occurred during command: {}", error),
         },
         nisshi_cli::Error::Perf(error) => match error {
             nisshi_perf::Error::Client(error) => {
                 report_failure!("{}", client_error_message(error, BROKER_OPTION))
+            }
+            nisshi_perf::Error::Api(code) => {
+                report_failure!("the broker refused the produce request: {code:?}")
             }
             _ => report_failure!("Unknown error occurred during command: {}", error),
         },

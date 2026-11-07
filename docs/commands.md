@@ -172,11 +172,36 @@ them, with its field names.
 | `user create`, `user delete` | an array of the one result for the user you named |
 | `cat produce` | an array of the one partition result, with `base_offset`, `error_code`, `error_message` and `record_errors` |
 | `cat consume` | always JSON, with or without the option: one array of records per batch, on its own line |
+| `generator` | one object when the run ends: a summary of what the broker accepted |
+| `perf produce` | one object per interval while the run goes, then one summary of the whole run |
 
 The JSON is printed whether or not the broker refused the request, and its `error_code` says
 why. `--silent` hides only the confirmation line, so `--output json` prints even with it. A
-command's log lines and error messages go to stderr, so stdout holds JSON only. `generator` and
-`perf` do not take `--output` yet.
+command's log lines and error messages go to stderr, so stdout holds JSON only.
+
+`generator` and `perf produce` run until their duration ends, so their JSON is one object per
+line, and the `type` field says which line it is. A run that is refused still prints its summary,
+and ends with exit status 4.
+
+```shell
+$ nisshi generator taxi --duration-seconds 5 --output json
+{"type":"summary","elapsed_ms":5001,"batches_produced":47,"records_produced":47}
+$ nisshi perf taxi produce --duration 5s --output json
+{"bytes_per_second":1647451.4,"bytes_sent":825271,"elapsed_ms":500,"latency_ms":{"max":3,"mean":0.08,"min":0},"records_per_second":1439.3,"records_sent":721,"type":"interval"}
+{"bytes_per_second":1304358.0,"bytes_sent":2611780,"elapsed_ms":2002,"latency_ms":{"max":32,"mean":0.18,"min":0},"records_per_second":1140.7,"records_sent":2284,"type":"summary"}
+```
+
+- `generator` has no report of its own for each interval, so `--output table` prints nothing and
+  `--output json` prints the one summary. It counts the batches the broker accepted.
+- `perf produce` prints an `interval` object each time its metrics are exported, every 60 seconds
+  unless `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds) says otherwise, and a `summary` last, even
+  when the run is shorter than an interval. `elapsed_ms`, `records_sent`, `bytes_sent` and the rates
+  of an `interval` are for that interval, and the summary's are for the whole run. The rates are
+  `null` when no time has elapsed. `latency_ms` is for the run so far in both, and is `null` until
+  a request was answered.
+- Both print the summary whenever a producer started, so also after a refusal (a refused login
+  or a refused produce request), with zeros if nothing was accepted. Neither prints anything when
+  the tool fails before that: an unreachable broker, a missing schema.
 
 ```shell
 $ nisshi topic create taxi --output json
@@ -193,9 +218,11 @@ $ nisshi topic create taxi --output json
 | 3 | broker unreachable | No connection opened: the address does not resolve, or the connection attempt was refused, failed or timed out. |
 | 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login or rejected the TLS connection, or the client refused what the broker offered (a certificate it does not trust). The status does not say whether a retry can succeed. For an error code, read the code: `--output json` prints it. |
 
-`generator` and `perf` keep running when the broker refuses a produce request, so a refused
-produce does not end them with 4. A refused login or TLS connection ends them with 4, because
-nothing can be produced. `nisshi perf consume` is not implemented and ends with 1.
+`generator` and `perf` stop at the first produce request that the broker refuses (an unknown
+topic or partition, a record that is too large) and end with 4, as they do for a refused login or
+TLS connection. A refusal repeats on every batch, so going on would count refusals and nothing
+else. The message on stderr names the error code, and the batches that the broker accepted before
+it are in the summary. `nisshi perf consume` is not implemented and ends with 1.
 
 Releases up to 0.8.2 exited with 1 when the broker refused a request or could not be reached. A
 script that tests for `1` should test for non-zero, or for `3` and `4`. The client tools also log

@@ -14,11 +14,11 @@
 
 use std::time::Duration;
 
-use super::{DEFAULT_BROKER, client_security::ClientSecurity};
+use super::{DEFAULT_BROKER, client_security::ClientSecurity, output::Output};
 use crate::{EnvVarExp, Result};
 use clap::Args;
 use human_units::iec::iec_unit;
-use nisshi_generator::Generate;
+use nisshi_generator::{Generate, ReportFormat};
 use nisshi_sans_io::ErrorCode;
 use url::Url;
 
@@ -49,11 +49,11 @@ pub(super) struct Arg {
     batch_size: u32,
 
     /// The maximum number of messages per second
-    #[clap(long, group = "output")]
+    #[clap(long, group = "rate")]
     per_second: Option<u32>,
 
     /// Message throughput
-    #[clap(long, group = "output")]
+    #[clap(long, group = "rate")]
     throughput: Option<Throughput>,
 
     /// The number of producers generating messages
@@ -67,6 +67,13 @@ pub(super) struct Arg {
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
+
+    /// What to print on stdout: `table` prints nothing, `json` prints one JSON object when the run
+    /// ends: {"type":"summary","elapsed_ms","batches_produced","records_produced"}, counting the
+    /// batches that the broker accepted. A refused produce request ends the run with exit status 4
+    /// and the summary is printed all the same
+    #[arg(long, value_enum, default_value_t = Output::Table)]
+    output: Output,
 
     #[command(flatten)]
     security: ClientSecurity,
@@ -89,8 +96,53 @@ impl Arg {
                 self.otlp_endpoint_url
                     .map(|expression| expression.into_inner()),
             )
+            .report(match self.output {
+                Output::Table => ReportFormat::Text,
+                Output::Json => ReportFormat::Json,
+            })
             .build()?;
 
         generate.main().await.map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arg, Output};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        arg: Arg,
+    }
+
+    fn output(args: &[&str]) -> Result<Output, clap::Error> {
+        Wrapper::try_parse_from(
+            ["generator", "t", "--schema-registry", "file://./etc/schema"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .map(|wrapper| wrapper.arg.output)
+    }
+
+    #[test]
+    fn prints_nothing_unless_asked_for_json() {
+        assert_eq!(Output::Table, output(&[]).unwrap());
+        assert_eq!(Output::Json, output(&["--output", "json"]).unwrap());
+        assert_eq!(
+            clap::error::ErrorKind::InvalidValue,
+            output(&["--output", "yaml"]).unwrap_err().kind()
+        );
+    }
+
+    #[test]
+    fn the_rate_options_exclude_each_other() {
+        assert_eq!(
+            clap::error::ErrorKind::ArgumentConflict,
+            output(&["--per-second", "1", "--throughput", "1B/s"])
+                .unwrap_err()
+                .kind()
+        );
     }
 }
