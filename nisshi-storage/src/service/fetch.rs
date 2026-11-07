@@ -269,6 +269,9 @@ where
     /// limits only how long a Fetch waits for new records ([ReplicaManager.scala#L1523-L1563]). A
     /// read that reaches the partition deadline answers with what it finished.
     ///
+    /// A read that fails after the partition has records sets `read_failed`, and the partition
+    /// answers with those records.
+    ///
     /// [ReplicaManager.scala#L1523-L1563]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1523-L1563
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -284,6 +287,7 @@ where
         isolation: IsolationLevel,
         topic: &str,
         fetch_partition: &FetchPartition,
+        read_failed: &mut bool,
     ) -> Result<PartitionData>
     where
         G: Storage,
@@ -434,8 +438,26 @@ where
                 Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
                     return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
                 }
+                // An earlier read of this partition returned records, so the partition answers
+                // with them instead of failing the whole Fetch. The consumer's next Fetch then
+                // starts after them.
+                Err(error) if !batches.is_empty() => {
+                    error!(?tp, offset, ?error, "fetch read failed after earlier reads");
+                    *read_failed = true;
+                    break;
+                }
                 read => read.inspect_err(|error| error!(?tp, ?error))?,
             };
+
+            if let Some(error) = &read.failed {
+                *read_failed = true;
+                error!(
+                    ?tp,
+                    offset,
+                    ?error,
+                    "fetch read failed after it sent records"
+                );
+            }
 
             // The reported offsets must bound every record in `batches`. Offsets only grow, so
             // the maximum of each offset bounds the records of every read. The loop does not
@@ -494,6 +516,12 @@ where
             // The loop ends at the partition deadline instead of starting another read, because a
             // read started after the deadline returns no batches and counts as timed out.
             if read.timed_out.is_some() || Instant::now() >= partition_deadline {
+                break;
+            }
+
+            // The loop ends after a failed read instead of starting another, so that it does not
+            // send more reads to storage that is failing.
+            if read.failed.is_some() {
                 break;
             }
         }
@@ -657,6 +685,7 @@ where
         isolation: IsolationLevel,
         fetch: &FetchTopic,
         is_first_non_empty: &mut bool,
+        read_failed: &mut bool,
     ) -> Result<FetchableTopicResponse> {
         let metadata = self.storage.metadata(Some(&[fetch.into()])).await?;
 
@@ -717,6 +746,7 @@ where
                         isolation,
                         name,
                         fetch_partition,
+                        read_failed,
                     )
                     .await?;
 
@@ -823,6 +853,7 @@ where
                 // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
                 let mut round_max_bytes = max_bytes;
                 let mut is_first_non_empty = true;
+                let mut read_failed = false;
 
                 let mut left = topics
                     .iter()
@@ -840,6 +871,7 @@ where
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
+                            &mut read_failed,
                         )
                         .await?;
 
@@ -866,6 +898,20 @@ where
 
                 if answers_without_waiting(&responses) {
                     debug!(?iteration, "partition error, not waiting for min_bytes");
+                    break;
+                }
+
+                // A partition whose read failed answers with the records that it read before the
+                // failure. The Fetch answers now instead of reading the partition again in another
+                // round, so that it sends no more reads to storage that is failing. Kafka also
+                // answers at once when the read of a partition fails ([ReplicaManager.scala]).
+                //
+                // [ReplicaManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
+                if read_failed {
+                    debug!(
+                        ?iteration,
+                        "partition read failed, not waiting for min_bytes"
+                    );
                     break;
                 }
 
@@ -1115,6 +1161,8 @@ mod tests {
         /// Makes the first call send its batches and then never return, like an engine that spends
         /// its whole deadline assembling one truncated batch.
         first_call_stalls: bool,
+        /// Makes the second call fail before it sends anything.
+        second_call_fails: bool,
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
@@ -1144,6 +1192,7 @@ mod tests {
                 responses: Arc::new(Mutex::new(responses)),
                 call_offsets: Arc::new(Mutex::new(vec![])),
                 first_call_stalls: false,
+                second_call_fails: false,
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
@@ -1191,6 +1240,10 @@ mod tests {
                 .is_some_and(|unknown_from| calls >= unknown_from)
             {
                 return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
+            if calls == 2 && self.second_call_fails {
+                return Err(Error::Message("the read failed".into()));
             }
 
             let response = {
@@ -1293,6 +1346,7 @@ mod tests {
                     .partition(0)
                     .fetch_offset(fetch_offset)
                     .partition_max_bytes(max_bytes as i32),
+                &mut false,
             )
             .await
     }
@@ -1368,6 +1422,45 @@ mod tests {
 
         assert_eq!(1, batches.len());
         assert_eq!(vec![0, 4], storage.call_offsets());
+
+        Ok(())
+    }
+
+    /// A read that fails without records, after an earlier read of the partition returned
+    /// records, ends the partition's reads, and the partition answers with the earlier records.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_an_earlier_read_answers_with_its_records() -> Result<()> {
+        // The partition has a record at offset 2, which the failed second read would have
+        // returned.
+        let responses = vec![vec![batch(0, &[0, 1])?], vec![batch(2, &[0])?]];
+
+        let storage = Scripted {
+            second_call_fails: true,
+            ..Scripted::new(responses, OFFSET_STAGE)
+        };
+
+        let partition = fetch_partition_at(
+            storage.clone(),
+            Duration::from_millis(100),
+            1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            0,
+        )
+        .await?;
+        let batches = partition
+            .records
+            .map(|frame| frame.batches)
+            .unwrap_or_default();
+
+        assert_eq!(
+            vec![(0, 1)],
+            batches
+                .iter()
+                .map(|batch| (batch.base_offset, batch.max_offset()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(OFFSET_STAGE.high_watermark, partition.high_watermark);
+        assert_eq!(vec![0, 2], storage.call_offsets());
 
         Ok(())
     }
@@ -1920,6 +2013,8 @@ mod tests {
         /// Sends this batch, and then never returns, so its caller drops it at its partition
         /// deadline.
         SendThenStall(deflated::Batch),
+        /// Sends this batch, and then fails.
+        SendThenFail(deflated::Batch),
     }
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -2137,6 +2232,13 @@ mod tests {
                     pending::<()>().await;
                     drop(data);
                     Ok(())
+                }
+                Read::SendThenFail(batch) => {
+                    let mut data = fetched_sender
+                        .send_offsets(covering_stage(PARTITION_STAGE, slice::from_ref(&batch)))
+                        .await?;
+                    data.send_batch(batch).await?;
+                    Err(Error::Message("the read failed".into()))
                 }
             }
         }
@@ -2710,6 +2812,35 @@ mod tests {
 
             assert_eq!(Duration::ZERO, elapsed, "min_bytes {min_bytes}");
         }
+
+        Ok(())
+    }
+
+    /// A Fetch whose partition read fails after it sent records answers at once with those records,
+    /// below `min_bytes`, and does not read the partition again.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_it_sent_records_answers_below_min_bytes() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::SendThenFail(batch(0, &[0])?)])]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(PARTITION_STAGE.high_watermark, partitions[0].high_watermark);
+        assert_eq!(1, storage.calls(0).len());
 
         Ok(())
     }
