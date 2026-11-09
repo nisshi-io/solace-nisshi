@@ -14,6 +14,7 @@
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod pool;
+pub mod security;
 
 // Cargo only builds the modules declared above, so a file in `tests/it/` without a
 // `pub mod` line would never compile or run. Fail instead of skipping it silently.

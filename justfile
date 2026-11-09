@@ -128,7 +128,7 @@ release-sqlite: (cargo-build "--release" "--bin" "nisshi" "--no-default-features
 
 test: test-workspace test-doc
 
-test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "fuzz" "--exclude" "nisshi-smoke-test" args)
+test-workspace *args: (nextest "run" "--workspace" "--all-targets" "--all-features" "--no-fail-fast" "--exclude" "nisshi-smoke-test" args)
 
 # the tests that need no docker compose service (no Postgres, MinIO or Iceberg catalog);
 # NISSHI_WORKTREE_SERVICES=0 stops nextest's setup script starting this worktree's services
@@ -146,7 +146,7 @@ doc *args:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items {{ args }}
 
 cargo-fuzz +args:
-    CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz {{ args }}
+    cargo +nightly fuzz {{ args }}
 
 fuzz-request-decode: (cargo-fuzz "run" "fuzz_request_decode" "--" "-max_total_time=60")
 
@@ -154,7 +154,7 @@ fuzz-member-metadata: (cargo-fuzz "run" "fuzz_member_metadata" "--" "-max_total_
 
 # write the seed corpus under fuzz/corpus/, on the toolchain fuzz-ci runs on
 fuzz-generate-seed:
-    cargo +nightly run --package fuzz --bin generate_seeds
+    cargo +nightly run --manifest-path fuzz/Cargo.toml --bin generate_seeds
 
 # run every target listed under `tier` in fuzz/ci-targets.json for its budget
 # in seconds (or only `target`), as .github/workflows/fuzz.yml does; see
@@ -182,18 +182,10 @@ fuzz-ci tier target="":
     # cargo-fuzz defaults --target to the platform it was built for, which
     # is musl for its prebuilt Linux release, and ASan can't link against
     # musl. build, run and cmin must all get the same flags, or the next one
-    # rebuilds from scratch. (--codegen-units above 1 would build faster,
-    # but nightly rustc segfaults on typenum with it and the sanitizer.)
+    # rebuilds from scratch. (fuzz/Cargo.toml sets the release profile they
+    # build with: one codegen unit and no LTO.)
     opts=(--target "$(rustc +nightly -vV | sed -n 's/^host: //p')")
-    # Fuzz builds turn off the workspace's cross-crate LTO instead of
-    # inheriting `lto = "thin"` from Cargo.toml. With LTO, cargo compiles each
-    # dependency to bitcode only, and every target then generates the machine
-    # code for its whole dependency graph when it links, which takes minutes
-    # per target. LTO also makes the targets run fewer inputs per second.
-    # fuzz-cmin sets the same value, because cmin must get the same flags as
-    # build and run. The cargo-fuzz recipe sets it to build as fast.
-    export CARGO_PROFILE_RELEASE_LTO=false
-    cargo +nightly run --quiet --package fuzz --bin generate_seeds > /dev/null
+    cargo +nightly run --quiet --manifest-path fuzz/Cargo.toml --bin generate_seeds > /dev/null
     # Build only the targets of this tier, up front, so a failure to compile
     # shows before any fuzzing starts. `fuzz build` without a target builds
     # every target in fuzz/Cargo.toml, and the storage targets, which link the
@@ -217,7 +209,7 @@ fuzz-ci tier target="":
 fuzz-cmin target:
     #!/usr/bin/env bash
     set -euo pipefail
-    CARGO_PROFILE_RELEASE_LTO=false cargo +nightly fuzz cmin --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ quote(target) }}
+    cargo +nightly fuzz cmin --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{ quote(target) }}
 
 # the target names under `tier` in fuzz/ci-targets.json, as a JSON array
 fuzz-ci-matrix tier:
@@ -226,14 +218,20 @@ fuzz-ci-matrix tier:
 check:
     cargo check --workspace --all-features --all-targets
 
+# fuzz/ is a workspace of its own. Its pass shares target/ and the root's dev
+# profile, so it reuses each dependency that the root workspace built with the
+# same features.
 clippy:
     cargo clippy --workspace --all-features --all-targets -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --target-dir target --all-targets -- -D warnings
 
 fmt:
     cargo fmt --all --check
+    cargo fmt --manifest-path fuzz/Cargo.toml --all --check
 
 fmt-fix:
     cargo fmt --all
+    cargo fmt --manifest-path fuzz/Cargo.toml --all
 
 shellcheck:
     git ls-files -z '*.sh' '*.bash' | xargs -0 --no-run-if-empty shellcheck
@@ -500,7 +498,7 @@ cat-consume topic:
     target/debug/nisshi cat consume {{ topic }} --max-wait-time-ms=5000
 
 generator topic *args:
-    target/debug/nisshi generator {{ args }} {{ topic }} 2>&1 >generator.log
+    target/debug/nisshi generator {{ args }} {{ topic }} >generator.log 2>&1
 
 duckdb-k-unnest-v-parquet topic:
     duckdb -init etc/duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"

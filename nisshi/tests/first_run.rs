@@ -110,7 +110,7 @@ fn failed_topic_create_prints_no_confirmation() {
 
     let duplicate = broker.run(&["topic", "create", "taxi"], "");
 
-    assert_eq!(Some(1), duplicate.status.code(), "{duplicate:?}");
+    assert_eq!(Some(4), duplicate.status.code(), "{duplicate:?}");
     assert!(
         !String::from_utf8_lossy(&duplicate.stdout).contains("Created topic"),
         "{duplicate:?}"
@@ -129,7 +129,7 @@ fn failed_cat_produce_prints_no_confirmation() {
     );
 
     assert_eq!(
-        Some(1),
+        Some(4),
         missing_partition.status.code(),
         "{missing_partition:?}"
     );
@@ -157,4 +157,24 @@ fn closed_stdout_does_not_fail_a_command_that_succeeded() {
         "[{\"key\":null,\"value\":\"hello\"}]\n",
         stdout(&broker.run(&["cat", "consume", "taxi"], ""))
     );
+}
+
+#[test]
+fn closed_stdout_does_not_fail_a_json_command_that_succeeded() {
+    let broker = Broker::start();
+
+    for args in [
+        &["topic", "create", "taxi", "--output", "json"][..],
+        &["topic", "delete", "taxi", "--output", "json"][..],
+    ] {
+        let output = broker.run_with_closed_stdout(args, "");
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+
+    _ = stdout(&broker.run(&["topic", "create", "taxi"], ""));
+    let produced = broker.run_with_closed_stdout(
+        &["cat", "produce", "taxi", "--output", "json"],
+        "{\"value\": \"hello\"}\n",
+    );
+    assert!(produced.status.success(), "{produced:?}");
 }

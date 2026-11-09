@@ -22,7 +22,7 @@ use crate::{Error, Location, Result};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, NULL_TOPIC_ID, ProduceRequest, ProduceResponse,
     metadata_request::MetadataRequestTopic,
@@ -43,11 +43,13 @@ use url::Url;
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, T, P, S, F> {
     broker: B,
+    security: Security,
     topic: T,
     partition: P,
     schema_registry: S,
     file_name: F,
     confirm: bool,
+    json: bool,
 }
 
 pub(crate) type PhantomBuilder = Builder<
@@ -59,59 +61,81 @@ pub(crate) type PhantomBuilder = Builder<
 >;
 
 impl<B, T, P, S, F> Builder<B, T, P, S, F> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T, P, S, F> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String, P, S, F> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
     pub fn partition(self, partition: i32) -> Builder<B, T, i32, S, F> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
     pub fn schema_registry(self, schema_registry: Option<Url>) -> Builder<B, T, P, Option<Url>, F> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }
     }
 
     pub fn file_name(self, file_name: String) -> Builder<B, T, P, S, String> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name,
             confirm: self.confirm,
+            json: self.json,
         }
+    }
+
+    /// Print the broker's answer as JSON instead of a confirmation line: an array of the
+    /// partition's `PartitionProduceResponse`, as the broker sent it, printed whether or not it
+    /// carries an error code. Off by default, so a library caller gets no output.
+    pub fn json(self, json: bool) -> Builder<B, T, P, S, F> {
+        Self { json, ..self }
     }
 
     /// Print a confirmation line to stdout on success. Off by default, so a library caller gets no output.
@@ -124,11 +148,13 @@ impl Builder<Url, String, i32, Option<Url>, String> {
     pub fn build(self) -> super::Cat {
         super::Cat::Produce(Box::new(Configuration {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
             file_name: self.file_name,
             confirm: self.confirm,
+            json: self.json,
         }))
     }
 }
@@ -136,11 +162,13 @@ impl Builder<Url, String, i32, Option<Url>, String> {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     pub broker: Url,
+    security: Security,
     pub topic: String,
     pub partition: i32,
     pub schema_registry: Option<Url>,
     pub file_name: String,
     pub confirm: bool,
+    pub json: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +363,7 @@ impl Produce {
         debug!(?frame);
 
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -400,11 +429,23 @@ impl Produce {
 
         let error_code = ErrorCode::try_from(partition_response.error_code)?;
 
+        if self.configuration.json {
+            // The response as the broker sent it, with the `error_message` and `record_errors`
+            // that carry its reason. A failure to print is ignored, as for the confirmation
+            // line below.
+            _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                serde_json::to_string(&[partition_response])?
+            )
+            .inspect_err(|error| debug!(?error));
+        }
+
         if error_code != ErrorCode::None {
             if let Some(reason) = rejection_reason(&topic, partition_response) {
                 error!("{reason}");
             }
-        } else if self.configuration.confirm {
+        } else if self.configuration.confirm && !self.configuration.json {
             let produced = Produced {
                 topic,
                 partition: self.configuration.partition,
@@ -452,7 +493,9 @@ impl Display for Produced {
                 f,
                 "Produced {count} messages to {topic} partition {partition}, offsets \
                 {base_offset} to {}.",
-                base_offset + i64::from(count - 1)
+                // The broker supplies `base_offset`, and `fmt` can't fail, so a base offset
+                // too close to `i64::MAX` prints `i64::MAX` instead of overflowing.
+                base_offset.saturating_add(i64::from(count - 1))
             ),
         }
     }
@@ -527,11 +570,13 @@ mod tests {
     fn produce(file_name: &str) -> Produce {
         Produce::try_from(Configuration {
             broker: Url::parse("tcp://127.0.0.1:9092").unwrap(),
+            security: nisshi_client::Security::default(),
             topic: "greetings".into(),
             partition: 0,
             schema_registry: None,
             file_name: file_name.into(),
             confirm: true,
+            json: false,
         })
         .unwrap()
     }
@@ -843,6 +888,17 @@ mod tests {
         assert_eq!(
             "Produced 4 messages to taxi partition 0, offsets 0 to 3.",
             produced(0, 4)
+        );
+    }
+
+    #[test]
+    fn produced_range_past_i64_max_stops_at_it() {
+        assert_eq!(
+            format!(
+                "Produced 3 messages to taxi partition 0, offsets {0} to {0}.",
+                i64::MAX
+            ),
+            produced(i64::MAX, 3)
         );
     }
 

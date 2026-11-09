@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{collections::BTreeMap, slice, time::Duration};
+use tokio::time::Instant;
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
 use bytes::Bytes;
@@ -1465,7 +1466,7 @@ where
             min_bytes,
             max_bytes as u32,
             IsolationLevel::ReadUncommitted,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| {
@@ -1545,7 +1546,7 @@ where
             min_bytes,
             max_bytes as u32,
             IsolationLevel::ReadUncommitted,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| {

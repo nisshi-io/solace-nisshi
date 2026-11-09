@@ -45,7 +45,8 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
     schedule:
       interval: "weekly"
       day: "sunday"
@@ -140,6 +141,32 @@ updates:
       cargo-patch:
         patterns: ["*"]
         update-types: ["patch"]
+  # fuzz/ is a Cargo workspace of its own, with its own Cargo.lock. Its path
+  # dependencies inherit requirements from the root Cargo.toml's
+  # [workspace.dependencies], and Dependabot reads and edits that file from
+  # this directory too. Without `allow`, each bump of such a requirement
+  # would change the root Cargo.toml with only fuzz/Cargo.lock to match it,
+  # which fails `--locked` builds of the root workspace, and would conflict
+  # with the root entry's PR for the same line. So this entry updates only
+  # libfuzzer-sys, which only fuzz/Cargo.toml declares, and the rest of
+  # fuzz/Cargo.lock falls behind the root lock between releases. `allow`
+  # limits security updates too, so none is raised for the rest of it.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "06:00"
+      timezone: "America/Toronto"
+    target-branch: "main"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    allow:
+      - dependency-name: "libfuzzer-sys"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
   # The Dockerfile's alpine base and .devcontainer's rust base are pinned to
   # exact digests. A digest pin only stays current if something deliberately
   # bumps it, so both get the same Dependabot coverage the other ecosystems

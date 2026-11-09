@@ -36,9 +36,9 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
-use nisshi_sans_io::DeleteRecordsRequest;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
+use nisshi_sans_io::{DeleteRecordsRequest, ErrorCode};
 use nisshi_storage::{DeleteRecordsService, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -47,12 +47,15 @@ use url::Url;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
-fuzz_target!(|request: DeleteRecordsRequest| {
-    RUNTIME.block_on(async {
-        check_request(request.clone()).expect("encode/decode request");
+fuzz_target!(|input: (u16, DeleteRecordsRequest)| {
+    let (selector, request) = input;
+    let version = api_version::<DeleteRecordsRequest>(selector);
 
+    RUNTIME.block_on(async {
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let request = normalize_request(request).expect("normalized request");
+        let Some(request) = check_request(request, version).expect("encode/decode request") else {
+            return;
+        };
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
@@ -69,10 +72,23 @@ fuzz_target!(|request: DeleteRecordsRequest| {
 
         let service = DeleteRecordsService { storage };
 
-        service
-            .serve(request)
-            .await
-            .and_then(|response| check_response(response).map_err(Into::into))
-            .expect("served and decoded")
+        let response = service.serve(request).await.expect("served");
+
+        // The service answers an engine error in the failing partition and returns `Ok`, so
+        // this code is the only sign of an engine that failed. The in-memory engine does not
+        // fail a DeleteRecords call.
+        let storage_error = i16::from(ErrorCode::KafkaStorageError);
+
+        assert!(
+            response
+                .topics
+                .iter()
+                .flatten()
+                .flat_map(|topic| topic.partitions.iter().flatten())
+                .all(|partition| partition.error_code != storage_error),
+            "a partition answered KAFKA_STORAGE_ERROR: {response:?}"
+        );
+
+        check_response(response, version).expect("decoded")
     });
 });

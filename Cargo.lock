@@ -218,7 +218,7 @@ dependencies = [
  "digest 0.10.7",
  "log",
  "miniz_oxide 0.8.9",
- "num-bigint",
+ "num-bigint 0.4.8",
  "quad-rand",
  "rand 0.9.5",
  "regex-lite",
@@ -294,9 +294,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arrow"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cfdd0833e32a9874d2b55089333ad310c0be208aafa277385ce2461dec90be3"
+checksum = "c943b9bec582e47f8394e44713c3cbfbe645fd049e3a7771585f54849c710fe6"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -315,9 +315,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-arith"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a41203398f0eaa6f7ec8e62c0da742a21abf282c148fc157f6c35c90e29981a"
+checksum = "8b13b85a6a547a1669114e418f6ab3c3e39c2edb1b8be5ab2889e5739a433ae9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -354,15 +354,15 @@ checksum = "53ee609a07eb721c2e4a7669d7bb88e2106c560e7dec1219096fecf5eae356d1"
 dependencies = [
  "bytes",
  "half",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
 ]
 
 [[package]]
 name = "arrow-cast"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a8a327c9649f30d8406995f27642b68df354713cca3baaaf100f076f18d5f34"
+checksum = "9575323ffeb4bc6955f39bf8716f734671a32780f1fac9ba6c2891048fc0ea1f"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -382,9 +382,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-csv"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af0dd6d90d1955e9f9a014c1e563ee8aeffc21909085d25623e1da44d96eca26"
+checksum = "50659e76e264937e967167e08d76b1d50b1c162f723c5a3c0527d28c4cdf0d56"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -426,9 +426,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8a96aed3931c076adee39ec2a40d8219fc7f09e79bcdaca1df16272993e1e14"
+checksum = "a0efe21cd317f22e6b8d7eecc4ed71a043e7269a7bc313a8827c7fb8733866ca"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -451,9 +451,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-ord"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63a083ec750f5c043f02946b4baf05fcdbb55f4560a3277055caca5cc99f3eb0"
+checksum = "908a1b5aeefce5c6eb2a0a4e98f4ccacbd441fe0ed23fb799e634cd0135821e5"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-row"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "514ba0ef0d4c5896202dae736251ce415abb43a950bed570fb7981b8716c0e4c"
+checksum = "5383b1676492a509032f06fa4ca9522c886036aec4ebe8261bebfbce904af667"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -503,9 +503,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-string"
-version = "58.4.0"
+version = "58.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6789b388467525e3271326b6b4915666ecfdf5142aef09779445c954b67543c"
+checksum = "bd245a358d52e77bfcb99dc3e21f04b947383271b7a0b9ca8feec43e9039234d"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1149,7 +1149,7 @@ checksum = "8fa3f3d8cbf4dffcfe4991de61d012bef509a409ecbe9dd41049bfe32b4d4653"
 dependencies = [
  "autocfg",
  "libm",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
  "serde",
@@ -3273,7 +3273,7 @@ dependencies = [
  "asn1-rs",
  "displaydoc",
  "nom 7.1.3",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "rusticata-macros",
 ]
@@ -3403,7 +3403,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3599,7 +3599,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3985,7 +3985,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e246562084dde8ebbcc943b261c406ce4f68e5032ec28029a251a47d6a295500"
 dependencies = [
  "num",
- "num-bigint",
+ "num-bigint 0.4.8",
 ]
 
 [[package]]
@@ -4112,21 +4112,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fuzz"
-version = "0.8.1"
-dependencies = [
- "bytes",
- "libfuzzer-sys",
- "nisshi-sans-io",
- "nisshi-service",
- "nisshi-storage",
- "nisshi-storage-dynostore",
- "rama",
- "tokio",
- "url",
 ]
 
 [[package]]
@@ -5022,7 +5007,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5363,16 +5348,6 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
-
-[[package]]
-name = "libfuzzer-sys"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
-dependencies = [
- "arbitrary",
- "cc",
-]
 
 [[package]]
 name = "libloading"
@@ -5855,7 +5830,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "dotenv",
  "nisshi-broker",
@@ -5869,6 +5844,7 @@ dependencies = [
  "nisshi-schema",
  "nisshi-storage",
  "nisshi-topic",
+ "rcgen",
  "serde_json",
  "tempfile",
  "tokio",
@@ -5877,7 +5853,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-auth"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bytes",
  "nisshi-sans-io",
@@ -5891,7 +5867,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-broker"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5954,7 +5930,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cat"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bytes",
  "futures",
@@ -5974,7 +5950,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-cli"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bytes",
  "clap",
@@ -6000,6 +5976,7 @@ dependencies = [
  "regex",
  "rsasl",
  "rustls",
+ "serde_json",
  "sha2 0.10.9",
  "temp-env",
  "tempfile",
@@ -6014,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-client"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "backoff",
@@ -6028,17 +6005,40 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "rama",
+ "rcgen",
+ "rsasl",
+ "rustls",
+ "rustls-native-certs",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
+]
+
+[[package]]
+name = "nisshi-fuzz-harness"
+version = "0.8.2"
+dependencies = [
+ "arbitrary",
+ "bytes",
+ "nisshi-broker",
+ "nisshi-sans-io",
+ "nisshi-service",
+ "nisshi-storage",
+ "nisshi-storage-dynostore",
+ "rama",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]
 name = "nisshi-generator"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "futures",
  "futures-core",
@@ -6065,7 +6065,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-model"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "convert_case 0.12.0",
  "lazy_static",
@@ -6080,7 +6080,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-otel"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -6094,7 +6094,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-perf"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bytes",
  "futures",
@@ -6123,7 +6123,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-proxy"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6153,7 +6153,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-sans-io"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -6184,7 +6184,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-schema"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -6205,11 +6205,11 @@ dependencies = [
  "iceberg-storage-opendal",
  "jsonschema",
  "nisshi-sans-io",
- "num-bigint",
+ "num-bigint 0.5.1",
  "object_store 0.14.2",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
- "ordered-float 5.5.0",
+ "ordered-float 5.5.1",
  "parquet",
  "pretty_assertions",
  "protobuf",
@@ -6232,7 +6232,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-service"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6242,6 +6242,7 @@ dependencies = [
  "nanoid",
  "nisshi-auth",
  "nisshi-sans-io",
+ "nisshi-storage",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "rama",
@@ -6258,7 +6259,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-smoke-test"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "clap",
  "humantime",
@@ -6275,7 +6276,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6328,7 +6329,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-dynostore"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6360,7 +6361,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-null"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "nisshi-sans-io",
@@ -6374,7 +6375,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-slatedb"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6394,7 +6395,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-storage-sql"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6433,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "nisshi-topic"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "futures",
  "futures-core",
@@ -6511,7 +6512,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6520,7 +6521,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-complex",
  "num-integer",
  "num-iter",
@@ -6537,6 +6538,16 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -6585,7 +6596,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
 ]
@@ -7025,9 +7036,9 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "5.5.0"
+version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c7c9e0d9b23589f26070720bac724174bfec1083e82f7854cdd0267518343c0"
+checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
 dependencies = [
  "num-traits",
 ]
@@ -7167,7 +7178,7 @@ dependencies = [
  "half",
  "hashbrown 0.17.1",
  "lz4_flex",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
  "object_store 0.13.2",
@@ -7639,7 +7650,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7829,7 +7840,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8904,7 +8915,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8963,7 +8974,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9962,7 +9973,7 @@ checksum = "dfadb8526b6da90704feb293b0701a6aae62ea14983143344be2dc5ce30f1d82"
 dependencies = [
  "fnv",
  "nom 7.1.3",
- "ordered-float 5.5.0",
+ "ordered-float 5.5.1",
  "serde",
  "serde_json",
 ]
@@ -10026,7 +10037,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10628,7 +10639,7 @@ dependencies = [
  "libm",
  "loom",
  "miette",
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-traits",
  "pack1",
  "parking_lot",
@@ -11267,9 +11278,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -11330,7 +11341,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

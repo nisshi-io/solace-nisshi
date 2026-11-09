@@ -14,7 +14,9 @@
 
 pub mod group;
 mod maintenance;
+mod sweep_failures;
 
+use self::sweep_failures::SweepFailures;
 use crate::{
     CancelKind, Error, Result,
     coordinator::group::{
@@ -283,6 +285,9 @@ pub struct Broker<G, S> {
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
+    /// The scheme of the storage URL, which names the engine in a maintenance failure.
+    storage_engine: String,
+
     cancellation: CancellationToken,
 
     /// Present when OTLP metrics are enabled; flushed and shut down when
@@ -324,6 +329,7 @@ where
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
+            storage_engine: String::from("unknown"),
 
             cancellation: CancellationToken::new(),
 
@@ -523,6 +529,10 @@ where
         // previous sweep is still running.
         let mut maintenance_sweep: Option<AbortHandle> = None;
         let mut txn_sweep: Option<AbortHandle> = None;
+
+        let engine = &self.storage_engine;
+        let maintenance_failures = Arc::new(SweepFailures::maintain(engine));
+        let txn_failures = Arc::new(SweepFailures::maintain_transactions(engine));
 
         let mut set = JoinSet::new();
 
@@ -727,20 +737,20 @@ where
 
                 _ = interval.tick() => {
                     if maintenance_sweep.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                        debug!("maintain still in flight; skipping tick");
+                        maintenance_failures.overdue(std::time::Instant::now());
                     } else {
                         let storage = self.storage.clone();
+                        let failures = maintenance_failures.clone();
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintenance");
 
-                            async move {
-                                if let Err(err) = storage.maintain(SystemTime::now()).await {
-                                    debug!(?err);
-                                }
-                            }
-                            .instrument(span)
-                            .await
+                            failures
+                                .run(
+                                    async move { storage.maintain(SystemTime::now()).await }
+                                        .instrument(span),
+                                )
+                                .await
                         });
 
                         debug!(?handle);
@@ -750,20 +760,22 @@ where
 
                 _ = txn_interval.tick() => {
                     if txn_sweep.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                        debug!("maintain_transactions still in flight; skipping tick");
+                        txn_failures.overdue(std::time::Instant::now());
                     } else {
                         let storage = self.storage.clone();
+                        let failures = txn_failures.clone();
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintain_transactions");
 
-                            async move {
-                                if let Err(err) = storage.maintain_transactions(SystemTime::now()).await {
-                                    debug!(?err);
-                                }
-                            }
-                            .instrument(span)
-                            .await
+                            failures
+                                .run(
+                                    async move {
+                                        storage.maintain_transactions(SystemTime::now()).await
+                                    }
+                                    .instrument(span),
+                                )
+                                .await
                         });
 
                         debug!(?handle);
@@ -1088,6 +1100,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             None
         };
 
+        let storage_engine = engine_label(self.storage.scheme()).to_owned();
+
         Ok(Broker {
             node_id: self.node_id,
             cluster_id: self.cluster_id.clone(),
@@ -1105,17 +1119,30 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             banner: self.banner,
             maintenance_interval: intervals.maintenance,
             transaction_maintenance_interval: intervals.transaction_maintenance,
+            storage_engine,
             cancellation: self.cancellation,
             meter_provider,
         })
     }
 }
 
+/// Returns the engine label that the sweep log and metric carry for a storage URL scheme.
+///
+/// An alert matches this label, so one engine has one label: `postgresql://` is the same engine as
+/// `postgres://`. The storage factory owns the list of aliases, and this function copies the one
+/// alias that a factory accepts under two schemes.
+fn engine_label(scheme: &str) -> &str {
+    match scheme {
+        "postgresql" => "postgres",
+        scheme => scheme,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        address_family_unsupported_os_error, arm, bind, configure_listener, ipv4_fallback,
-        listener_addr, preferred_listener_addr,
+        address_family_unsupported_os_error, arm, bind, configure_listener, engine_label,
+        ipv4_fallback, listener_addr, preferred_listener_addr,
     };
     use crate::Error;
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1125,6 +1152,16 @@ mod tests {
     };
     use tokio::net::{TcpListener, TcpStream};
     use url::Url;
+
+    #[test]
+    fn engine_label_reports_one_label_per_engine() {
+        assert_eq!("postgres", engine_label("postgres"));
+        assert_eq!("postgres", engine_label("postgresql"));
+
+        for scheme in ["sqlite", "memory", "s3", "gs", "null", "slatedb"] {
+            assert_eq!(scheme, engine_label(scheme));
+        }
+    }
 
     async fn listener_addr_of(listener: &str) -> crate::Result<SocketAddr> {
         listener_addr(&Url::parse(listener).expect("listener URL")).await

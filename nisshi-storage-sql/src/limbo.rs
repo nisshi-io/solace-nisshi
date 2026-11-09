@@ -65,12 +65,13 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetRequest, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
-    Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    DeleteRecordsConcurrency, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
+    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate, max_message_bytes, producer_claim, read_deadline::ReadDeadline,
 };
 use opentelemetry::{
     KeyValue,
@@ -274,6 +275,52 @@ impl Engine {
     async fn connection(&self) -> Result<Connection> {
         let db = self.db.lock()?;
         db.connect().map_err(Into::into)
+    }
+
+    /// Returns the headers of the record at `offset` in `topition`.
+    async fn record_headers(
+        &self,
+        c: &Connection,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<Vec<Header>> {
+        let mut rows = c
+            .query(
+                &sql_lookup("header_fetch.sql")?,
+                (
+                    self.cluster.as_str(),
+                    topition.topic(),
+                    topition.partition(),
+                    offset,
+                ),
+            )
+            .await?;
+
+        let mut headers = vec![];
+
+        while let Some(row) = rows.next().await? {
+            let mut header_builder = Header::builder();
+
+            if let Some(k) = row
+                .get_value(0)
+                .map(|value| value.as_blob().cloned())
+                .inspect_err(|err| error!(?err))?
+            {
+                header_builder = header_builder.key(Bytes::from(k));
+            }
+
+            if let Some(v) = row
+                .get_value(1)
+                .map(|value| value.as_blob().cloned())
+                .inspect_err(|err| error!(?err))?
+            {
+                header_builder = header_builder.value(Bytes::from(v));
+            }
+
+            headers.push(header_builder.build());
+        }
+
+        Ok(headers)
     }
 
     fn attributes_for_error(&self, sql: &str, error: &turso::Error) -> Vec<KeyValue> {
@@ -1398,6 +1445,14 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
 
 #[async_trait]
 impl Storage for Engine {
+    /// A Turso connection has no busy handler, so a write that finds another
+    /// connection's write lock held fails at once with `Busy`. The factory puts a
+    /// `nisshi_storage::SemaphoreProxy` in front of the engine, which runs one write at a time,
+    /// so a second call at once gains nothing.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::serial()
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(?broker_registration);
 
@@ -1729,14 +1784,25 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
         // The batch is inflated before the transaction starts, so the wait
         // for a decode permit and the decode do not hold a connection or the
         // database write lock.
         let inflated = inflate(deflated.clone())
             .await
             .inspect_err(|err| debug!(?err))?;
+
+        self.produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
         let mut connection = self.connection().await?;
         let tx = connection
@@ -1757,10 +1823,17 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<deflated::Batch>> {
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
+
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+
+        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
+            return Ok(vec![]);
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
@@ -1778,10 +1851,14 @@ impl Storage for Engine {
             max_bytes
         );
 
-        let c = self.connection().await?;
+        let Ok(c) = read_deadline.timeout(self.connection()).await else {
+            return Ok(vec![]);
+        };
 
-        let mut records = c
-            .query(
+        let c = c?;
+
+        let records = async {
+            c.query(
                 &sql_lookup("record_fetch.sql")?,
                 (
                     self.cluster.as_str(),
@@ -1793,11 +1870,23 @@ impl Storage for Engine {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err))?;
+            .inspect_err(|err| error!(?err))
+            .map_err(Error::from)
+        };
+
+        let Ok(records) = read_deadline.timeout(records).await else {
+            return Ok(vec![]);
+        };
+
+        let mut records = records?;
 
         let mut batches = vec![];
 
-        if let Some(row) = records.next().await? {
+        let Ok(first) = read_deadline.timeout(records.next()).await else {
+            return Ok(vec![]);
+        };
+
+        if let Some(row) = first? {
             let offset_delta = 0;
             let timestamp_delta = 0;
 
@@ -1813,8 +1902,15 @@ impl Storage for Engine {
                 .inspect(|base_offset| debug!(base_offset))
                 .inspect_err(|err| error!(?err))?;
 
-            let record_builder = {
-                let mut record_builder = Record::builder()
+            let Ok(headers) = read_deadline
+                .timeout(self.record_headers(&c, topition, base_offset))
+                .await
+            else {
+                return Ok(vec![]);
+            };
+
+            let record_builder = headers?.into_iter().fold(
+                Record::builder()
                     .offset_delta(offset_delta)
                     .timestamp_delta(timestamp_delta)
                     .key(
@@ -1828,44 +1924,9 @@ impl Storage for Engine {
                             .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
                             .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                             .inspect_err(|err| error!(?err))?,
-                    );
-
-                let mut headers = c
-                    .query(
-                        &sql_lookup("header_fetch.sql")?,
-                        (
-                            self.cluster.as_str(),
-                            topition.topic(),
-                            topition.partition(),
-                            base_offset,
-                        ),
-                    )
-                    .await?;
-
-                while let Some(header) = headers.next().await? {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .get_value(0)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
-                    }
-
-                    if let Some(v) = header
-                        .get_value(1)
-                        .map(|value| value.as_blob().cloned())
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
-                    }
-
-                    record_builder = record_builder.header(header_builder);
-                }
-
-                record_builder
-            };
+                    ),
+                |record_builder, header| record_builder.header(header.into()),
+            );
 
             let mut batch_builder = inflated::Batch::builder()
                 .base_offset(base_offset)
@@ -1883,8 +1944,7 @@ impl Storage for Engine {
                 .base_timestamp(
                     row.get_value(2)
                         .map_err(Error::from)
-                        .and_then(LiteTimestamp::try_from)
-                        .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                        .and_then(LiteTimestamp::millis)
                         .inspect_err(|err| error!(?err))?,
                 )
                 .producer_id(
@@ -1902,7 +1962,41 @@ impl Storage for Engine {
                 .record(record_builder)
                 .last_offset_delta(offset_delta);
 
-            while let Some(row) = records.next().await? {
+            loop {
+                // Turso returns from a step that waits for I/O, so the timer of `read_deadline`
+                // can stop the read between I/O steps. The read keeps each record that it
+                // finished.
+                let Ok(next) = read_deadline.timeout(records.next()).await else {
+                    break;
+                };
+
+                let Some(row) = next? else {
+                    break;
+                };
+
+                let offset = row
+                    .get_value(0)
+                    .map_err(Into::into)
+                    .and_then(|value| {
+                        value
+                            .as_integer()
+                            .copied()
+                            .ok_or(Error::UnexpectedValue(value))
+                    })
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
+
+                // The read takes the record's headers before it starts a new batch for the record,
+                // so that each batch it starts holds at least one record.
+                let Ok(headers) = read_deadline
+                    .timeout(self.record_headers(&c, topition, offset))
+                    .await
+                else {
+                    break;
+                };
+
+                let headers = headers?;
+
                 let attributes = row
                     .get_value(1)
                     .map(|value| {
@@ -1930,8 +2024,7 @@ impl Storage for Engine {
                 let timestamp = row
                     .get_value(2)
                     .map_err(Error::from)
-                    .and_then(LiteTimestamp::try_from)
-                    .and_then(|system_time| to_timestamp(&system_time.0).map_err(Into::into))
+                    .and_then(LiteTimestamp::millis)
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
@@ -1971,24 +2064,12 @@ impl Storage for Engine {
                         .producer_epoch(producer_epoch);
                 }
 
-                let offset = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
                 let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
 
                 let timestamp_delta = timestamp - batch_builder.base_timestamp;
 
-                let record_builder = {
-                    let mut record_builder = Record::builder()
+                let record_builder = headers.into_iter().fold(
+                    Record::builder()
                         .offset_delta(offset_delta)
                         .timestamp_delta(timestamp_delta)
                         .key(
@@ -2004,46 +2085,9 @@ impl Storage for Engine {
                                 .map(|o| o.map(Bytes::from))
                                 .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                                 .inspect_err(|err| error!(?err))?,
-                        );
-
-                    let mut headers = c
-                        .query(
-                            &sql_lookup("header_fetch.sql")?,
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
-                        let mut header_builder = Header::builder();
-
-                        if let Some(k) = header
-                            .get_value(0)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(k);
-                        }
-
-                        if let Some(v) = header
-                            .get_value(1)
-                            .map(|value| value.as_blob().cloned())
-                            .map(|o| o.map(Bytes::from))
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(v);
-                        }
-
-                        record_builder = record_builder.header(header_builder);
-                    }
-
-                    record_builder
-                };
+                        ),
+                    |record_builder, header| record_builder.header(header.into()),
+                );
 
                 batch_builder = batch_builder
                     .record(record_builder)
@@ -2462,6 +2506,10 @@ impl Storage for Engine {
                                 .map_err(Into::into)
                                 .and_then(|value| match value {
                                     Value::Null => Ok(None),
+                                    // A record that was produced without a timestamp stores
+                                    // NO_TIMESTAMP, -1, and `SystemTime` cannot hold a negative
+                                    // millisecond count, so this answers no timestamp for it.
+                                    Value::Integer(timestamp) if timestamp < 0 => Ok(None),
                                     value => LiteTimestamp::try_from(value)
                                         .map(SystemTime::from)
                                         .map(Some),
@@ -2880,7 +2928,7 @@ impl Storage for Engine {
                         .name(name)
                         .value(value)
                         .read_only(false)
-                        .is_default(None)
+                        .is_default(Some(false))
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                         .is_sensitive(false)
                         .synonyms(Some([].into()))
@@ -3622,7 +3670,7 @@ impl Storage for Engine {
                                 error!(?err, cluster = self.cluster, transaction_id, producer)
                             }) {
                                 Ok(()) => ErrorCode::ConcurrentTransactions,
-                                Err(_) => ErrorCode::UnknownServerError,
+                                Err(err) => return Err(Error::from(err)),
                             };
 
                             return Ok(ProducerIdResponse::failed(error));
@@ -3796,7 +3844,7 @@ impl Storage for Engine {
                     )
                 }) {
                     Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::UnknownServerError,
+                    Err(err) => return Err(Error::from(err)),
                 };
 
                 Ok(ProducerIdResponse {
@@ -3872,7 +3920,7 @@ impl Storage for Engine {
                             .inspect_err(|err| error!(?err, ?transaction_id, producer, epoch))
                         {
                             Ok(()) => ErrorCode::None,
-                            Err(_) => ErrorCode::UnknownServerError,
+                            Err(err) => return Err(Error::from(err)),
                         };
 
                         Ok(ProducerIdResponse {
@@ -4286,6 +4334,20 @@ impl TryFrom<Value> for LiteTimestamp {
     }
 }
 
+impl LiteTimestamp {
+    /// Returns the Kafka timestamp, in milliseconds since the epoch, that the stored `value` holds.
+    ///
+    /// A record that a producer sent without a timestamp stores NO_TIMESTAMP, -1. A [`SystemTime`]
+    /// cannot hold a negative millisecond count, so an integer is returned as stored.
+    fn millis(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(timestamp) => Ok(timestamp),
+            value => LiteTimestamp::try_from(value)
+                .and_then(|timestamp| to_timestamp(&timestamp.0).map_err(Into::into)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
@@ -4302,6 +4364,14 @@ mod tests {
             LiteTimestamp::try_from(Value::Null),
             Err(Error::UnexpectedValue(Value::Null))
         );
+    }
+
+    #[test]
+    fn stored_millis_keep_a_negative_no_timestamp() -> Result<()> {
+        assert_eq!(-1, LiteTimestamp::millis(Value::Integer(-1))?);
+        assert_eq!(1_234, LiteTimestamp::millis(Value::Integer(1_234))?);
+
+        Ok(())
     }
 
     #[test]
@@ -4453,6 +4523,199 @@ mod tests {
         assert_eq!(Some("abc"), row.get_value(0)?.as_text().map(String::as_str));
 
         Ok(())
+    }
+
+    /// The fetch statements count a record's headers toward `max_bytes`: three records with a
+    /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
+    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
+    /// because it rejects some SQL that SQLite takes.
+    #[tokio::test]
+    async fn fetch_counts_header_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(
+            &connection,
+            &[(Value::Blob(b"h".to_vec()), Value::Blob(vec![0; 99]))],
+        )
+        .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            for (max_bytes, expected) in [(250, vec![0, 1]), (50, vec![0]), (1_000, vec![0, 1, 2])]
+            {
+                assert_eq!(
+                    expected,
+                    fetched_offsets(&connection, statement, key, max_bytes).await?,
+                    "{statement} within {max_bytes}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Each header costs 2 bytes of framing, even when its key is empty and its value is null: 50
+    /// such headers and a one byte key cost a record 101 bytes, so a budget of 150 bytes returns
+    /// one record. A fetch that dropped the framing, or that took the largest header of a record
+    /// instead of the sum of its headers, would count 1 to 3 bytes for a record and return all
+    /// three.
+    #[tokio::test]
+    async fn fetch_counts_the_framing_of_every_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(&connection, &vec![(Value::Blob(vec![]), Value::Null); 50])
+            .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0],
+                fetched_offsets(&connection, statement, key, 150).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A header costs the length of its key and the length of its value. Each record has one
+    /// header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
+    /// and so costs 85 bytes with its own key, and a budget of 100 bytes returns one record. A
+    /// fetch that left out the key, or the value, or took the larger header of the two, would
+    /// count 43 to 45 bytes and return two.
+    #[tokio::test]
+    async fn fetch_counts_the_key_and_the_value_of_every_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(
+            &connection,
+            &[
+                (Value::Blob(vec![0; 40]), Value::Null),
+                (Value::Null, Value::Blob(vec![0; 40])),
+            ],
+        )
+        .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0],
+                fetched_offsets(&connection, statement, key, 100).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The fetch statements, each with the key that it filters on: `record_fetch_keyed.sql` reads
+    /// the records of a virtual topic by their key.
+    const FETCH_STATEMENTS: [(&str, Option<&[u8]>); 2] = [
+        ("record_fetch.sql", None),
+        ("record_fetch_keyed.sql", Some(b"k")),
+    ];
+
+    /// Creates the tables that the fetch statements read, and partition 0 of topic `t` in
+    /// cluster `c`.
+    async fn create_fetch_tables(connection: &Connection) -> Result<()> {
+        for ddl in [
+            "010-cluster.sql",
+            "030-topition.sql",
+            "040-record.sql",
+            "040-header.sql",
+        ] {
+            _ = connection
+                .execute(&DDL.get(ddl)?, ())
+                .await
+                .inspect_err(|err| error!(ddl, ?err))?;
+        }
+
+        // The Turso engine does not take the DDL of the topic table (`default false not null`)
+        for sql in [
+            "create table topic (
+                id integer primary key autoincrement,
+                cluster int not null,
+                name text not null
+            )",
+            "insert into cluster (name) values ('c')",
+            "insert into topic (cluster, name) values (1, 't')",
+            "insert into topition (topic, partition) values (1, 0)",
+        ] {
+            _ = connection.execute(sql, ()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Stores three records at offsets 0 to 2 of partition 0, each with the key `k`, no value and
+    /// the given headers as `(key, value)` pairs.
+    async fn insert_records_with_headers(
+        connection: &Connection,
+        headers: &[(Value, Value)],
+    ) -> Result<()> {
+        for offset in 0..3 {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+
+            for (ordinal, (key, value)) in headers.iter().enumerate() {
+                _ = connection
+                    .execute(
+                        "insert into header (topition, offset_id, ordinal, k, v)
+                            values (1, ?1, ?2, ?3, ?4)",
+                        vec![
+                            Value::from(offset),
+                            Value::from(i64::try_from(ordinal)?),
+                            key.clone(),
+                            value.clone(),
+                        ],
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offsets that `statement` selects when it reads partition 0 from offset 0
+    /// within `max_bytes`, up to a high watermark of 3. `key` is the key that a keyed statement
+    /// filters on.
+    async fn fetched_offsets(
+        connection: &Connection,
+        statement: &str,
+        key: Option<&[u8]>,
+        max_bytes: i64,
+    ) -> Result<Vec<i64>> {
+        let mut params = vec![
+            Value::from("c"),
+            Value::from("t"),
+            Value::from(0),
+            Value::from(0),
+            Value::from(max_bytes),
+            Value::from(3),
+        ];
+        params.extend(key.map(|key| Value::Blob(key.to_vec())));
+
+        let sql = sql_lookup(statement)?;
+        let mut rows = connection.prepare(&sql).await?.query(params).await?;
+        let mut offsets = vec![];
+        while let Some(row) = rows.next().await? {
+            offsets.push(row.get::<i64>(0)?);
+        }
+
+        Ok(offsets)
     }
 
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the
@@ -5188,6 +5451,105 @@ mod tests {
             ErrorCode::try_from(known_partitions[0].error_code)?
         );
         assert_eq!(1, known_partitions[0].low_watermark);
+
+        Ok(())
+    }
+
+    /// The storage that the factory builds runs one write at a time, so calls that write at
+    /// the same time, as the DeleteRecords service makes one call for each partition, all
+    /// succeed. Turso fails a write that finds another connection's write lock held with
+    /// `Busy`, so this fails if the factory does not put a proxy in front of the engine. It
+    /// runs in CI: a database file in a temporary directory needs no service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn factory_storage_runs_concurrent_delete_records_calls_one_at_a_time() -> Result<()> {
+        use std::sync::Arc as Shared;
+
+        use nisshi_sans_io::delete_records_request::DeleteRecordsPartition;
+        use nisshi_storage::{StorageFactory as _, StorageFactoryConfiguration};
+        use tokio::{sync::Barrier, task::JoinSet};
+        use tokio_util::sync::CancellationToken;
+
+        let _guard = init_tracing()?;
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+
+        let node = 12321;
+        let cluster = "nisshi";
+
+        let engine = factory::LimboFactory
+            .build(StorageFactoryConfiguration {
+                node_id: node,
+                cluster: cluster.to_owned(),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: storage_url(&temp_dir)?,
+                schema_registry: None,
+                lake_house: None,
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        assert_eq!(1, engine.delete_records_concurrency().per_request());
+
+        let partitions = 4;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("t".into())
+                    .num_partitions(partitions)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // A call holds the write lock for a short time, so one round of calls can miss
+        // each other. Many rounds, each started together, make them meet.
+        for _ in 0..50 {
+            let start = Shared::new(Barrier::new(usize::try_from(partitions)?));
+            let mut calls = JoinSet::new();
+
+            for partition in 0..partitions {
+                let engine = engine.clone();
+                let start = Shared::clone(&start);
+
+                _ = calls.spawn(async move {
+                    _ = start.wait().await;
+
+                    engine
+                        .delete_records(&[DeleteRecordsTopic::default()
+                            .name("t".into())
+                            .partitions(Some(vec![
+                                DeleteRecordsPartition::default()
+                                    .partition_index(partition)
+                                    .offset(-1),
+                            ]))])
+                        .await
+                });
+            }
+
+            while let Some(call) = calls.join_next().await {
+                let topics = call??;
+
+                assert_eq!(
+                    vec![ErrorCode::None],
+                    topics
+                        .iter()
+                        .flat_map(|topic| topic.partitions.iter().flatten())
+                        .map(|partition| ErrorCode::try_from(partition.error_code))
+                        .collect::<Result<Vec<_>, _>>()?
+                );
+            }
+        }
 
         Ok(())
     }

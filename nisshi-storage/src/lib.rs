@@ -162,7 +162,7 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     offset_commit_request::OffsetCommitRequestPartition,
-    record::deflated,
+    record::{deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -192,7 +192,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::{sync::AcquireError, task::JoinError};
+use tokio::{sync::AcquireError, task::JoinError, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
@@ -203,11 +203,16 @@ mod assignment;
 mod authorized_operations;
 mod batch;
 pub mod config;
+#[cfg(test)]
+mod decoded_batch_probe;
+mod decoded_budget;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
+mod operation;
+mod produce_path;
 mod producer;
 mod proxy;
 mod service;
@@ -216,31 +221,36 @@ mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
+pub use decoded_budget::{
+    configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
+};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
+pub use operation::StorageOperation;
 pub use producer::{
-    OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted, producer_claim,
+    FirstSequence, OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted,
+    producer_claim,
 };
 pub use proxy::SemaphoreProxy;
-pub use service::deadline;
+pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequestLayer,
+    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequest, ChannelRequestLayer,
     ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
-    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FetchValidationLayer, FetchValidationService, FindCoordinatorService,
+    CreateTopicsValidationLayer, CreateTopicsValidationService, DELETE_RECORDS_CONCURRENCY,
+    DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency, DeleteRecordsService,
+    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
+    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FetchValidationLayer, FetchValidationService, FindCoordinatorService,
     IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, ProduceService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response,
+    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
+    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
+    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
+    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -319,11 +329,44 @@ pub enum Error {
         schema_version: i32,
     },
 
-    /// The database records schema `recorded_version`, which is older than `schema_version`. A
-    /// broker of `schema_version` can't upgrade the recorded schema.
+    /// The database records schema `recorded_version`, which is older than `schema_version`, and
+    /// a broker of `schema_version` has no step that upgrades it. Every version from 1 has one, so
+    /// the recorded version is below 1: a row that holds a version that no release records.
     OutdatedSchema {
         recorded_version: i32,
         schema_version: i32,
+    },
+
+    /// The database has tables but records no schema version, and a broker of `schema_version`,
+    /// which is newer than version 1, can't tell which tables it lacks.
+    UnversionedSchema {
+        schema_version: i32,
+    },
+
+    /// The database records schema `schema_version` but has no `cluster` table on the
+    /// `search_path` that the connection uses. Nisshi creates `cluster` before it records a
+    /// version, so the search path changed or someone dropped or moved the tables.
+    MissingClusterTable {
+        schema_version: i32,
+        search_path: String,
+    },
+
+    /// The step that upgrades the schema from `from_version` to `to_version` failed with the
+    /// SQLSTATE `code`, and the upgrade rolled back.
+    ///
+    /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
+    /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
+    /// or `header` holds message payloads. The `message` of a SQLSTATE in class `22`, data
+    /// exception, is a fixed phrase instead of the server's, because that message quotes the value
+    /// that failed. The fields are boxed strings, so that this variant does not make [`Error`]
+    /// larger.
+    SchemaStepFailed {
+        from_version: i32,
+        to_version: i32,
+        code: Box<str>,
+        message: Box<str>,
+        table: Option<Box<str>>,
+        constraint: Option<Box<str>>,
     },
 
     InsufficientCapacity(#[from] InsufficientCapacity),
@@ -478,20 +521,203 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns the error code that a group request, such as `ListGroups` or `DescribeGroups`,
-    /// reports when storage fails with this error.
+    /// Returns whether a retry of the failed operation may succeed.
     ///
-    /// A storage error that carries a code keeps that code. Any other storage error is treated as
-    /// transient, so the response reports `COORDINATOR_NOT_AVAILABLE`, which Kafka clients
-    /// [retry].
+    /// A failure of the storage backend, such as an object store, PostgreSQL, the connection
+    /// pool, libSQL, Turso or I/O, may clear on its own, so it is transient. Everything else is
+    /// permanent: a value that can't be decoded, a request that the storage rejects, or a broken
+    /// invariant fails the same way on every retry.
     ///
-    /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L3614-L3620
-    pub fn group_request_error_code(&self) -> ErrorCode {
+    /// Two backend errors are permanent because a retry can't fix them. An object store error
+    /// that names a missing object, a rejected credential or an unsupported operation, and a
+    /// PostgreSQL error whose SQLSTATE names a request that the server never accepts: an
+    /// unsupported feature, a cardinality violation, a data exception, an integrity constraint
+    /// violation, a missing database or schema, a syntax error or access rule violation, a
+    /// program limit exceeded, an internal error (classes 0A, 21, 22, 23, 3D, 3F, 42, 54 and
+    /// XX), or a statement in a failed transaction (25P02). Every other SQLSTATE is transient.
+    ///
+    /// [`Error::Acquire`], [`Error::UnableToSend`], [`Error::OneshotRecv`] and an
+    /// [`Error::Join`] of a cancelled task are transient. A semaphore, a channel to the storage
+    /// service or an offloaded task ends when the broker shuts down, and a retry reaches the
+    /// broker that replaces it. An [`Error::Join`] of a panicked task is permanent, because the
+    /// same input panics the task again.
+    ///
+    /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
+    /// batch took its offset, so a retry can store the batch twice.
+    ///
+    /// A failure of the schema setup, such as [`Error::SchemaStepFailed`], is permanent for the
+    /// caller, because a restart of the broker retries the setup, not the caller.
+    ///
+    /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
+    /// [`Error::error_code`] keeps.
+    ///
+    /// The match lists every variant, so that a new variant does not compile until its author
+    /// decides whether a retry may succeed.
+    pub fn is_transient(&self) -> bool {
         match self {
-            Self::Api(error_code) => *error_code,
-            _ => ErrorCode::CoordinatorNotAvailable,
+            Self::Acquire(_) | Self::Io(_) | Self::UnableToSend | Self::OneshotRecv => true,
+
+            Self::Join(error) => error.is_cancelled(),
+
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::ObjectStore(error) => !matches!(
+                error.as_ref(),
+                object_store::Error::NotFound { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+                    | object_store::Error::InvalidPath { .. }
+                    | object_store::Error::NotSupported { .. }
+                    | object_store::Error::NotImplemented { .. }
+                    | object_store::Error::UnknownConfigurationKey { .. }
+            ),
+
+            // A credential provider that returned nothing may recover. A misconfigured one
+            // fails at startup, before any client request.
+            #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+            Self::NoCredentials(_) => true,
+
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            Self::Pool(_) => true,
+
+            #[cfg(feature = "postgres")]
+            Self::TokioPostgres(error) => match error.as_db_error() {
+                Some(db_error) => is_transient_sqlstate(db_error.code()),
+
+                // Without a SQLSTATE the error is the client's. A closed connection and an I/O
+                // error clear on a retry. A value that doesn't convert to its Rust type, a
+                // query that found no row, and a protocol mismatch do not.
+                None => {
+                    error.is_closed()
+                        || error::Error::source(error.as_ref())
+                            .is_some_and(|source| source.is::<io::Error>())
+                }
+            },
+
+            #[cfg(feature = "libsql")]
+            Self::LibSql(_) => true,
+
+            #[cfg(feature = "turso")]
+            Self::Turso(_) => true,
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(_) => true,
+
+            Self::Api(_)
+            | Self::AuthenticationUnsupported { .. }
+            | Self::UserCredentialsUnsupported { .. }
+            | Self::AcksZeroProduceFailed { .. }
+            | Self::ChronoParse(_)
+            | Self::Decode(_)
+            | Self::Boxed(_)
+            | Self::FeatureNotEnabled { .. }
+            | Self::Glob(_)
+            | Self::NoEngineForScheme { .. }
+            | Self::IncompatibleSchema { .. }
+            | Self::OutdatedSchema { .. }
+            | Self::UnversionedSchema { .. }
+            | Self::MissingClusterTable { .. }
+            | Self::SchemaStepFailed { .. }
+            | Self::InsufficientCapacity(_)
+            | Self::LessThanBaseOffset { .. }
+            | Self::LessThanLastOffset { .. }
+            | Self::LessThanMaxTime { .. }
+            | Self::LessThanMinTime { .. }
+            | Self::MessageTooLarge { .. }
+            | Self::Message(_)
+            | Self::NoSuchEntry { .. }
+            | Self::NoSuchOffset(_)
+            | Self::OsString(_)
+            | Self::StartupFailed { .. }
+            | Self::ParseFilter(_)
+            | Self::Pattern(_)
+            | Self::ParseInt(_)
+            | Self::PhantomCached()
+            | Self::Poison
+            | Self::ProgressStyleTemplate(_)
+            | Self::Regex(_)
+            | Self::SansIo(_)
+            | Self::Schema(_)
+            | Self::Rustls(_)
+            | Self::SegmentEmpty(_)
+            | Self::SegmentMissing { .. }
+            | Self::SerdeJson(_)
+            | Self::SystemTime(_)
+            | Self::TryFromInt(_)
+            | Self::TryFromSlice(_)
+            | Self::TryGet(_)
+            | Self::UnexpectedBody(_)
+            | Self::UnexpectedServiceResponse(_)
+            | Self::UnknownCacheKey(_)
+            | Self::InvalidStorageOptionValue { .. }
+            | Self::UnrecognizedStorageOption { .. }
+            | Self::UnsupportedTxnAddPartitionsVersion
+            | Self::UnexpectedAddPartitionsToTxnRequest(_)
+            | Self::Url(_)
+            | Self::UnknownTxnState(_)
+            | Self::Uuid(_) => false,
+
+            #[cfg(any(feature = "postgres", feature = "libsql"))]
+            Self::DeadPoolBuild(_) => false,
+
+            #[cfg(feature = "slatedb")]
+            Self::Postcard(_) => false,
+
+            #[cfg(feature = "turso")]
+            Self::UnexpectedValue(_) => false,
+
+            #[cfg(feature = "libsql")]
+            Self::UnexpectedLibSqlValue(_) => false,
         }
     }
+
+    /// Returns the error code that a request reports when storage fails with this error.
+    ///
+    /// A storage error that carries a code keeps that code. A transient error, see
+    /// [`Error::is_transient`], answers `retriable`: the code that Kafka clients retry for the
+    /// API that is answering. Any other error is permanent and answers `UNKNOWN_SERVER_ERROR`,
+    /// which clients report at once, because a retry can't fix it. Kafka's group coordinator
+    /// answers the same way: its [`handleOperationException`] maps a timeout or an unavailable
+    /// log to a retriable code and every other exception to `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// Each API passes the retriable code that its Kafka clients handle:
+    /// `COORDINATOR_NOT_AVAILABLE` for the group APIs, `KAFKA_STORAGE_ERROR` for Produce, and so
+    /// on. This method is the only place that picks between the retriable code and
+    /// `UNKNOWN_SERVER_ERROR`.
+    ///
+    /// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1170
+    pub fn error_code(&self, retriable: ErrorCode) -> ErrorCode {
+        match self {
+            Self::Api(error_code) => *error_code,
+            error if error.is_transient() => retriable,
+            _ => ErrorCode::UnknownServerError,
+        }
+    }
+}
+
+/// Returns whether a PostgreSQL error with `sqlstate` may clear on a retry.
+///
+/// The SQLSTATE classes for an unsupported feature (0A), a cardinality violation (21), a data
+/// exception (22), an integrity constraint violation (23), a missing database or schema (3D and
+/// 3F), a syntax error or access rule violation (42), a program limit exceeded (54) and an
+/// internal error (XX) name a request that the server never accepts. So does
+/// `in_failed_sql_transaction` (25P02), which a code bug causes. All of them are permanent.
+/// Class 0A is safe to call permanent because Nisshi runs only at the `READ COMMITTED` level
+/// and takes no runtime lock above `ROW EXCLUSIVE` on PostgreSQL, so a hot standby answers
+/// `read_only_sql_transaction` (25006) and not `feature_not_supported` (0A000). A request-time
+/// `pg_advisory_xact_lock` or a `SERIALIZABLE` transaction would change that. Every other state
+/// is transient. A state that nobody listed, such as
+/// `read_only_sql_transaction` (25006) on a pooled connection to a primary that a failover
+/// has demoted, or `lock_not_available` (55P03), then answers the retriable code and not a
+/// fatal one.
+#[cfg(feature = "postgres")]
+fn is_transient_sqlstate(sqlstate: &tokio_postgres::error::SqlState) -> bool {
+    let permanent_class = matches!(
+        sqlstate.code().get(..2),
+        Some("0A" | "21" | "22" | "23" | "3D" | "3F" | "42" | "54" | "XX")
+    );
+
+    !permanent_class && *sqlstate != tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
 }
 
 impl Display for Error {
@@ -1856,6 +2082,21 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>>;
 
+    /// Returns how many [`Storage::delete_records`] calls the
+    /// [`DeleteRecordsService`] may run at once, for one request and across
+    /// all requests.
+    ///
+    /// The service makes one call for each partition of a request. The default
+    /// is [`DELETE_RECORDS_CONCURRENCY`] calls for a request and no limit across
+    /// requests. A storage that runs its writes one at a time answers
+    /// [`DeleteRecordsConcurrency::serial`], so that a second call never waits
+    /// behind the first after the deadline check. A storage that wraps another
+    /// answers what the storage it wraps answers, unless the wrapper changes
+    /// how the calls run.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::default()
+    }
+
     /// Delete a topic from this storage.
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode>;
 
@@ -1883,16 +2124,51 @@ pub trait Storage: Debug + Send + Sync + 'static {
         batch: deflated::Batch,
     ) -> Result<i64>;
 
+    /// Produce a batch that the caller has already decoded.
+    ///
+    /// [`ProduceService`] decodes every client batch to validate it, and then hands the decoded
+    /// batch down so that a backend which needs one does not decode the same bytes again. A
+    /// backend that has no use for the decoded batch keeps this default, which drops `inflated`
+    /// before it calls [`Storage::produce`], so that it holds no decoded records while it waits
+    /// for storage.
+    ///
+    /// `inflated` must be `deflated` decoded with [`inflate_produced`], including the timestamp
+    /// type, `base_timestamp`, `max_timestamp` and `crc` that [`ProduceService`] set on `deflated`.
+    /// A caller that cannot promise that calls [`Storage::produce`].
+    ///
+    /// A wrapper must forward this method as well as [`Storage::produce`], or the default
+    /// discards the decoded batch and the inner backend decodes it again. A wrapper that would
+    /// make the produce wait for a permit or a slot calls [`Storage::produce`] instead, so that a
+    /// waiting produce holds its compressed bytes only. The result and the errors are those of
+    /// [`Storage::produce`].
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        drop(inflated);
+
+        self.produce(transaction_id, topition, deflated).await
+    }
+
     /// Fetch deflated batches from storage.
     ///
-    /// The batches hold at most `max_bytes`, except that a read can exceed it by
-    /// one batch. A read returns the first batch at or after `offset` even when
-    /// that batch alone is larger than `max_bytes`, so that a consumer gets past
-    /// it (KIP-74). The fetch service relies on this: without it, a consumer
-    /// whose fetch limit is smaller than a record never reads past that record.
+    /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
+    /// returns the first batch at or after `offset` even when that batch alone is larger than
+    /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
+    /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
-    /// For a topic or partition that does not exist, see
-    /// [`Storage::offset_stage`].
+    /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
+    ///
+    /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
+    /// for the read without a time limit of their own, so a read that overruns its deadline holds
+    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
+    /// that a read finished.
+    ///
+    /// The batches run in offset order from the batch that holds `offset`, with no gap between
+    /// them, also when the deadline stops the read. An answer with no batches is always valid.
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -1900,7 +2176,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>>;
 
     /// Query the offset stage for a topic partition.
@@ -1919,6 +2195,26 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// error in the response. Any other error closes the client's
     /// connection.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
+
+    /// Query the offset stage for a topic partition, reading its high
+    /// watermark from the source of truth rather than from a cache.
+    ///
+    /// [`Storage::offset_stage`] may answer from a cache that lags a write
+    /// through another broker (dynostore keeps `watermark.json` for up to 5s).
+    /// Fetch calls this before it answers a fetch offset above the high
+    /// watermark with `OFFSET_OUT_OF_RANGE`, so that a client that is ahead
+    /// of a stale high watermark is not sent an error. An engine whose
+    /// `offset_stage` is always current keeps the default.
+    ///
+    /// A type that wraps a [`Storage`] must forward this method. The default calls the
+    /// wrapper's own `offset_stage`, which answers from the wrapped store's cache, so a wrapper
+    /// that does not forward it makes a dynostore Fetch reset a consumer that is only ahead of
+    /// a stale high watermark.
+    ///
+    /// The errors are those of [`Storage::offset_stage`].
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
+    }
 
     /// Query the offsets for one or more topic partitions. See
     /// [`ListOffsetResponse::offset`] for when an answer has no offset.
@@ -2156,6 +2452,10 @@ where
         self.as_ref().delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2173,6 +2473,18 @@ where
         self.as_ref().produce(transaction_id, topition, batch).await
     }
 
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2180,15 +2492,19 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.as_ref().current_offset_stage(topition).await
     }
 
     async fn list_offsets(
@@ -2437,6 +2753,10 @@ where
         self.as_ref().delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2454,6 +2774,18 @@ where
         self.as_ref().produce(transaction_id, topition, batch).await
     }
 
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2461,15 +2793,19 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.as_ref().current_offset_stage(topition).await
     }
 
     async fn list_offsets(
@@ -3305,16 +3641,114 @@ mod tests {
     fn storage_error_with_a_code_keeps_that_code() {
         assert_eq!(
             ErrorCode::UnknownServerError,
-            Error::Api(ErrorCode::UnknownServerError).group_request_error_code()
+            Error::Api(ErrorCode::UnknownServerError)
+                .error_code(ErrorCode::CoordinatorNotAvailable)
         );
     }
 
     #[test]
-    fn other_storage_error_answers_coordinator_not_available() {
+    fn transient_storage_error_answers_the_retriable_code() {
+        let error = Error::Io(Arc::new(io::Error::other("connection reset")));
+
+        assert!(error.is_transient());
         assert_eq!(
             ErrorCode::CoordinatorNotAvailable,
-            Error::Message("connection refused".into()).group_request_error_code()
+            error.error_code(ErrorCode::CoordinatorNotAvailable)
         );
+    }
+
+    #[test]
+    fn permanent_storage_error_answers_unknown_server_error() {
+        for error in [
+            Error::Message("connection refused".into()),
+            Error::Poison,
+            Error::Decode(Bytes::new()),
+        ] {
+            assert!(!error.is_transient(), "{error:?}");
+            assert_eq!(
+                ErrorCode::UnknownServerError,
+                error.error_code(ErrorCode::CoordinatorNotAvailable),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_closed_semaphore_or_channel_or_a_cancelled_task_is_transient() {
+        let semaphore = tokio::sync::Semaphore::new(0);
+        semaphore.close();
+        let acquire = semaphore.acquire().await.expect_err("closed semaphore");
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.expect_err("aborted task");
+
+        for error in [
+            Error::from(acquire),
+            Error::UnableToSend,
+            Error::OneshotRecv,
+            Error::Join(Arc::new(cancelled)),
+        ] {
+            assert!(error.is_transient(), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn error_from_a_panicked_task_is_permanent() {
+        let panicked = tokio::spawn(async { panic!("injected panic") })
+            .await
+            .expect_err("panicked task");
+
+        assert!(!Error::Join(Arc::new(panicked)).is_transient());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_sqlstate_is_transient_unless_its_class_names_a_request_the_server_never_accepts() {
+        use tokio_postgres::error::SqlState;
+
+        // A failover and a busy server produce these states, and they clear on their own.
+        for sqlstate in [
+            SqlState::CONNECTION_FAILURE,
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::READ_ONLY_SQL_TRANSACTION,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::ADMIN_SHUTDOWN,
+        ] {
+            assert!(is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
+        }
+
+        for sqlstate in [
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            SqlState::UNIQUE_VIOLATION,
+            SqlState::SYNTAX_ERROR,
+            SqlState::INTERNAL_ERROR,
+            SqlState::PROGRAM_LIMIT_EXCEEDED,
+            SqlState::FEATURE_NOT_SUPPORTED,
+            SqlState::CARDINALITY_VIOLATION,
+            SqlState::INVALID_CATALOG_NAME,
+            SqlState::INVALID_SCHEMA_NAME,
+            SqlState::IN_FAILED_SQL_TRANSACTION,
+        ] {
+            assert!(!is_transient_sqlstate(&sqlstate), "{sqlstate:?}");
+        }
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn object_store_error_is_transient_unless_a_retry_cannot_fix_it() {
+        let generic = object_store::Error::Generic {
+            store: "S3",
+            source: "timed out".into(),
+        };
+
+        let not_found = object_store::Error::NotFound {
+            path: "a".into(),
+            source: "missing".into(),
+        };
+
+        assert!(Error::from(generic).is_transient());
+        assert!(!Error::from(not_found).is_transient());
     }
 
     #[test]

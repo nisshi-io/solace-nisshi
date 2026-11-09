@@ -18,7 +18,10 @@ use nisshi_perf::Perf;
 use nisshi_sans_io::ErrorCode;
 use url::Url;
 
-use crate::{EnvVarExp, Result, cli::DEFAULT_BROKER};
+use crate::{
+    EnvVarExp, Result,
+    cli::{DEFAULT_BROKER, client_security::ClientSecurity},
+};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -72,6 +75,9 @@ pub(super) struct Arg {
     /// The topic to generate messages into
     #[clap(value_parser)]
     topic: String,
+
+    #[command(flatten)]
+    security: ClientSecurity,
 }
 
 impl Arg {
@@ -87,6 +93,7 @@ impl Arg {
                 duration,
             } => Perf::builder()
                 .broker(self.broker.into_inner())
+                .security(self.security.build()?)
                 .topic(self.topic)
                 .partition(partition)
                 .batch_size(batch_size)
@@ -100,7 +107,11 @@ impl Arg {
                 .await
                 .map_err(Into::into),
 
-            Command::Consume => todo!(),
+            // Not implemented: a clean failure, with an exit status that a script can read,
+            // instead of a panic.
+            Command::Consume => Err(crate::Error::Box(
+                "perf consume is not implemented: only perf produce is available".into(),
+            )),
         }
     }
 }

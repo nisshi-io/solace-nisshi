@@ -14,6 +14,15 @@
 
 use clap::ValueEnum;
 
+/// The `--output` of a command that has one format only, JSON: `cat consume` prints each batch of
+/// records as a JSON array on a line, and has no table to print.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(super) enum JsonOnly {
+    /// JSON for scripts
+    #[default]
+    Json,
+}
+
 /// How a command prints its result, chosen with `--output`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub(super) enum Output {

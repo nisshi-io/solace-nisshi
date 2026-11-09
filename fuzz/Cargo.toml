@@ -1,23 +1,33 @@
 [package]
 name = "fuzz"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "Apache-2.0"
 publish = false
-version.workspace = true
+version = "0.0.0"
 
 [package.metadata]
 cargo-fuzz = true
 
+# A workspace of its own rather than a member of the root one, so the root's
+# `cargo metadata`, which FOSSA and cargo-deny read, leaves out libfuzzer-sys.
+# It has its own Cargo.lock, which can fall behind the root one between
+# releases, because Dependabot updates only libfuzzer-sys in it.
+[workspace]
+
+# bytes, rama, tokio and url repeat the requirements in the root Cargo.toml's
+# [workspace.dependencies]; change both together. Dependabot bumps them only
+# in the root one.
 [dependencies]
-bytes.workspace = true
-libfuzzer-sys.workspace = true
-nisshi-sans-io = { workspace = true, features = ["arbitrary"] }
-nisshi-service.workspace = true
-nisshi-storage-dynostore.workspace = true
-nisshi-storage.workspace = true
-rama.workspace = true
-tokio.workspace = true
-url.workspace = true
+bytes = { version = "1", features = ["serde"] }
+libfuzzer-sys = "0.4"
+nisshi-fuzz-harness = { path = "../nisshi-fuzz-harness", default-features = false }
+nisshi-sans-io = { path = "../nisshi-sans-io", default-features = false, features = ["arbitrary"] }
+nisshi-service = { path = "../nisshi-service", default-features = false }
+nisshi-storage = { path = "../nisshi-storage", default-features = false }
+nisshi-storage-dynostore = { path = "../nisshi-storage-dynostore", default-features = false }
+rama = { version = "0.4.0", features = ["http", "tcp"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+url = { version = "2.5.4", features = ["serde"] }
 
 [[bin]]
 name = "generate_seeds"
@@ -227,3 +237,24 @@ doc = false
 bench = false
 
 [lints]
+
+# Cargo reads profiles from the workspace root only, so the root Cargo.toml's
+# profiles don't reach this workspace, and it sets its own.
+[profile.release]
+# Nightly rustc segfaults on typenum with the sanitizer when it builds with
+# more than one codegen unit.
+codegen-units = 1
+# With LTO, every target generates the machine code for its whole dependency
+# graph when it links, which takes minutes per target, and the targets run
+# fewer inputs per second.
+lto = false
+
+# These two tables must stay equal to the root Cargo.toml's [profile.dev] and
+# [profile.dev.package."*"].
+# `just clippy` checks this workspace in target/ after the root one, and a
+# different profile builds each shared dependency again.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

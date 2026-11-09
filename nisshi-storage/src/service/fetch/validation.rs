@@ -371,6 +371,8 @@ mod tests {
             .topics(Some(
                 [nisshi_sans_io::fetch_request::FetchTopic::default()
                     .topic(Some("t".into()))
+                    // The response echoes the id, and a v13 response cannot encode without one.
+                    .topic_id(Some([1; 16]))
                     .partitions(Some(
                         [nisshi_sans_io::fetch_request::FetchPartition::default().partition(0)]
                             .into(),

@@ -15,21 +15,27 @@
 use std::{
     borrow::Cow,
     sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use tokio::time::Instant;
+
 use nisshi_sans_io::{
-    Ack, ApiKey, BatchAttribute, ConfigResource, ErrorCode, ProduceRequest, ProduceResponse,
-    RequestInput, SuppressResponseExtension, TimestampType,
+    Ack, ApiKey, BatchAttribute, Compression, ConfigResource, ErrorCode, ProduceRequest,
+    ProduceResponse, RequestInput, SuppressResponseExtension, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse, TopicProduceResponse},
-    record::{deflated, inflated},
+    record::{MAX_DECODED_BATCH_BYTES, Record, deflated, inflated},
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, METER, Result, Storage, Topition, message_timestamp_type, offload};
+use crate::{
+    Error, METER, Result, Storage, Topition,
+    decoded_budget::{self, DecodedBytesBudget, Exhausted},
+    message_timestamp_type, offload,
+};
 
 /// Counts the connections closed by a failed `acks=0` Produce, by the error
 /// code of the first failing partition.
@@ -138,6 +144,12 @@ const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///   [`ProduceService`]. Every backend skips schema validation and lake
 ///   writes for a control batch, so a client must not be able to set the bit.
 ///   `INVALID_RECORD`.
+/// - A batch with a producer ID must have a base sequence of at least 0. A
+///   negative one is refused before any producer state is read, as
+///   `LogValidator` does ([LogValidator.java#L513-L516]): the client sees
+///   `INVALID_RECORD` and the batch is not stored, whatever the engine keeps
+///   for the producer. A batch without a producer ID (-1) carries the
+///   no-sequence value -1 and passes. `INVALID_RECORD`.
 /// - The compression codec in the attributes must be one Kafka defines. An
 ///   unknown codec id is a defect in the client's batch header, like a bad
 ///   record count. Kafka returns `UNKNOWN_SERVER_ERROR` for it only because
@@ -157,6 +169,7 @@ const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///
 /// [DefaultRecordBatch.java#L393-L398]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L393-L398
 /// [UnifiedLog.scala#L1189-L1193]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1189-L1193
+/// [LogValidator.java#L513-L516]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L513-L516
 fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
     if batch.computed_crc() != batch.crc {
         return Some((ErrorCode::CorruptMessage, CRC_MISMATCH));
@@ -166,6 +179,14 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
         return Some((
             ErrorCode::InvalidRecord,
             "clients may not write control batches",
+        ));
+    }
+
+    // Kafka's `hasProducerId()` is `producerId > -1`.
+    if batch.producer_id > -1 && batch.base_sequence < 0 {
+        return Some((
+            ErrorCode::InvalidRecord,
+            "negative base sequence with a producer ID",
         ));
     }
 
@@ -199,14 +220,24 @@ fn rejection(batch: &deflated::Batch) -> Option<(ErrorCode, &'static str)> {
 /// A batch over the decoded-size limit is reported as `MESSAGE_TOO_LARGE`:
 /// Kafka's code for "this batch is too large for the broker", which a
 /// producer can recover from on its own (the Java producer splits a batch of
-/// more than one record and retries). `UNKNOWN_SERVER_ERROR` is reserved for
-/// failures the client did not cause.
+/// more than one record and retries). Any other error answers
+/// [`Error::error_code`] with `KAFKA_STORAGE_ERROR`, the code Kafka answers
+/// when appending to its log fails with a storage exception ([`ReplicaManager.scala`]), which Kafka
+/// producers retry: a backend that is briefly unavailable doesn't fail the
+/// producer. `UNKNOWN_SERVER_ERROR` is reserved for failures that a retry
+/// can't fix, which the client did not cause either.
+///
+/// A retry after `KAFKA_STORAGE_ERROR` assumes that the batch was not stored.
+/// The object store backend writes the batch before it advances the producer's
+/// sequence, so a failure of the advance can leave the batch stored, and the
+/// retry stores it again. See `DynoStore::advance_idempotent_sequence`.
+///
+/// [`ReplicaManager.scala`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1425-L1436
 fn storage_error_code(error: &Error) -> ErrorCode {
     match error {
-        Error::Api(error_code) => *error_code,
         Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_))
         | Error::MessageTooLarge { .. } => ErrorCode::MessageTooLarge,
-        _ => ErrorCode::UnknownServerError,
+        error => error.error_code(ErrorCode::KafkaStorageError),
     }
 }
 
@@ -262,6 +293,40 @@ mod rejection_tests {
             Some((ErrorCode::CorruptMessage, CRC_MISMATCH)),
             rejection(&batch)
         );
+    }
+
+    #[test]
+    fn a_negative_base_sequence_with_a_producer_id_is_an_invalid_record() {
+        for base_sequence in [-1, -3, i32::MIN] {
+            let batch = with_valid_crc(deflated::Batch {
+                producer_id: 7,
+                base_sequence,
+                record_count: 1,
+                last_offset_delta: 0,
+                ..Default::default()
+            });
+
+            assert_eq!(
+                Some((
+                    ErrorCode::InvalidRecord,
+                    "negative base sequence with a producer ID"
+                )),
+                rejection(&batch)
+            );
+        }
+    }
+
+    #[test]
+    fn the_no_sequence_value_without_a_producer_id_is_not_rejected() {
+        let batch = with_valid_crc(deflated::Batch {
+            producer_id: -1,
+            base_sequence: -1,
+            record_count: 1,
+            last_offset_delta: 0,
+            ..Default::default()
+        });
+
+        assert_eq!(None, rejection(&batch));
     }
 
     #[test]
@@ -379,10 +444,19 @@ mod rejection_tests {
     }
 
     #[test]
-    fn other_storage_errors_are_unknown_server_error() {
+    fn permanent_storage_errors_are_unknown_server_error() {
         assert_eq!(
             ErrorCode::UnknownServerError,
             storage_error_code(&Error::SansIo(nisshi_sans_io::Error::Overflow))
+        );
+    }
+
+    /// A backend failure may clear, so the producer retries it.
+    #[test]
+    fn transient_storage_errors_are_kafka_storage_error() {
+        assert_eq!(
+            ErrorCode::KafkaStorageError,
+            storage_error_code(&Error::from(std::io::Error::other("connection reset")))
         );
     }
 }
@@ -603,33 +677,86 @@ fn producer_log_append_time(
     })
 }
 
-/// Validates a client batch for a topic whose `message.timestamp.type` is `timestamp_type`, and
-/// sets its timestamps for that type: [`rewrite_create_time`] for `CreateTime`, and
-/// [`stamp_log_append_time`] for `LogAppendTime`.
+/// A client batch that is decoded and validated, or the rejection that answers it.
+type Validated = std::result::Result<inflated::Batch, Rejection>;
+
+/// Decodes a client batch, validates it for a topic whose `message.timestamp.type` is
+/// `timestamp_type`, and sets its timestamps for that type: [`rewrite_create_time`] for
+/// `CreateTime`, and [`stamp_log_append_time`] for `LogAppendTime`.
 ///
 /// The function decodes the batch for both types, so a batch that does not decode is rejected on
 /// every topic, with the error code that [`undecodable_batch`] gives it.
 ///
-/// Returns `Ok(Some(_))` for a batch that the client must not store, and `Err` for a broker-side
-/// failure.
+/// Returns the decoded batch for a batch that the client may store. The decoded batch matches
+/// `batch` after the timestamps are set, as [`Storage::produce_inflated`] requires, so that the
+/// storage backend does not decode the batch again. Returns `Ok(Err(_))` for a batch that the
+/// client must not store, and `Err` for a broker-side failure.
 fn validate_timestamps(
     batch: &mut deflated::Batch,
     timestamp_type: TimestampType,
     now: i64,
-) -> Result<Option<Rejection>> {
-    let inflated = match inflate_produced(&*batch) {
+) -> Result<Validated> {
+    // The decode takes a clone, which shares the record bytes with `batch`, so that it clears the
+    // compression bits of the attributes as a backend's own decode of a stored batch does.
+    let mut inflated = match inflate_produced(batch.clone()) {
         Ok(inflated) => inflated,
-        Err(error) => return Ok(Some(undecodable_batch(&error))),
+        Err(error) => return Ok(Err(undecodable_batch(&error))),
     };
 
     if let Some(rejection) = producer_log_append_time(batch, timestamp_type) {
-        return Ok(Some(rejection));
+        return Ok(Err(rejection));
     }
 
-    match timestamp_type {
-        TimestampType::CreateTime => rewrite_create_time(batch, &inflated, now),
-        TimestampType::LogAppendTime => stamp_log_append_time(batch, now),
+    let rejection = match timestamp_type {
+        TimestampType::CreateTime => rewrite_create_time(batch, &inflated, now)?,
+        TimestampType::LogAppendTime => stamp_log_append_time(batch, now)?,
+    };
+
+    if let Some(rejection) = rejection {
+        return Ok(Err(rejection));
     }
+
+    // The rewrite changed these header fields of `batch`, and only these. The decoded records are
+    // the same.
+    inflated.attributes = BatchAttribute::try_from(batch.attributes)?
+        .compression(Compression::None)
+        .into();
+    inflated.base_timestamp = batch.base_timestamp;
+    inflated.max_timestamp = batch.max_timestamp;
+    inflated.crc = batch.crc;
+
+    // A header rewrite that this copy does not know leaves the stored header and the decoded
+    // batch apart, and a backend that stores the decoded batch's header then stores the wrong one.
+    debug_assert!(
+        headers_agree(batch, &inflated),
+        "the decoded batch's header differs from the stored batch's header: {batch:?} and {inflated:?}"
+    );
+
+    Ok(Ok(inflated))
+}
+
+/// Returns whether `inflated` has every header field of `deflated`, apart from the compression
+/// bits of the attributes, which a decode clears, and the record bytes.
+fn headers_agree(deflated: &deflated::Batch, inflated: &inflated::Batch) -> bool {
+    let without_compression = |attributes: i16| {
+        BatchAttribute::try_from(attributes)
+            .map(|attributes| i16::from(attributes.compression(Compression::None)))
+    };
+
+    deflated.base_offset == inflated.base_offset
+        && deflated.batch_length == inflated.batch_length
+        && deflated.partition_leader_epoch == inflated.partition_leader_epoch
+        && deflated.magic == inflated.magic
+        && deflated.crc == inflated.crc
+        && without_compression(deflated.attributes).ok()
+            == without_compression(inflated.attributes).ok()
+        && deflated.last_offset_delta == inflated.last_offset_delta
+        && deflated.base_timestamp == inflated.base_timestamp
+        && deflated.max_timestamp == inflated.max_timestamp
+        && deflated.producer_id == inflated.producer_id
+        && deflated.producer_epoch == inflated.producer_epoch
+        && deflated.base_sequence == inflated.base_sequence
+        && usize::try_from(deflated.record_count).is_ok_and(|count| count == inflated.records.len())
 }
 
 /// Runs [`validate_timestamps`] on Tokio's blocking thread pool, because it decodes the batch, and
@@ -638,13 +765,13 @@ async fn validate_timestamps_offloaded(
     batch: deflated::Batch,
     timestamp_type: TimestampType,
     now: i64,
-) -> Result<(deflated::Batch, Option<Rejection>)> {
+) -> Result<(deflated::Batch, Validated)> {
     // The batch moves into the closure and back out, because `offload` needs a `'static` closure. A
     // clone would only add a handle to the same record bytes, so moving the batch keeps one owner.
     offload(move || {
         let mut batch = batch;
-        let rejection = validate_timestamps(&mut batch, timestamp_type, now)?;
-        Ok((batch, rejection))
+        let validated = validate_timestamps(&mut batch, timestamp_type, now)?;
+        Ok((batch, validated))
     })
     .await
 }
@@ -672,6 +799,79 @@ fn corrupt_batch() -> Rejection {
 }
 
 #[cfg(test)]
+mod reject_log_tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::Level;
+
+    use super::*;
+    use crate::service::counting_storage::CountingStorage;
+
+    /// The log lines written at `warn` or above.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for WarnLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An operator can tell a producer ID without sequencing (-1) from a corrupt batch
+    /// (`i32::MIN`) by the sequence and epoch in the warn that `reject` writes.
+    #[test]
+    fn the_rejection_warn_names_the_base_sequence_and_producer_epoch() {
+        let log = WarnLog::default();
+        let writer = log.clone();
+        let service = ProduceService {
+            storage: CountingStorage::default(),
+        };
+        let batch = deflated::Batch {
+            producer_id: 7,
+            producer_epoch: 3,
+            base_sequence: i32::MIN,
+            ..Default::default()
+        };
+
+        tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_max_level(Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+            || {
+                let response = service.reject(
+                    "orders",
+                    0,
+                    &batch,
+                    (
+                        ErrorCode::InvalidRecord,
+                        "negative base sequence with a producer ID",
+                    )
+                        .into(),
+                );
+                assert_eq!(i16::from(ErrorCode::InvalidRecord), response.error_code);
+            },
+        );
+
+        let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(
+            text.contains(&format!("base_sequence={}", i32::MIN)),
+            "{text}"
+        );
+        assert!(text.contains("producer_epoch=3"), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod validate_timestamps_tests {
     use std::assert_matches;
 
@@ -682,6 +882,15 @@ mod validate_timestamps_tests {
     use super::*;
 
     const FIXED_NOW: i64 = 1_800_000_000_000;
+
+    /// [`super::validate_timestamps`], keeping only its rejection.
+    fn validate_timestamps(
+        batch: &mut deflated::Batch,
+        timestamp_type: TimestampType,
+        now: i64,
+    ) -> Result<Option<Rejection>> {
+        super::validate_timestamps(batch, timestamp_type, now).map(|validated| validated.err())
+    }
 
     fn batch(base_timestamp: i64, max_timestamp: i64, deltas: &[i64]) -> Result<deflated::Batch> {
         let builder = deltas.iter().enumerate().try_fold(
@@ -1028,6 +1237,90 @@ mod validate_timestamps_tests {
         Ok(())
     }
 
+    /// The batch that [`validate_timestamps`] returns is `batch` decoded as a backend decodes a
+    /// stored batch, after the timestamps are set. A backend that gets it through
+    /// [`Storage::produce_inflated`] then sees what its own decode would give.
+    fn assert_decoded_matches(batch: &deflated::Batch, inflated: &inflated::Batch) -> Result<()> {
+        assert_eq!(&inflated::Batch::try_from(batch.clone())?, inflated);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_batch_matches_after_a_create_time_rewrite() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0, 300, 100])?;
+        let before = batch.clone();
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_ne!(
+            before.max_timestamp, batch.max_timestamp,
+            "the header changed"
+        );
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_when_the_header_is_unchanged() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, FIXED_NOW + 7, &[0, 7])?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_after_a_log_append_time_stamp() -> Result<()> {
+        let mut batch = batch(FIXED_NOW - 5_000, FIXED_NOW - 5_000, &[0, 10])?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::LogAppendTime)?;
+
+        assert_eq!(FIXED_NOW, batch.max_timestamp);
+        assert_eq!(FIXED_NOW, inflated.max_timestamp);
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_for_a_compressed_batch() -> Result<()> {
+        let mut batch: deflated::Batch = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .base_timestamp(FIXED_NOW)
+            .max_timestamp(NO_TIMESTAMP)
+            .last_offset_delta(1)
+            .record(Record::builder().offset_delta(0).timestamp_delta(0))
+            .record(Record::builder().offset_delta(1).timestamp_delta(9))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_eq!(
+            Compression::Gzip,
+            BatchAttribute::try_from(batch.attributes)?.compression,
+            "the stored batch keeps its codec"
+        );
+        assert_eq!(
+            Compression::None,
+            BatchAttribute::try_from(inflated.attributes)?.compression,
+            "the decoded batch holds no codec"
+        );
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    fn validate_timestamps_ok(
+        batch: &mut deflated::Batch,
+        timestamp_type: TimestampType,
+    ) -> Result<inflated::Batch> {
+        match super::validate_timestamps(batch, timestamp_type, FIXED_NOW)? {
+            Ok(inflated) => Ok(inflated),
+            Err(rejection) => panic!("rejected: {rejection:?}"),
+        }
+    }
+
     // The test runtime has a single thread. If the rewrite decoded the batch
     // inline, the spawned task would decode, rewrite and return within its
     // first poll, so it would already be finished when `yield_now` returns.
@@ -1082,13 +1375,250 @@ mod validate_timestamps_tests {
             "the batch was decoded on the runtime thread"
         );
 
-        let (batch, rejection) = rewrite.await??;
+        let (batch, validated) = rewrite.await??;
 
-        assert_eq!(None, rejection);
+        assert_matches!(validated, Ok(_));
         assert_eq!(FIXED_NOW + i64::try_from(RECORDS)? - 1, batch.max_timestamp);
         assert_eq!(batch.computed_crc(), batch.crc);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod produce_service_tests {
+    use std::assert_matches;
+
+    use bytes::Bytes;
+    use nisshi_sans_io::record::{Record, deflated::Frame};
+    use rama::extensions::Extensions;
+
+    use super::*;
+    use crate::service::counting_storage::{CountingStorage, Listing, Lookup};
+
+    const TOPIC: &str = "abc";
+
+    async fn produce(
+        storage: &CountingStorage,
+        index: i32,
+        batch: deflated::Batch,
+    ) -> Result<PartitionProduceResponse> {
+        let response = ProduceService {
+            storage: storage.clone(),
+        }
+        .serve(RequestInput {
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(TOPIC.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(index)
+                                .records(Some(Frame {
+                                    batches: vec![batch],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+        let mut partitions = response
+            .responses
+            .unwrap_or_default()
+            .remove(0)
+            .partition_responses
+            .unwrap_or_default();
+
+        Ok(partitions.remove(0))
+    }
+
+    fn batch(max_timestamp: i64) -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .base_timestamp(1_800_000_000_000)
+            .max_timestamp(max_timestamp)
+            .last_offset_delta(0)
+            .record(
+                Record::builder()
+                    .value(Bytes::from_static(b"value").into())
+                    .timestamp_delta(0),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// A batch with record data that does not decode, and a CRC that matches it.
+    fn undecodable() -> Result<deflated::Batch> {
+        let mut batch = batch(1_800_000_000_000)?;
+        batch.record_data = Bytes::from_static(b"\xff\xff\xff");
+        batch.crc = batch.computed_crc();
+
+        Ok(batch)
+    }
+
+    /// The decode in the service reaches storage, so that no backend decodes the batch again.
+    #[tokio::test]
+    async fn the_decoded_batch_reaches_storage() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &[TOPIC]);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+
+        // Within the timestamp window, with a header that the service rewrites.
+        let sent = {
+            let mut sent = batch(-1)?;
+            sent.base_timestamp = now;
+            sent.crc = sent.computed_crc();
+            sent
+        };
+
+        let response = produce(&storage, 0, sent).await?;
+        assert_eq!(i16::from(ErrorCode::None), response.error_code);
+
+        let produced = storage.produced();
+        assert_eq!(1, produced.len());
+
+        let inflated = produced[0]
+            .inflated
+            .as_ref()
+            .expect("stored through produce_inflated");
+        assert_eq!(
+            &inflated::Batch::try_from(produced[0].deflated.clone())?,
+            inflated
+        );
+        assert_eq!(now, inflated.max_timestamp, "the rewritten header");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_does_not_decode_does_not_reach_storage() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &[TOPIC]);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_eq!(i16::from(ErrorCode::InvalidRecord), response.error_code);
+        assert_eq!(
+            Vec::<crate::service::counting_storage::Produced>::new(),
+            storage.produced()
+        );
+
+        Ok(())
+    }
+
+    /// Kafka looks up the partition before it validates the batch, so a rejected batch for a
+    /// partition that does not exist gets `UNKNOWN_TOPIC_OR_PARTITION`.
+    #[tokio::test]
+    async fn a_rejected_batch_for_a_missing_topic_answers_unknown_topic_or_partition() -> Result<()>
+    {
+        let storage = CountingStorage::new(Listing::Topics, &[]);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_matches!(
+            ErrorCode::try_from(response.error_code)?,
+            ErrorCode::UnknownTopicOrPartition
+        );
+        assert!(storage.produced().is_empty());
+
+        Ok(())
+    }
+
+    /// A lookup that fails does not say whether the partition exists, so the rejection stands.
+    #[tokio::test]
+    async fn a_failed_metadata_lookup_keeps_the_rejection() -> Result<()> {
+        // The topic does not exist, so a lookup that worked would replace the rejection.
+        let storage = CountingStorage::new(Listing::Topics, &[]).with_lookup(Lookup::Error);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_matches!(
+            ErrorCode::try_from(response.error_code)?,
+            ErrorCode::InvalidRecord
+        );
+        assert_eq!(1, storage.lookups());
+
+        Ok(())
+    }
+
+    /// A lookup that answers for another topic does not say whether this partition exists, so the
+    /// rejection stands.
+    #[tokio::test]
+    async fn a_metadata_lookup_that_answers_for_another_topic_keeps_the_rejection() -> Result<()> {
+        // The topic exists. The lookup lists one topic with no name and an unknown-topic error,
+        // as the null engine's listing does, which the service takes for this topic if it does not
+        // match by name.
+        let storage =
+            CountingStorage::new(Listing::NamelessTopic, &[TOPIC]).with_lookup(Lookup::Listed);
+
+        let response = produce(&storage, 0, undecodable()?).await?;
+
+        assert_matches!(
+            ErrorCode::try_from(response.error_code)?,
+            ErrorCode::InvalidRecord
+        );
+
+        Ok(())
+    }
+}
+
+/// The message that goes with `REQUEST_TIMED_OUT` when the decoded-batch budget stays spent.
+const BUDGET_SPENT: &str =
+    "the broker is holding too many decoded produce batches, retry the request";
+
+/// What a Produce request needs to reserve the bytes of a decoded batch: the budget, and how
+/// long the whole request may still wait for it.
+///
+/// Only the time that a partition spends waiting for the budget counts. The time that an earlier
+/// partition spends decoding or in the storage engine does not, so a slow storage engine does
+/// not make a later partition answer `REQUEST_TIMED_OUT` while the budget is free. Partitions run
+/// one after another, so the remaining wait needs no synchronisation.
+struct Admission<'a> {
+    budget: &'a DecodedBytesBudget,
+    remaining: Duration,
+}
+
+impl Admission<'_> {
+    /// Waits for `bytes` of the budget, for at most the remaining wait, and takes the time that
+    /// this took, on success as well as on failure, out of the remaining wait.
+    async fn reserve(&mut self, bytes: usize) -> Result<decoded_budget::Reservation, Exhausted> {
+        let started = Instant::now();
+        let reserved = self.budget.reserve(bytes, started + self.remaining).await;
+        self.remaining = self.remaining.saturating_sub(started.elapsed());
+        reserved
+    }
+}
+
+/// The most that decoding `batch` can charge to the budget.
+///
+/// A compressed batch can decode to any size up to [`MAX_DECODED_BATCH_BYTES`], and nothing in
+/// the batch says which: a Snappy block declares a size that a client controls, and a zstd
+/// frame from a streaming encoder, which is what Kafka clients write, carries none. So the
+/// reservation is the maximum, and [`Reservation::shrink_to`] returns the excess after the
+/// decode.
+///
+/// An uncompressed batch decodes to its records, whose `Bytes` share the wire buffer, so the
+/// decoded size is the `Record` and `Header` structures. A record is at least 7 bytes on the
+/// wire and `size_of::<Record>()` decoded, and a header at least 2 bytes on the wire and 64
+/// decoded, so 32 times the record data bounds the headers, and each counted record bounds the
+/// records.
+///
+/// [`Reservation::shrink_to`]: crate::decoded_budget::Reservation::shrink_to
+fn decoded_upper_bound(batch: &deflated::Batch) -> usize {
+    match Compression::try_from(batch.attributes) {
+        Ok(Compression::None) => batch
+            .record_data
+            .len()
+            .saturating_mul(32)
+            .saturating_add(
+                usize::try_from(batch.record_count)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(size_of::<Record>()),
+            )
+            .min(MAX_DECODED_BATCH_BYTES),
+        _ => MAX_DECODED_BATCH_BYTES,
     }
 }
 
@@ -1242,6 +1772,8 @@ where
             topic = name,
             partition = index,
             producer_id = batch.producer_id,
+            producer_epoch = batch.producer_epoch,
+            base_sequence = batch.base_sequence,
             attributes = batch.attributes,
             record_count = batch.record_count,
             last_offset_delta = batch.last_offset_delta,
@@ -1261,6 +1793,102 @@ where
             .record_errors(Some(rejection.record_error.into_iter().collect()))
     }
 
+    /// Returns whether `topition` is known not to exist. A metadata lookup that fails, or that
+    /// answers anything unexpected, leaves the answer at `false`, so that the caller keeps the
+    /// rejection that it has.
+    ///
+    /// The lookup is the one that Fetch makes: every engine numbers a topic's partitions from 0,
+    /// so the count of partitions bounds the valid indexes.
+    async fn partition_is_missing(&self, topition: &Topition) -> bool {
+        let Ok(metadata) = self
+            .storage
+            .metadata(Some(&[topition.into()]))
+            .await
+            .inspect_err(|error| {
+                debug!(
+                    ?error,
+                    topic = topition.topic(),
+                    "the metadata lookup for a rejected batch failed"
+                )
+            })
+        else {
+            return false;
+        };
+
+        // The null engine lists every topic whatever the lookup names, so only the entry with
+        // this topic's name answers for it.
+        let Some(topic) = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name.as_deref() == Some(topition.topic()))
+        else {
+            debug!(
+                topic = topition.topic(),
+                "the metadata lookup for a rejected batch did not answer for the topic"
+            );
+
+            return false;
+        };
+
+        match ErrorCode::try_from(topic.error_code) {
+            Ok(ErrorCode::UnknownTopicOrPartition) => true,
+            Ok(ErrorCode::None) => {
+                let count = topic.partitions.as_deref().map_or(0, <[_]>::len);
+
+                !usize::try_from(topition.partition()).is_ok_and(|index| index < count)
+            }
+            error_code => {
+                debug!(
+                    ?error_code,
+                    topic = topition.topic(),
+                    "the metadata lookup for a rejected batch answered an error code that does not say whether the partition exists"
+                );
+
+                false
+            }
+        }
+    }
+
+    /// Rejects `batch` as [`Self::reject`] does, unless its partition does not exist.
+    ///
+    /// Kafka looks up the partition before it validates a batch, so a batch sent to a partition
+    /// that does not exist gets `UNKNOWN_TOPIC_OR_PARTITION`, whatever is wrong with the batch
+    /// ([`ReplicaManager.appendToLocalLog`] reads the partition, and only
+    /// [`UnifiedLog.append`] validates the batch). This service validates the batch before it
+    /// calls storage, so it looks up the topic's metadata only when a batch is rejected. A
+    /// batch that is stored costs no extra call. Any other storage error leaves the rejection
+    /// as it was.
+    ///
+    /// [`ReplicaManager.appendToLocalLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1406-L1409
+    /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L780-L813
+    async fn reject_unless_unknown(
+        &self,
+        topition: &Topition,
+        batch: &deflated::Batch,
+        rejection: Rejection,
+    ) -> PartitionProduceResponse {
+        let rejection = if self.partition_is_missing(topition).await {
+            // The client gets the replacement, so the log keeps the reason that the batch was
+            // rejected. Once the partition exists, the same batch is rejected with that reason.
+            debug!(
+                topic = topition.topic(),
+                partition = topition.partition(),
+                error_code = ?rejection.error_code,
+                reason = %rejection.message,
+                "the rejection is replaced, because the partition does not exist"
+            );
+
+            Rejection::new(
+                ErrorCode::UnknownTopicOrPartition,
+                "this server does not host this topic-partition",
+            )
+        } else {
+            rejection
+        };
+
+        self.reject(topition.topic(), topition.partition(), batch, rejection)
+    }
+
     #[instrument(skip_all)]
     async fn partition(
         &self,
@@ -1268,6 +1896,7 @@ where
         name: &str,
         timestamp_type: TimestampType,
         partition: PartitionProduceData,
+        admission: &mut Admission<'_>,
     ) -> PartitionProduceResponse {
         // The decoder turns a zero-length records field into `None`, so it
         // counts as zero batches.
@@ -1282,6 +1911,12 @@ where
         // batch, so this check runs before `rejection`. See
         // [ProduceRequest.java#L225-L246].
         //
+        // Kafka looks up the partition first ([KafkaApis.scala#L634], before `validateRecords` at
+        // L638), so a request with a wrong batch count for a partition that does not exist gets
+        // `UNKNOWN_TOPIC_OR_PARTITION` there. This check does not look the partition up, because
+        // it has no batch to report, so it answers `INVALID_RECORD` for such a request.
+        //
+        // [KafkaApis.scala#L634]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L634
         // [ProduceRequest.java#L225-L246]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java#L225-L246
         let batch_count = batches.len();
         let Ok([mut batch]) = <[deflated::Batch; 1]>::try_from(batches) else {
@@ -1301,8 +1936,12 @@ where
                 .error_message(Some(REASON.into()));
         };
 
+        let tp = Topition::new(name, partition.index);
+
         if let Some(rejection) = rejection(&batch) {
-            return self.reject(name, partition.index, &batch, rejection.into());
+            return self
+                .reject_unless_unknown(&tp, &batch, rejection.into())
+                .await;
         }
 
         let now = SystemTime::now()
@@ -1310,16 +1949,49 @@ where
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
-        match validate_timestamps_offloaded(batch, timestamp_type, now).await {
-            Ok((validated, None)) => batch = validated,
-            Ok((validated, Some(rejection))) => {
-                return self.reject(name, partition.index, &validated, rejection);
+        // The reservation is held until `produce_inflated` returns, and dropped on every other
+        // path out of this function. A partition that waits here holds only its compressed
+        // batch.
+        let compression = Compression::try_from(batch.attributes).unwrap_or_default();
+        let mut reservation = match admission.reserve(decoded_upper_bound(&batch)).await {
+            Ok(reservation) => reservation,
+            Err(Exhausted { requested, waited }) => {
+                warn!(
+                    topic = name,
+                    partition = partition.index,
+                    requested,
+                    ?waited,
+                    "decoded-batch budget stayed spent, answering REQUEST_TIMED_OUT"
+                );
+
+                return self
+                    .error(partition.index, ErrorCode::RequestTimedOut)
+                    .error_message(Some(BUDGET_SPENT.into()));
+            }
+        };
+
+        let inflated = match validate_timestamps_offloaded(batch, timestamp_type, now).await {
+            Ok((validated, Ok(inflated))) => {
+                batch = validated;
+                inflated
+            }
+            Ok((validated, Err(rejection))) => {
+                return self.reject_unless_unknown(&tp, &validated, rejection).await;
             }
             Err(err) => {
                 error!(?err);
                 return self.error(partition.index, ErrorCode::UnknownServerError);
             }
-        }
+        };
+
+        // The decoded size is known now. A compressed batch is charged for its inflated record
+        // bytes as well as its `Record` structures, which is what the decoder charges, and these
+        // bytes are what a few KB of compressed input turns into.
+        reservation.shrink_to(
+            inflated
+                .decoded_size(&compression)
+                .unwrap_or_else(|_| reservation.bytes()),
+        );
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic.
         let log_append_time_ms = match timestamp_type {
@@ -1327,12 +1999,15 @@ where
             TimestampType::LogAppendTime => now,
         };
 
-        let tp = Topition::new(name, partition.index);
         let producer_id = batch.producer_id;
         let producer_epoch = batch.producer_epoch;
         let base_sequence = batch.base_sequence;
 
-        match self.storage.produce(transaction_id, &tp, batch).await {
+        match self
+            .storage
+            .produce_inflated(transaction_id, &tp, batch, inflated)
+            .await
+        {
             Ok(base_offset) => PartitionProduceResponse::default()
                 .index(partition.index)
                 .error_code(ErrorCode::None.into())
@@ -1349,7 +2024,10 @@ where
                 // Logged once, here, with the partition: a rejection
                 // the client caused is a warning, an internal failure
                 // is an error.
-                if error_code == ErrorCode::UnknownServerError {
+                if matches!(
+                    error_code,
+                    ErrorCode::UnknownServerError | ErrorCode::KafkaStorageError
+                ) {
                     error!(
                         topic = name,
                         partition = partition.index,
@@ -1424,6 +2102,7 @@ where
         &self,
         transaction_id: Option<&str>,
         topic: TopicProduceData,
+        admission: &mut Admission<'_>,
     ) -> TopicProduceResponse {
         let partition_data = topic.partition_data.unwrap_or_default();
         let mut partitions = Vec::with_capacity(partition_data.len());
@@ -1432,8 +2111,14 @@ where
             Ok(timestamp_type) => {
                 for partition in partition_data {
                     partitions.push(
-                        self.partition(transaction_id, &topic.name, timestamp_type, partition)
-                            .await,
+                        self.partition(
+                            transaction_id,
+                            &topic.name,
+                            timestamp_type,
+                            partition,
+                            admission,
+                        )
+                        .await,
                     )
                 }
             }
@@ -1469,9 +2154,34 @@ where
     type Output = ProduceResponse;
     type Error = Error;
 
-    #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
+        self.serve_with(
+            &decoded_budget::produce(),
+            decoded_budget::WAIT_TIMEOUT,
+            input.into(),
+        )
+        .await
+    }
+}
+
+impl<G> ProduceService<G>
+where
+    G: Storage,
+{
+    /// Serves `input`, with its decoded batches held against `budget`.
+    #[instrument(skip(self, budget, wait, input))]
+    pub(super) async fn serve_with(
+        &self,
+        budget: &DecodedBytesBudget,
+        wait: Duration,
+        input: RequestInput<ProduceRequest>,
+    ) -> Result<ProduceResponse> {
+        // One wait for the whole request, so that a request with many partitions does not wait
+        // the full time for each one. Each partition takes the time that it waited out of it.
+        let mut admission = Admission {
+            budget,
+            remaining: wait,
+        };
 
         let topics = input.request.topic_data.unwrap_or_default();
         let mut responses = Vec::with_capacity(topics.len());
@@ -1501,8 +2211,12 @@ where
         } else {
             for topic in topics {
                 responses.push(
-                    self.topic(input.request.transactional_id.as_deref(), topic)
-                        .await,
+                    self.topic(
+                        input.request.transactional_id.as_deref(),
+                        topic,
+                        &mut admission,
+                    )
+                    .await,
                 )
             }
         }

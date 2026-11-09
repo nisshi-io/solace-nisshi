@@ -33,10 +33,19 @@ use tracing::{debug, instrument};
 
 use super::METER;
 
+/// A document with the version of the object it was read from, which is `None` for a document
+/// that does not exist.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DataVersion<D> {
-    data: D,
-    version: Option<UpdateVersion>,
+pub(super) struct DataVersion<D> {
+    pub(super) data: D,
+    pub(super) version: Option<UpdateVersion>,
+}
+
+/// A document that [`OptiCon::fetch`] read, with the generation that the [`OptiCon`] had before
+/// the GET began.
+pub(super) struct Fetched<D> {
+    pub(super) document: DataVersion<D>,
+    generation: u64,
 }
 
 impl<D> From<&DataVersion<D>> for PutMode {
@@ -114,8 +123,50 @@ where
         }
     }
 
+    /// Returns the version of the document that this value holds, which is `None` until it holds
+    /// one.
+    pub(super) fn version(&self) -> Result<Option<UpdateVersion>> {
+        self.data_version
+            .lock()
+            .map(|guard| guard.as_ref().and_then(|held| held.version.clone()))
+            .map_err(Into::into)
+    }
+
+    /// Reads the document with an unconditional GET, keeps it as [`Self::keep`] does, and returns
+    /// what the GET returned.
+    ///
+    /// The kept document is shared, and a call that began later can replace it, so a caller that
+    /// must decide from the document this GET returned uses the return value, not [`Self::with`].
+    pub(super) async fn get(&self, object_store: &impl ObjectStore) -> Result<DataVersion<D>> {
+        let fetched = self.fetch(object_store).await?;
+        self.keep(&fetched)?;
+        Ok(fetched.document)
+    }
+
+    /// Keeps a document that [`Self::fetch`] returned, so that [`Self::version`] and
+    /// [`Self::with`] start from it. A change to the kept document since that GET began stops
+    /// this call from keeping it, because the change may hold a later version.
+    pub(super) fn keep(&self, fetched: &Fetched<D>) -> Result<()> {
+        let document = &fetched.document;
+
+        self.install(
+            fetched.generation,
+            document.version.is_some().then(|| document.clone()),
+        )
+        .map(|_not_installed| ())
+    }
+
+    /// Reads the document with an unconditional GET and returns what the GET returned, without
+    /// keeping it.
+    ///
+    /// [`Self::with`] revalidates with `If-None-Match`, which a [`Cache`](super::metadata::Cache)
+    /// in front of the store answers from memory for its retention. A GET without a version
+    /// reaches the store, and leaves the cache holding the version it returned.
+    ///
+    /// A caller that reads a second document before it answers keeps this one afterwards,
+    /// because a kept version tells the next call that the document is already accounted for.
     #[instrument(skip_all, fields(path = %self.path))]
-    async fn get(&self, object_store: &impl ObjectStore) -> Result<()> {
+    pub(super) async fn fetch(&self, object_store: &impl ObjectStore) -> Result<Fetched<D>> {
         const METHOD: &str = "get";
         REQUESTS.add(1, &[KeyValue::new("method", METHOD)]);
 
@@ -149,13 +200,16 @@ where
 
                 debug!(?version);
 
-                self.install(before, Some(DataVersion { data, version }))
-                    .map(|_not_installed| ())
+                Ok(Fetched {
+                    document: DataVersion { data, version },
+                    generation: before,
+                })
             }
 
-            Err(object_store::Error::NotFound { .. }) => {
-                self.install(before, None).map(|_not_installed| ())
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(Fetched {
+                document: DataVersion::default(),
+                generation: before,
+            }),
 
             Err(otherwise) => Err(otherwise.into()),
         }
@@ -344,7 +398,7 @@ where
                     object_store::Error::Precondition { .. }
                     | object_store::Error::AlreadyExists { .. },
                 ) => {
-                    self.get(object_store).await?;
+                    _ = self.get(object_store).await?;
                     continue;
                 }
 
@@ -709,6 +763,58 @@ mod tests {
         // The held read began before the write, so it may answer with the older value.
         assert_eq!(1, reader.await.expect("reader")?);
 
+        assert_eq!(2, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
+        assert_eq!(Some(written), object_store.if_none_match().last().cloned());
+
+        Ok(())
+    }
+
+    /// A `get` that read a document before a write and returns after it returns what it read,
+    /// and does not keep that version over the write's: the next read presents the write's
+    /// version.
+    #[tokio::test]
+    async fn get_overlapping_a_write_does_not_keep_the_older_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let object_store = Arc::new(Held::default());
+        let path = Path::from("/abc/test.json");
+
+        // The object exists, at a version this OptiCon has not read.
+        OptiCon::<X>::path(path.clone())
+            .with_mut(object_store.as_ref(), |x| {
+                x.0 = 1;
+                Ok(())
+            })
+            .await?;
+
+        let opticon = OptiCon::<X>::path(path.clone());
+
+        object_store.hold_next_get();
+        let getter = tokio::spawn({
+            let opticon = opticon.clone();
+            let object_store = object_store.clone();
+            async move { opticon.get(object_store.as_ref()).await }
+        });
+        object_store.reached().await;
+
+        opticon
+            .with_mut(object_store.as_ref(), |x| {
+                x.0 = 2;
+                Ok(())
+            })
+            .await?;
+
+        let written = object_store.inner().head(&path).await?.e_tag;
+
+        object_store.release();
+
+        // The held GET began before the write, so it returns the older document.
+        assert_eq!(1, getter.await.expect("getter")?.data.0);
+
+        assert_eq!(
+            written,
+            opticon.version()?.and_then(|version| version.e_tag)
+        );
         assert_eq!(2, opticon.with(object_store.as_ref(), |x| Ok(x.0)).await?);
         assert_eq!(Some(written), object_store.if_none_match().last().cloned());
 

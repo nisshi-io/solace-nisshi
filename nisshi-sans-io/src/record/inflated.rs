@@ -258,6 +258,11 @@ fn decoded_record_size(
 }
 
 impl Batch {
+    /// True if the batch holds a control record, such as a transaction marker, not data.
+    pub fn is_control(&self) -> bool {
+        self.attributes & BatchAttribute::CONTROL_BITMASK == BatchAttribute::CONTROL_BITMASK
+    }
+
     pub fn compression(&self) -> Result<Compression> {
         Compression::try_from(self.attributes)
     }

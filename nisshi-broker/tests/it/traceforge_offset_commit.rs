@@ -301,10 +301,10 @@ impl Storage for FaultInjectingStorage {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: tokio::time::Instant,
     ) -> StorageResult<Vec<deflated::Batch>> {
         self.inner
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 

@@ -1082,6 +1082,8 @@ async fn test_list_offsets_earliest_after_delete_records() {
 mod cleanup_policy {
     use std::time::{Duration, SystemTime};
 
+    use tokio::time::Instant;
+
     use nisshi_sans_io::{
         BatchAttribute, Compression, IsolationLevel,
         create_topics_request::CreatableTopicConfig,
@@ -1133,7 +1135,7 @@ mod cleanup_policy {
                 1,
                 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::ZERO,
+                Instant::now() + Duration::from_secs(5),
             )
             .await
             .unwrap()

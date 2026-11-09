@@ -728,7 +728,7 @@ where
                 min_bytes,
                 max_bytes,
                 isolation,
-                max_wait,
+                tokio::time::Instant::now() + max_wait,
             )
             .await
             .inspect_err(|err| error!(?err, fetch_offset))?
@@ -864,7 +864,7 @@ where
             1,
             50 * 1024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_secs(5),
+            tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
         .inspect_err(|err| error!(?err))?
@@ -1328,12 +1328,10 @@ fn assert_offset_out_of_range(
     Ok(())
 }
 
-/// A fetch offset below the log start is answered with
-/// `OFFSET_OUT_OF_RANGE` straight away (not after `max_wait`), without
-/// disturbing another partition in the same request, and the service keeps
-/// answering valid fetches afterwards. A fetch offset above the high
-/// watermark is answered with `NONE` and no records on every engine, where
-/// Kafka answers `NONE` only up to the log end offset.
+/// A fetch offset below the log start or above the high watermark is
+/// answered with `OFFSET_OUT_OF_RANGE` straight away (not after `max_wait`),
+/// without disturbing another partition in the same request, and the service
+/// keeps answering valid fetches afterwards.
 pub async fn offset_out_of_range<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
 where
     C: Into<String>,
@@ -1384,21 +1382,20 @@ where
         assert_offset_out_of_range(&partitions[0], fetch_offset)?;
     }
 
-    // a client can be ahead of the high watermark that a broker reads
+    // above the high watermark, as above the log end offset in Kafka
     for fetch_offset in [high_watermark + 1, i64::MAX] {
-        let response = fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], 500).await?;
+        let started_at = SystemTime::now();
+        let response = fetch_offsets(&sc, &topic_name, &[(0, fetch_offset)], max_wait_ms).await?;
+        let elapsed = started_at.elapsed()?;
+
+        assert!(
+            elapsed < answered_within,
+            "fetch at {fetch_offset} took {elapsed:?}"
+        );
+
         let partitions = partition_data(response);
         assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?,
-            "fetch at {fetch_offset}"
-        );
-        assert_eq!(
-            high_watermark, partitions[0].high_watermark,
-            "fetch at {fetch_offset}"
-        );
-        assert!(partitions[0].records.is_none(), "fetch at {fetch_offset}");
+        assert_offset_out_of_range(&partitions[0], fetch_offset)?;
     }
 
     // one partition out of range, the other idle at its high watermark: the
@@ -2563,7 +2560,51 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
+    #[tokio::test]
+    async fn kv_header() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::kv_header(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_non_txn() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_non_txn(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mid_batch() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::mid_batch(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn oversized_first_record_is_returned_alone() -> Result<()> {
         let _guard = init_tracing()?;
@@ -2579,7 +2620,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
     #[tokio::test]
     async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
         let _guard = init_tracing()?;

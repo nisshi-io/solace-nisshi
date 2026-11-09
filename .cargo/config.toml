@@ -1,0 +1,5 @@
+# Links the C runtime into the Windows binary, as musl is linked into the Linux
+# binaries. Without it, nisshi.exe needs the Visual C++ Redistributable, which
+# Windows does not include, and does not start on a machine that lacks it.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

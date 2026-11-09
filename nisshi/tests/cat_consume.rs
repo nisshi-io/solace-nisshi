@@ -63,8 +63,7 @@ fn fetch_offset_inside_a_batch_skips_the_records_before_it() {
 
 /// Fetch answers an offset below the log start with `OFFSET_OUT_OF_RANGE` and no records, and
 /// `-1` is below it. That must not look like a valid offset with nothing to read to the caller.
-/// An offset above the high watermark is answered with no error by design, so it is not covered
-/// here.
+/// An offset above the high watermark gets the same answer, so the same path fails it.
 #[test]
 fn fetch_offset_below_the_log_start_fails_with_the_error() {
     let broker = taxi();
@@ -76,4 +75,39 @@ fn fetch_offset_below_the_log_start_fails_with_the_error() {
 
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     assert!(stderr.contains("OffsetOutOfRange"), "{stderr}");
+}
+
+/// A topic that doesn't exist is answered with `UNKNOWN_TOPIC_OR_PARTITION` and no records, which
+/// must not look like an empty topic, so the error names the topic.
+#[test]
+fn missing_topic_fails_naming_the_topic() {
+    let broker = Broker::start();
+
+    let output = broker.run(&["cat", "consume", "no-such-topic"], "");
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!("", String::from_utf8(output.stdout.clone()).unwrap());
+
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(stderr.contains("no-such-topic"), "{stderr}");
+    assert!(stderr.contains("UnknownTopicOrPartition"), "{stderr}");
+    assert!(!stderr.contains("Unknown error occurred"), "{stderr}");
+    // The metadata error code names the cause before any fetch, as it does on Kafka.
+    assert!(stderr.contains("looking up topic"), "{stderr}");
+}
+
+/// A partition that doesn't exist on a topic that does is reported the same way.
+#[test]
+fn missing_partition_fails_naming_the_topic_and_partition() {
+    let broker = taxi();
+
+    let output = broker.run(&["cat", "consume", "taxi", "--partition", "9"], "");
+
+    assert!(!output.status.success(), "{output:?}");
+
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(stderr.contains("taxi"), "{stderr}");
+    assert!(stderr.contains("partition 9"), "{stderr}");
+    assert!(stderr.contains("UnknownTopicOrPartition"), "{stderr}");
+    assert!(!stderr.contains("Unknown error occurred"), "{stderr}");
 }

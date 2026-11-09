@@ -26,7 +26,13 @@ pub struct Guard {
 }
 
 pub fn init(tracing_format: TracingFormat) -> Result<Guard> {
-    tracing::init_tracing_subscriber(tracing_format).map(|tracer| Guard { tracer })
+    tracing::init_tracing_subscriber(tracing_format, false).map(|tracer| Guard { tracer })
+}
+
+/// Initializes logging as [`init`] does, with the log lines on stderr instead of stdout. A client
+/// tool's stdout carries its result (`--output json`), so a log line there would break it.
+pub fn init_stderr(tracing_format: TracingFormat) -> Result<Guard> {
+    tracing::init_tracing_subscriber(tracing_format, true).map(|tracer| Guard { tracer })
 }
 
 /// Installs the global OTLP meter provider and returns it so the caller can

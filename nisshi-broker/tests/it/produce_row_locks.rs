@@ -303,7 +303,7 @@ async fn stored_records(
                 1,
                 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::ZERO,
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
         assert!(

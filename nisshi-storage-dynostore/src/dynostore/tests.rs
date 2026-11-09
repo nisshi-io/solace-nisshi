@@ -27,6 +27,7 @@ use super::{DynoStore, EMPTY_GROUP_SENTINEL, decode_group_segment, group_path_pa
 
 mod batched_produce;
 mod concurrent_retry;
+mod current_offset_stage;
 mod delete_records;
 mod describe_groups;
 mod epoch_fence;
@@ -41,11 +42,14 @@ mod list_offsets;
 mod list_offsets_storage_error;
 mod metadata_read_error;
 mod offset_commit_unknown_partition;
+mod partition_without_producer_state;
 mod ping;
 mod post_write_failure_reason;
+mod produce_inflated;
 mod produce_topic_guard;
 mod produce_write_failure;
 mod producer_detail;
+mod recreated_producer;
 mod stale_watermark;
 mod transaction_last_stable;
 mod unknown_partition_guard;
@@ -277,6 +281,7 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         high: Some(66),
         time_index: TimeIndex::complete(),
         producer_epochs: BTreeMap::new(),
+        reclaimed: None,
     })?;
     assert!(!written.contains("timestamps"), "{written}");
     let round_trip: Watermark = serde_json::from_str(&written)?;

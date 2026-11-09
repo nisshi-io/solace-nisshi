@@ -18,7 +18,7 @@ use tracing::{Level, Subscriber};
 use tracing_subscriber::{
     EnvFilter, Layer,
     filter::{FilterExt, LevelFilter, filter_fn},
-    fmt::format::FmtSpan,
+    fmt::{format::FmtSpan, writer::BoxMakeWriter},
     layer::{Filter, SubscriberExt},
     util::SubscriberInitExt,
 };
@@ -83,7 +83,19 @@ fn is_reqsign_core(target: &str) -> bool {
     target == "reqsign_core" || target.starts_with("reqsign_core::")
 }
 
-pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
+/// Where the log lines go: stdout, or stderr for a client tool whose stdout carries its result.
+fn log_writer(to_stderr: bool) -> BoxMakeWriter {
+    if to_stderr {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    }
+}
+
+pub(super) fn init_tracing_subscriber(
+    tracing_format: TracingFormat,
+    to_stderr: bool,
+) -> Result<Guard> {
     // let provider = init_tracer_provider()?;
 
     // let tracer = provider.tracer(format!("{}-otel-subscriber", env!("CARGO_PKG_NAME")));
@@ -92,6 +104,7 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
         TracingFormat::Text => tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
+                    .with_writer(log_writer(to_stderr))
                     .with_level(true)
                     .with_line_number(true)
                     .with_thread_ids(false)
@@ -104,6 +117,7 @@ pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<G
         TracingFormat::Json => tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
+                    .with_writer(log_writer(to_stderr))
                     .json()
                     .with_filter(log_filter()?),
             )

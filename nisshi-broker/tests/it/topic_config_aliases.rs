@@ -23,6 +23,7 @@ use std::{
     io,
     sync::{Arc, Mutex, OnceLock},
 };
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use nisshi_broker::{Error, Result};
@@ -261,7 +262,7 @@ async fn records_of_virtual_topic(
             1,
             50 * 1_024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_millis(500),
+            Instant::now() + Duration::from_millis(500),
         )
         .await
     else {

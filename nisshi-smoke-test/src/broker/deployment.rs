@@ -97,7 +97,7 @@ impl Deployment {
     /// Stops a broker that didn't start, if it is still running, and removes it and its files. The
     /// returned [`FailedStart`] holds its whole log, so nothing is lost.
     pub(super) fn stop_and_collect_failed_start(mut self, reason: String) -> FailedStart {
-        let exit_code = self.host.stop_after_failed_start(&self.log);
+        let (exit_code, log_problem) = self.host.stop_after_failed_start(&self.log);
 
         FailedStart::from_log(
             format!(
@@ -108,6 +108,7 @@ impl Deployment {
             ),
             exit_code,
             &self.log,
+            log_problem,
             reason,
         )
     }

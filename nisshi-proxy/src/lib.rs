@@ -20,9 +20,8 @@ use nisshi_client::{
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
     ApiKey, DescribeConfigsRequest, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
-    MetadataRequest, MetadataResponse, NULL_TOPIC_ID, ProduceRequest, RequestInput,
-    find_coordinator_response::Coordinator, metadata_request::MetadataRequestTopic,
-    metadata_response::MetadataResponseBroker, topic_config,
+    MetadataRequest, ProduceRequest, RequestInput, find_coordinator_response::Coordinator,
+    topic_config,
 };
 use nisshi_service::{
     BytesFrameLayer, FrameApiKeyMatcher, FrameRequestLayer, TcpBytesLayer, TcpContextLayer,
@@ -57,6 +56,7 @@ use crate::{
 };
 
 mod acks_zero;
+mod metadata;
 mod produce;
 mod sasl;
 mod topic;
@@ -136,6 +136,22 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 /// quiet.
 const ORIGIN_POOL_MAX_SIZE: usize = 256;
 
+/// Returns the `FindCoordinator` request that the proxy sends to its origin for a client's
+/// `request`.
+///
+/// A v0 client request has a `key` and no `key_type`, and the origin may be asked at v1 or
+/// later, where `key_type` is mandatory: a v0 request asks for a group coordinator, so the
+/// key type is 0.
+fn origin_find_coordinator_request(request: FindCoordinatorRequest) -> FindCoordinatorRequest {
+    FindCoordinatorRequest::default()
+        .key_type(request.key_type.or(Some(0)))
+        .coordinator_keys(
+            request
+                .coordinator_keys
+                .or(request.key.map(|key| vec![key])),
+        )
+}
+
 #[derive(Clone, Debug)]
 pub struct Proxy {
     listener: Url,
@@ -203,51 +219,7 @@ impl Proxy {
 
         let meta = HijackLayer::new(
             FrameApiKeyMatcher(MetadataRequest::KEY),
-            (
-                FrameRequestLayer::<MetadataRequest>::new(),
-                MapInputLayer::new(move |input: RequestInput<MetadataRequest>| {
-                    MetadataRequest::default()
-                        .topics(input.request.topics.map(|topics| {
-                            topics
-                                .into_iter()
-                                .map(|topic| {
-                                    MetadataRequestTopic::default()
-                                        .name(topic.name)
-                                        .topic_id(topic.topic_id.or(Some(NULL_TOPIC_ID)))
-                                })
-                                .collect()
-                        }))
-                        .allow_auto_topic_creation(
-                            input.request.allow_auto_topic_creation.or(Some(false)),
-                        )
-                        .include_cluster_authorized_operations(
-                            input.request.include_cluster_authorized_operations,
-                        )
-                        .include_topic_authorized_operations(
-                            input
-                                .request
-                                .include_topic_authorized_operations
-                                .or(Some(false)),
-                        )
-                }),
-                MapOutputLayer::new(move |response: MetadataResponse| {
-                    let brokers = response.brokers.as_ref().map(|brokers| {
-                        brokers
-                            .iter()
-                            .map(|broker| {
-                                MetadataResponseBroker::default()
-                                    .node_id(broker.node_id)
-                                    .host(host.clone())
-                                    .port(port)
-                                    .rack(broker.rack.clone())
-                            })
-                            .collect()
-                    });
-
-                    response.brokers(brokers)
-                }),
-            )
-                .into_layer(request_origin.clone()),
+            metadata::service(request_origin.clone(), host.clone(), port),
         );
 
         let host = String::from(self.advertised_listener.host_str().unwrap_or("localhost"));
@@ -257,14 +229,7 @@ impl Proxy {
             (
                 FrameRequestLayer::<FindCoordinatorRequest>::new(),
                 MapInputLayer::new(move |input: RequestInput<FindCoordinatorRequest>| {
-                    FindCoordinatorRequest::default()
-                        .key_type(input.request.key_type)
-                        .coordinator_keys(
-                            input
-                                .request
-                                .coordinator_keys
-                                .or(input.request.key.map(|key| vec![key])),
-                        )
+                    origin_find_coordinator_request(input.request)
                 }),
                 MapOutputLayer::new(move |response: FindCoordinatorResponse| {
                     let coordinators = response.coordinators.as_ref().map(|coordinators| {
@@ -408,7 +373,8 @@ mod tests {
     use std::{fs::File, sync::Arc, thread};
 
     use nisshi_sans_io::{
-        DescribeConfigsRequest, DescribeConfigsResponse, Frame, FrameInput, Header, ProduceResponse,
+        DescribeConfigsRequest, DescribeConfigsResponse, Frame, FrameInput, Header,
+        MetadataResponse, ProduceResponse,
     };
     use nisshi_service::{FrameService, RequestApiKeyMatcher, ResponseService};
     use rama::extensions::Extensions;
@@ -439,6 +405,33 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    #[test]
+    fn v0_find_coordinator_request_encodes_at_the_newest_version() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        // A v0 client sends a key and no key type.
+        let request = origin_find_coordinator_request(
+            FindCoordinatorRequest::default().key(Some("g".into())),
+        );
+
+        let decoded = Frame::request(
+            Header::Request {
+                api_key: FindCoordinatorRequest::KEY,
+                api_version: 4,
+                correlation_id: 0,
+                client_id: Some("abc".into()),
+            },
+            request.into(),
+        )
+        .and_then(Frame::request_from_bytes)?;
+
+        let request = FindCoordinatorRequest::try_from(decoded.body)?;
+        assert_eq!(Some(0), request.key_type);
+        assert_eq!(Some(vec![String::from("g")]), request.coordinator_keys);
+
+        Ok(())
     }
 
     #[tokio::test]

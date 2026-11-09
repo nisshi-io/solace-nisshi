@@ -17,7 +17,7 @@ use std::{
     io::{self, Write},
 };
 
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, MetadataResponse, metadata_response::MetadataResponseTopic,
 };
@@ -26,26 +26,37 @@ use url::Url;
 
 use crate::{Error, Result, Topic};
 
-/// How `topic list` prints the topics.
+/// How a topic command prints its result.
+///
+/// `Json` prints the broker's per-item results as one JSON array on one line, as the broker sent
+/// them: the topics of the metadata response for `list`, and the one result for the topic that
+/// `create` or `delete` named.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Format {
     /// A table of topic names and partition counts, for people to read.
     #[default]
     Table,
-    /// The topics of the metadata response as JSON on one line, for scripts.
+    /// The broker's results as JSON on one line, for scripts.
     Json,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B> {
     broker: B,
+    security: Security,
     format: Format,
 }
 
 impl<B> Builder<B> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: Url) -> Builder<Url> {
         Builder {
             broker,
+            security: self.security,
             format: self.format,
         }
     }
@@ -59,6 +70,7 @@ impl Builder<Url> {
     pub fn build(self) -> Topic {
         Topic::List(Configuration {
             broker: self.broker,
+            security: self.security,
             format: self.format,
         })
     }
@@ -67,6 +79,7 @@ impl Builder<Url> {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     format: Format,
 }
 
@@ -86,6 +99,7 @@ impl TryFrom<Configuration> for List {
 impl List {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
         let client = ConnectionManager::builder(self.configuration.broker.clone())
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await

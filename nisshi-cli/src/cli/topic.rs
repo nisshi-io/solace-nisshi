@@ -20,7 +20,7 @@ use nisshi_sans_io::ErrorCode;
 use nisshi_topic::{Format, Topic};
 use url::Url;
 
-use super::{DEFAULT_BROKER, output::Output};
+use super::{DEFAULT_BROKER, client_security::ClientSecurity, output::Output};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -41,9 +41,16 @@ pub(super) enum Command {
         #[arg(long, value_parser = parse_key_val::<String, String>)]
         config: Vec<(String, String)>,
 
-        /// Print no confirmation on success (errors still print)
+        /// Print no confirmation on success (errors still print). With --output json the
+        /// result is printed anyway
         #[arg(long)]
         silent: bool,
+
+        /// Print a confirmation line, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// Delete an existing topic
@@ -55,6 +62,12 @@ pub(super) enum Command {
         /// The name of the topic to delete
         #[clap(value_parser)]
         name: String,
+
+        /// Print nothing, or the broker's result as a JSON array for scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// List existing topics
@@ -66,42 +79,69 @@ pub(super) enum Command {
         /// Print a table of topics and partition counts, or the broker's metadata as JSON
         #[arg(long, value_enum, default_value_t = Output::Table)]
         output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 }
 
-impl From<Command> for Topic {
-    fn from(value: Command) -> Self {
-        match value {
+fn format(output: Output) -> Format {
+    match output {
+        Output::Table => Format::Table,
+        Output::Json => Format::Json,
+    }
+}
+
+impl TryFrom<Command> for Topic {
+    type Error = crate::Error;
+
+    fn try_from(value: Command) -> Result<Self> {
+        Ok(match value {
             Command::Create {
                 broker,
                 name,
                 partitions,
                 config,
                 silent,
+                output,
+                security,
             } => Topic::create()
                 .broker(broker)
+                .security(security.build()?)
                 .name(name)
                 .partitions(partitions)
                 .config(HashMap::from_iter(config))
                 .confirm(!silent)
+                .format(format(output))
                 .build(),
 
-            Command::Delete { broker, name } => Topic::delete().broker(broker).name(name).build(),
-
-            Command::List { broker, output } => Topic::list()
+            Command::Delete {
+                broker,
+                name,
+                output,
+                security,
+            } => Topic::delete()
                 .broker(broker)
-                .format(match output {
-                    Output::Table => Format::Table,
-                    Output::Json => Format::Json,
-                })
+                .security(security.build()?)
+                .name(name)
+                .format(format(output))
                 .build(),
-        }
+
+            Command::List {
+                broker,
+                output,
+                security,
+            } => Topic::list()
+                .broker(broker)
+                .security(security.build()?)
+                .format(format(output))
+                .build(),
+        })
     }
 }
 
 impl Command {
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        Topic::from(self).main().await.map_err(Into::into)
+        Topic::try_from(self)?.main().await.map_err(Into::into)
     }
 }
 
@@ -174,5 +214,33 @@ mod tests {
                 .unwrap_err()
                 .kind()
         );
+    }
+
+    fn output(args: &[&str]) -> Result<Output, clap::Error> {
+        let Wrapper { command } =
+            Wrapper::try_parse_from(std::iter::once("topic").chain(args.iter().copied()))?;
+
+        match command {
+            Command::List { output, .. }
+            | Command::Create { output, .. }
+            | Command::Delete { output, .. } => Ok(output),
+        }
+    }
+
+    #[test]
+    fn create_and_delete_print_a_table_unless_asked_for_json() {
+        for subcommand in ["create", "delete"] {
+            assert_eq!(Output::Table, output(&[subcommand, "t"]).unwrap());
+            assert_eq!(
+                Output::Json,
+                output(&[subcommand, "t", "--output", "json"]).unwrap()
+            );
+            assert_eq!(
+                clap::error::ErrorKind::InvalidValue,
+                output(&[subcommand, "t", "--output", "yaml"])
+                    .unwrap_err()
+                    .kind()
+            );
+        }
     }
 }

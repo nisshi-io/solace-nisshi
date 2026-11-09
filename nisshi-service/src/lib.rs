@@ -254,6 +254,7 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod metadata_topic_ids;
 mod peer_address;
 mod stream;
 mod transaction_abortable;
@@ -263,9 +264,12 @@ pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
 
 pub use version_gate::{
     CAPPED_API_VERSIONS, VersionGateLayer, VersionGateService, capped_range, routable_max_version,
+    routable_range,
 };
 
 pub use input::TcpListenerInput;
+
+pub use metadata_topic_ids::{MetadataTopicIdLayer, MetadataTopicIdService, refuse_topic_ids};
 
 pub use transaction_abortable::{
     TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,

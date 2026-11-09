@@ -8,8 +8,8 @@ name: ci
 # ref) - it's hygiene, keeping the repo's cache budget from being consumed
 # by entries on refs nothing else can restore from. Applies to fmt, clippy,
 # test (postgres:16, its only leg), cargo-publish-dry-run,
-# third-party-license, release and macos below (release and macos also skip
-# the cache entirely on tags). The two compat jobs only restore test's entry,
+# third-party-license, release, macos and windows below (release, macos and
+# windows also skip the cache entirely on tags). The two compat jobs only restore test's entry,
 # through the `dev` shared key, and never save. build-storage and
 # build-storage-lake use no cache: they run `cargo check`, which reuses little
 # of a full build's artifacts.
@@ -28,13 +28,13 @@ name: ci
 #   postgres:16 again (Postgres 17, 18 and 19 run nightly in tier-c.yml), the
 #   postgres and sqlite compat legs (S3 compat runs nightly),
 #   cargo-publish-dry-run, src, release,
-#   macos, smoke, smoke-oldest-client, smoke-report, and bench-instructions
+#   macos, windows, smoke, smoke-oldest-client, smoke-report, and bench-instructions
 #   (report-only: ci-gate does not need it).
 #
 # Only `typos` runs ahead of `release`, and only `release` runs ahead of
 # `smoke`, so the release -> smoke chain starts with the rest of the run.
-# `macos` is a compile-only check except on a `v*` tag, where it builds the
-# release tarball (tier-c.yml builds the macOS release nightly). smoke builds
+# `macos` and `windows` are compile-only checks except on a `v*` tag, where
+# they build the release archive (tier-c.yml builds both releases nightly). smoke builds
 # a single-platform image from release's binaries on each os and pushes
 # nothing. No job in this workflow pushes an image: tier-c.yml's edge-publish
 # pushes the `edge` image from the binaries that `release` uploads on a push
@@ -56,7 +56,7 @@ name: ci
 # calls this workflow through `workflow_call`, and publishes the release only
 # after it passes. A called run keeps the tag's `push` event and
 # `refs/tags/v*` ref, so the conditions below treat it as a push, and macos
-# builds the full release.
+# and windows build the full release.
 #
 # On top of the tiers, the `changes` job skips every Rust job on a
 # pull_request that only touches CI config this workflow doesn't read, or
@@ -225,7 +225,7 @@ jobs:
           # under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -701,7 +701,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -739,7 +739,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-about@0.8.4
       # The release binary is built with --all-features, so the list is too.
@@ -813,7 +813,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -897,7 +897,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -971,8 +971,9 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   # The static Linux binaries: smoke, release.yml's publish-image and
-  # tier-c.yml's edge-publish build the image from them. macos is the same
-  # build for macOS, in a job of its own so smoke needn't wait for it.
+  # tier-c.yml's edge-publish build the image from them. macos and windows
+  # are the same build for those platforms, in jobs of their own so smoke
+  # needn't wait for them.
   release:
     if: *tier_b
     # test, src and the build matrices are not here, so this leg starts with
@@ -1025,7 +1026,7 @@ jobs:
       # dependencies. cargo-about writes the licence list that the tarball and
       # the image carry. This job generates it beside the build, instead of
       # waiting on the third-party-license job, which takes minutes.
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1111,7 +1112,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1132,6 +1133,86 @@ jobs:
         with:
           name: nisshi-${{env.TARGET}}
           path: nisshi-${{env.TARGET}}.tar.gz
+          if-no-files-found: error
+
+  # The macos job's build for Windows. It packs a zip instead of a tarball,
+  # because Windows Explorer opens a zip and needs another tool for a tarball.
+  windows:
+    if: *tier_b
+    needs: [changes, typos]
+    runs-on: windows-latest
+    # The cold release build takes about an hour on the Windows runner, about
+    # twice as long as on macOS, and a timeout on a tag cancels the release.
+    timeout-minutes: 120
+    # The runner's default shell is PowerShell, whose `>` writes UTF-16, and
+    # THIRD-PARTY-LICENSE.html must stay UTF-8.
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # Empty, so the action does not set RUSTFLAGS, which would replace
+          # the static C runtime setting in .cargo/config.toml.
+          rustflags: ""
+          build-warnings: ""
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Not release's key: `check` writes different artifacts.
+          cache-key: ${{ env.TARGET }}-check
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: rustc -vV
+      - run: rustup target add "$TARGET"
+      - if: ${{github.ref_type != 'tag'}}
+        run: cargo check --bin nisshi --all-features --target "$TARGET"
+      - if: ${{github.ref_type == 'tag'}}
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-auditable@0.7.6,cargo-about@0.8.4
+          fallback: none
+      - if: ${{github.ref_type == 'tag'}}
+        run: |
+          # The licence scan needs no build output, so it runs beside the build.
+          # wait returns the scan's exit status, so a failed scan fails the step.
+          cargo about generate --all-features about.hbs >THIRD-PARTY-LICENSE.html &
+          about=$!
+          cargo auditable build --release --bin nisshi --all-features --target "$TARGET"
+          wait "$about"
+      # A dynamically linked C runtime shows up as an import of VCRUNTIME140.dll.
+      - if: ${{github.ref_type == 'tag'}}
+        run: |
+          bin=target/"${TARGET}"/release/nisshi.exe
+          [ -f "$bin" ] || { echo "::error::$bin does not exist"; exit 1; }
+          ! grep -a -q -i vcruntime140 "$bin" || { echo "::error::$bin imports the Visual C++ runtime DLL"; exit 1; }
+      # Git Bash on the runner has no zip command, and PowerShell has
+      # Compress-Archive built in.
+      - if: ${{github.ref_type == 'tag'}}
+        shell: pwsh
+        run: |
+          $dist = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP nisshi-dist)
+          $bin = New-Item -ItemType Directory -Path (Join-Path $dist bin)
+          Copy-Item "target/$env:TARGET/release/nisshi.exe" $bin
+          Copy-Item compose.yaml, example.env, LICENSE, NOTICE, THIRD-PARTY-LICENSE.html, README.md $dist
+          Copy-Item etc $dist -Recurse
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath "nisshi-$env:TARGET.zip"
+      # Extracts the zip with the tar that the quickstart uses, and runs the
+      # quickstart's steps against the extracted exe.
+      - if: ${{github.ref_type == 'tag'}}
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP nisshi-extract)
+          & "$env:SystemRoot\System32\tar.exe" -xf "nisshi-$env:TARGET.zip" -C $out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .github/scripts/windows-smoke.ps1 -Exe (Join-Path $out bin\nisshi.exe)
+      - if: ${{github.ref_type == 'tag'}}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nisshi-${{env.TARGET}}
+          path: nisshi-${{env.TARGET}}.zip
           if-no-files-found: error
 
   # Single stable required-check context for branch protection. Every other
@@ -1164,6 +1245,7 @@ jobs:
       - smoke-oldest-client
       - release
       - macos
+      - windows
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The timings step lists the run's jobs.
@@ -1204,7 +1286,7 @@ jobs:
       - name: Tier A ran on pull_request
         if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
         env:
-          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-oldest-client release macos
+          TIER_B: build-storage build-storage-lake cargo-publish-dry-run src smoke smoke-oldest-client release macos windows
         run: |
           skipped=$(jq -r --arg tier_b "$TIER_B" '($tier_b | split(" ")) as $exempt | to_entries[] | select(.value.result == "skipped") | select(.key as $k | $exempt | index($k) | not) | .key' <<<"$NEEDS")
           [ -z "$skipped" ] || { echo "::error::Tier A job skipped on a pull_request run, check for a needs edge onto a Tier B job: $(tr '\n' ' ' <<<"$skipped")"; exit 1; }

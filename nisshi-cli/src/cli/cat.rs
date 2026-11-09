@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::DEFAULT_BROKER;
-use crate::Result;
+use super::{
+    DEFAULT_BROKER,
+    client_security::ClientSecurity,
+    output::{JsonOnly, Output},
+};
+use crate::{EnvVarExp, Result};
 use clap::Subcommand;
 use nisshi_cat::Cat;
 use nisshi_sans_io::ErrorCode;
@@ -41,11 +45,19 @@ pub(super) enum Command {
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
         #[arg(long, env = "SCHEMA_REGISTRY")]
-        schema_registry: Option<Url>,
+        schema_registry: Option<EnvVarExp<Url>>,
 
-        /// Print no confirmation on success (errors still print)
+        /// Print no confirmation on success (errors still print). With --output json the
+        /// broker's result is printed anyway
         #[arg(long)]
         silent: bool,
+
+        /// Print a confirmation line, or the broker's partition result as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// Consume Avro/JSON/Protobuf messages from a topic
@@ -64,7 +76,7 @@ pub(super) enum Command {
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
         #[arg(long, env = "SCHEMA_REGISTRY")]
-        schema_registry: Option<Url>,
+        schema_registry: Option<EnvVarExp<Url>>,
 
         /// The maximum time in milliseconds to wait for a message
         #[arg(long, default_value = "5000")]
@@ -85,12 +97,21 @@ pub(super) enum Command {
         /// The maximum bytes to fetch from the partition
         #[arg(long, default_value = "1048576")]
         partition_max_bytes: i32,
+
+        /// Consume prints each batch of records as a JSON array on its own line, and has no
+        /// other format: this option is accepted so that every tool takes --output json
+        #[arg(long, value_enum, default_value_t = JsonOnly::Json)]
+        output: JsonOnly,
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 }
 
-impl From<Command> for Cat {
-    fn from(value: Command) -> Self {
-        match value {
+impl TryFrom<Command> for Cat {
+    type Error = crate::Error;
+
+    fn try_from(value: Command) -> Result<Self> {
+        Ok(match value {
             Command::Produce {
                 broker,
                 topic,
@@ -98,13 +119,17 @@ impl From<Command> for Cat {
                 partition,
                 schema_registry,
                 silent,
+                output,
+                security,
             } => Cat::produce()
                 .broker(broker)
+                .security(security.build()?)
                 .topic(topic)
                 .partition(partition)
-                .schema_registry(schema_registry)
+                .schema_registry(schema_registry.map(EnvVarExp::into_inner))
                 .file_name(file)
                 .confirm(!silent)
+                .json(output == Output::Json)
                 .build(),
 
             Command::Consume {
@@ -117,24 +142,27 @@ impl From<Command> for Cat {
                 max_bytes,
                 fetch_offset,
                 partition_max_bytes,
+                output: JsonOnly::Json,
+                security,
             } => Cat::consume()
                 .broker(broker)
+                .security(security.build()?)
                 .topic(topic)
                 .partition(partition)
-                .schema_registry(schema_registry)
+                .schema_registry(schema_registry.map(EnvVarExp::into_inner))
                 .max_wait_time_ms(max_wait_time_ms)
                 .min_bytes(min_bytes)
                 .max_bytes(max_bytes)
                 .fetch_offset(fetch_offset)
                 .partition_max_bytes(partition_max_bytes)
                 .build(),
-        }
+        })
     }
 }
 
 impl Command {
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        Cat::from(self).main().await.map_err(Into::into)
+        Cat::try_from(self)?.main().await.map_err(Into::into)
     }
 }
 
@@ -178,6 +206,27 @@ mod tests {
         match command {
             Command::Produce { silent, .. } => silent,
             Command::Consume { .. } => panic!("expected produce: {args:?}"),
+        }
+    }
+
+    fn output(args: &[&str]) -> Result<(), clap::Error> {
+        Wrapper::try_parse_from(std::iter::once("cat").chain(args.iter().copied())).map(|_| ())
+    }
+
+    #[test]
+    fn produce_takes_a_table_or_json_output_and_consume_only_json() {
+        assert!(output(&["produce", "t", "--output", "json"]).is_ok());
+        assert!(output(&["produce", "t", "--output", "table"]).is_ok());
+        assert!(output(&["consume", "t", "--output", "json"]).is_ok());
+        for args in [
+            ["produce", "t", "--output", "yaml"],
+            ["consume", "t", "--output", "table"],
+        ] {
+            assert_eq!(
+                clap::error::ErrorKind::InvalidValue,
+                output(&args).unwrap_err().kind(),
+                "{args:?}"
+            );
         }
     }
 

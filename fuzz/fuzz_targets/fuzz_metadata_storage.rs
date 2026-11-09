@@ -28,9 +28,10 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::MetadataRequest;
+use nisshi_service::refuse_topic_ids;
 use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -39,12 +40,22 @@ use url::Url;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
-fuzz_target!(|request: MetadataRequest| {
-    RUNTIME.block_on(async {
-        check_request(request.clone()).expect("encode/decode request");
+fuzz_target!(|input: (u16, MetadataRequest)| {
+    let (selector, request) = input;
+    let version = api_version::<MetadataRequest>(selector);
 
+    RUNTIME.block_on(async {
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let request = normalize_request(request).expect("normalized request");
+        let Some(request) = check_request(request, version).expect("encode/decode request") else {
+            return;
+        };
+
+        // The broker routes Metadata through a layer that refuses a v10 or v11 request with a
+        // null topic name or a topic ID, so the service never sees one. Serving it here would
+        // make this target find that gap on every run.
+        if let Some(refusal) = refuse_topic_ids(version, &request) {
+            return check_response(refusal, version).expect("decoded refusal");
+        }
 
         let mut builder = StorageContainer::builder()
             .cluster_id("fuzz")
@@ -68,7 +79,7 @@ fuzz_target!(|request: MetadataRequest| {
         service
             .serve(request)
             .await
-            .and_then(|response| check_response(response).map_err(Into::into))
+            .and_then(|response| check_response(response, version).map_err(Into::into))
             .expect("served and decoded")
     });
 });

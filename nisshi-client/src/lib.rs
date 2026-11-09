@@ -114,8 +114,9 @@ use std::{
     cmp,
     collections::BTreeMap,
     error, fmt, io,
+    ops::RangeInclusive,
     sync::{Arc, LazyLock, PoisonError},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 use backoff::{ExponentialBackoffBuilder, future::retry};
@@ -148,12 +149,18 @@ use tracing_subscriber::filter::ParseError;
 use url::Url;
 
 mod consumer;
+mod security;
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
+pub use security::{Sasl, SaslMechanism, Security, Tls, TlsOptions, TlsRejection};
+use security::{Session, Stream};
 
 /// Client Errors
 #[derive(thiserror::Error, Clone, Debug)]
+#[non_exhaustive]
 pub enum Error {
+    /// The broker refused the SASL login, or does not offer the mechanism. The message says why.
+    Authentication(String),
     DeadPoolBuild(#[from] BuildError),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
@@ -163,29 +170,214 @@ pub enum Error {
     Poison,
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
     Protocol(#[from] nisshi_sans_io::Error),
+    /// The SCRAM login stopped, because the broker asked for an iteration count outside the range
+    /// that the client accepts. The client refused the login, not the broker.
+    ScramIterations {
+        iterations: u32,
+        accepted: RangeInclusive<u32>,
+    },
+    /// The client logs in with SASL, and the broker's listener does not use SASL: it is a
+    /// `PLAINTEXT` or `SSL` listener, or a Nisshi broker that started without `--authentication`.
+    SaslNotUsed,
     Service(#[from] nisshi_service::Error),
     Timeout(Duration),
+    /// The TLS options can't be used: a certificate, the private key or the server name. Nothing
+    /// has connected yet.
+    TlsConfiguration(String),
+    /// The TLS handshake with the broker failed: its certificate is not trusted or is not valid
+    /// for its name, or its listener does not use TLS.
+    Tls(String),
+    /// The broker sent a TLS alert that rejects the connection: it wants a client certificate, or
+    /// does not accept the one that the client sent.
+    TlsRejected(TlsRejection),
     UnknownApiKey(i16),
     UnknownHost(Url),
 }
 
+/// The kind of failure that an I/O error on the connection to the broker is.
+fn io_failure_kind(error: &io::Error) -> FailureKind {
+    match error.kind() {
+        io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe => FailureKind::Closed,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::AddrNotAvailable => FailureKind::Unreachable,
+        _ => FailureKind::Other,
+    }
+}
+
+/// What a failed [`Error`] means to whoever has to act on it, as [`Error::failure_kind`] says.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FailureKind {
+    /// The client's own options can't be used: the TLS options or the broker's URL. Nothing was
+    /// sent to a broker.
+    Options,
+
+    /// The client could not open a connection: the address does not resolve, or the attempt was
+    /// refused, failed or timed out.
+    Unreachable,
+
+    /// The client connected, and the TLS connection or the login was refused, or the client
+    /// refused what the broker offered.
+    Refused,
+
+    /// The client connected, and the broker closed the connection before it answered.
+    Closed,
+
+    /// The client connected and sent the request, and no answer came within the deadline. The
+    /// broker may have applied the request.
+    TimedOut,
+
+    /// Any other failure.
+    Other,
+}
+
 impl Error {
-    /// Returns whether the client failed to open a connection to the broker, as opposed to
-    /// failing after it connected. A pool error that comes from a refused, failed or timed out
-    /// connection attempt is a connect failure, and a pool error that comes from waiting for a
-    /// free connection is not.
-    pub fn is_connect_failure(&self) -> bool {
+    fn tls(error: impl fmt::Display) -> Self {
+        Self::TlsConfiguration(error.to_string())
+    }
+
+    /// Returns what this failure means to whoever has to act on it. A command that reports the
+    /// failure and one that numbers its exit status both ask this, so the two agree. The match
+    /// has no wildcard arm: a new variant of [`Error`] does not compile until its author has
+    /// said which kind it is.
+    pub fn failure_kind(&self) -> FailureKind {
         match self {
-            Self::Pool(cause) => !matches!(
-                cause.downcast_ref::<PoolError<Error>>(),
+            Self::TlsConfiguration(_) | Self::ParseUrl(_) => FailureKind::Options,
+            Self::UnknownHost(_) => FailureKind::Unreachable,
+            Self::Authentication(_)
+            | Self::SaslNotUsed
+            | Self::ScramIterations { .. }
+            | Self::Tls(_)
+            | Self::TlsRejected(_) => FailureKind::Refused,
+            Self::Timeout(_) => FailureKind::TimedOut,
+            Self::Io(cause) => io_failure_kind(cause),
+            // The pool wraps what its connection manager returned while it opened a connection.
+            // Only a failed attempt to reach the broker, or a create timeout, is unreachable:
+            // waiting for a free connection is not.
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                // The connection manager looks up the broker's address before it connects, and
+                // that is the only thing that raises a service error while it opens a
+                // connection. A lookup that fails does not say why in the kind of its I/O
+                // error, so any such failure means the address does not resolve.
+                Some(PoolError::Backend(Self::Service(
+                    nisshi_service::Error::Io(_) | nisshi_service::Error::UnknownHost(_),
+                ))) => FailureKind::Unreachable,
+                Some(PoolError::Backend(error)) => error.failure_kind(),
+                Some(PoolError::Timeout(TimeoutType::Create)) => FailureKind::Unreachable,
                 Some(
                     PoolError::Timeout(TimeoutType::Wait | TimeoutType::Recycle)
-                        | PoolError::Closed
-                        | PoolError::NoRuntimeSpecified
-                )
+                    | PoolError::Closed
+                    | PoolError::NoRuntimeSpecified
+                    | PoolError::PostCreateHook(_),
+                ) => FailureKind::Other,
+                // A pool error of another type: only opening a connection raises one.
+                None => FailureKind::Unreachable,
+            },
+            Self::DeadPoolBuild(_)
+            | Self::Join(_)
+            | Self::Message(_)
+            | Self::ParseFilter(_)
+            | Self::Poison
+            | Self::Protocol(_)
+            | Self::UnknownApiKey(_) => FailureKind::Other,
+            Self::Service(nisshi_service::Error::UnknownHost(_)) => FailureKind::Unreachable,
+            Self::Service(nisshi_service::Error::Io(cause)) => io_failure_kind(cause),
+            Self::Service(_) => FailureKind::Other,
+        }
+    }
+
+    /// Returns whether the client failed to open a connection to the broker, as opposed to
+    /// failing after it connected.
+    pub fn is_connect_failure(&self) -> bool {
+        self.failure_kind() == FailureKind::Unreachable
+    }
+
+    /// Returns the I/O error behind this failure, when the connection to the broker failed or
+    /// closed, whether the client was opening the connection or using it.
+    pub fn io_error(&self) -> Option<&io::Error> {
+        match self {
+            Self::Io(cause) => Some(cause),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Io(cause))) => Some(cause),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns why the TLS handshake with the broker failed, when the client connected and the
+    /// handshake then failed: the broker's certificate is not trusted or is not valid for the
+    /// broker's name, or its listener does not use TLS.
+    pub fn tls_failure(&self) -> Option<&str> {
+        match self {
+            Self::Tls(message) => Some(message),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Tls(message))) => Some(message),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns the alert that rejected the TLS connection, when the broker sent one: it wants a
+    /// client certificate, or does not accept the one that the client sent.
+    pub fn tls_rejection(&self) -> Option<&TlsRejection> {
+        match self {
+            Self::TlsRejected(rejection) => Some(rejection),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::TlsRejected(rejection))) => Some(rejection),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns the iteration count that the broker asked a SCRAM login for, and the range that the
+    /// client accepts, when the count is outside that range.
+    pub fn scram_iterations(&self) -> Option<(u32, &RangeInclusive<u32>)> {
+        match self {
+            Self::ScramIterations {
+                iterations,
+                accepted,
+            } => Some((*iterations, accepted)),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::ScramIterations {
+                    iterations,
+                    accepted,
+                })) => Some((*iterations, accepted)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns whether the client logged in with SASL to a listener that does not use SASL.
+    pub fn sasl_not_used(&self) -> bool {
+        match self {
+            Self::SaslNotUsed => true,
+            Self::Pool(cause) => matches!(
+                cause.downcast_ref::<PoolError<Error>>(),
+                Some(PoolError::Backend(Self::SaslNotUsed))
             ),
-            Self::UnknownHost(_) => true,
             _ => false,
+        }
+    }
+
+    /// Returns why the broker refused the SASL login, when the client connected and the
+    /// broker then refused it or does not offer the mechanism.
+    pub fn login_failure(&self) -> Option<&str> {
+        match self {
+            Self::Authentication(message) => Some(message),
+            Self::Pool(cause) => match cause.downcast_ref::<PoolError<Error>>() {
+                Some(PoolError::Backend(Self::Authentication(message))) => Some(message),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -217,9 +409,15 @@ where
     }
 }
 
+/// A TLS alert from the broker, after the handshake, is a rejection of the connection: that is
+/// how a TLS 1.3 broker refuses a client certificate. Any other rustls error on a connection
+/// that is already open stays an I/O error, because the handshake did not cause it.
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
+        match security::rustls_cause(&value).and_then(TlsRejection::from_rustls) {
+            Some(rejection) => Self::TlsRejected(rejection),
+            None => Self::Io(Arc::new(value)),
+        }
     }
 }
 
@@ -241,8 +439,14 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 ///  Broker connection stream with [`correlation id`][`Header#variant.Request.field.correlation_id`]
 #[derive(Debug)]
 pub struct Connection {
-    stream: TcpStream,
+    stream: Stream,
     correlation_id: i32,
+
+    /// When the broker stops accepting requests on this connection until it logs in again,
+    /// after the session lifetime that its SaslAuthenticate response sets. The client doesn't
+    /// re-authenticate: the pool discards the connection a little before then, and a new one
+    /// logs in.
+    session_expires: Option<Instant>,
 
     /// True from the write of a request until its complete response is read. A request
     /// that fails or is cancelled leaves it true, and the pool then discards the
@@ -255,6 +459,7 @@ pub struct Connection {
 pub struct ConnectionManager {
     broker: Url,
     client_id: Option<String>,
+    security: Security,
     versions: BTreeMap<i16, i16>,
     connect_timeout: Duration,
     max_idle: Duration,
@@ -302,7 +507,7 @@ impl managed::Manager for ConnectionManager {
         let backoff = ExponentialBackoffBuilder::new()
             .with_max_elapsed_time(Some(self.connect_timeout))
             .build();
-        retry(backoff, || async {
+        let stream = retry(backoff, || async {
             Ok(timeout(CONNECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr))
                 .await
                 .unwrap_or_else(|_elapsed| Err(io::ErrorKind::TimedOut.into()))
@@ -317,15 +522,32 @@ impl managed::Manager for ConnectionManager {
                 .inspect_err(|err| {
                     debug!(broker = %self.broker, ?err, elapsed = start.elapsed().map_or(0, |duration| duration.as_millis() as u64));
                     TCP_CONNECT_ERRORS.add(1, &attributes);
-                })
-                .map(|stream| Connection {
-                    stream,
-                    correlation_id: 0,
-                    in_flight: false,
                 })?)
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+
+        // A refused TLS handshake or SASL login is not retried: the same credentials fail
+        // the same way, so the caller gets the reason at once.
+        let mut stream = match self.security.tls_config() {
+            Some(tls) => tls.connect(&self.broker, stream).await?,
+            None => Stream::Plain(stream),
+        };
+
+        let mut correlation_id = 0;
+        let mut session = Session::default();
+
+        if let Some(sasl) = self.security.sasl_config() {
+            session = sasl
+                .login(&mut stream, self.client_id.as_deref(), &mut correlation_id)
+                .await?;
+        }
+
+        Ok(Connection {
+            stream,
+            correlation_id,
+            session_expires: session.expires(Instant::now()),
+            in_flight: false,
+        })
     }
 
     async fn recycle(
@@ -359,9 +581,19 @@ impl ConnectionManager {
             return Err("idle");
         }
 
+        if obj
+            .session_expires
+            .is_some_and(|expires| Instant::now() >= expires)
+        {
+            return Err("session expiring");
+        }
+
         // An idle connection has nothing to read. Reading one byte is safe, because the
-        // pool discards the connection whenever the read returns anything.
-        match obj.stream.try_read(&mut [0u8; 1]) {
+        // pool discards the connection whenever the read returns anything. On a TLS
+        // connection it reads from the TCP socket under the TLS session, where an idle
+        // connection has nothing either, and a close_notify or an unread record is also
+        // a reason to discard.
+        match obj.stream.tcp().try_read(&mut [0u8; 1]) {
             Ok(0) => Err("closed by broker"),
             Ok(_) => Err("unread bytes"),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
@@ -419,6 +651,7 @@ async fn pool_get(pool: &Pool) -> Result<Object<ConnectionManager>, PoolError<Er
 pub struct Builder {
     broker: Url,
     client_id: Option<String>,
+    security: Security,
     max_size: Option<usize>,
     wait_timeout: Duration,
     connect_timeout: Duration,
@@ -447,6 +680,7 @@ impl Builder {
         Self {
             broker,
             client_id: None,
+            security: Security::default(),
             max_size: None,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -459,6 +693,14 @@ impl Builder {
     /// Client id used when making requests to the broker
     pub fn client_id(self, client_id: Option<String>) -> Self {
         Self { client_id, ..self }
+    }
+
+    /// How the connections are secured, by default not at all. With
+    /// [`Tls`] each connection completes a TLS handshake before anything else, and with [`Sasl`]
+    /// each connection then logs in before it carries a request, so a pool that logs in with SCRAM
+    /// pays for a login whenever it opens a connection.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
     }
 
     /// Maximum number of connections in the pool, by default twice the number of CPUs
@@ -515,10 +757,11 @@ impl Builder {
         }
     }
 
-    fn pool(&self, versions: BTreeMap<i16, i16>) -> Result<Pool, Error> {
+    fn pool(&self, versions: BTreeMap<i16, i16>, security: Security) -> Result<Pool, Error> {
         let builder = Pool::builder(ConnectionManager {
             broker: self.broker.clone(),
             client_id: self.client_id.clone(),
+            security,
             versions,
             connect_timeout: self.connect_timeout,
             max_idle: self.max_idle,
@@ -549,7 +792,10 @@ impl Builder {
             .client_software_name(Some(env!("CARGO_PKG_NAME").into()))
             .client_software_version(Some(env!("CARGO_PKG_VERSION").into()));
 
-        let client = self.pool(versions).map(Client::new)?;
+        // A broker answers ApiVersions before a login, so this pool only needs TLS.
+        let client = self
+            .pool(versions, self.security.without_sasl())
+            .map(Client::new)?;
 
         let supported = RootMessageMeta::messages().requests();
 
@@ -578,7 +824,7 @@ impl Builder {
     pub async fn build(self) -> Result<Pool, Error> {
         self.bootstrap()
             .await
-            .and_then(|versions| self.pool(versions))
+            .and_then(|versions| self.pool(versions, self.security.clone()))
     }
 }
 
@@ -959,9 +1205,9 @@ fn response_timeout(manager: &ConnectionManager, body: &Body) -> Duration {
 pub struct BytesConnectionService;
 
 impl BytesConnectionService {
-    async fn write(
+    pub(crate) async fn write(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Stream,
         frame: Bytes,
         attributes: &[KeyValue],
     ) -> Result<(), Error> {
@@ -969,26 +1215,35 @@ impl BytesConnectionService {
 
         let start = SystemTime::now();
 
-        stream
-            .write_all(&frame[..])
-            .await
-            .inspect(|_| {
-                TCP_SEND_DURATION.record(
-                    start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes,
-                );
+        // tokio-rustls's `poll_write` returns once rustls holds the bytes, and its
+        // `poll_read` never sends them, so only a flush puts the tail of a large
+        // request on the socket. A bare TCP stream flushes as a no-op.
+        async {
+            stream.write_all(&frame[..]).await?;
+            stream.flush().await
+        }
+        .await
+        .inspect(|_| {
+            TCP_SEND_DURATION.record(
+                start
+                    .elapsed()
+                    .map_or(0, |duration| duration.as_millis() as u64),
+                attributes,
+            );
 
-                TCP_BYTES_SENT.add(frame.len() as u64, attributes);
-            })
-            .inspect_err(|_| {
-                TCP_SEND_ERRORS.add(1, attributes);
-            })
-            .map_err(Into::into)
+            TCP_BYTES_SENT.add(frame.len() as u64, attributes);
+        })
+        .inspect_err(|_| {
+            TCP_SEND_ERRORS.add(1, attributes);
+        })
+        .map_err(Into::into)
     }
 
-    async fn read(&self, stream: &mut TcpStream, attributes: &[KeyValue]) -> Result<Bytes, Error> {
+    pub(crate) async fn read(
+        &self,
+        stream: &mut Stream,
+        attributes: &[KeyValue],
+    ) -> Result<Bytes, Error> {
         let start = SystemTime::now();
 
         let mut size = [0u8; 4];
@@ -1029,8 +1284,8 @@ impl Service<BytesConnection> for BytesConnectionService {
             ..
         } = req;
 
-        let local = connection.stream.local_addr()?;
-        let peer = connection.stream.peer_addr()?;
+        let local = connection.stream.tcp().local_addr()?;
+        let peer = connection.stream.tcp().peer_addr()?;
 
         let attributes = [KeyValue::new("peer", peer.to_string())];
 
@@ -1212,6 +1467,137 @@ mod connect_failure_tests {
 }
 
 #[cfg(test)]
+mod failure_kind_tests {
+    use super::{Error, FailureKind, PoolError, TimeoutType};
+    use std::{io, sync::Arc, time::Duration};
+
+    fn io_error(kind: io::ErrorKind) -> Error {
+        Error::Io(Arc::new(io::Error::from(kind)))
+    }
+
+    fn backend(error: Error) -> Error {
+        Error::from(PoolError::Backend(error))
+    }
+
+    #[test]
+    fn options_that_cannot_be_used_are_options() {
+        assert_eq!(
+            FailureKind::Options,
+            Error::TlsConfiguration("bad".into()).failure_kind()
+        );
+        assert_eq!(
+            FailureKind::Options,
+            Error::ParseUrl(url::ParseError::EmptyHost).failure_kind()
+        );
+    }
+
+    #[test]
+    fn a_connection_that_does_not_open_is_unreachable() {
+        for error in [
+            io_error(io::ErrorKind::ConnectionRefused),
+            backend(io_error(io::ErrorKind::ConnectionRefused)),
+            backend(io_error(io::ErrorKind::TimedOut)),
+            backend(io_error(io::ErrorKind::HostUnreachable)),
+            Error::from(PoolError::<Error>::Timeout(TimeoutType::Create)),
+            Error::UnknownHost("tcp://nowhere:9092".parse().expect("url")),
+            Error::Service(nisshi_service::Error::UnknownHost(
+                "tcp://nowhere:9092".parse().expect("url"),
+            )),
+        ] {
+            assert_eq!(FailureKind::Unreachable, error.failure_kind(), "{error}");
+        }
+    }
+
+    /// `ConnectionManager::create` resolves the broker's address first. A host that does not
+    /// resolve comes out of the pool as a service error, from `lookup_host`, whose I/O error has
+    /// no kind that says so (`Uncategorized`), or as `UnknownHost` when the lookup finds no IPv4
+    /// address.
+    #[test]
+    fn an_address_that_does_not_resolve_is_unreachable_inside_the_pool() {
+        let lookup_failed = || {
+            nisshi_service::Error::Io(Arc::new(io::Error::other(
+                "failed to lookup address information: Name or service not known",
+            )))
+        };
+        let unknown_host = || {
+            nisshi_service::Error::UnknownHost("tcp://nowhere.invalid:9092".parse().expect("url"))
+        };
+
+        for error in [
+            backend(Error::Service(lookup_failed())),
+            backend(Error::Service(unknown_host())),
+        ] {
+            assert_eq!(FailureKind::Unreachable, error.failure_kind(), "{error}");
+            assert!(error.is_connect_failure(), "{error}");
+        }
+
+        // Outside the pool, a service error is unreachable only when it says so.
+        assert_eq!(
+            FailureKind::Other,
+            Error::Service(lookup_failed()).failure_kind()
+        );
+    }
+
+    /// A broker that closes the connection during the login or the handshake is a closed
+    /// connection, as it is when it closes one that the client is using. It is not a broker that
+    /// the client could not reach.
+    #[test]
+    fn a_closed_connection_is_closed_whether_or_not_the_pool_wrapped_it() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            for error in [io_error(kind), backend(io_error(kind))] {
+                assert_eq!(FailureKind::Closed, error.failure_kind(), "{error}");
+                assert_eq!(Some(kind), error.io_error().map(io::Error::kind));
+            }
+        }
+    }
+
+    #[test]
+    fn a_login_a_tls_failure_or_a_refused_offer_is_refused_even_inside_the_pool() {
+        for error in [
+            Error::Authentication("bad password".into()),
+            Error::SaslNotUsed,
+            Error::Tls("untrusted".into()),
+            Error::ScramIterations {
+                iterations: 1,
+                accepted: 4096..=65536,
+            },
+            backend(Error::Authentication("bad password".into())),
+            backend(Error::SaslNotUsed),
+            backend(Error::Tls("untrusted".into())),
+        ] {
+            assert_eq!(FailureKind::Refused, error.failure_kind(), "{error}");
+        }
+    }
+
+    /// The request was sent, so the broker may have applied it.
+    #[test]
+    fn a_request_without_an_answer_is_timed_out_not_unreachable() {
+        let error = Error::Timeout(Duration::from_secs(30));
+
+        assert_eq!(FailureKind::TimedOut, error.failure_kind());
+        assert!(!error.is_connect_failure());
+    }
+
+    #[test]
+    fn waiting_for_a_free_connection_is_neither_unreachable_nor_closed() {
+        for timeout in [TimeoutType::Wait, TimeoutType::Recycle] {
+            assert_eq!(
+                FailureKind::Other,
+                Error::from(PoolError::<Error>::Timeout(timeout)).failure_kind()
+            );
+        }
+        assert_eq!(
+            FailureKind::Other,
+            Error::Message("boom".into()).failure_kind()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{fs::File, thread};
 
@@ -1345,6 +1731,7 @@ mod tests {
         Ok(ConnectionManager {
             broker: Url::parse("tcp://localhost:9092")?,
             client_id: None,
+            security: Security::default(),
             versions: BTreeMap::new(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_idle: DEFAULT_MAX_IDLE,

@@ -22,26 +22,31 @@ use std::{
 use async_trait::async_trait;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse, record::deflated,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, instrument};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
+    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version, service::read_deadline::ReadDeadline,
 };
 
 #[derive(Clone, Debug)]
@@ -124,6 +129,10 @@ where
         self.storage.delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.storage.delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.introduce_latency().await?;
 
@@ -150,6 +159,21 @@ where
             .await
     }
 
+    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -157,12 +181,19 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        self.introduce_latency().await?;
+        let Ok(latency) = ReadDeadline::new(StorageOperation::Fetch, deadline)
+            .timeout(self.introduce_latency())
+            .await
+        else {
+            return Ok(vec![]);
+        };
+
+        latency?;
 
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -170,6 +201,12 @@ where
         self.introduce_latency().await?;
 
         self.storage.offset_stage(topition).await
+    }
+
+    async fn current_offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.introduce_latency().await?;
+
+        self.storage.current_offset_stage(topition).await
     }
 
     async fn list_offsets(
