@@ -23,7 +23,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
@@ -336,7 +336,9 @@ enum SkippedGap {
     /// A produce took the offsets, failed to write its batch object, and recorded the failure.
     FailedProduce,
     /// No failed produce is recorded for the gap, and the batch after the gap is older than
-    /// [`BATCH_SETTLED_AFTER`], so no produce can still be writing a batch into the gap.
+    /// [`BATCH_SETTLED_AFTER`]. We take every produce to finish within that time, so no produce
+    /// is still writing a batch into the gap. The broker does not enforce that bound, and a
+    /// slower produce's batch is skipped and never read.
     Settled,
     /// The offsets are below the partition's log start.
     BelowLogStart,
@@ -356,6 +358,45 @@ impl SkippedGap {
 /// Whether this process has logged a warning for a fetch that skipped a gap. Each later one logs
 /// at debug, because every fetch that crosses a gap skips it again.
 static FETCH_GAP_SKIPPED_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Counts the fetches that stop at base offsets that have no batch object and no recorded failed
+/// produce, because the batch after them is younger than [`BATCH_SETTLED_AFTER`].
+static FETCH_GAP_WAITED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_gap_waited")
+        .with_description(format!(
+            "Fetches that stopped at base offsets with no batch object and no recorded failed \
+             produce, because a produce can still be writing their batch; consumers wait there \
+             until the batch after the gap is {} seconds old. A count that lasts for minutes \
+             points at a broker that stopped between taking the offsets and writing the batch",
+            BATCH_SETTLED_AFTER.as_secs()
+        ))
+        .build()
+});
+
+/// How old the batch after a gap is when a fetch that stops at the gap warns. A produce that is
+/// still writing its batch finishes well within this time, so an older batch points at a produce
+/// that ended without its batch or its failure record.
+const GAP_WAIT_WARNED_AFTER: Duration = Duration::from_secs(30);
+
+/// The shortest time between two warnings for fetches that stop at a gap.
+const GAP_WAIT_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When this process last warned for a fetch that stopped at a gap, in seconds since the epoch.
+static GAP_WAIT_LAST_WARNED_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns whether a warning for a fetch that stopped at a gap is due, and if so takes it.
+fn gap_wait_warning_is_due() -> bool {
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_secs());
+    let last_secs = GAP_WAIT_LAST_WARNED_SECS.load(Ordering::Relaxed);
+
+    now_secs.saturating_sub(last_secs) >= GAP_WAIT_WARNING_INTERVAL.as_secs()
+        && GAP_WAIT_LAST_WARNED_SECS
+            .compare_exchange(last_secs, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
 
 /// A backfill of one partition's time index in progress (see
 /// [`DynoStore::begin_time_index_backfill`]).
@@ -1069,8 +1110,8 @@ struct Watermark {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reclaimed: Option<i64>,
     /// The offsets of each produce that took them and failed to write its batch object, as a map
-    /// from the start of each range to its exclusive end. A fetch skips them (see
-    /// [`DynoStore::offset_past_gap`]).
+    /// from the start of each range to its exclusive end. A fetch skips them, except a batch that
+    /// a failed produce stored anyway (see [`DynoStore::offset_past_gap`]).
     ///
     /// A broker that does not know this key drops it when it writes the document.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1084,11 +1125,16 @@ impl Watermark {
     /// Over the limit, the lowest range goes, and a fetch takes it as a gap with no recorded failed
     /// produce. That costs a consumer a wait only if the batch after the range is younger than
     /// [`BATCH_SETTLED_AFTER`], so only when more than this many ranges that are not contiguous
-    /// fail within that time. Contiguous failed produces merge into one range.
+    /// fail within that time. Contiguous failed produces merge into one range, so a burst of
+    /// failures, such as during an object store outage, holds one range.
     const MAX_FAILED_PRODUCES: usize = 64;
 
     /// Records `offsets` as a produce that failed to write its batch object, merged with each
     /// recorded range contiguous with it, and forgets each recorded range below the log start.
+    ///
+    /// A put can store its batch object and still report an error, so a recorded range can hold
+    /// a batch. A fetch therefore looks for a stored batch inside a recorded range before it
+    /// skips the range (see [`DynoStore::offset_past_gap`]).
     fn record_failed_produce(&mut self, Range { mut start, mut end }: Range<i64>) {
         if let Some((&before_start, &before_end)) = self.failed_produces.range(..start).next_back()
             && before_end == start
@@ -2301,20 +2347,31 @@ impl DynoStore {
             })
             .await?;
 
-        if let Some(next_offset) = failed_produce_end {
+        let first_batch_after_gap = self
+            .first_batch_after_gap(topition, gap_start, high_watermark)
+            .await?;
+
+        // Every produce of a recorded range has failed, so the fetch reads a batch that one of
+        // them stored before its put reported an error, at once and whatever its age, and skips
+        // the rest of the range.
+        if let Some(failed_produce_end) = failed_produce_end {
+            let next_offset = first_batch_after_gap
+                .map(|(base_offset, _)| base_offset)
+                .filter(|&base_offset| base_offset < failed_produce_end)
+                .unwrap_or(failed_produce_end);
+
             self.skipped_gap(topition, gap_start, next_offset, SkippedGap::FailedProduce);
             return Ok(Some(next_offset));
         }
 
-        let Some((next_offset, written)) = self
-            .first_batch_after_gap(topition, gap_start, high_watermark)
-            .await?
-        else {
+        let Some((next_offset, written)) = first_batch_after_gap else {
             return Ok(None);
         };
 
-        // The gap's produce took its offsets before the produce of the batch after the gap, so it
-        // has finished once that batch is older than `BATCH_SETTLED_AFTER`.
+        // The gap's produce took its offsets before the produce of the batch after the gap. We take
+        // every produce to finish within `BATCH_SETTLED_AFTER`, so the gap's produce has finished
+        // once that batch is older. The broker does not enforce that bound, and a slower produce's
+        // batch is skipped and never read.
         //
         // We measure the age on the broker's clock, so the margin also covers clock skew between
         // the broker and the store. We do not measure it against the watermark document's write
@@ -2329,13 +2386,7 @@ impl DynoStore {
         } else if settled {
             SkippedGap::Settled
         } else {
-            debug!(
-                ?topition,
-                gap_start,
-                next_offset,
-                "fetch stops at base offsets that have no batch object, because a produce can \
-                 still be writing their batch"
-            );
+            self.stopped_at_gap(topition, gap_start, next_offset, written);
             return Ok(None);
         };
 
@@ -2351,18 +2402,78 @@ impl DynoStore {
         gap_start: i64,
         high_watermark: i64,
     ) -> Result<Option<(i64, SystemTime)>> {
-        // Nothing records where the batch after a gap starts, so this lists the rest of the
-        // partition after `gap_start`. A store can list keys out of order, so this takes the
-        // lowest base offset instead of the first one listed.
-        self.batch_stream(topition, gap_start + 1)
-            .try_filter(|&(base_offset, _)| ready(base_offset < high_watermark))
-            .try_fold(None, |lowest: Option<(i64, SystemTime)>, listed| {
-                ready(Ok(Some(match lowest {
-                    Some(lowest) if lowest.0 <= listed.0 => lowest,
-                    _ => listed,
-                })))
-            })
-            .await
+        // Nothing records where the batch after a gap starts, so this lists the partition after
+        // `gap_start`. A store that lists keys in order lists the lowest key first, and the read
+        // stops after the second key, so a gap costs one page of the listing however long the
+        // partition is. A second key below the first shows a store that lists out of order, and
+        // the read then takes the lowest key of the whole listing.
+        let mut listing = self.batch_stream(topition, gap_start + 1);
+
+        let Some(first) = listing.try_next().await? else {
+            return Ok(None);
+        };
+
+        let lowest = match listing.try_next().await? {
+            Some(second) if second.0 < first.0 => {
+                listing
+                    .try_fold(second, |lowest, listed| {
+                        ready(Ok(if listed.0 < lowest.0 { listed } else { lowest }))
+                    })
+                    .await?
+            }
+            _ => first,
+        };
+
+        Ok(Some(lowest).filter(|&(base_offset, _)| base_offset < high_watermark))
+    }
+
+    /// Counts and logs a fetch that stops at the offsets `gap_start..next_offset`, which no batch
+    /// object holds, because the batch at `next_offset`, written at `written`, is younger than
+    /// [`BATCH_SETTLED_AFTER`].
+    ///
+    /// It warns when that batch is older than [`GAP_WAIT_WARNED_AFTER`], at most once each
+    /// [`GAP_WAIT_WARNING_INTERVAL`], and logs at debug otherwise.
+    fn stopped_at_gap(
+        &self,
+        topition: &Topition,
+        gap_start: i64,
+        next_offset: i64,
+        written: SystemTime,
+    ) {
+        FETCH_GAP_WAITED.add(
+            1,
+            &[
+                KeyValue::new("cluster", self.cluster.clone()),
+                KeyValue::new("topic", topition.topic().to_owned()),
+            ],
+        );
+
+        let age = SystemTime::now()
+            .duration_since(written)
+            .unwrap_or_default();
+
+        if age >= GAP_WAIT_WARNED_AFTER && gap_wait_warning_is_due() {
+            warn!(
+                ?topition,
+                gap_start,
+                next_offset,
+                age_secs = age.as_secs(),
+                settled_after_secs = BATCH_SETTLED_AFTER.as_secs(),
+                "fetch stops at base offsets that have no batch object and no recorded failed \
+                 produce; fetches wait there until the batch after them is settled_after_secs \
+                 old; later ones within a minute log at debug and count in \
+                 nisshi_fetch_gap_waited"
+            );
+        } else {
+            debug!(
+                ?topition,
+                gap_start,
+                next_offset,
+                age_secs = age.as_secs(),
+                "fetch stops at base offsets that have no batch object, because a produce can \
+                 still be writing their batch"
+            );
+        }
     }
 
     /// Counts and logs a fetch that skips the offsets `gap_start..next_offset`, which no batch
@@ -3311,7 +3422,9 @@ impl DynoStore {
                 ?error,
                 ?topition,
                 ?offsets,
-                "could not record a failed produce"
+                settled_after_secs = BATCH_SETTLED_AFTER.as_secs(),
+                "could not record a failed produce; fetches stop at these offsets until the batch \
+                 after them is settled_after_secs old"
             ),
         }
     }
@@ -3766,8 +3879,8 @@ impl DynoStore {
                 Ok(location) => location,
                 Err(error) => {
                     // A failed PUT can still have stored the batch. Recording its offsets as a
-                    // failed produce is still safe, because `send_batches_from` reads a stored
-                    // batch before it reads this record.
+                    // failed produce is still safe, because a fetch reads a stored batch inside a
+                    // recorded range before it skips the range.
                     self.record_failed_produce(topition, offsets).await;
                     return Err(error);
                 }
@@ -3883,6 +3996,9 @@ impl Storage for DynoStore {
                             // reclaim mark to the new one, or `maintain` would skip the
                             // new topic's cuts below it.
                             _ = watermark.reclaimed.take();
+                            // A failed produce of the deleted topic would make a fetch skip the
+                            // new topic's batches at those offsets.
+                            watermark.failed_produces.clear();
                             watermark.time_index = TimeIndex::complete();
 
                             Ok(())

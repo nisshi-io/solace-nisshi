@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{Error, Result, Storage as _, Topition};
+use nisshi_storage::{Error, Result, Storage as _, TopicId, Topition};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
@@ -839,6 +839,65 @@ async fn fetch_skips_the_offsets_of_a_failed_produce_at_once() -> Result<(), Err
     Ok(())
 }
 
+/// A fetch that skips a failed produce's offsets reads the batch of the next produce, also when
+/// that produce stored its batch and still reported a failure, which recorded its offsets too.
+#[tokio::test]
+async fn fetch_reads_a_stored_batch_whose_produce_reported_a_failure() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = FailingObjectStore::failing_put_on_demand(InMemory::new());
+    let storage = DynoStore::new("nisshi", 111, store.clone())?;
+    let topition = create_partition(
+        &storage,
+        "fetch_reads_a_stored_batch_whose_produce_reported_a_failure",
+    )
+    .await?;
+    produce(&storage, &topition, 1, 10).await?;
+
+    // The produce of offsets 10 to 19 writes no batch.
+    store.fail_next_put(|location, _| held_put_store::is_batch(location));
+    assert!(produce(&storage, &topition, 1, 10).await.is_err());
+
+    // The produce of offsets 20 to 29 stores its batch, and its put still reports an error.
+    store.fail_next_put_after_it_stores(|location, _| held_put_store::is_batch(location));
+    assert!(produce(&storage, &topition, 1, 10).await.is_err());
+
+    produce(&storage, &topition, 1, 10).await?;
+
+    assert_eq!(
+        vec![0, 20, 30],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A topic created again under the name of a deleted topic starts with no failed produces, also
+/// when a produce of the deleted topic recorded its failure after the deletion.
+#[tokio::test]
+async fn a_recreated_topic_has_no_failed_produces_of_the_deleted_topic() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new("nisshi", 111, InMemory::new())?;
+    let name = "a_recreated_topic_has_no_failed_produces_of_the_deleted_topic";
+    let topition = create_partition(&storage, name).await?;
+
+    _ = storage.delete_topic(&TopicId::Name(name.into())).await?;
+    storage.record_failed_produce(&topition, 10..20).await;
+    _ = create_partition(&storage, name).await?;
+
+    let failed_produces = storage
+        .watermark_for(&topition)?
+        .with(&storage.object_store, |watermark| {
+            Ok(watermark.failed_produces.clone())
+        })
+        .await?;
+
+    assert!(failed_produces.is_empty(), "{failed_produces:?}");
+
+    Ok(())
+}
+
 /// A fetch stops at a gap with no recorded failed produce while the batch after it is younger than
 /// [`BATCH_SETTLED_AFTER`], because a produce can still be writing the gap's batch, and skips the
 /// gap once that batch is older.
@@ -885,6 +944,41 @@ async fn fetch_skips_a_gap_with_no_recorded_failure_only_once_it_settles() -> Re
     assert_eq!(
         vec![20],
         fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A fetch that reaches a gap with no recorded failed produce lists only the first keys after the
+/// gap on a store that lists keys in order, however many batches follow the gap.
+#[tokio::test]
+async fn gap_lookup_lists_only_the_first_keys_after_the_gap() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("gap_lookup_lists_only_the_first_keys_after_the_gap").await?;
+    produce(&storage, &topition, 50, 10).await?;
+
+    // The produce at 10 took its offsets and stopped before it wrote its batch or recorded its
+    // failure.
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 10))
+        .await?;
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
+
+    listing.reset_counts();
+    assert_eq!(
+        vec![20],
+        fetch_base_offsets(&storage, &topition, 10, 1, READ_TIME).await?
+    );
+
+    // The gap's lookup listed two keys, and the lookup of the batch that holds offset 10 listed
+    // the batch at 0 and the first key above 10.
+    assert!(
+        listing.listed_batches() <= 4,
+        "listed {} batches",
+        listing.listed_batches()
     );
 
     Ok(())
