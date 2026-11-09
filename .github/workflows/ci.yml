@@ -618,7 +618,7 @@ jobs:
   # is skipped on a push to main), and remove `continue-on-error` from the job
   # and from the compare step.
   bench-instructions:
-    if: *tier_b_off_main
+    if: needs.changes.outputs.rust == 'true'
     needs: [changes]
     runs-on: ubuntu-latest
     continue-on-error: true
