@@ -150,7 +150,6 @@ jobs:
           GIT_REF_INPUT: ${{ inputs.git_ref }}
           FULL_VERSION_INPUT: ${{ inputs.product_full_version }}
           ACTOR: ${{ github.actor }}
-          FOSSA_LICENSING_BLOCK: ${{ vars.FOSSA_LICENSING_BLOCK }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: ${{ github.workspace }}/trusted/.github/scripts/guardian-scan-context.sh
 
@@ -250,10 +249,10 @@ jobs:
           # has no Guardian secrets, so these are empty either way.
           guardian_url: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_URL || '' }}
           guardian_token: ${{ fromJSON(env.IS_TRUNK) && secrets.GUARDIAN_API_TOKEN || '' }}
-      # Blocks on trunk only. To make it report-only while a license issue is
-      # waived in FOSSA (the Guardian gate stays on):
-      #   gh variable set FOSSA_LICENSING_BLOCK --body false
-      # and `gh variable delete FOSSA_LICENSING_BLOCK` to block again.
+      # Blocks on trunk only, on a license the policy denies (policy_conflict)
+      # or a dependency FOSSA finds no license for (unlicensed_dependency). A
+      # flagged license (policy_flag) asks for a review, not a block, so it is
+      # only reported.
       - name: FOSSA licensing guard
         uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@e4bf21b3baccc34376983ad72256f08c7ee4c8a7 # main 2026-11-02, untagged
         with:
@@ -263,7 +262,7 @@ jobs:
           fossa_revision: ${{ env.FOSSA_REVISION }}
           fossa_category: licensing
           fossa_mode: ${{ env.FOSSA_MODE }}
-          block_on: policy_conflict
+          block_on: policy_conflict,unlicensed_dependency
           enable_diff_mode: ${{ env.IS_PR }}
           enable_pr_comment: ${{ env.IS_PR }}
           enable_status_check: ${{ env.IS_PR }}
