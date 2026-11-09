@@ -58,7 +58,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Record, deflated, inflated::Batch},
-    to_system_time, to_timestamp,
+    to_system_time,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -96,7 +96,7 @@ use tokio_postgres::{
     config::Host,
     error::SqlState,
     tls::MakeTlsConnect,
-    types::{ToSql, Type},
+    types::{FromSql, ToSql, Type},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
@@ -2203,23 +2203,29 @@ impl Postgres {
                     debug!(?row);
 
                     row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
-                        // A record without a timestamp is stored before the epoch, which
-                        // `ListOffsetResponse::timestamp` cannot convert. The service answers -1
-                        // for Earliest and Latest, as Kafka does, so that is harmless here.
-                        row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
-                            debug!(
-                                cluster = self.cluster,
-                                ?topition,
-                                ?offset_type,
-                                offset,
-                                ?timestamp
-                            );
+                        // Only a Timestamp lookup reads the timestamp, because the service drops
+                        // it for Earliest and Latest. Reading it for those two would fail a
+                        // request on an instant that this platform's `SystemTime` cannot hold,
+                        // although the request never uses it.
+                        let timestamp = match offset_type {
+                            ListOffset::Timestamp(_) => row
+                                .try_get::<_, Option<CheckedSystemTime>>(1)?
+                                .map(|CheckedSystemTime(time)| time),
+                            ListOffset::Earliest | ListOffset::Latest => None,
+                        };
 
-                            ListOffsetResponse {
-                                timestamp,
-                                offset,
-                                ..Default::default()
-                            }
+                        debug!(
+                            cluster = self.cluster,
+                            ?topition,
+                            ?offset_type,
+                            offset,
+                            ?timestamp
+                        );
+
+                        Ok(ListOffsetResponse {
+                            timestamp,
+                            offset,
+                            ..Default::default()
                         })
                     })
                 },
@@ -6041,10 +6047,6 @@ const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
 /// <https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L583-L602>
 ///
 /// Returns an error for a timestamp that PostgreSQL cannot hold.
-///
-/// Only this write side is checked. The read side of a timestamp before 1601 is unchecked: the
-/// `postgres-types` `FromSql<SystemTime>` conversion and the fetch paths can panic a Windows
-/// broker on a row that a Linux broker wrote (SOL-157762).
 fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
     if timestamp >= 0 {
         to_system_time(timestamp).map_err(Into::into)
@@ -6068,15 +6070,90 @@ fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
     }
 }
 
-/// Returns the Kafka timestamp, in milliseconds since the epoch, of a stored `system_time`.
-/// The inverse of [`to_sql_timestamp`]: an instant before the epoch is a negative timestamp, as
-/// -1 is for a record that was produced without one.
-pub(crate) fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
-    match system_time.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(_) => to_timestamp(system_time).map_err(Into::into),
-        Err(before) => i64::try_from(before.duration().as_millis())
-            .map(|millis| -millis)
-            .map_err(Into::into),
+/// The error of a `FromSql` conversion.
+type FromSqlError = Box<dyn std::error::Error + Sync + Send>;
+
+/// The seconds from the Unix epoch to 2000-01-01 00:00:00, the instant that PostgreSQL counts its
+/// timestamps from.
+const POSTGRES_EPOCH_SECONDS: u64 = 946_684_800;
+
+/// A `timestamp` or `timestamptz` column read as a Kafka timestamp: milliseconds since the Unix
+/// epoch, negative before it, as [`to_sql_timestamp`] stores them.
+///
+/// The conversion does not go through [`SystemTime`], because a Windows [`SystemTime`] cannot hold
+/// an instant before 1601, and another platform can have stored such an instant. A fraction of a
+/// millisecond is dropped toward zero. A PostgreSQL infinity reads as the finite value of its
+/// eight bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct KafkaTimestamp(pub(crate) i64);
+
+impl<'a> FromSql<'a> for KafkaTimestamp {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> std::result::Result<Self, FromSqlError> {
+        let microseconds = i64::from_be_bytes(raw.try_into()?);
+
+        // The sum is an `i128`, because the microseconds of a late timestamp plus the epoch
+        // offset exceed `i64::MAX`.
+        let milliseconds =
+            (i128::from(microseconds) + i128::from(POSTGRES_EPOCH_SECONDS) * 1_000_000) / 1_000;
+
+        Ok(Self(i64::try_from(milliseconds)?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
+    }
+}
+
+/// A `timestamp` or `timestamptz` column read as a [`SystemTime`], with an error for an instant
+/// that this platform's [`SystemTime`] cannot hold.
+///
+/// The `postgres-types` conversion to [`SystemTime`] panics for such an instant: it uses `-` and
+/// `+`, which panic on overflow, and a Windows [`SystemTime`] holds neither an instant before 1601
+/// nor one past the year 30828. Another platform can have stored either.
+#[derive(Debug)]
+pub(crate) struct CheckedSystemTime(pub(crate) SystemTime);
+
+impl CheckedSystemTime {
+    /// Reads the eight bytes of a `timestamp` as the instant that many microseconds after `epoch`.
+    fn from_sql_after(epoch: SystemTime, raw: &[u8]) -> std::result::Result<Self, FromSqlError> {
+        let microseconds = i64::from_be_bytes(raw.try_into()?);
+
+        system_time_after(epoch, microseconds)
+            .map(Self)
+            .ok_or_else(|| {
+                format!(
+                    "timestamp {microseconds} microseconds from 2000-01-01 is outside the range \
+                     of this platform's SystemTime"
+                )
+                .into()
+            })
+    }
+}
+
+impl<'a> FromSql<'a> for CheckedSystemTime {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> std::result::Result<Self, FromSqlError> {
+        Self::from_sql_after(postgres_epoch(), raw)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
+    }
+}
+
+/// The instant that PostgreSQL counts its timestamps from: 2000-01-01 00:00:00.
+fn postgres_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(POSTGRES_EPOCH_SECONDS)
+}
+
+/// Returns the instant `microseconds` after `epoch`, before it when negative, or `None` when
+/// [`SystemTime`] cannot hold that instant.
+fn system_time_after(epoch: SystemTime, microseconds: i64) -> Option<SystemTime> {
+    let offset = Duration::from_micros(microseconds.unsigned_abs());
+
+    if microseconds < 0 {
+        epoch.checked_sub(offset)
+    } else {
+        epoch.checked_add(offset)
     }
 }
 
@@ -6084,6 +6161,7 @@ pub(crate) fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
 mod tests {
     use super::*;
 
+    use bytes::BytesMut;
     use futures_util::future;
     use nisshi_sans_io::{
         add_partitions_to_txn_request::AddPartitionsToTxnTopic,
@@ -6112,6 +6190,24 @@ mod tests {
     };
     use tokio::task::JoinHandle;
 
+    /// The Kafka timestamp that a `timestamp` column of `microseconds` from 2000-01-01 reads as.
+    fn read_kafka_timestamp(microseconds: i64) -> Result<i64> {
+        KafkaTimestamp::from_sql(&Type::TIMESTAMP, &microseconds.to_be_bytes())
+            .map(|KafkaTimestamp(timestamp)| timestamp)
+            .map_err(|err| Error::Message(err.to_string()))
+    }
+
+    /// A `timestamp` value on the wire: microseconds from 2000-01-01, as eight big-endian bytes.
+    fn wire_timestamp(system_time: SystemTime) -> Result<BytesMut> {
+        let mut wire = BytesMut::new();
+
+        _ = system_time
+            .to_sql(&Type::TIMESTAMP, &mut wire)
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+        Ok(wire)
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
@@ -6124,11 +6220,11 @@ mod tests {
             1_700_000_000_000,
             MIN_SQL_TIMESTAMP_MS,
         ] {
-            assert_eq!(
-                timestamp,
-                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
-                "{timestamp}"
-            );
+            let wire = wire_timestamp(to_sql_timestamp(timestamp)?)?;
+            let KafkaTimestamp(read) = KafkaTimestamp::from_sql(&Type::TIMESTAMP, &wire)
+                .map_err(|err| Error::Message(err.to_string()))?;
+
+            assert_eq!(timestamp, read, "{timestamp}");
         }
 
         Ok(())
@@ -6140,11 +6236,11 @@ mod tests {
     #[test]
     fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
         for timestamp in [-1, -2, -86_400_000, 0, 1, 1_700_000_000_000] {
-            assert_eq!(
-                timestamp,
-                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
-                "{timestamp}"
-            );
+            let wire = wire_timestamp(to_sql_timestamp(timestamp)?)?;
+            let KafkaTimestamp(read) = KafkaTimestamp::from_sql(&Type::TIMESTAMP, &wire)
+                .map_err(|err| Error::Message(err.to_string()))?;
+
+            assert_eq!(timestamp, read, "{timestamp}");
         }
         assert_matches!(
             to_sql_timestamp(MIN_SQL_TIMESTAMP_MS),
@@ -6161,6 +6257,231 @@ mod tests {
             Err(Error::Message(_))
         );
         assert_matches!(to_sql_timestamp(i64::MIN), Err(Error::Message(_)));
+    }
+
+    #[test]
+    fn kafka_timestamp_counts_milliseconds_from_the_unix_epoch() -> Result<()> {
+        const EPOCH_MICROSECONDS: i64 = 946_684_800_000_000;
+
+        // 2000-01-01 is 946_684_800_000 milliseconds after the Unix epoch.
+        assert_eq!(946_684_800_000, read_kafka_timestamp(0)?);
+        assert_eq!(946_684_801_000, read_kafka_timestamp(1_000_000)?);
+        // The Unix epoch itself, and one millisecond on each side of it.
+        assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS)?);
+        assert_eq!(1, read_kafka_timestamp(-EPOCH_MICROSECONDS + 1_000)?);
+        assert_eq!(-1, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1_000)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn kafka_timestamp_truncates_toward_zero() -> Result<()> {
+        const EPOCH_MICROSECONDS: i64 = 946_684_800_000_000;
+
+        assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS + 999)?);
+        // Before the Unix epoch the result rounds up, where a floor division gives -1 and -2.
+        assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1)?);
+        assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS - 999)?);
+        assert_eq!(-1, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1_999)?);
+        assert_eq!(-2, read_kafka_timestamp(-EPOCH_MICROSECONDS - 2_000)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn kafka_timestamp_reads_the_bounds_of_the_timestamp_column() -> Result<()> {
+        // 4713 BC and 294276 AD, the bounds of PostgreSQL's `timestamp`.
+        assert_eq!(
+            MIN_SQL_TIMESTAMP_MS,
+            read_kafka_timestamp(-211_813_488_000_000_000)?
+        );
+        assert_eq!(
+            9_224_318_015_999_999,
+            read_kafka_timestamp(9_223_371_331_199_999_999)?
+        );
+
+        // -infinity and infinity are `i64::MIN` and `i64::MAX`, and read as ordinary values.
+        // The sum with the epoch offset of `i64::MAX` does not fit in an `i64`.
+        assert_eq!(-9_222_425_352_054_775, read_kafka_timestamp(i64::MIN)?);
+        assert_eq!(9_224_318_721_654_775, read_kafka_timestamp(i64::MAX)?);
+
+        Ok(())
+    }
+
+    /// Reads the same value as the `postgres-types` conversion to a `SystemTime` and back, on a
+    /// platform where that conversion does not panic.
+    #[cfg(not(windows))]
+    #[test]
+    fn kafka_timestamp_equals_the_read_through_system_time() -> Result<()> {
+        fn through_system_time(microseconds: i64) -> Result<i64> {
+            let system_time = SystemTime::from_sql(&Type::TIMESTAMP, &microseconds.to_be_bytes())
+                .map_err(|err| Error::Message(err.to_string()))?;
+
+            match system_time.duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(after) => Ok(i64::try_from(after.as_millis())?),
+                Err(before) => Ok(-i64::try_from(before.duration().as_millis())?),
+            }
+        }
+
+        for microseconds in [
+            i64::MIN,
+            i64::MIN + 1,
+            -211_813_488_000_000_000,
+            -12_591_158_400_000_001,
+            -12_591_158_400_000_000,
+            -946_684_800_000_001,
+            -946_684_800_000_000,
+            -946_684_799_999_999,
+            -1_999,
+            -1,
+            0,
+            1,
+            999,
+            1_000,
+            1_700_000_000_000_000,
+            9_223_371_331_199_999_999,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            assert_eq!(
+                through_system_time(microseconds)?,
+                read_kafka_timestamp(microseconds)?,
+                "{microseconds}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn kafka_timestamp_refuses_a_value_that_is_not_eight_bytes() {
+        assert_matches!(KafkaTimestamp::from_sql(&Type::TIMESTAMP, &[0; 4]), Err(_));
+        assert_matches!(KafkaTimestamp::from_sql(&Type::TIMESTAMP, &[0; 9]), Err(_));
+    }
+
+    #[test]
+    fn system_time_after_counts_from_the_given_epoch() {
+        assert_eq!(
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800)),
+            system_time_after(postgres_epoch(), 0)
+        );
+        assert_eq!(
+            Some(postgres_epoch() + Duration::from_micros(1)),
+            system_time_after(postgres_epoch(), 1)
+        );
+        assert_eq!(
+            Some(postgres_epoch() - Duration::from_micros(1)),
+            system_time_after(postgres_epoch(), -1)
+        );
+    }
+
+    /// An instant a little after the lowest one that this platform's `SystemTime` holds. Where the
+    /// `SystemTime` holds an `i64` count of seconds, that is the limit of the count, which no
+    /// `i64` count of microseconds from 2000-01-01 reaches. A Windows `SystemTime` is a count of
+    /// 100 nanosecond intervals from 1601, and its lowest instant is 1601-01-01.
+    fn near_lowest() -> SystemTime {
+        #[cfg(not(windows))]
+        let seconds = i64::MAX.unsigned_abs();
+        #[cfg(windows)]
+        let seconds = 11_644_473_600 - 1;
+
+        SystemTime::UNIX_EPOCH - Duration::from_secs(seconds)
+    }
+
+    /// `SystemTime - Duration` panics beyond what a `SystemTime` holds, as it does before 1601 on
+    /// Windows. The test takes the epoch as a parameter, so that the conversion meets that limit
+    /// on every platform.
+    #[test]
+    fn checked_system_time_is_an_error_where_subtracting_from_the_epoch_panics() -> Result<()> {
+        let beyond_lowest = Duration::from_secs(10_000_000);
+        let wire = -i64::try_from(beyond_lowest.as_micros())?;
+
+        assert!(std::panic::catch_unwind(|| near_lowest() - beyond_lowest).is_err());
+
+        assert_matches!(
+            CheckedSystemTime::from_sql_after(near_lowest(), &wire.to_be_bytes()),
+            Err(_)
+        );
+        assert_matches!(
+            CheckedSystemTime::from_sql_after(near_lowest(), &i64::MIN.to_be_bytes()),
+            Err(_)
+        );
+
+        let CheckedSystemTime(read) =
+            CheckedSystemTime::from_sql_after(near_lowest(), &(-1_000_i64).to_be_bytes())
+                .map_err(|err| Error::Message(err.to_string()))?;
+        assert_eq!(near_lowest() - Duration::from_millis(1), read);
+
+        Ok(())
+    }
+
+    /// `SystemTime + Duration` panics past what a `SystemTime` holds, which a Windows broker
+    /// reaches for a timestamp after the year 30828.
+    #[cfg(not(windows))]
+    #[test]
+    fn checked_system_time_is_an_error_where_adding_to_the_epoch_panics() -> Result<()> {
+        let near_highest = SystemTime::UNIX_EPOCH + Duration::from_secs(i64::MAX.unsigned_abs());
+        let beyond_highest = Duration::from_secs(10_000_000);
+        let wire = i64::try_from(beyond_highest.as_micros())?;
+
+        assert!(std::panic::catch_unwind(|| near_highest + beyond_highest).is_err());
+
+        assert_matches!(
+            CheckedSystemTime::from_sql_after(near_highest, &wire.to_be_bytes()),
+            Err(_)
+        );
+
+        let CheckedSystemTime(read) =
+            CheckedSystemTime::from_sql_after(near_highest, &1_000_i64.to_be_bytes())
+                .map_err(|err| Error::Message(err.to_string()))?;
+        assert_eq!(near_highest + Duration::from_millis(1), read);
+
+        Ok(())
+    }
+
+    #[test]
+    fn checked_system_time_reads_the_instant_that_the_write_side_stored() -> Result<()> {
+        for timestamp in [-1, -86_400_000, 0, 1, 1_700_000_000_000] {
+            let CheckedSystemTime(read) = CheckedSystemTime::from_sql(
+                &Type::TIMESTAMP,
+                &wire_timestamp(to_sql_timestamp(timestamp)?)?,
+            )
+            .map_err(|err| Error::Message(err.to_string()))?;
+
+            assert_eq!(to_sql_timestamp(timestamp)?, read, "{timestamp}");
+        }
+
+        Ok(())
+    }
+
+    /// A row that a Linux broker wrote with a timestamp before 1601 is an error here, where the
+    /// `postgres-types` conversion panics.
+    #[cfg(windows)]
+    #[test]
+    fn checked_system_time_refuses_a_timestamp_before_1601() {
+        // 1601-01-01 is 12_591_158_400 seconds before 2000-01-01.
+        const FLOOR_MICROSECONDS: i64 = -12_591_158_400_000_000;
+
+        assert_matches!(
+            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &FLOOR_MICROSECONDS.to_be_bytes()),
+            Ok(_)
+        );
+        assert_matches!(
+            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &(FLOOR_MICROSECONDS - 1).to_be_bytes()),
+            Err(_)
+        );
+        assert_matches!(
+            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &i64::MIN.to_be_bytes()),
+            Err(_)
+        );
+    }
+
+    #[test]
+    fn checked_system_time_refuses_a_value_that_is_not_eight_bytes() {
+        assert_matches!(
+            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &[0; 4]),
+            Err(_)
+        );
     }
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
@@ -13662,6 +13983,151 @@ mod tests {
             .await?;
 
         assert_eq!(Some(1), responses[0].1.offset);
+
+        Ok(())
+    }
+
+    /// Sets the stored timestamp of the record at `offset` to `instant`, a PostgreSQL timestamp
+    /// literal, as a broker on another platform would have written it.
+    async fn store_timestamp(
+        storage: &Postgres,
+        topition: &Topition,
+        offset: i64,
+        instant: &str,
+    ) -> Result<()> {
+        let c = storage.connection().await?;
+
+        let updated = c
+            .execute(
+                "update record r \
+                 set timestamp = cast(cast($4 as text) as timestamp) \
+                 where r.topition = ( \
+                     select tp.id \
+                     from cluster c \
+                     join topic t on t.cluster = c.id \
+                     join topition tp on tp.topic = t.id \
+                     where c.name = $1 and t.name = $2 and tp.partition = $3) \
+                 and r.offset_id = $5",
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &instant,
+                    &offset,
+                ],
+            )
+            .await?;
+
+        assert_eq!(1, updated);
+
+        Ok(())
+    }
+
+    /// The timestamp of each record, in milliseconds since the epoch, in offset order.
+    fn record_timestamps(batches: Vec<deflated::Batch>) -> Result<Vec<i64>> {
+        batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
+            let inflated = Batch::try_from(batch)?;
+
+            acc.extend(
+                inflated
+                    .records
+                    .iter()
+                    .map(|record| inflated.base_timestamp + record.timestamp_delta),
+            );
+
+            Ok(acc)
+        })
+    }
+
+    /// The earliest instant that a Windows `SystemTime` holds is 1601-01-01, and every platform
+    /// reads it and a later instant as it did before.
+    #[tokio::test]
+    async fn fetch_and_list_offsets_read_the_earliest_instant_that_windows_holds() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        produce_at(&storage, &topition, &[0, 0]).await?;
+        store_timestamp(&storage, &topition, 0, "1601-01-01 00:00:00").await?;
+        store_timestamp(&storage, &topition, 1, "1900-01-01 00:00:00").await?;
+
+        let batches = storage
+            .fetch_until_deadline(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?
+            .batches;
+
+        assert_eq!(
+            vec![-11_644_473_600_000, -2_208_988_800_000],
+            record_timestamps(batches)?
+        );
+
+        let floor = SystemTime::UNIX_EPOCH - Duration::from_secs(11_644_473_600);
+        let responses = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(topition.clone(), ListOffset::Timestamp(floor))],
+            )
+            .await?;
+
+        assert_eq!(Some(0), responses[0].1.offset);
+        assert_eq!(Some(floor), responses[0].1.timestamp);
+
+        Ok(())
+    }
+
+    /// A Linux broker can store a timestamp before 1601, and a broker on every platform, a
+    /// Windows broker included, reads it: Fetch returns it, and ListOffsets answers for Earliest
+    /// and Latest.
+    #[tokio::test]
+    async fn fetch_and_list_offsets_read_a_timestamp_before_1601_on_every_platform() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        produce_at(&storage, &topition, &[0, 0, 0]).await?;
+        store_timestamp(&storage, &topition, 0, "1600-12-31 23:59:59.999").await?;
+        store_timestamp(&storage, &topition, 1, "-infinity").await?;
+        store_timestamp(&storage, &topition, 2, "infinity").await?;
+
+        let batches = storage
+            .fetch_until_deadline(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await?
+            .batches;
+
+        assert_eq!(
+            vec![
+                -11_644_473_600_001,
+                -9_222_425_352_054_775,
+                9_224_318_721_654_775
+            ],
+            record_timestamps(batches)?
+        );
+
+        for offset_type in [ListOffset::Earliest, ListOffset::Latest] {
+            let responses = storage
+                .list_offsets(
+                    IsolationLevel::ReadUncommitted,
+                    &[(topition.clone(), offset_type)],
+                )
+                .await?;
+
+            assert_matches!(responses[0].1.offset, Some(_));
+            assert_eq!(None, responses[0].1.timestamp);
+        }
 
         Ok(())
     }
