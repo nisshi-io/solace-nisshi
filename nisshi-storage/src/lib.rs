@@ -216,6 +216,7 @@ mod operation;
 mod produce_path;
 mod producer;
 mod proxy;
+mod request_timer;
 mod service;
 #[cfg(test)]
 mod storage_double;
@@ -236,6 +237,7 @@ pub use producer::{
     producer_claim,
 };
 pub use proxy::SemaphoreProxy;
+pub use request_timer::RequestTimer;
 pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
@@ -1253,6 +1255,22 @@ impl OffsetStage {
 
     pub fn log_start(&self) -> i64 {
         self.log_start
+    }
+
+    /// Returns whether this stage covers the records before `next`: its high watermark is at
+    /// least `next`, and for a `ReadCommitted` read, which returns only committed records, its
+    /// last stable offset is too.
+    pub(crate) fn covers(&self, next: i64, isolation: IsolationLevel) -> bool {
+        self.high_watermark >= next
+            && (isolation == IsolationLevel::ReadUncommitted || self.last_stable >= next)
+    }
+
+    /// Returns this stage with its high watermark raised to at least `next`.
+    pub(crate) fn with_high_watermark_at_least(self, next: i64) -> Self {
+        Self {
+            high_watermark: self.high_watermark.max(next),
+            ..self
+        }
     }
 }
 
@@ -3411,6 +3429,42 @@ mod tests {
     use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+
+    /// A stage covers the records before `next` when its high watermark reaches `next`, and, for
+    /// a `ReadCommitted` read, its last stable offset does too.
+    #[test]
+    fn offset_stage_covers_records_by_isolation() {
+        let stage = OffsetStage {
+            last_stable: 5,
+            high_watermark: 10,
+            log_start: 0,
+        };
+
+        assert!(stage.covers(10, IsolationLevel::ReadUncommitted));
+        assert!(!stage.covers(11, IsolationLevel::ReadUncommitted));
+        assert!(stage.covers(5, IsolationLevel::ReadCommitted));
+        assert!(!stage.covers(6, IsolationLevel::ReadCommitted));
+    }
+
+    /// Raising the high watermark leaves the last stable offset and the log start as they are.
+    #[test]
+    fn offset_stage_raises_only_its_high_watermark() {
+        let stage = OffsetStage {
+            last_stable: 5,
+            high_watermark: 10,
+            log_start: 2,
+        };
+
+        assert_eq!(
+            OffsetStage {
+                last_stable: 5,
+                high_watermark: 12,
+                log_start: 2,
+            },
+            stage.with_high_watermark_at_least(12)
+        );
+        assert_eq!(stage, stage.with_high_watermark_at_least(8));
+    }
 
     #[test]
     fn authentication_unsupported_message_names_the_engines_that_can() {

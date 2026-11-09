@@ -497,6 +497,22 @@ where
                 break;
             }
         }
+
+        // Each engine bounds the records that it sends by the offset stage that it sent first, so
+        // the stage already covers `offset`, the offset after the last record. The assertion makes
+        // an engine that breaks that contract fail its tests. In a release build, the service
+        // raises the high watermark, so a client never receives one below its records. It leaves
+        // the last stable offset alone, because raising it would tell a `ReadCommitted` client
+        // that records of an open transaction are committed.
+        if !batches.is_empty() {
+            debug_assert!(
+                offset_stage.covers(offset, isolation),
+                "{tp:?}: a read sent records up to {offset} past the offsets that it sent: \
+                 {offset_stage:?}"
+            );
+            offset_stage = offset_stage.with_high_watermark_at_least(offset);
+        }
+
         Ok(Self::partition_data(partition_index, offset_stage, batches))
             .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }

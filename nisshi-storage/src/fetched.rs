@@ -228,8 +228,10 @@ where
             Err(timed_out) => {
                 fetched.timed_out = Some(timed_out);
 
-                // The channel outlives the read that the deadline dropped, so the items that the
-                // read sent before the deadline are still in it.
+                // A read behind `RequestChannelService` runs on another task, so it can send items
+                // while this loop handles the items before them, and the deadline then stops the
+                // loop before it receives them. The channel outlives the read that the deadline
+                // dropped, so those items are still in it.
                 while let Ok(item) = receiver.0.try_recv() {
                     add_item(item, &mut fetched, &mut batches)?;
                 }
@@ -312,6 +314,14 @@ impl FetchedBatches {
     /// batch. Each stored record holds the broker's time of its own produce request, so one batch
     /// cannot hold two such times.
     pub(crate) fn push_record(&mut self, record: FetchedRecord) -> Result<()> {
+        // An engine sends records in offset order, and a batch's deltas assume it.
+        debug_assert!(
+            self.next_offset().is_none_or(|next| record.offset >= next),
+            "record {} follows offset {:?}",
+            record.offset,
+            self.next_offset()
+        );
+
         let starts_batch = self.open.as_ref().is_none_or(|open| {
             open.attributes != record.attributes
                 || open.producer_id != record.producer_id
@@ -362,6 +372,14 @@ impl FetchedBatches {
     pub(crate) fn into_batches(mut self) -> Result<Vec<deflated::Batch>> {
         self.close()?;
         Ok(self.closed)
+    }
+
+    /// Returns the offset after the last record or batch added.
+    fn next_offset(&self) -> Option<i64> {
+        self.open
+            .as_ref()
+            .map(|open| open.base_offset + i64::from(open.last_offset_delta) + 1)
+            .or_else(|| self.closed.last().map(|batch| batch.max_offset() + 1))
     }
 
     /// Finishes the open batch, if there is one.
@@ -520,6 +538,18 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A record below the offset after the record before it breaks the order that the batch's
+    /// offset deltas assume, so a debug build stops.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "record 1 follows offset Some(3)")]
+    fn a_record_out_of_offset_order_fails_the_assertion() {
+        let mut batches = FetchedBatches::default();
+
+        batches.push_record(record(2, 1_000, 0)).expect("record 2");
+        batches.push_record(record(1, 1_000, 0)).expect("record 1");
     }
 
     #[test]

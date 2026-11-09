@@ -128,8 +128,9 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    RequestTimer, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
     fetched::FetchedSender,
     produce_path,
     service::read_deadline::{QueueWait as _, ReadWait},
@@ -515,7 +516,7 @@ impl RequestChannelService {
         SentRequest {
             response: resp_rx,
             started: started_rx,
-            start,
+            timer: RequestTimer::new(&STORAGE_CHANNEL_REQUEST_DURATION, operation, start),
             operation,
         }
     }
@@ -526,7 +527,7 @@ impl RequestChannelService {
 struct SentRequest {
     response: oneshot::Receiver<Result<Response>>,
     started: oneshot::Receiver<()>,
-    start: Instant,
+    timer: RequestTimer,
     operation: StorageOperation,
 }
 
@@ -535,20 +536,20 @@ impl SentRequest {
         let operation = self.operation;
         let attributes = [operation.attribute()];
 
-        self.response
+        let response = self
+            .response
             .await
             .map_err(|_| Error::OneshotRecv)
             .and_then(|outcome| outcome)
             .map_err(ServiceError::from)
-            .inspect(|_| {
-                let elapsed_millis = self.start.elapsed().as_millis() as u64;
-                STORAGE_CHANNEL_REQUEST_DURATION.record(elapsed_millis, &attributes);
-                debug!(%operation, elapsed_millis);
-            })
+            .inspect(|_| debug!(%operation))
             .inspect_err(|err| {
                 error!(%operation, ?err);
                 STORAGE_CHANNEL_ERROR.add(1, &attributes);
-            })
+            });
+
+        self.timer.end(&response);
+        response
     }
 }
 
@@ -573,7 +574,10 @@ static STORAGE_CHANNEL_REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::ne
     METER
         .u64_histogram("nisshi_storage_channel_request_duration")
         .with_unit("ms")
-        .with_description("Storage channel request latency in milliseconds")
+        .with_description(
+            "Storage channel request latency in milliseconds. outcome=stopped counts a request \
+             that its caller dropped, such as a fetch at its deadline.",
+        )
         .build()
 });
 

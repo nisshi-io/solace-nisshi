@@ -65,8 +65,8 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
-    RequestStorageService, Result, ScramCredential, SemaphoreProxy, StartupFailure, Storage,
-    StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    RequestStorageService, RequestTimer, Result, ScramCredential, SemaphoreProxy, StartupFailure,
+    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     bounded_channel, check_claim,
     config::{self, apply_op},
@@ -93,7 +93,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, SystemTime},
 };
-use tokio::{fs::rename, sync::Semaphore, task::JoinSet};
+use tokio::{fs::rename, sync::Semaphore, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -2108,8 +2108,14 @@ impl Storage for Engine {
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
-        let start = SystemTime::now();
-        self.inner
+        let timer = RequestTimer::new(
+            &ENGINE_REQUEST_DURATION,
+            StorageOperation::Fetch,
+            Instant::now(),
+        );
+
+        let fetched = self
+            .inner
             .fetch(
                 topition,
                 offset,
@@ -2118,13 +2124,10 @@ impl Storage for Engine {
                 isolation_level,
                 fetched_sender,
             )
-            .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Fetch.attribute()],
-                )
-            })
+            .await;
+
+        timer.end(&fetched);
+        fetched
     }
 
     #[instrument(skip_all)]
@@ -3292,160 +3295,163 @@ impl Storage for Delegate {
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
-        let started_at = SystemTime::now();
-
-        debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
-
-        let (base_topic, key_filter): (&str, Option<&str>) =
-            self.topic_with_key(topition.topic()).await?;
-
-        let offset_stage = self.offset_stage(topition).await?;
-
-        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
-            offset_stage.last_stable
-        } else {
-            offset_stage.high_watermark
-        };
-
-        debug!(
-            cluster = self.cluster,
-            ?topition,
-            offset,
-            ?isolation_level,
-            high_watermark,
-            min_bytes,
-            max_bytes
+        let timer = RequestTimer::new(
+            &DELEGATE_REQUEST_DURATION,
+            StorageOperation::Fetch,
+            Instant::now(),
         );
 
-        let c = self.connection().await?;
+        let fetched = async {
+            debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
-        let mut records = if let Some(key) = key_filter {
-            let key_bytes = key.as_bytes().to_vec();
-            c.query(
-                "record_fetch_keyed.sql",
-                (
-                    self.cluster.as_str(),
-                    base_topic,
-                    topition.partition(),
-                    offset,
-                    (max_bytes as i64),
-                    high_watermark,
-                    key_bytes,
-                ),
-            )
-            .await
-        } else {
-            c.query(
-                "record_fetch.sql",
-                (
-                    self.cluster.as_str(),
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    (max_bytes as i64),
-                    high_watermark,
-                ),
-            )
-            .await
-        }
-        .inspect_err(|err| error!(?err))?;
+            let (base_topic, key_filter): (&str, Option<&str>) =
+                self.topic_with_key(topition.topic()).await?;
 
-        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+            let offset_stage = self.offset_stage(topition).await?;
 
-        // This loop can run past the read's deadline by the time that it takes to read one full
-        // channel of records, with the header query of each. The caller stops the read at its
-        // deadline only while the read waits. libSQL reads each row synchronously inside `next`,
-        // without waiting, so the read waits only when its channel is full.
-        //
-        // A step that waits for a lock blocks for up to the connection's busy timeout, so the
-        // read can overrun its deadline by that much. In WAL mode a read waits for a lock only
-        // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
-        // configured instead of shrinking to the time left, because it applies to each wait and
-        // is shared with every later user of the pooled connection.
-        while let Some(row) = records.next().await? {
-            let offset = row
-                .get::<i64>(0)
-                .inspect(|offset| debug!(offset))
-                .inspect_err(|err| error!(?err))?;
+            let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+                offset_stage.last_stable
+            } else {
+                offset_stage.high_watermark
+            };
 
-            let mut headers = vec![];
+            debug!(
+                cluster = self.cluster,
+                ?topition,
+                offset,
+                ?isolation_level,
+                high_watermark,
+                min_bytes,
+                max_bytes
+            );
 
-            let mut header_rows = c
-                .query(
-                    "header_fetch.sql",
+            let c = self.connection().await?;
+
+            let mut records = if let Some(key) = key_filter {
+                let key_bytes = key.as_bytes().to_vec();
+                c.query(
+                    "record_fetch_keyed.sql",
+                    (
+                        self.cluster.as_str(),
+                        base_topic,
+                        topition.partition(),
+                        offset,
+                        (max_bytes as i64),
+                        high_watermark,
+                        key_bytes,
+                    ),
+                )
+                .await
+            } else {
+                c.query(
+                    "record_fetch.sql",
                     (
                         self.cluster.as_str(),
                         topition.topic(),
                         topition.partition(),
                         offset,
+                        (max_bytes as i64),
+                        high_watermark,
                     ),
                 )
+                .await
+            }
+            .inspect_err(|err| error!(?err))?;
+
+            let mut data = fetched_sender.send_offsets(offset_stage).await?;
+
+            // This loop can run past the read's deadline by the time that it takes to read one full
+            // channel of records, with the header query of each. The caller stops the read at its
+            // deadline only while the read waits. libSQL reads each row synchronously inside `next`,
+            // without waiting, so the read waits only when its channel is full.
+            //
+            // A step that waits for a lock blocks for up to the connection's busy timeout, so the
+            // read can overrun its deadline by that much. In WAL mode a read waits for a lock only
+            // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
+            // configured instead of shrinking to the time left, because it applies to each wait and
+            // is shared with every later user of the pooled connection.
+            while let Some(row) = records.next().await? {
+                let offset = row
+                    .get::<i64>(0)
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
+
+                let mut headers = vec![];
+
+                let mut header_rows = c
+                    .query(
+                        "header_fetch.sql",
+                        (
+                            self.cluster.as_str(),
+                            topition.topic(),
+                            topition.partition(),
+                            offset,
+                        ),
+                    )
+                    .await?;
+
+                while let Some(header) = header_rows.next().await? {
+                    let mut header_builder = Header::builder();
+
+                    if let Some(k) = header
+                        .get::<Option<Vec<u8>>>(0)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.key(Bytes::from(k));
+                    }
+
+                    if let Some(v) = header
+                        .get::<Option<Vec<u8>>>(1)
+                        .inspect_err(|err| error!(?err))?
+                    {
+                        header_builder = header_builder.value(Bytes::from(v));
+                    }
+
+                    headers.push(header_builder);
+                }
+
+                data.send_record(FetchedRecord {
+                    offset,
+                    timestamp: row
+                        .get_value(2)
+                        .map_err(Error::from)
+                        .and_then(LiteTimestamp::millis)
+                        .inspect(|timestamp| debug!(?timestamp))
+                        .inspect_err(|err| error!(?err))?,
+                    attributes: row
+                        .get::<Option<i32>>(1)
+                        .map(|attributes| attributes.unwrap_or(0))
+                        .inspect_err(|err| error!(?err))? as i16,
+                    producer_id: row
+                        .get::<Option<i64>>(6)
+                        .map(|producer_id| producer_id.unwrap_or(-1))
+                        .inspect_err(|err| error!(?err))?,
+                    producer_epoch: i16::try_from(
+                        row.get::<Option<i32>>(7)
+                            .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                            .inspect_err(|err| error!(?err))?,
+                    )?,
+                    key: row
+                        .get::<Option<Vec<u8>>>(3)
+                        .map(|o| o.map(Bytes::from))
+                        .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
+                        .inspect_err(|err| error!(?err))?,
+                    value: row
+                        .get::<Option<Vec<u8>>>(4)
+                        .map(|o| o.map(Bytes::from))
+                        .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
+                        .inspect_err(|err| error!(?err))?,
+                    headers,
+                })
                 .await?;
-
-            while let Some(header) = header_rows.next().await? {
-                let mut header_builder = Header::builder();
-
-                if let Some(k) = header
-                    .get::<Option<Vec<u8>>>(0)
-                    .inspect_err(|err| error!(?err))?
-                {
-                    header_builder = header_builder.key(Bytes::from(k));
-                }
-
-                if let Some(v) = header
-                    .get::<Option<Vec<u8>>>(1)
-                    .inspect_err(|err| error!(?err))?
-                {
-                    header_builder = header_builder.value(Bytes::from(v));
-                }
-
-                headers.push(header_builder);
             }
 
-            data.send_record(FetchedRecord {
-                offset,
-                timestamp: row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::millis)
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?,
-                attributes: row
-                    .get::<Option<i32>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))? as i16,
-                producer_id: row
-                    .get::<Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?,
-                producer_epoch: i16::try_from(
-                    row.get::<Option<i32>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?,
-                key: row
-                    .get::<Option<Vec<u8>>>(3)
-                    .map(|o| o.map(Bytes::from))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
-                value: row
-                    .get::<Option<Vec<u8>>>(4)
-                    .map(|o| o.map(Bytes::from))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
-                headers,
-            })
-            .await?;
+            Ok::<_, Error>(())
         }
+        .await;
 
-        if let Ok(elapsed) = started_at.elapsed() {
-            DELEGATE_REQUEST_DURATION.record(
-                elapsed.as_millis() as u64,
-                &[StorageOperation::Fetch.attribute()],
-            )
-        }
-
-        Ok(())
+        timer.end(&fetched);
+        fetched
     }
 
     #[instrument(skip(self))]

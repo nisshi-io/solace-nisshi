@@ -317,8 +317,9 @@ static FETCH_GAP_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_fetch_gap_skipped")
         .with_description(
-            "Fetches that skipped base offsets with no batch object, which a failed produce \
-             leaves; each one listed the partition after the gap",
+            "Fetches that skipped base offsets with no batch object: a produce that failed or \
+             is still writing its batch, or a deleted batch; each one listed the partition after \
+             the gap",
         )
         .build()
 });
@@ -2264,9 +2265,10 @@ impl DynoStore {
                     ?topition,
                     gap_start_offset,
                     next,
-                    "fetch skips base offsets that have no batch object, which a failed produce \
-                     leaves; every fetch that crosses this gap lists the partition after it; later \
-                     ones log at debug and count in nisshi_fetch_gap_skipped"
+                    "fetch skips base offsets that have no batch object, because a produce failed \
+                     or is still writing their batch, or the batch was deleted; every fetch that \
+                     crosses this gap lists the partition after it; later ones log at debug and \
+                     count in nisshi_fetch_gap_skipped"
                 );
             }
         }
