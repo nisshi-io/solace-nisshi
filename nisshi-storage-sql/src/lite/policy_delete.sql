@@ -49,7 +49,16 @@ ancient as (
     select r.topition, r.offset_id
     from record r
     join deletion del on del.topition = r.topition
-    where $2 - r.timestamp > del.retention_ms
+    -- A record without a timestamp stores NO_TIMESTAMP, -1. Kafka expires such a record by when
+    -- its log segment was last written ([LogSegment.largestTimestamp]), so this query expires it
+    -- by created_at, the time that the broker appended it, in UTC seconds. Kafka applies the same
+    -- rule to any negative timestamp, so this query does too.
+    --
+    -- [LogSegment.largestTimestamp]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L855-L860
+    where $2 - case
+        when r.timestamp < 0 then cast(strftime('%s', r.created_at) as integer) * 1000
+        else r.timestamp
+    end > del.retention_ms
 )
 
 delete from record
