@@ -143,9 +143,21 @@ pub trait FetchUntilDeadline: Storage {
     /// for room once its channel is full. Everything that the read sent before the deadline,
     /// including the batch that it was building, stays in the returned [`FetchRead`].
     ///
-    /// A read that fails after it has sent a record also returns what it sent, with its error in
-    /// [`FetchRead::failed`]. A read that fails before it sends a record returns its error.
+    /// A read that fails returns its error, also after it has sent records.
     fn fetch_until_deadline(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation: IsolationLevel,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<FetchRead>> + Send;
+
+    /// Runs a read as [`FetchUntilDeadline::fetch_until_deadline`] does, but keeps the records of
+    /// a read that fails after it has sent a record: the read returns what it sent, with its error
+    /// in [`FetchRead::failed`]. A read that fails before it sends a record returns its error.
+    fn fetch_until_deadline_or_failure(
         &self,
         topition: &Topition,
         offset: i64,
@@ -166,7 +178,8 @@ pub struct FetchRead {
     pub batches: Vec<deflated::Batch>,
     /// Why the read stopped before its end, if its deadline stopped it.
     pub timed_out: Option<TimedOut>,
-    /// The error that ended the read, if the read failed after it had sent a record.
+    /// The error that ended the read, if the read failed after it had sent a record. Only
+    /// [`FetchUntilDeadline::fetch_until_deadline_or_failure`] returns such a read.
     pub failed: Option<Error>,
 }
 
@@ -183,13 +196,36 @@ where
         isolation: IsolationLevel,
         deadline: Instant,
     ) -> impl Future<Output = Result<FetchRead>> + Send {
+        let read = read(
+            self, topition, offset, min_bytes, max_bytes, isolation, deadline,
+        );
+
+        async move {
+            let read = read.await?;
+
+            match read.failed {
+                Some(error) => Err(error),
+                None => Ok(read),
+            }
+        }
+    }
+
+    fn fetch_until_deadline_or_failure(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        min_bytes: u32,
+        max_bytes: u32,
+        isolation: IsolationLevel,
+        deadline: Instant,
+    ) -> impl Future<Output = Result<FetchRead>> + Send {
         read(
             self, topition, offset, min_bytes, max_bytes, isolation, deadline,
         )
     }
 }
 
-/// Runs a read as [`FetchUntilDeadline::fetch_until_deadline`] describes.
+/// Runs a read as [`FetchUntilDeadline::fetch_until_deadline_or_failure`] describes.
 async fn read<G>(
     storage: &G,
     topition: &Topition,
@@ -790,6 +826,19 @@ mod tests {
         assert_matches!(read, Err(Error::Api(ErrorCode::UnknownTopicOrPartition)));
     }
 
+    /// A read that fails after it has sent records returns its error from `fetch_until_deadline`,
+    /// so a caller that only reads `batches` never takes a partial read for a whole one.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_it_sent_records_returns_its_error() {
+        let read = fetch_from_start(
+            &SendsThenFails { records: 2 },
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert_matches!(read, Err(Error::Message(_)));
+    }
+
     /// A storage double whose read sends `records` records, and then fails while it holds its
     /// sender.
     #[derive(Debug)]
@@ -810,11 +859,16 @@ mod tests {
         // read fails, and the caller takes them after the failure.
         let records = i64::try_from(CHANNEL_CAPACITY * 2)?;
 
-        let read = fetch_from_start(
-            &SendsThenFails { records },
-            Instant::now() + Duration::from_secs(1),
-        )
-        .await?;
+        let read = SendsThenFails { records }
+            .fetch_until_deadline_or_failure(
+                &Topition::new("abc", 0),
+                0,
+                0,
+                u32::MAX,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
 
         assert_matches!(read.failed, Some(Error::Message(_)));
         assert_eq!(None, read.timed_out);

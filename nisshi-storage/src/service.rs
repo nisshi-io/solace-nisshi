@@ -2091,7 +2091,7 @@ mod tests {
         });
 
         let read = storage
-            .fetch_until_deadline(
+            .fetch_until_deadline_or_failure(
                 &Topition::new("abc", 0),
                 0,
                 1,

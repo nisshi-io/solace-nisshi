@@ -270,12 +270,13 @@ where
     /// read that reaches the partition deadline answers with what it finished.
     ///
     /// A read that fails after the partition has records sets `read_failed`, and the partition
-    /// answers with those records.
+    /// answers with those records. A read that fails before the partition has records answers the
+    /// partition with an error code, and the other partitions of the Fetch are still answered.
     ///
     /// [ReplicaManager.scala#L1523-L1563]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1523-L1563
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, min_bytes, isolation, fetch_partition),
+        skip(self, min_bytes, isolation, fetch_partition, read_failed),
         fields(partition = fetch_partition.partition)
     )]
     async fn fetch_partition(
@@ -312,7 +313,14 @@ where
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
                     return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
                 }
-                Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
+                Ok(Ok(offset_stage)) => offset_stage,
+                Ok(Err(error)) => {
+                    error!(?tp, ?error, "offset stage read failed");
+                    return Ok(Self::unknown_offsets(
+                        partition_index,
+                        error.error_code(ErrorCode::KafkaStorageError),
+                    ));
+                }
                 Err(reason) => {
                     log_timed_out(
                         &tp,
@@ -424,7 +432,7 @@ where
 
             let read = self
                 .storage
-                .fetch_until_deadline(
+                .fetch_until_deadline_or_failure(
                     &tp,
                     offset,
                     min_bytes,
@@ -439,21 +447,44 @@ where
                     return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
                 }
                 // An earlier read of this partition returned records, so the partition answers
-                // with them instead of failing the whole Fetch. The consumer's next Fetch then
+                // with them instead of with the read's error code. The consumer's next Fetch then
                 // starts after them.
                 Err(error) if !batches.is_empty() => {
                     error!(?tp, offset, ?error, "fetch read failed after earlier reads");
                     *read_failed = true;
                     break;
                 }
-                read => read.inspect_err(|error| error!(?tp, ?error))?,
+                // Kafka answers a failed read in the partition's error code, and still answers
+                // the other partitions of the Fetch ([`ReplicaManager.readFromLog`]).
+                //
+                // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+                Err(error) => {
+                    error!(?tp, offset, ?error, "fetch read failed");
+                    return Ok(Self::unknown_offsets(
+                        partition_index,
+                        error.error_code(ErrorCode::KafkaStorageError),
+                    ));
+                }
+                Ok(read) => read,
             };
 
             if let Some(error) = &read.failed {
                 *read_failed = true;
+
+                // The read failed after its last record, so the next Fetch starts there.
+                let failed_at = read
+                    .batches
+                    .iter()
+                    .map(|batch| batch.max_offset() + 1)
+                    .max()
+                    .unwrap_or(offset);
+                let records: u32 = read.batches.iter().map(|batch| batch.record_count).sum();
+
                 error!(
                     ?tp,
                     offset,
+                    failed_at,
+                    records,
                     ?error,
                     "fetch read failed after it sent records"
                 );
@@ -917,12 +948,16 @@ where
                     break;
                 }
 
-                // A partition whose read failed answers with the records that it read before the
-                // failure. The Fetch answers now instead of reading the partition again in another
-                // round, so that it sends no more reads to storage that is failing. Kafka also
-                // answers at once when the read of a partition fails ([ReplicaManager.scala]).
+                // A partition whose read failed after it sent records answers with those records
+                // and no error code. Kafka answers a failed read with the partition's error code and
+                // no records ([`ReplicaManager.readFromLog`]). We keep the records, because each one
+                // was complete when the engine sent it, and the consumer's next Fetch starts at the
+                // failure and gets its error code. The Fetch answers now instead of reading the
+                // failing partition again in another round, as Kafka answers at once when the read
+                // of a partition fails ([`ReplicaManager.fetchMessages`]).
                 //
-                // [ReplicaManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
+                // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+                // [`ReplicaManager.fetchMessages`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
                 if read_failed {
                     debug!(
                         ?iteration,
@@ -2031,6 +2066,8 @@ mod tests {
         SendThenStall(deflated::Batch),
         /// Sends this batch, and then fails.
         SendThenFail(deflated::Batch),
+        /// Fails before it sends anything.
+        Fail,
     }
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -2088,6 +2125,9 @@ mod tests {
         /// Partitions of [`TOPIC`] that the metadata lists, and whose
         /// offset stage read answers [`ErrorCode::UnknownTopicOrPartition`].
         deleted: Arc<Mutex<BTreeSet<i32>>>,
+        /// Partitions of [`TOPIC`] whose offset stage read fails with an error that has no Kafka
+        /// error code.
+        failing_offset_stages: Arc<Mutex<BTreeSet<i32>>>,
         calls: Arc<Mutex<Vec<Call>>>,
         read_ends: Arc<Mutex<Vec<ReadEnd>>>,
         /// Whether each offset stage read takes a permit from its read
@@ -2140,6 +2180,16 @@ mod tests {
         /// read the metadata.
         fn delete_after_metadata(self, partition: i32) -> Self {
             _ = self.deleted.lock().expect("deleted").insert(partition);
+            self
+        }
+
+        /// Makes each offset stage read of `partition` of [`TOPIC`] fail.
+        fn fail_offset_stage(self, partition: i32) -> Self {
+            _ = self
+                .failing_offset_stages
+                .lock()
+                .expect("failing offset stages")
+                .insert(partition);
             self
         }
 
@@ -2256,6 +2306,7 @@ mod tests {
                     data.send_batch(batch).await?;
                     Err(Error::Message("the read failed".into()))
                 }
+                Read::Fail => Err(Error::Message("the read failed".into())),
             }
         }
 
@@ -2288,6 +2339,15 @@ mod tests {
 
             if topition.topic() == TOPIC && self.deleted.lock()?.contains(&topition.partition()) {
                 return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
+            if topition.topic() == TOPIC
+                && self
+                    .failing_offset_stages
+                    .lock()?
+                    .contains(&topition.partition())
+            {
+                return Err(Error::Message("the offset stage read failed".into()));
             }
 
             Ok(PARTITION_STAGE)
@@ -2857,6 +2917,109 @@ mod tests {
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(PARTITION_STAGE.high_watermark, partitions[0].high_watermark);
         assert_eq!(1, storage.calls(0).len());
+
+        Ok(())
+    }
+
+    /// A Fetch whose partition read fails without records, after an earlier read of the partition
+    /// returned records, answers at once with those records, below `min_bytes`.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_an_earlier_read_answers_below_min_bytes() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?), Read::Fail])]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(2, storage.calls(0).len());
+
+        Ok(())
+    }
+
+    /// A partition whose read fails without records answers with an error code, and the records
+    /// that an earlier partition kept from its own failed read stay in the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_without_records_answers_its_partition_with_an_error_code()
+    -> Result<()> {
+        let storage = Partitions::new([
+            (0, vec![Read::SendThenFail(batch(0, &[0])?)]),
+            (1, vec![Read::Fail]),
+        ]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0, 1])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        // The read fails with a permanent error, which Kafka also answers with
+        // `UNKNOWN_SERVER_ERROR`.
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(-1, partitions[1].high_watermark);
+
+        Ok(())
+    }
+
+    /// A partition whose offset stage read fails answers with an error code, without a read of
+    /// its records, and the other partitions of the Fetch keep their records.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_stage_read_that_fails_answers_its_partition_with_an_error_code() -> Result<()>
+    {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)]), (1, vec![])])
+            .fail_offset_stage(1);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0, 1])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        // The read fails with a permanent error, which Kafka also answers with
+        // `UNKNOWN_SERVER_ERROR`.
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(-1, partitions[1].high_watermark);
+        assert!(storage.calls(1).is_empty());
 
         Ok(())
     }
