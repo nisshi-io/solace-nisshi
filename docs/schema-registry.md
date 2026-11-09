@@ -190,7 +190,7 @@ Produce a message that is invalid for the person schema (the `age` must be great
 echo '{"key": "567-89-8765", "value":	{"firstName": "John", "lastName": "Doe", "age": -1}}' | ./target/debug/nisshi cat produce person
 ```
 
-The command prints no confirmation, exits with status 1, and prints the error that the broker returned:
+The command prints no confirmation, exits with status 4 (the broker refused the request, see the [exit codes](commands.md#exit-codes)), and prints the error that the broker returned:
 
 ```shell
 2024-12-19T11:51:28.408011Z ERROR nisshi: 57: This record has failed the validation on broker and hence will be rejected.

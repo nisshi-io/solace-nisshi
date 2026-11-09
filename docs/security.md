@@ -46,9 +46,10 @@ is not encrypted is ignored with a warning.
 Note for existing deployments: before 0.7 these flags were accepted but had no
 effect, so a broker started with `--cert` and `--key` was serving plaintext.
 After upgrading, that same command line serves TLS only, and `--cert` without
-`--key` (or the reverse) is rejected. The bundled `nisshi cat`, `topic`, `perf`
-and `proxy` subcommands connect in plaintext and cannot yet talk to a TLS
-listener. `--key-passphrase-file` is unknown to earlier releases, so rolling
+`--key` (or the reverse) is rejected. The bundled `nisshi cat`, `topic`, `user`,
+`generator` and `perf` subcommands connect over TLS with `--tls-ca-file` or
+`--tls` (see [Commands](commands.md#connecting-to-a-broker-with-tls-or-sasl)),
+but `proxy` connects in plaintext. `--key-passphrase-file` is unknown to earlier releases, so rolling
 the binary back means removing that flag from the command line as well.
 
 ## Outbound TLS
@@ -117,8 +118,11 @@ needs an engine that can store them, such as SQLite (`sqlite://`) or
 PostgreSQL (`postgres://`). On an engine that can't, such as `memory://` or
 `s3://`, the broker refuses to start and names the engines that can.
 
-The `nisshi` commands, such as `user`, `topic` and `cat`, don't log in yet.
-Against a broker with `--authentication` they fail with `error: Connected to
+The `nisshi` commands `user`, `topic`, `cat`, `generator` and `perf` log in
+with `--sasl-username`, the password in the `SASL_PASSWORD` environment
+variable or in `--sasl-password-file`, and `--sasl-mechanism`; see
+[Commands](commands.md#connecting-to-a-broker-with-tls-or-sasl). Without them
+they fail against a broker with `--authentication` with `error: Connected to
 the broker, but it closed the connection`.
 
 To create the first user, run the broker on the same storage without
@@ -149,9 +153,18 @@ To create the first user, run the broker on the same storage without
    nisshi broker --storage-engine sqlite://nisshi.db --authentication
    ```
 
-Until the `nisshi` commands support SASL, manage users and topics on a broker
-with `--authentication` with the Apache Kafka® command line tools and a client
-configuration file:
+Once the broker runs with `--authentication`, log in with the same options to
+manage its users and topics. The first command creates a second user; add
+`--tls-ca-file` when the listener serves TLS:
+
+```shell
+read -rs SASL_PASSWORD && export SASL_PASSWORD
+nisshi user create bob bob-secret --mechanism scram256 --sasl-username alice --sasl-mechanism scram-sha-256
+nisshi topic list --sasl-username alice --sasl-mechanism scram-sha-256
+```
+
+`user create` still takes the new user's password as an argument. The Apache
+Kafka® command line tools work too, with a client configuration file:
 
 ```properties
 security.protocol=SASL_PLAINTEXT

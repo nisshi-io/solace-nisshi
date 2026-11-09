@@ -166,9 +166,18 @@ impl StoredEpochs {
     /// Returns [`OLDER_EPOCH_ERROR`] for an epoch lower than the partition's, as Kafka answers
     /// for a client's batch ([ProducerAppendInfo.java]).
     ///
-    /// With [`FirstSequence::Any`], returns [`InvalidRecord`](ErrorCode::InvalidRecord) for a
-    /// negative first sequence on a partition that holds no state for the producer, as Kafka's
-    /// [`LogValidator`] does for a batch with a producer ID.
+    /// Returns [`InvalidRecord`](ErrorCode::InvalidRecord) for a negative first sequence,
+    /// whatever the partition holds for the producer. Kafka's [`LogValidator`] refuses a batch
+    /// with a producer ID and a base sequence below 0 before [ProducerAppendInfo.java] checks
+    /// its sequence, so a client sees INVALID_RECORD, not a duplicate or out-of-order sequence.
+    /// The Produce service's `rejection` is the check that matches Kafka, for -1 too. A batch
+    /// with a producer ID and sequence -1 counts as having no sequence here (see
+    /// `deflated::Batch::is_idempotent`), so this check is reachable only for sequences below
+    /// -1, and it covers a caller that goes straight to storage.
+    ///
+    /// For a transactional producer this check comes before the epoch check. Kafka answers
+    /// INVALID_PRODUCER_EPOCH first for a transactional batch at a stale epoch, because it
+    /// verifies the transaction before it validates the batch; we do not reorder that here.
     ///
     /// Returns [`InvalidProducerEpoch`](ErrorCode::InvalidProducerEpoch) for:
     /// - a transactional producer's epoch other than its newest. Kafka's coordinator answers
@@ -197,18 +206,19 @@ impl StoredEpochs {
         base_sequence: i32,
         first_sequence: FirstSequence,
     ) -> Result<ProduceEpoch, ErrorCode> {
+        // Kafka's LogValidator refuses a negative sequence before it reads any producer state
+        // ([`LogValidator`]), so this comes first, for every engine and whether or not the
+        // partition holds state. The Produce service refuses it earlier still, and this covers a
+        // caller that goes straight to storage.
+        if base_sequence < 0 {
+            return Err(ErrorCode::InvalidRecord);
+        }
+
         // Only a zombie producer sends from a retired producer ID, so the broker answers
         // PRODUCER_FENCED, which the client treats as fatal. INVALID_PRODUCER_EPOCH makes
         // the client bump its epoch and send again.
         if self.newest == i16::MAX {
             return Err(ErrorCode::ProducerFenced);
-        }
-
-        if first_sequence == FirstSequence::Any
-            && self.partition_has_no_state()
-            && base_sequence < 0
-        {
-            return Err(ErrorCode::InvalidRecord);
         }
 
         if self.transactional {
@@ -429,10 +439,6 @@ mod tests {
         );
         assert_eq!(
             Err(ErrorCode::OutOfOrderSequenceNumber),
-            unwritten.check_batch(5, -1)
-        );
-        assert_eq!(
-            Err(ErrorCode::OutOfOrderSequenceNumber),
             unwritten.check_batch_for(5, 1_000, FirstSequence::Zero)
         );
     }
@@ -468,24 +474,28 @@ mod tests {
     }
 
     #[test]
-    fn partition_without_state_refuses_a_negative_first_sequence() {
+    fn a_negative_sequence_is_an_invalid_record_whatever_the_partition_holds() {
         let unwritten = StoredEpochs {
             partition: None,
             ..IDEMPOTENT
         };
+        let retired = StoredEpochs {
+            newest: i16::MAX,
+            ..IDEMPOTENT
+        };
 
-        assert_eq!(
-            Err(ErrorCode::InvalidRecord),
-            unwritten.check_batch_for(5, -1, FirstSequence::Any)
-        );
-        assert_eq!(
-            Err(ErrorCode::InvalidRecord),
-            StoredEpochs {
-                partition: None,
-                ..TRANSACTIONAL
+        for stored in [IDEMPOTENT, unwritten, TRANSACTIONAL, retired] {
+            for first_sequence in [FirstSequence::Zero, FirstSequence::Any] {
+                for base_sequence in [-1, -5, i32::MIN] {
+                    assert_eq!(
+                        Err(ErrorCode::InvalidRecord),
+                        stored.check_batch_for(5, base_sequence, first_sequence),
+                        "{stored:?} {first_sequence:?} {base_sequence}"
+                    );
+                }
             }
-            .check_batch_for(3, -5, FirstSequence::Any)
-        );
+            assert_eq!(Err(ErrorCode::InvalidRecord), stored.check_batch(5, -3));
+        }
     }
 
     #[test]

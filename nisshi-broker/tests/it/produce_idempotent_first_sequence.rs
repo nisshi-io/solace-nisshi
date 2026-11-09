@@ -142,8 +142,37 @@ where
     );
     assert_eq!(0, storage.offset_stage(&topition).await?.high_watermark());
 
-    // The refused batch left no state, so the producer still starts at any sequence.
-    assert_eq!(0, produce(&storage, &topition, producer, 40, 1).await?);
+    // The refused batch left no state, so the producer still starts at sequence 0.
+    assert_eq!(0, produce(&storage, &topition, producer, 0, 1).await?);
+
+    Ok(())
+}
+
+/// Kafka refuses a negative sequence in `LogValidator`, before it reads the partition's producer
+/// state, so a partition that holds state for the producer answers INVALID_RECORD too, not
+/// DUPLICATE_SEQUENCE_NUMBER or OUT_OF_ORDER_SEQUENCE_NUMBER.
+pub async fn a_negative_sequence_on_a_partition_with_state_is_refused_and_stores_nothing<G>(
+    storage: G,
+) -> Result<()>
+where
+    G: Storage,
+{
+    let (topition, producer) = topic_and_producer(&storage).await?;
+
+    assert_eq!(0, produce(&storage, &topition, producer, 0, 2).await?);
+
+    // -1 is left out: with a producer ID it is a batch without a sequence, which storage takes as
+    // a plain batch, and the Produce service refuses it before storage (see `rejection`).
+    for base_sequence in [-2, -3, i32::MIN] {
+        assert_matches!(
+            produce(&storage, &topition, producer, base_sequence, 1).await,
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
+    }
+    assert_eq!(2, storage.offset_stage(&topition).await?.high_watermark());
+
+    // The refused batches changed no state, so the next sequence is accepted.
+    assert_eq!(2, produce(&storage, &topition, producer, 2, 1).await?);
 
     Ok(())
 }
@@ -184,12 +213,10 @@ where
 {
     let (topition, producer) = topic_and_producer(&storage).await?;
 
-    for base_sequence in [5, -3] {
-        assert_matches!(
-            produce(&storage, &topition, producer, base_sequence, 1).await,
-            Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-        );
-    }
+    assert_matches!(
+        produce(&storage, &topition, producer, 5, 1).await,
+        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+    );
     assert_eq!(0, storage.offset_stage(&topition).await?.high_watermark());
 
     // The refused batches left no state, so the producer still starts at sequence 0.
@@ -265,6 +292,7 @@ backend_tests!(
         a_new_partition_accepts_any_first_sequence,
         a_new_partition_accepts_the_largest_first_sequence_and_wraps,
         a_negative_first_sequence_is_refused_and_stores_nothing,
+        a_negative_sequence_on_a_partition_with_state_is_refused_and_stores_nothing,
         a_batch_that_overtook_a_failed_first_batch_does_not_make_its_resend_a_duplicate,
     ]
 );
@@ -274,6 +302,8 @@ backend_tests!(
     crate::common::lite_storage,
     [
         a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_negative_first_sequence_is_refused_and_stores_nothing,
+        a_negative_sequence_on_a_partition_with_state_is_refused_and_stores_nothing,
         a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
     ]
 );
@@ -283,6 +313,8 @@ backend_tests!(
     crate::common::postgres_storage,
     [
         a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_negative_first_sequence_is_refused_and_stores_nothing,
+        a_negative_sequence_on_a_partition_with_state_is_refused_and_stores_nothing,
         a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
     ]
 );
@@ -292,6 +324,8 @@ backend_tests!(
     turso_storage,
     [
         a_first_sequence_above_zero_is_out_of_order_and_stores_nothing,
+        a_negative_first_sequence_is_refused_and_stores_nothing,
+        a_negative_sequence_on_a_partition_with_state_is_refused_and_stores_nothing,
         a_later_batch_is_not_stored_ahead_of_a_first_batch_that_failed,
     ]
 );

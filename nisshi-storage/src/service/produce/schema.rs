@@ -28,7 +28,7 @@ use tracing::{debug, instrument};
 use super::{partition::PartitionProduce, response};
 
 /// A [`Layer`] that validates the records of a batch against the schema of the topic in
-/// `schemas`, and gives its inner [`Service`] the batch.
+/// `schemas`, and gives its inner [`Service`] the batch with its decoded records.
 #[derive(Clone, Debug, Default)]
 pub struct SchemaValidationLayer {
     schemas: Option<Registry>,
@@ -53,7 +53,7 @@ impl<S> Layer<S> for SchemaValidationLayer {
     }
 }
 
-/// A [`Service`] passing a batch to `inner` when its records match the schema of the topic, or
+/// A [`Service`] passing a batch and its decoded records to `inner` when the records match the schema of the topic, or
 /// answering the partition with the error code of the failed validation.
 ///
 /// The service passes the batch without validation when it has no schemas, or when the topic's
@@ -76,7 +76,7 @@ impl<S> Debug for SchemaValidationService<S> {
 impl<S> Service<PartitionProduce<(deflated::Batch, inflated::Batch)>> for SchemaValidationService<S>
 where
     S: Service<
-            PartitionProduce<deflated::Batch>,
+            PartitionProduce<(deflated::Batch, inflated::Batch)>,
             Output = PartitionProduceResponse,
             Error = Infallible,
         >,
@@ -117,10 +117,9 @@ where
             ));
         }
 
-        // The decoded batch is not needed after validation, so storage does not hold its memory.
-        drop(inflated);
-
-        self.inner.serve(request.with_batch(batch)).await
+        self.inner
+            .serve(request.with_batch((batch, inflated)))
+            .await
     }
 }
 
@@ -166,18 +165,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_batch_that_matches_the_schema_is_passed_on_without_its_decoded_records() -> Result<()>
-    {
-        let inner = RecordingPartitions::<deflated::Batch>::default();
-        let (deflated, inflated) = person(21)?;
+    async fn a_batch_that_matches_the_schema_is_passed_on_with_its_decoded_records() -> Result<()> {
+        let inner = RecordingPartitions::<(deflated::Batch, inflated::Batch)>::default();
+        let sent = person(21)?;
 
         let Ok(response) = SchemaValidationLayer::new(Some(person_schemas()?))
             .layer(inner.clone())
-            .serve(partition_produce((deflated.clone(), inflated), &[]))
+            .serve(partition_produce(sent.clone(), &[]))
             .await;
 
         assert_eq!(ErrorCode::None, error_code(&response));
-        assert_eq!(vec![deflated], inner.served());
+        assert_eq!(vec![sent], inner.served());
 
         Ok(())
     }
@@ -185,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn a_batch_that_breaks_the_schema_is_an_invalid_record_and_is_not_passed_on() -> Result<()>
     {
-        let inner = RecordingPartitions::<deflated::Batch>::default();
+        let inner = RecordingPartitions::<(deflated::Batch, inflated::Batch)>::default();
 
         let Ok(response) = SchemaValidationLayer::new(Some(person_schemas()?))
             .layer(inner.clone())
@@ -201,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn a_topic_with_schema_validation_off_passes_a_batch_that_breaks_the_schema() -> Result<()>
     {
-        let inner = RecordingPartitions::<deflated::Batch>::default();
+        let inner = RecordingPartitions::<(deflated::Batch, inflated::Batch)>::default();
 
         let Ok(response) = SchemaValidationLayer::new(Some(person_schemas()?))
             .layer(inner.clone())
@@ -219,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_topic_with_a_lake_sink_validates_when_schema_validation_is_off() -> Result<()> {
-        let inner = RecordingPartitions::<deflated::Batch>::default();
+        let inner = RecordingPartitions::<(deflated::Batch, inflated::Batch)>::default();
 
         let Ok(response) = SchemaValidationLayer::new(Some(person_schemas()?))
             .layer(inner.clone())
@@ -240,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_layer_without_schemas_passes_a_batch_that_breaks_the_schema() -> Result<()> {
-        let inner = RecordingPartitions::<deflated::Batch>::default();
+        let inner = RecordingPartitions::<(deflated::Batch, inflated::Batch)>::default();
 
         let Ok(response) = SchemaValidationLayer::new(None)
             .layer(inner.clone())

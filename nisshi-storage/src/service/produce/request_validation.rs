@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::response;
+use super::{admission::Admission, response};
 use crate::{Error, Result};
 
 /// A [`ProduceRequest`] whose `acks` is valid.
@@ -42,6 +42,7 @@ pub struct ValidatedTopic {
     pub(super) name: String,
     pub(super) transaction_id: Option<String>,
     pub(super) partitions: Vec<PartitionProduceData>,
+    pub(super) admission: Admission,
 }
 
 /// A [`Layer`] that gives its inner [`Service`] a [`ValidatedProduceRequest`], and answers a
@@ -123,6 +124,7 @@ where
                         name: topic.name,
                         transaction_id: request.transactional_id.clone(),
                         partitions: topic.partition_data.unwrap_or_default(),
+                        admission: Admission::default(),
                     })
                     .collect(),
             })

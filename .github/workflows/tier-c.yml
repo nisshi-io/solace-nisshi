@@ -4,8 +4,8 @@ name: tier-c
 # Tier C is the optional scheduled tier, run twice a day. It runs the checks
 # that are too slow or too unstable to gate a merge: the compat suites on the
 # S3 engine, the `test` suite on more Postgres versions, including one beta,
-# the build on Windows, and the full macOS release build (ci.yml only checks
-# macOS, except on a `v*` tag). It also publishes the `edge` image, see below.
+# and the full Windows and macOS release builds (ci.yml only checks Windows
+# and macOS, except on a `v*` tag). It also publishes the `edge` image, see below.
 #
 # Tier C does not gate anything. It is not in the `needs` of ci-gate and it is
 # not a required check. A red run opens or updates one GitHub issue with the
@@ -109,7 +109,7 @@ jobs:
           # that ci.yml restores on every pull request.
           cache-shared-key: dev
           cache-save-if: false
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@0.9.146
       # The test and report steps match ci.yml's `test` job, which explains
@@ -300,23 +300,42 @@ jobs:
       - run: echo "## franz-go compatibility report card (s3)" >> "${GITHUB_STEP_SUMMARY}"
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
-  build-windows:
+  # The same build as macos-release below, for Windows. It also runs the
+  # quickstart's steps against the exe, because Windows has code that no other
+  # job runs, and the merge queue only checks the Windows build.
+  windows-release:
     if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Shorter than the 120 minutes of the `windows` job in ci.yml, which builds
+    # the same release, so this job fails before a tag build would time out.
+    timeout-minutes: 100
+    env:
+      TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-        with:
-          just-version: 1.58.0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
+          # The same settings as the release build in ci.yml.
+          rustflags: ""
+          build-warnings: ""
           cache: false
-      - run: just build dev
+      - run: rustup target add "$env:TARGET"
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-auditable@0.7.6
+          fallback: none
+      - run: cargo auditable build --release --bin nisshi --all-features --target "$env:TARGET"
+      # The same check as the windows job in ci.yml.
+      - shell: bash
+        run: |
+          bin=target/"${TARGET}"/release/nisshi.exe
+          [ -f "$bin" ] || { echo "::error::$bin does not exist"; exit 1; }
+          ! grep -a -q -i vcruntime140 "$bin" || { echo "::error::$bin imports the Visual C++ runtime DLL"; exit 1; }
+      - run: .github/scripts/windows-smoke.ps1 -Exe "target/$env:TARGET/release/nisshi.exe"
   # The release profile, the linker and cargo-auditable, which the `macos`
-  # job in ci.yml skips off a tag. It uploads nothing.
+  # and `windows` jobs in ci.yml skip off a tag. It uploads nothing.
   macos-release:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-latest
@@ -335,7 +354,7 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$TARGET"
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -453,7 +472,7 @@ jobs:
     # This job reads the result of each job above. A beta leg that fails does
     # not change the result of `test`, so it does not raise an alert.
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [test, compat-librdkafka, compat-franz-go, build-windows, macos-release, edge-gate, edge-publish]
+    needs: [test, compat-librdkafka, compat-franz-go, windows-release, macos-release, edge-gate, edge-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # The job writes to issues and nothing else. It has no checkout, so

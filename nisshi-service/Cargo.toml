@@ -21,6 +21,7 @@ indicatif.workspace = true
 nanoid.workspace = true
 nisshi-auth.workspace = true
 nisshi-sans-io.workspace = true
+nisshi-storage.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true

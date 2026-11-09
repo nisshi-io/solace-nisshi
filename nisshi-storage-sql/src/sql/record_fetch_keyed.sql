@@ -14,7 +14,26 @@
 -- limitations under the License.
 
 -- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, blob) as
+-- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
+-- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
+-- The header table is probed by its primary key for each record, so a record that holds only
+-- headers still spends the budget. The probe is a result column of a derived table, because the
+-- Turso engine does not accept a subquery inside the argument of a window function.
 with sized as (
+select
+
+offset_id,
+attributes,
+timestamp,
+k,
+v,
+sum(row_bytes) over (order by offset_id) as bytes,
+row_number() over (order by offset_id) as ordinal,
+producer_id,
+producer_epoch
+
+from (
+
 select
 
 r.offset_id,
@@ -22,8 +41,11 @@ r.attributes,
 r.timestamp,
 r.k,
 r.v,
-sum(coalesce(length(r.k), 0) + coalesce(length(r.v), 0)) over (order by r.offset_id) as bytes,
-row_number() over (order by r.offset_id) as ordinal,
+coalesce(length(r.k), 0) + coalesce(length(r.v), 0)
+    + (select coalesce(sum(coalesce(length(h.k), 0) + coalesce(length(h.v), 0) + 2), 0)
+       from header h
+       where h.topition = r.topition
+       and h.offset_id = r.offset_id) as row_bytes,
 r.producer_id,
 r.producer_epoch
 
@@ -41,7 +63,7 @@ and t.name = $2
 and tp.partition = $3
 and r.offset_id >= $4
 and r.offset_id < $6
-and r.k = $7)
+and r.k = $7) sized_rows)
 
 -- The query returns the first row even when that row alone is larger than $5, so that a consumer
 -- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first

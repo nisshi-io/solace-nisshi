@@ -94,6 +94,7 @@ where
                             index: partition.index,
                             transaction_id: topic.transaction_id.clone(),
                             configuration: Arc::clone(&configuration),
+                            admission: topic.admission.clone(),
                             batch: batches,
                         })
                         .await;

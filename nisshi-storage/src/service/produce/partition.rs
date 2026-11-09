@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use super::topic_configuration::TopicConfiguration;
+use super::{admission::Admission, topic_configuration::TopicConfiguration};
 
 /// A partition of a Produce request on its way to storage, with the configuration of its topic.
 ///
@@ -25,9 +25,9 @@ use super::topic_configuration::TopicConfiguration;
 ///   sent them, `Vec<deflated::Batch>`, and passes the one batch that remains.
 /// - [`TimestampService`](super::TimestampService) takes a `deflated::Batch` and passes it with
 ///   the same batch decoded, `(deflated::Batch, inflated::Batch)`.
-/// - [`SchemaValidationService`](super::SchemaValidationService) takes the pair, and passes the
-///   `deflated::Batch`.
-/// - [`StorePartitionService`](super::StorePartitionService) takes the `deflated::Batch`.
+/// - [`SchemaValidationService`](super::SchemaValidationService) takes the pair, and passes it on.
+/// - [`StorePartitionService`](super::StorePartitionService) takes the pair, so that the storage
+///   engine does not decode the batch again.
 ///
 /// A step answers a partition that it rejects with [`PartitionProduceResponse`], and does not call
 /// its inner service.
@@ -44,6 +44,9 @@ pub struct PartitionProduce<B> {
     /// The topic's configuration, which every partition of the topic shares.
     pub configuration: Arc<TopicConfiguration>,
 
+    /// The decoded-batch budget that the partitions of the request share.
+    pub admission: Admission,
+
     pub batch: B,
 }
 
@@ -56,6 +59,7 @@ impl<B> PartitionProduce<B> {
                 index: self.index,
                 transaction_id: self.transaction_id,
                 configuration: self.configuration,
+                admission: self.admission,
                 batch: (),
             },
             self.batch,
@@ -71,6 +75,7 @@ impl PartitionProduce<()> {
             index: self.index,
             transaction_id: self.transaction_id,
             configuration: self.configuration,
+            admission: self.admission,
             batch,
         }
     }

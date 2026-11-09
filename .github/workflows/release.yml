@@ -1,7 +1,7 @@
 name: release
 
 # The only workflow a `v*` tag runs. It calls ci.yml for the build and every
-# test, then publishes in order: the version tags on the image, the tarballs
+# test, then publishes in order: the version tags on the image, the archives
 # on the GitHub release, then the crates. Each step needs the one before, and
 # the first needs `ci`, `on-main`, `release-tag` and `release-readiness` (the
 # Guardian scan of the tag), so a red run or a Guardian block publishes
@@ -193,7 +193,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-  # Attaches the tarballs to the GitHub release. It is a job of its own so
+  # Attaches the archives to the GitHub release. It is a job of its own so
   # that `contents: write`, which can create tags the main ruleset doesn't
   # cover, is held by a job that compiles nothing, and the `release`
   # environment's deployment policy (`v*` tags) is a second, server-side check
@@ -212,14 +212,16 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          # Two hyphens: the tarballs are nisshi-<target>, and docker
+          # Two hyphens: the archives are nisshi-<target>, and docker
           # build-push-action's build record is `nisshi-io~nisshi~<id>.dockerbuild`.
           pattern: nisshi-*-*
           merge-multiple: true
-          path: tarballs
+          path: archives
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: tarballs/*.tar.gz
+          files: |
+            archives/*.tar.gz
+            archives/*.zip
           fail_on_unmatched_files: true
           # A semver prerelease (v0.7.0-pre.3) has a hyphen. Marking it keeps
           # it off "Latest", as publish-image keeps it off the `latest` image.

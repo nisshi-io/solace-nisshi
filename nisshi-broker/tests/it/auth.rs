@@ -910,7 +910,7 @@ impl Storage for Engine {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        _deadline: tokio::time::Instant,
     ) -> nisshi_storage::Result<Vec<Batch>> {
         unimplemented!()
     }

@@ -751,7 +751,7 @@ where
 
                 _ = interval.tick() => {
                     if maintenance_sweep.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                        debug!("maintain still in flight; skipping tick");
+                        maintenance_failures.overdue(std::time::Instant::now());
                     } else {
                         let storage = self.storage.clone();
                         let failures = maintenance_failures.clone();
@@ -759,14 +759,12 @@ where
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintenance");
 
-                            async move {
-                                failures.record(
-                                    storage.maintain(SystemTime::now()).await,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                            .instrument(span)
-                            .await
+                            failures
+                                .run(
+                                    async move { storage.maintain(SystemTime::now()).await }
+                                        .instrument(span),
+                                )
+                                .await
                         });
 
                         debug!(?handle);
@@ -776,7 +774,7 @@ where
 
                 _ = txn_interval.tick() => {
                     if txn_sweep.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                        debug!("maintain_transactions still in flight; skipping tick");
+                        txn_failures.overdue(std::time::Instant::now());
                     } else {
                         let storage = self.storage.clone();
                         let failures = txn_failures.clone();
@@ -784,14 +782,14 @@ where
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintain_transactions");
 
-                            async move {
-                                failures.record(
-                                    storage.maintain_transactions(SystemTime::now()).await,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                            .instrument(span)
-                            .await
+                            failures
+                                .run(
+                                    async move {
+                                        storage.maintain_transactions(SystemTime::now()).await
+                                    }
+                                    .instrument(span),
+                                )
+                                .await
                         });
 
                         debug!(?handle);

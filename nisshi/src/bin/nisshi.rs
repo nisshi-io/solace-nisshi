@@ -15,7 +15,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use dotenv::dotenv;
 use nisshi_broker::{TracingFormat, otel};
-use nisshi_cli::{Cli, Outcome};
+use nisshi_cli::{Cli, ExitStatus, Outcome};
+use nisshi_client::FailureKind;
 use nisshi_sans_io::ErrorCode;
 use std::{
     io,
@@ -36,28 +37,131 @@ const ORIGIN_OPTION: &str = "--origin-url (or ORIGIN_URL)";
 
 /// Returns the error message for a command whose Kafka client failed. `broker_option` names
 /// the option and the environment variable that give the command its broker.
+///
+/// The match on [`nisshi_client::FailureKind`] is the one that `ExitStatus::of_client_error` makes,
+/// so the message and the exit status of a failure agree.
 fn client_error_message(error: &nisshi_client::Error, broker_option: &str) -> String {
-    match error {
-        nisshi_client::Error::Pool(cause) if error.is_connect_failure() => format!(
-            "Could not connect to the broker: {cause}. Check that it is running (nisshi broker) \
-            and that {broker_option} points at it."
-        ),
-        // A broker that serves only TLS, or that requires authentication, accepts the connection
-        // and then closes it when the plaintext request arrives.
-        nisshi_client::Error::Io(cause)
-            if matches!(
-                cause.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-            ) =>
-        {
+    let failed = || format!("The request to the broker failed: {error}");
+
+    match error.failure_kind() {
+        FailureKind::Options => match error {
+            nisshi_client::Error::TlsConfiguration(reason) => format!(
+                "The TLS options can't be used: {reason}. Check --tls-ca-file, --tls-cert-file, \
+                --tls-key-file and --tls-server-name."
+            ),
+            _ => failed(),
+        },
+        // The pool wraps the failure of an attempt to open a connection, including an address
+        // that does not resolve.
+        FailureKind::Unreachable => {
+            let cause = match error {
+                nisshi_client::Error::Pool(cause) => cause.to_string(),
+                error => error.to_string(),
+            };
+
             format!(
-                "Connected to the broker, but it closed the connection: {cause}. This command \
-                connects in plaintext and does not authenticate, so it can't use a broker that \
-                serves only TLS (--cert and --key) or that requires authentication \
-                (--authentication)."
+                "Could not connect to the broker: {cause}. Check that it is running (nisshi \
+                broker) and that {broker_option} points at it."
             )
         }
-        _ => format!("The request to the broker failed: {error}"),
+        FailureKind::Refused => refusal_message(error, broker_option).unwrap_or_else(failed),
+        // A broker that serves only TLS, or that requires authentication, accepts the connection
+        // and then closes it when the plaintext request arrives. The same broker closes a
+        // connection that it restarted or lost.
+        FailureKind::Closed => error.io_error().map_or_else(failed, |cause| {
+            format!(
+                "Connected to the broker, but it closed the connection: {cause}. Without \
+                --tls (or another --tls-* option) this command connects in plaintext, so it \
+                can't use a broker that serves only TLS (--cert and --key). Without \
+                --sasl-username it does not log in, so it can't use a broker that requires \
+                authentication (--authentication). A broker that restarted also closes its \
+                connections. The broker may have applied the request, so check before you retry."
+            )
+        }),
+        FailureKind::TimedOut => match error {
+            nisshi_client::Error::Timeout(deadline) => format!(
+                "The broker did not answer within {deadline:?}. The command connected and sent \
+                its request, so the broker may have applied it: check before you retry."
+            ),
+            _ => failed(),
+        },
+        FailureKind::Other => failed(),
+    }
+}
+
+/// Returns the error message for a TLS connection or a login that was refused, or for a SCRAM
+/// login that the client refused, or `None` when `error` is none of those.
+fn refusal_message(error: &nisshi_client::Error, broker_option: &str) -> Option<String> {
+    if let Some((iterations, accepted)) = error.scram_iterations() {
+        return Some(format!(
+            "The client refused the SCRAM login: the broker asked for {iterations} iterations, \
+            and the client accepts {} to {}. Kafka's own client refuses fewer than {}. Recreate \
+            the user's credential with `nisshi user create --iterations` set within that range \
+            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
+            can also ask for such a count.",
+            accepted.start(),
+            accepted.end(),
+            accepted.start()
+        ));
+    }
+
+    if let Some(rejection) = error.tls_rejection() {
+        return Some(tls_rejection_message(rejection));
+    }
+
+    if error.sasl_not_used() {
+        return Some(format!(
+            "The broker's listener does not use SASL, so the command must not log in: it is a \
+            PLAINTEXT or SSL listener, or a Nisshi broker started without --authentication. \
+            Remove --sasl-username (and unset a stray SASL_USERNAME), or point {broker_option} \
+            at the broker's SASL listener."
+        ));
+    }
+
+    if let Some(reason) = error.login_failure() {
+        return Some(format!(
+            "The broker refused the login: {reason}. Check --sasl-username, the password in \
+            SASL_PASSWORD (or --sasl-password-file) and --sasl-mechanism."
+        ));
+    }
+
+    error.tls_failure().map(|reason| {
+        format!(
+            "The TLS handshake with the broker failed: {reason}. Without --tls the command \
+            connects in plaintext. With it, add --tls-ca-file for a broker certificate that the \
+            system doesn't trust, and --tls-server-name (or --tls-no-hostname-check) when the \
+            certificate is for another name."
+        )
+    })
+}
+
+/// Returns the error message for a TLS alert that rejected the connection.
+fn tls_rejection_message(rejection: &nisshi_client::TlsRejection) -> String {
+    match rejection {
+        nisshi_client::TlsRejection::CertificateRequired => "The broker requires a client \
+            certificate for TLS, and the command sent none. Set --tls-cert-file and \
+            --tls-key-file."
+            .to_owned(),
+        nisshi_client::TlsRejection::ClientCertificate(alert) => format!(
+            "The broker does not accept the client certificate: it sent the TLS alert {alert}. \
+            Check --tls-cert-file and --tls-key-file, and that the broker trusts the authority \
+            that signed the certificate."
+        ),
+        nisshi_client::TlsRejection::HandshakeFailure => "The broker rejected the TLS \
+            connection: it sent the TLS alert HandshakeFailure. A broker that negotiates TLS 1.2 \
+            and requires a client certificate sends it when the command sent none, so check \
+            --tls-cert-file and --tls-key-file. Otherwise the broker and the client share no \
+            TLS version or cipher suite."
+            .to_owned(),
+        nisshi_client::TlsRejection::Negotiation(alert) => format!(
+            "The broker rejected the TLS connection: it sent the TLS alert {alert}, because the \
+            broker and the client share no TLS version or cipher suite."
+        ),
+        nisshi_client::TlsRejection::Other(alert) => {
+            format!("The broker rejected the TLS connection: it sent the TLS alert {alert}.")
+        }
+        // `TlsRejection` is `non_exhaustive`.
+        rejection => format!("The broker rejected the TLS connection: {rejection:?}."),
     }
 }
 
@@ -70,8 +174,113 @@ fn cat_error_message(error: &nisshi_cat::Error) -> String {
         | nisshi_cat::Error::NoMessages { .. }
         | nisshi_cat::Error::NotAnArray { .. }
         | nisshi_cat::Error::Fetch { .. }
-        | nisshi_cat::Error::Metadata { .. } => error.to_string(),
+        | nisshi_cat::Error::Metadata { .. }
+        | nisshi_cat::Error::RecordOffsetOverflow { .. } => error.to_string(),
         _ => format!("Unknown error occurred during command: {error}"),
+    }
+}
+
+/// The SQLSTATE of a statement that waited for a table lock until its `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// The SQLSTATE of a statement that the role isn't allowed to run.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// Returns the message for a schema setup of `storage` that failed because of the schema version
+/// that the database records, or `None` for any other error.
+fn schema_version_message(
+    storage: &impl std::fmt::Display,
+    error: &nisshi_storage::Error,
+) -> Option<String> {
+    match error {
+        nisshi_storage::Error::IncompatibleSchema {
+            recorded_version,
+            oldest_compatible_version,
+            schema_version,
+        } => Some(format!(
+            "storage {storage} records schema version {recorded_version}, which a release with \
+                schema version {oldest_compatible_version} or later can use. This release has \
+                schema version {schema_version}: upgrade Nisshi."
+        )),
+        nisshi_storage::Error::UnversionedSchema { schema_version } => Some(format!(
+            "storage {storage} has Nisshi tables but records no schema version, and this release \
+                has schema version {schema_version} with steps that upgrade only a recorded \
+                version. Start a release that records schema version 1 once, such as 0.8, then \
+                start this one."
+        )),
+        nisshi_storage::Error::OutdatedSchema {
+            recorded_version,
+            schema_version,
+        } => Some(format!(
+            "storage {storage} records schema version {recorded_version}, which is not a valid \
+                version: this release has schema version {schema_version} and upgrades only from \
+                version 1. Correct the row in nisshi_schema_version, or restore the database \
+                from a backup."
+        )),
+        nisshi_storage::Error::MissingClusterTable {
+            schema_version,
+            search_path,
+        } => Some(format!(
+            "storage {storage} records schema version {schema_version} but has no `cluster` table \
+                on the search path `{search_path}`. First check the `search_path` option in the \
+                storage URL (options=-c search_path=...): it must name the schema that holds \
+                Nisshi's tables. If it does, the tables were dropped or moved: restore the \
+                database from a backup."
+        )),
+        nisshi_storage::Error::SchemaStepFailed {
+            from_version,
+            to_version,
+            code,
+            table,
+            ..
+        } if &**code == LOCK_NOT_AVAILABLE => Some(format!(
+            "storage {storage} could not upgrade its schema from version {from_version} to \
+                {to_version}: the step waited for a lock on {} that another session holds, until \
+                its lock timeout. The upgrade rolled back and the database is unchanged. To find \
+                the session that holds the lock, look in pg_stat_activity for a session that is \
+                idle in transaction or runs a long query, and see docs/storage.md. Start the \
+                broker again to retry.",
+            table.as_deref().unwrap_or("a table"),
+        )),
+        nisshi_storage::Error::SchemaStepFailed {
+            from_version,
+            to_version,
+            code,
+            message,
+            table,
+            constraint,
+        } => Some(format!(
+            "storage {storage} failed its schema upgrade from version {from_version} to \
+                {to_version}: {message} (SQLSTATE {code}{}{}). The upgrade rolled back and the \
+                database is unchanged. Fix the cause, then start the broker again.",
+            table
+                .as_ref()
+                .map(|table| format!(", table {table}"))
+                .unwrap_or_default(),
+            constraint
+                .as_ref()
+                .map(|constraint| format!(", constraint {constraint}"))
+                .unwrap_or_default(),
+        )),
+        nisshi_storage::Error::Api(ErrorCode::RequestTimedOut) => Some(format!(
+            "storage {storage} failed its schema setup because a statement or a wait passed its \
+                time limit: a schema upgrade step, the wait for another broker's upgrade, or the \
+                wait for a database connection. The setup rolled back and the database is \
+                unchanged. Start the broker again to retry."
+        )),
+        _ => None,
+    }
+}
+
+/// Returns whether `error` is a refusal of the database role to change the schema.
+fn is_insufficient_privilege(error: &nisshi_storage::Error) -> bool {
+    match error {
+        #[cfg(feature = "postgres")]
+        nisshi_storage::Error::TokioPostgres(error) => {
+            error.code().map(|code| code.code()) == Some(INSUFFICIENT_PRIVILEGE)
+        }
+        nisshi_storage::Error::SchemaStepFailed { code, .. } => &**code == INSUFFICIENT_PRIVILEGE,
+        _ => false,
     }
 }
 
@@ -144,16 +353,31 @@ fn invalid_storage_option_value_message(
     format!("storage option {option}={value} is not valid for the {scheme} engine: give {expected}")
 }
 
-/// Runs the command, and exits with failure when it returns an error or a Kafka error code.
+/// Runs the command. A client tool exits with the [`ExitStatus`] that names how it ended:
+/// failure when it returns an error that no other status names, and refused when it returns a
+/// Kafka error code. `nisshi broker` and `nisshi proxy` are servers, not scripted tools: they
+/// exit with 0, or with 1 for any failure, as they always have.
 ///
-/// `main` reports an error and then returns [`ExitCode::FAILURE`], instead of returning the
-/// error, because Rust prints the `Debug` form of an error that `main` returns, after the
-/// message that this function has already reported.
+/// `main` reports an error and then returns an exit code, instead of returning the error,
+/// because Rust prints the `Debug` form of an error that `main` returns, after the message that
+/// this function has already reported.
 #[tokio::main]
 async fn main() -> ExitCode {
     _ = dotenv().ok();
 
-    let _guard = match otel::init(TracingFormat::Text) {
+    // Parse before logging starts, so that the command says where its log lines go: a client
+    // tool prints its result on stdout, so its log lines go to stderr, where a script that
+    // parses `--output json` does not read them. The broker and the proxy log to stdout.
+    let cli = Cli::from_command_line();
+    let client_tool = cli.is_client_tool();
+
+    let init = if client_tool {
+        otel::init_stderr
+    } else {
+        otel::init
+    };
+
+    let _guard = match init(TracingFormat::Text) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("Error: {err:?}");
@@ -161,7 +385,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match Cli::run().await {
+    match cli.run().await {
         Ok(outcome) => {
             match outcome {
                 Outcome {
@@ -172,12 +396,21 @@ async fn main() -> ExitCode {
                 _ => error!("{}", outcome.error_code),
             }
 
-            outcome.error_code.report()
+            if client_tool {
+                ExitStatus::of_error_code(outcome.error_code).into()
+            } else {
+                outcome.error_code.report()
+            }
         }
 
         Err(err) => {
             report_error(&err);
-            ExitCode::FAILURE
+
+            if client_tool {
+                ExitStatus::of_error(&err).into()
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -233,6 +466,7 @@ fn report_error(err: &nisshi_cli::Error) {
         nisshi_cli::Error::Client(error) => {
             report_failure!("{}", client_error_message(error, TOPIC_BROKER_OPTION))
         }
+        nisshi_cli::Error::Box(error) => report_failure!("{error}"),
         nisshi_cli::Error::Server(error) => match &**error {
             #[cfg(any(feature = "dynostore", feature = "slatedb"))]
             nisshi_broker::Error::Storage(nisshi_storage::Error::NoCredentials(source)) => {
@@ -253,40 +487,23 @@ fn report_error(err: &nisshi_cli::Error) {
                     "storage {storage} failed its startup check: {source}{}",
                     startup_check_hint(storage.scheme())
                 ),
-                nisshi_storage::StartupFailure::SchemaSetup => match &**source {
-                    nisshi_storage::Error::IncompatibleSchema {
-                        recorded_version,
-                        oldest_compatible_version,
-                        schema_version,
-                    } => report_failure!(
-                        "storage {storage} records schema version {recorded_version}, which a \
-                            release with schema version {oldest_compatible_version} or later can \
-                            use. This release has schema version {schema_version}: upgrade Nisshi."
-                    ),
-                    nisshi_storage::Error::OutdatedSchema {
-                        recorded_version,
-                        schema_version,
-                    } => report_failure!(
-                        "storage {storage} records schema version {recorded_version}, which is \
-                            older than this release's schema version {schema_version}. This \
-                            release can't upgrade the schema: run the release that set up this \
-                            database."
-                    ),
-                    #[cfg(feature = "postgres")]
-                    nisshi_storage::Error::TokioPostgres(err)
-                        if err.code().map(|code| code.code()) == Some("42501") =>
-                    {
+                nisshi_storage::StartupFailure::SchemaSetup => {
+                    if is_insufficient_privilege(source) {
                         report_failure!(
                             "storage {storage} failed its schema setup: {source}. The \
-                                database records no schema version that this release can use, so \
-                                the broker must change the schema, and its role isn't allowed \
-                                to. Start one broker once with the credentials of the role that \
-                                owns Nisshi's tables, then start the others with this role. See \
-                                the PostgreSQL section of docs/storage.md."
+                                database records no schema version that this release can \
+                                use, so the broker must change the schema, and its role \
+                                isn't allowed to. Start one broker once with the \
+                                credentials of the role that owns Nisshi's tables, then \
+                                start the others with this role. See the PostgreSQL \
+                                section of docs/storage.md."
                         )
+                    } else if let Some(message) = schema_version_message(storage, source) {
+                        report_failure!("{message}")
+                    } else {
+                        report_failure!("storage {storage} failed its schema setup: {source}")
                     }
-                    _ => report_failure!("storage {storage} failed its schema setup: {source}"),
-                },
+                }
             },
             nisshi_broker::Error::Storage(nisshi_storage::Error::AuthenticationUnsupported {
                 engine,
@@ -334,6 +551,10 @@ fn report_error(err: &nisshi_cli::Error) {
         | nisshi_cli::Error::TlsKeyLegacyEncrypted { .. }
         | nisshi_cli::Error::TlsKeyPassphraseFile { .. }
         | nisshi_cli::Error::TlsRequiresCertAndKey
+        | nisshi_cli::Error::SaslPasswordAmbiguous
+        | nisshi_cli::Error::SaslPasswordFile { .. }
+        | nisshi_cli::Error::SaslPasswordMissing
+        | nisshi_cli::Error::SaslPasswordNotUnicode
         | nisshi_cli::Error::LakeRequiresSchemaRegistry { .. } => report_failure!("{err}"),
         nisshi_cli::Error::Tls(error) => report_failure!(
             "TLS configuration rejected: {error}. Check that --key is the private key for the \
@@ -348,8 +569,178 @@ mod tests {
     use super::{
         BROKER_OPTION, TOPIC_BROKER_OPTION, cat_error_message, client_error_message, failure_line,
         feature_not_enabled_message, invalid_storage_option_value_message,
-        listener_host_unresolved_message, listener_in_use_message,
+        is_insufficient_privilege, listener_host_unresolved_message, listener_in_use_message,
+        schema_version_message,
     };
+
+    /// Each way that a recorded schema version stops a start tells the operator what to do next:
+    /// upgrade Nisshi, start an earlier release once, or repair the row.
+    #[test]
+    fn schema_version_message_gives_each_case_its_own_next_step() {
+        let storage = "postgres://db/nisshi";
+
+        assert_eq!(
+            Some(
+                "storage postgres://db/nisshi records schema version 3, which a release with \
+                    schema version 3 or later can use. This release has schema version 2: \
+                    upgrade Nisshi."
+                    .to_owned()
+            ),
+            schema_version_message(
+                &storage,
+                &nisshi_storage::Error::IncompatibleSchema {
+                    recorded_version: 3,
+                    oldest_compatible_version: 3,
+                    schema_version: 2,
+                }
+            )
+        );
+
+        assert_eq!(
+            Some(
+                "storage postgres://db/nisshi has Nisshi tables but records no schema version, \
+                    and this release has schema version 2 with steps that upgrade only a \
+                    recorded version. Start a release that records schema version 1 once, such \
+                    as 0.8, then start this one."
+                    .to_owned()
+            ),
+            schema_version_message(
+                &storage,
+                &nisshi_storage::Error::UnversionedSchema { schema_version: 2 }
+            )
+        );
+    }
+
+    /// A row that records version 0 is a hand edit or a failed rollback, so the message must say
+    /// that the version is invalid and not that the database records none.
+    #[test]
+    fn schema_version_message_calls_a_recorded_version_below_1_invalid() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::OutdatedSchema {
+                recorded_version: 0,
+                schema_version: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("records schema version 0, which is not a valid version"));
+        assert!(message.contains("restore the database from a backup"));
+        assert!(!message.contains("records no schema version"));
+    }
+
+    /// A database that records a version but lost its `cluster` table points the operator first at
+    /// the `search_path` option of the storage URL, and names the search path in effect.
+    #[test]
+    fn schema_version_message_names_the_search_path_of_a_missing_cluster_table() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::MissingClusterTable {
+                schema_version: 1,
+                search_path: "\"$user\", public".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("records schema version 1 but has no `cluster` table"));
+        assert!(message.contains("on the search path `\"$user\", public`"));
+        assert!(message.contains("First check the `search_path` option in the storage URL"));
+        assert!(message.contains("restore the database from a backup"));
+    }
+
+    /// A step that waits for a table lock until its lock timeout is a conflict that a restart
+    /// retries, so the message says that the database is unchanged and how to find the blocker.
+    #[test]
+    fn schema_version_message_calls_a_step_lock_timeout_a_conflict_that_a_restart_retries() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::SchemaStepFailed {
+                from_version: 1,
+                to_version: 2,
+                code: "55P03".into(),
+                message: "canceling statement due to lock timeout".into(),
+                table: Some("record".into()),
+                constraint: None,
+            },
+        )
+        .unwrap();
+
+        assert!(message.contains("from version 1 to 2"));
+        assert!(message.contains("waited for a lock on record that another session holds"));
+        assert!(message.contains("the database is unchanged"));
+        assert!(message.contains("pg_stat_activity"));
+        assert!(message.contains("Start the broker again to retry"));
+    }
+
+    /// Any other failed step reports what the server says without its row data, and says that the
+    /// database is unchanged.
+    #[test]
+    fn schema_version_message_reports_a_failed_step_with_its_table_and_constraint() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::SchemaStepFailed {
+                from_version: 2,
+                to_version: 3,
+                code: "23505".into(),
+                message: "could not create unique index \"record_key\"".into(),
+                table: Some("record".into()),
+                constraint: Some("record_key".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            "storage postgres://db/nisshi failed its schema upgrade from version 2 to 3: could \
+                not create unique index \"record_key\" (SQLSTATE 23505, table record, constraint \
+                record_key). The upgrade rolled back and the database is unchanged. Fix the \
+                cause, then start the broker again.",
+            message
+        );
+    }
+
+    /// A timeout during the setup is a wait that a restart retries, and the message names each
+    /// wait that can time out.
+    #[test]
+    fn schema_version_message_calls_a_setup_timeout_a_wait_that_a_restart_retries() {
+        let message = schema_version_message(
+            &"postgres://db/nisshi",
+            &nisshi_storage::Error::Api(nisshi_sans_io::ErrorCode::RequestTimedOut),
+        )
+        .unwrap();
+
+        assert!(message.contains("a schema upgrade step"));
+        assert!(message.contains("the wait for another broker's upgrade"));
+        assert!(message.contains("the database is unchanged"));
+        assert!(message.contains("Start the broker again to retry"));
+    }
+
+    /// A step that the role isn't allowed to run keeps the advice about the role that owns the
+    /// tables, which the CLI gives for a refused statement outside a step too.
+    #[test]
+    fn a_failed_step_with_sqlstate_42501_is_an_insufficient_privilege() {
+        let step = |code: &str| nisshi_storage::Error::SchemaStepFailed {
+            from_version: 1,
+            to_version: 2,
+            code: code.into(),
+            message: "must be owner of table cluster".into(),
+            table: None,
+            constraint: None,
+        };
+
+        assert!(is_insufficient_privilege(&step("42501")));
+        assert!(!is_insufficient_privilege(&step("55P03")));
+    }
+
+    #[test]
+    fn schema_version_message_leaves_other_errors_alone() {
+        assert_eq!(
+            None,
+            schema_version_message(
+                &"postgres://db/nisshi",
+                &nisshi_storage::Error::Message("anything else".into())
+            )
+        );
+    }
 
     /// The smoke tests find a failed start by the `error: ` prefix.
     #[test]
@@ -403,6 +794,12 @@ mod tests {
             nisshi_cat::Error::Metadata {
                 topic: "taxi".into(),
                 error_code: 29,
+            },
+            nisshi_cat::Error::RecordOffsetOverflow {
+                topic: "taxi".into(),
+                partition: 0,
+                base_offset: i64::MAX,
+                offset_delta: 1,
             },
         ] {
             assert_eq!(error.to_string(), cat_error_message(&error));
@@ -482,12 +879,125 @@ mod tests {
         assert!(message.contains("--authentication"), "{message}");
     }
 
+    /// The request was sent before the deadline passed, so the message says that the broker may
+    /// have applied it, and does not say that the broker was unreachable.
     #[test]
-    fn request_failure_after_connecting_is_not_reported_as_a_connect_failure() {
+    fn request_without_an_answer_says_the_broker_may_have_applied_it() {
         let error = nisshi_client::Error::Timeout(Duration::from_secs(30));
 
         assert_eq!(
-            "The request to the broker failed: Timeout(30s)",
+            "The broker did not answer within 30s. The command connected and sent its request, \
+            so the broker may have applied it: check before you retry.",
+            client_error_message(&error, BROKER_OPTION)
+        );
+    }
+
+    #[test]
+    fn broker_that_closes_the_connection_says_the_request_may_have_been_applied() {
+        let error =
+            nisshi_client::Error::Io(Arc::new(io::Error::from(io::ErrorKind::ConnectionReset)));
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(
+            message.starts_with("Connected to the broker, but it closed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("may have applied the request, so check before you retry"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn scram_iteration_count_outside_the_accepted_range_is_the_clients_refusal() {
+        let error = nisshi_client::Error::ScramIterations {
+            iterations: 1000,
+            accepted: 4096..=65536,
+        };
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert_eq!(
+            "The client refused the SCRAM login: the broker asked for 1000 iterations, and the \
+            client accepts 4096 to 65536. Kafka's own client refuses fewer than 4096. Recreate \
+            the user's credential with `nisshi user create --iterations` set within that range \
+            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
+            can also ask for such a count.",
+            message
+        );
+        assert!(
+            !message.contains("refused the login: the broker"),
+            "{message}"
+        );
+        assert!(!message.contains("--sasl-password-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_requires_a_client_certificate_names_the_options_that_give_one() {
+        let error =
+            nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::CertificateRequired);
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("--tls-cert-file"), "{message}");
+        assert!(message.contains("--tls-key-file"), "{message}");
+        assert!(!message.contains("--tls-ca-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_does_not_accept_the_client_certificate_names_the_alert_and_the_trust() {
+        let error = nisshi_client::Error::TlsRejected(
+            nisshi_client::TlsRejection::ClientCertificate("UnknownCA".to_owned()),
+        );
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("UnknownCA"), "{message}");
+        assert!(
+            message.contains("the broker trusts the authority"),
+            "{message}"
+        );
+        assert!(!message.contains("--tls-ca-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_sends_a_handshake_failure_names_the_client_certificate_options() {
+        let error =
+            nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::HandshakeFailure);
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("HandshakeFailure"), "{message}");
+        assert!(message.contains("--tls-cert-file"), "{message}");
+        assert!(message.contains("--tls-key-file"), "{message}");
+        assert!(message.contains("cipher suite"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_shares_no_tls_version_or_cipher_suite_does_not_name_the_certificate_options() {
+        let error = nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::Negotiation(
+            "ProtocolVersion".to_owned(),
+        ));
+
+        let message = client_error_message(&error, BROKER_OPTION);
+
+        assert!(message.contains("ProtocolVersion"), "{message}");
+        assert!(
+            message.contains("share no TLS version or cipher suite"),
+            "{message}"
+        );
+        assert!(!message.contains("--tls-cert-file"), "{message}");
+    }
+
+    #[test]
+    fn broker_that_rejects_the_tls_connection_names_the_alert() {
+        let error = nisshi_client::Error::TlsRejected(nisshi_client::TlsRejection::Other(
+            "ProtocolVersion".to_owned(),
+        ));
+
+        assert_eq!(
+            "The broker rejected the TLS connection: it sent the TLS alert ProtocolVersion.",
             client_error_message(&error, BROKER_OPTION)
         );
     }

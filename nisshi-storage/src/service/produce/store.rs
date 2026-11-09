@@ -15,7 +15,9 @@
 use std::convert::Infallible;
 
 use nisshi_sans_io::{
-    ErrorCode, TimestampType, produce_response::PartitionProduceResponse, record::deflated,
+    ErrorCode, TimestampType,
+    produce_response::PartitionProduceResponse,
+    record::{deflated, inflated},
 };
 use rama::Service;
 use tracing::instrument;
@@ -23,11 +25,12 @@ use tracing::instrument;
 use super::{partition::PartitionProduce, response, timestamps::NO_TIMESTAMP};
 use crate::{Storage, Topition};
 
-/// A [`Service`] using its [`Storage`] taking a [`PartitionProduce`] of a validated batch,
-/// returning the partition's [`PartitionProduceResponse`].
+/// A [`Service`] using its [`Storage`] taking a [`PartitionProduce`] of a validated batch and its
+/// decoded records, returning the partition's [`PartitionProduceResponse`].
 ///
-/// The service stores the batch as it is. The steps before it validate the batch and set its
-/// timestamps.
+/// The service stores the batch as it is, and gives the storage engine the decoded records through
+/// [`Storage::produce_inflated`], so that the engine does not decode the batch again. The steps
+/// before it validate the batch and set its timestamps.
 #[derive(Clone, Debug)]
 pub struct StorePartitionService<G> {
     storage: G,
@@ -42,7 +45,7 @@ where
     }
 }
 
-impl<G> Service<PartitionProduce<deflated::Batch>> for StorePartitionService<G>
+impl<G> Service<PartitionProduce<(deflated::Batch, inflated::Batch)>> for StorePartitionService<G>
 where
     G: Storage,
 {
@@ -52,9 +55,9 @@ where
     #[instrument(skip_all)]
     async fn serve(
         &self,
-        request: PartitionProduce<deflated::Batch>,
+        request: PartitionProduce<(deflated::Batch, inflated::Batch)>,
     ) -> Result<Self::Output, Self::Error> {
-        let (request, batch) = request.take_batch();
+        let (request, (batch, inflated)) = request.take_batch();
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic. For a `LogAppendTime`
         // topic the timestamp step stamped the batch with the time of the append, as its
@@ -73,7 +76,12 @@ where
         Ok(
             match self
                 .storage
-                .produce(request.transaction_id.as_deref(), &topition, batch)
+                .produce_inflated(
+                    request.transaction_id.as_deref(),
+                    &topition,
+                    batch,
+                    inflated,
+                )
                 .await
             {
                 Ok(base_offset) => PartitionProduceResponse::default()

@@ -102,10 +102,11 @@ pub(super) struct Arg {
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
     ///
-    /// `global` propagates this argument into every top-level tool, because `Cli` flattens this
-    /// struct. clap merges the matches of a tool that declares its own `schema_registry` into this
-    /// one, so every such tool must declare it as `EnvVarExp<Url>`, or reading it here panics. The test
-    /// `an_argument_with_a_global_arguments_name_has_its_type` checks this for every tool.
+    /// `global` lets a lake subcommand take this argument after its own name, as in
+    /// `broker iceberg --location x --schema-registry y`. clap merges the matches of a lake
+    /// subcommand that declares its own `schema_registry` into this one, so it must declare it as
+    /// `EnvVarExp<Url>`, or reading it here panics. The test
+    /// `an_argument_with_a_global_arguments_name_has_its_type` checks this.
     #[arg(long, env = "SCHEMA_REGISTRY", global = true)]
     schema_registry: Option<EnvVarExp<Url>>,
 
@@ -128,6 +129,13 @@ pub(super) struct Arg {
     /// The partitions of an auto-created topic, or of one created with -1 partitions, as Kafka's num.partitions
     #[arg(long, env = "NUM_PARTITIONS", default_value_t = DEFAULT_NUM_PARTITIONS, value_parser = clap::value_parser!(i32).range(1..))]
     num_partitions: i32,
+
+    /// The bytes of decoded batches that Produce requests may hold at once, from the decode of a
+    /// batch until storage returns. A request over the budget waits, then answers
+    /// REQUEST_TIMED_OUT after 10 seconds. Defaults to 1 GiB, or 100 MiB for each runtime worker
+    /// when that is more
+    #[arg(long, env = "PRODUCE_DECODED_BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+    produce_decoded_bytes: Option<u64>,
 
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -155,7 +163,24 @@ pub(super) struct Arg {
     silent: bool,
 }
 
-fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
+/// The options that name a private key and its passphrase file, so that an error names the flag
+/// the user gave: the broker's or a client command's.
+#[derive(Clone, Copy)]
+pub(super) struct KeyOptions {
+    pub(super) key: &'static str,
+    pub(super) passphrase_file: &'static str,
+}
+
+const BROKER_KEY_OPTIONS: KeyOptions = KeyOptions {
+    key: "--key",
+    passphrase_file: "--key-passphrase-file",
+};
+
+/// Reads PEM certificates from `filename`, which the user gave as `option`.
+pub(super) fn load_certs(
+    filename: &Path,
+    option: &'static str,
+) -> Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(filename)
         .and_then(|der| der.collect::<Result<Vec<_>, TlsPkiPemError>>())
         .and_then(|certs| {
@@ -168,6 +193,7 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
             }
         })
         .map_err(|cause| Error::TlsCertificate {
+            option,
             path: filename.to_path_buf(),
             cause,
         })
@@ -177,7 +203,10 @@ fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
 /// editors and `echo`) is not part of the passphrase. An empty file means
 /// "no passphrase", matching how OpenSSL reads a `file:` password source and
 /// how mounted secrets behave.
-fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>> {
+pub(super) fn load_passphrase(
+    filename: Option<&Path>,
+    option: &'static str,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let Some(filename) = filename else {
         return Ok(None);
     };
@@ -186,6 +215,7 @@ fn load_passphrase(filename: Option<&Path>) -> Result<Option<Zeroizing<Vec<u8>>>
         fs::read(filename)
             .map(Zeroizing::new)
             .map_err(|cause| Error::TlsKeyPassphraseFile {
+                option,
                 path: filename.to_path_buf(),
                 cause,
             })?;
@@ -250,8 +280,13 @@ fn unsupported_encryption(error: &pkcs8::Error) -> Option<String> {
     }
 }
 
-fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<PrivateKeyDer<'static>> {
+pub(super) fn load_private_key(
+    filename: &Path,
+    passphrase: Option<&[u8]>,
+    options: KeyOptions,
+) -> Result<PrivateKeyDer<'static>> {
     let key_error = |cause| Error::TlsPrivateKey {
+        option: options.key,
         path: filename.to_path_buf(),
         cause,
     };
@@ -274,6 +309,7 @@ fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<Privat
     if let Some(section) = encrypted_pkcs8_section(&pem) {
         let Some(passphrase) = passphrase else {
             return Err(Error::TlsKeyPassphraseRequired {
+                option: options.passphrase_file,
                 path: filename.to_path_buf(),
             });
         };
@@ -283,6 +319,7 @@ fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<Privat
         return decrypt_pkcs8(section, passphrase).map_err(|cause| {
             unsupported_encryption(&cause).map_or_else(
                 || Error::TlsKeyDecrypt {
+                    option: options.passphrase_file,
                     path: filename.to_path_buf(),
                     cause,
                 },
@@ -296,8 +333,9 @@ fn load_private_key(filename: &Path, passphrase: Option<&[u8]>) -> Result<Privat
 
     if passphrase.is_some() {
         warn!(
-            "TLS private key {} is not encrypted; --key-passphrase-file ignored",
-            filename.display()
+            "TLS private key {} is not encrypted; {} ignored",
+            filename.display(),
+            options.passphrase_file
         );
     }
 
@@ -309,7 +347,7 @@ fn server_config(
     private_key: &Path,
     passphrase_file: Option<&Path>,
 ) -> Result<ServerConfig> {
-    let passphrase = load_passphrase(passphrase_file)?;
+    let passphrase = load_passphrase(passphrase_file, BROKER_KEY_OPTIONS.passphrase_file)?;
 
     // Both `ring` and `aws-lc-rs` are compiled into this binary (via other
     // dependencies), so the provider must be chosen explicitly: rustls panics
@@ -318,8 +356,12 @@ fn server_config(
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(
-            load_certs(certs)?,
-            load_private_key(private_key, passphrase.as_deref().map(Vec::as_slice))?,
+            load_certs(certs, "--cert")?,
+            load_private_key(
+                private_key,
+                passphrase.as_deref().map(Vec::as_slice),
+                BROKER_KEY_OPTIONS,
+            )?,
         )
         .map_err(Into::into)
 }
@@ -529,6 +571,13 @@ impl Arg {
             None => None,
         };
 
+        if let Some(bytes) = self.produce_decoded_bytes {
+            // Nothing has served a request yet, so this sets the budget.
+            _ = nisshi_storage::configure_produce_decoded_bytes(
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+            );
+        }
+
         let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
@@ -737,6 +786,30 @@ mod tests {
     }
 
     #[test]
+    fn produce_decoded_bytes_is_unset_by_default_and_rejects_zero() {
+        temp_env::with_vars_unset(["PRODUCE_DECODED_BYTES"], || {
+            assert_eq!(
+                None,
+                parse(&[]).expect("defaults parse").produce_decoded_bytes
+            );
+
+            assert_eq!(
+                Some(1 << 30),
+                parse(&["--produce-decoded-bytes=1073741824"])
+                    .expect("a byte count parses")
+                    .produce_decoded_bytes
+            );
+
+            assert_eq!(
+                clap::error::ErrorKind::ValueValidation,
+                parse(&["--produce-decoded-bytes=0"])
+                    .expect_err("0 would admit no produce")
+                    .kind()
+            );
+        });
+    }
+
+    #[test]
     fn num_partitions_sets_the_default() {
         let arg = parse(&["--num-partitions=4"]).expect("4 parses");
 
@@ -840,7 +913,7 @@ mod tests {
         let err = server_config(&pem.cert, &encrypted, None).expect_err("encrypted key must fail");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }
@@ -886,7 +959,8 @@ mod tests {
                 err,
                 Error::TlsCertificate {
                     ref path,
-                    cause: TlsPkiPemError::NoItemsFound
+                    cause: TlsPkiPemError::NoItemsFound,
+                    ..
                 } if *path == pem.key
             ),
             "{err:?}"
@@ -1048,7 +1122,7 @@ mod tests {
             .expect_err("encrypted key without a passphrase must fail");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }
@@ -1158,7 +1232,7 @@ mod tests {
             .expect_err("an empty passphrase file is no passphrase");
 
         assert!(
-            matches!(err, Error::TlsKeyPassphraseRequired { ref path } if *path == encrypted),
+            matches!(err, Error::TlsKeyPassphraseRequired { ref path, .. } if *path == encrypted),
             "{err:?}"
         );
     }

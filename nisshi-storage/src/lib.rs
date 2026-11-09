@@ -162,7 +162,7 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     offset_commit_request::OffsetCommitRequestPartition,
-    record::deflated,
+    record::{deflated, inflated},
     to_system_time, to_timestamp,
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
@@ -192,7 +192,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::{sync::AcquireError, task::JoinError};
+use tokio::{sync::AcquireError, task::JoinError, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
@@ -203,12 +203,16 @@ mod assignment;
 mod authorized_operations;
 mod batch;
 pub mod config;
+#[cfg(test)]
+mod decoded_batch_probe;
+mod decoded_budget;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
 mod operation;
+mod produce_path;
 mod producer;
 mod proxy;
 mod service;
@@ -217,6 +221,9 @@ mod topic_defaults;
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
+pub use decoded_budget::{
+    configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
+};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
@@ -225,28 +232,29 @@ pub use producer::{
     producer_claim,
 };
 pub use proxy::SemaphoreProxy;
-pub use service::deadline;
+pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AcksZeroLayer, AcksZeroService, AlterUserScramCredentialsService, AutoCreateRefusals,
-    BatchValidationLayer, BatchValidationService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DeleteAclsService,
-    DeleteGroupsService, DeleteRecordsService, DeleteTopicsService, DescribeAclsService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
-    PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
-    ProduceService, ProduceTopicService, Request, RequestChannelService, RequestLayer,
-    RequestReceiver, RequestSender, RequestService, RequestStorageService, Response,
-    SchemaValidationLayer, SchemaValidationService, StorePartitionService, StoredPartitions,
-    TimestampLayer, TimestampService, TopicConfiguration, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest,
+    AcksZeroLayer, AcksZeroService, Admission, AlterUserScramCredentialsService,
+    AutoCreateRefusals, BatchValidationLayer, BatchValidationService, ChannelRequest,
+    ChannelRequestLayer, ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService,
+    CreateTopicsService, CreateTopicsValidationLayer, CreateTopicsValidationService,
+    DELETE_RECORDS_CONCURRENCY, DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
+    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
+    InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
+    MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService,
+    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
     ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
     describe_groups_response, inflate_produced, list_groups_response,
 };
@@ -327,11 +335,44 @@ pub enum Error {
         schema_version: i32,
     },
 
-    /// The database records schema `recorded_version`, which is older than `schema_version`. A
-    /// broker of `schema_version` can't upgrade the recorded schema.
+    /// The database records schema `recorded_version`, which is older than `schema_version`, and
+    /// a broker of `schema_version` has no step that upgrades it. Every version from 1 has one, so
+    /// the recorded version is below 1: a row that holds a version that no release records.
     OutdatedSchema {
         recorded_version: i32,
         schema_version: i32,
+    },
+
+    /// The database has tables but records no schema version, and a broker of `schema_version`,
+    /// which is newer than version 1, can't tell which tables it lacks.
+    UnversionedSchema {
+        schema_version: i32,
+    },
+
+    /// The database records schema `schema_version` but has no `cluster` table on the
+    /// `search_path` that the connection uses. Nisshi creates `cluster` before it records a
+    /// version, so the search path changed or someone dropped or moved the tables.
+    MissingClusterTable {
+        schema_version: i32,
+        search_path: String,
+    },
+
+    /// The step that upgrades the schema from `from_version` to `to_version` failed with the
+    /// SQLSTATE `code`, and the upgrade rolled back.
+    ///
+    /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
+    /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
+    /// or `header` holds message payloads. The `message` of a SQLSTATE in class `22`, data
+    /// exception, is a fixed phrase instead of the server's, because that message quotes the value
+    /// that failed. The fields are boxed strings, so that this variant does not make [`Error`]
+    /// larger.
+    SchemaStepFailed {
+        from_version: i32,
+        to_version: i32,
+        code: Box<str>,
+        message: Box<str>,
+        table: Option<Box<str>>,
+        constraint: Option<Box<str>>,
     },
 
     InsufficientCapacity(#[from] InsufficientCapacity),
@@ -510,6 +551,9 @@ impl Error {
     /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
     /// batch took its offset, so a retry can store the batch twice.
     ///
+    /// A failure of the schema setup, such as [`Error::SchemaStepFailed`], is permanent for the
+    /// caller, because a restart of the broker retries the setup, not the caller.
+    ///
     /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
     /// [`Error::error_code`] keeps.
     ///
@@ -577,6 +621,9 @@ impl Error {
             | Self::NoEngineForScheme { .. }
             | Self::IncompatibleSchema { .. }
             | Self::OutdatedSchema { .. }
+            | Self::UnversionedSchema { .. }
+            | Self::MissingClusterTable { .. }
+            | Self::SchemaStepFailed { .. }
             | Self::InsufficientCapacity(_)
             | Self::LessThanBaseOffset { .. }
             | Self::LessThanLastOffset { .. }
@@ -2041,6 +2088,21 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>>;
 
+    /// Returns how many [`Storage::delete_records`] calls the
+    /// [`DeleteRecordsService`] may run at once, for one request and across
+    /// all requests.
+    ///
+    /// The service makes one call for each partition of a request. The default
+    /// is [`DELETE_RECORDS_CONCURRENCY`] calls for a request and no limit across
+    /// requests. A storage that runs its writes one at a time answers
+    /// [`DeleteRecordsConcurrency::serial`], so that a second call never waits
+    /// behind the first after the deadline check. A storage that wraps another
+    /// answers what the storage it wraps answers, unless the wrapper changes
+    /// how the calls run.
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::default()
+    }
+
     /// Delete a topic from this storage.
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode>;
 
@@ -2072,16 +2134,51 @@ pub trait Storage: Debug + Send + Sync + 'static {
         batch: deflated::Batch,
     ) -> Result<i64>;
 
+    /// Produce a batch that the caller has already decoded.
+    ///
+    /// [`ProduceService`] decodes every client batch to validate it, and then hands the decoded
+    /// batch down so that a backend which needs one does not decode the same bytes again. A
+    /// backend that has no use for the decoded batch keeps this default, which drops `inflated`
+    /// before it calls [`Storage::produce`], so that it holds no decoded records while it waits
+    /// for storage.
+    ///
+    /// `inflated` must be `deflated` decoded with [`inflate_produced`], including the timestamp
+    /// type, `base_timestamp`, `max_timestamp` and `crc` that [`ProduceService`] set on `deflated`.
+    /// A caller that cannot promise that calls [`Storage::produce`].
+    ///
+    /// A wrapper must forward this method as well as [`Storage::produce`], or the default
+    /// discards the decoded batch and the inner backend decodes it again. A wrapper that would
+    /// make the produce wait for a permit or a slot calls [`Storage::produce`] instead, so that a
+    /// waiting produce holds its compressed bytes only. The result and the errors are those of
+    /// [`Storage::produce`].
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        drop(inflated);
+
+        self.produce(transaction_id, topition, deflated).await
+    }
+
     /// Fetch deflated batches from storage.
     ///
-    /// The batches hold at most `max_bytes`, except that a read can exceed it by
-    /// one batch. A read returns the first batch at or after `offset` even when
-    /// that batch alone is larger than `max_bytes`, so that a consumer gets past
-    /// it (KIP-74). The fetch service relies on this: without it, a consumer
-    /// whose fetch limit is smaller than a record never reads past that record.
+    /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
+    /// returns the first batch at or after `offset` even when that batch alone is larger than
+    /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
+    /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
-    /// For a topic or partition that does not exist, see
-    /// [`Storage::offset_stage`].
+    /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
+    ///
+    /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
+    /// for the read without a time limit of their own, so a read that overruns its deadline holds
+    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
+    /// that a read finished.
+    ///
+    /// The batches run in offset order from the batch that holds `offset`, with no gap between
+    /// them, also when the deadline stops the read. An answer with no batches is always valid.
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2089,7 +2186,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>>;
 
     /// Query the offset stage for a topic partition.
@@ -2365,6 +2462,10 @@ where
         self.as_ref().delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2382,6 +2483,18 @@ where
         self.as_ref().produce(transaction_id, topition, batch).await
     }
 
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2389,10 +2502,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -2650,6 +2763,10 @@ where
         self.as_ref().delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.as_ref().delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2667,6 +2784,18 @@ where
         self.as_ref().produce(transaction_id, topition, batch).await
     }
 
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        self.as_ref()
+            .produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2674,10 +2803,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 

@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// A test that awaits `ProduceService` makes the compiler lay out the future of every step of the
+// produce path in one type, which overflows the default query depth.
+#![recursion_limit = "256"]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
@@ -29,6 +32,7 @@ pub mod create_topics_validate_only;
 pub mod decode_error_log;
 pub mod delete_groups;
 pub mod delete_records;
+pub mod delete_records_many_partitions;
 pub mod delete_topics;
 pub mod describe_cluster;
 pub mod describe_configs;
@@ -39,6 +43,8 @@ pub mod describe_topic_partitions;
 pub mod dynostore_meta_cache;
 pub mod fetch;
 pub mod fetch_after_delete_records;
+pub mod fetch_deadline;
+pub mod fetch_header_bytes;
 pub mod fetch_max_wait;
 pub mod fetch_unknown_partition;
 pub mod fetch_wire;
@@ -79,6 +85,7 @@ pub mod produce_idempotent_epoch_bump;
 pub mod produce_idempotent_first_sequence;
 #[cfg(feature = "postgres")]
 pub mod produce_idempotent_race;
+pub mod produce_inflated;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
 pub mod produce_max_message_bytes;
@@ -87,6 +94,7 @@ pub mod produce_post_write_advance_failed;
 #[cfg(feature = "postgres")]
 pub mod produce_row_locks;
 pub mod produce_schema_validation;
+pub mod produce_unknown_partition_order;
 pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;

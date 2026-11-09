@@ -13,20 +13,24 @@
 // limitations under the License.
 
 mod acks_zero;
+mod admission;
 mod batch_validation;
 mod partition;
 mod rejection;
 mod request_validation;
 mod response;
 mod schema;
+#[cfg(test)]
+mod stack_tests;
 mod store;
 #[cfg(test)]
 mod test_support;
 mod timestamps;
 mod topic;
 mod topic_configuration;
+mod unknown_partition;
 
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, ProduceRequest, ProduceResponse, produce_response::TopicProduceResponse,
@@ -38,6 +42,7 @@ use tracing::{debug, instrument};
 
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
+    admission::Admission,
     batch_validation::{BatchValidationLayer, BatchValidationService},
     partition::PartitionProduce,
     request_validation::{
@@ -49,8 +54,12 @@ pub use self::{
     timestamps::{TimestampLayer, TimestampService},
     topic::ProduceTopicService,
     topic_configuration::TopicConfiguration,
+    unknown_partition::{UnknownPartitionLayer, UnknownPartitionService},
 };
-use crate::{Error, Result, Storage};
+use crate::{
+    Error, Result, Storage,
+    decoded_budget::{self, DecodedBytesBudget},
+};
 
 /// Inflate a batch that a client sent in a Produce request, mapping a
 /// decode failure to `INVALID_RECORD`.
@@ -109,6 +118,7 @@ where
 /// [`ProduceService::new`] gives it a [`ProduceTopicService`] that uses a [`Storage`]. Call
 /// [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
 /// ```no_run
+/// # #![recursion_limit = "256"]
 /// use bytes::Bytes;
 /// use rama::{Layer as _, Service as _};
 /// use nisshi_sans_io::{
@@ -208,6 +218,8 @@ where
 #[derive(Clone, Debug)]
 pub struct ProduceService<S> {
     topics: S,
+    budget: Arc<DecodedBytesBudget>,
+    wait: Duration,
 }
 
 impl<S> ApiKey for ProduceService<S> {
@@ -215,9 +227,13 @@ impl<S> ApiKey for ProduceService<S> {
 }
 
 /// The steps that [`ProduceService::new`] applies to each partition of a topic, in order: the
-/// batch checks, the timestamp validation, the schema validation, and the write to storage.
-pub type StoredPartitions<G> =
-    BatchValidationService<TimestampService<SchemaValidationService<StorePartitionService<G>>>>;
+/// batch checks, the timestamp validation, the schema validation, and the write to storage. The
+/// outermost step also answers a rejected batch for a partition that does not exist with
+/// `UNKNOWN_TOPIC_OR_PARTITION`.
+pub type StoredPartitions<G> = UnknownPartitionService<
+    G,
+    BatchValidationService<TimestampService<SchemaValidationService<StorePartitionService<G>>>>,
+>;
 
 impl<G> ProduceService<ProduceTopicService<G, StoredPartitions<G>>>
 where
@@ -234,14 +250,41 @@ where
     /// the topic's `schema.validation` is `false`.
     pub fn with_schemas(storage: G, schemas: Option<Registry>) -> Self {
         let partitions = (
+            UnknownPartitionLayer::new(storage.clone()),
             BatchValidationLayer::new(),
             TimestampLayer::new(),
             SchemaValidationLayer::new(schemas),
         )
             .into_layer(StorePartitionService::new(storage.clone()));
 
+        Self::from_topics(ProduceTopicService::new(storage, partitions))
+    }
+}
+
+impl<S> ProduceService<S> {
+    /// Returns a service that serves each topic with `topics`, and holds the decoded batches of a
+    /// request against the process-wide budget, for which a request waits at most
+    /// [`decoded_budget::WAIT_TIMEOUT`].
+    fn from_topics(topics: S) -> Self {
         Self {
-            topics: ProduceTopicService::new(storage, partitions),
+            topics,
+            budget: decoded_budget::produce(),
+            wait: decoded_budget::WAIT_TIMEOUT,
+        }
+    }
+
+    /// Returns this service holding the decoded batches of a request against `budget`, for which
+    /// a request waits at most `wait`.
+    #[cfg(test)]
+    pub(super) fn with_decoded_budget(
+        self,
+        budget: Arc<DecodedBytesBudget>,
+        wait: Duration,
+    ) -> Self {
+        Self {
+            budget,
+            wait,
+            ..self
         }
     }
 }
@@ -271,7 +314,16 @@ where
     async fn serve(&self, request: ValidatedProduceRequest) -> Result<Self::Output, Self::Error> {
         let mut responses = Vec::with_capacity(request.topics.len());
 
+        // One wait for the whole request, so that a request with many partitions does not wait
+        // the full time for each one.
+        let admission = Admission::new(Arc::clone(&self.budget), self.wait);
+
         for topic in request.topics {
+            let topic = ValidatedTopic {
+                admission: admission.clone(),
+                ..topic
+            };
+
             let Ok(response) = self.topics.serve(topic).await;
             responses.push(response);
         }
@@ -406,9 +458,7 @@ mod fan_out_tests {
             .collect();
 
         let response = ProduceRequestValidationLayer::new()
-            .layer(ProduceService {
-                topics: topics_service.clone(),
-            })
+            .layer(ProduceService::from_topics(topics_service.clone()))
             .serve(RequestInput {
                 request: ProduceRequest::default()
                     .acks(-1)

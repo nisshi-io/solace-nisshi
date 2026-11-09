@@ -814,20 +814,20 @@ impl Schema {
 
 impl AsJsonValue for Schema {
     fn as_json_value(&self, batch: &Batch) -> Result<Value> {
-        Ok(Value::Array(
-            batch
-                .records
-                .iter()
-                .inspect(|record| debug!(?record))
-                .map(|record| {
-                    Value::Object(Map::from_iter(
-                        self.to_json_value(MessageKind::Key, record.key.clone())
-                            .into_iter()
-                            .chain(self.to_json_value(MessageKind::Value, record.value.clone())),
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        ))
+        batch
+            .records
+            .iter()
+            .inspect(|record| debug!(?record))
+            .map(|record| {
+                // A side that fails is an error, not a missing field: `Result` is an iterator
+                // of zero items for an `Err`, which would drop the field from the output.
+                let key = self.to_json_value(MessageKind::Key, record.key.clone())?;
+                let value = self.to_json_value(MessageKind::Value, record.value.clone())?;
+
+                Ok(Value::Object(Map::from_iter([key, value])))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array)
     }
 }
 
@@ -841,7 +841,7 @@ mod tests {
 
     use nisshi_sans_io::record::Record;
     use serde_json::json;
-    use std::{fs::File, sync::Arc, thread};
+    use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
@@ -1345,6 +1345,72 @@ mod tests {
         assert!(!configuration.skip());
         assert_eq!(Some(1..=3), configuration.repeated_range());
         assert_eq!(Some("\"elit\""), configuration.repeated_script());
+
+        Ok(())
+    }
+
+    const KEY_VALUE_PROTO: &[u8] = br#"
+        syntax = 'proto3';
+
+        message Key {
+          int32 id = 1;
+        }
+
+        message Value {
+          string name = 1;
+          string email = 2;
+        }
+        "#;
+
+    #[test]
+    fn as_json_value_prints_key_and_value() -> Result<()> {
+        let schema = Schema::try_from(Bytes::from_static(KEY_VALUE_PROTO))?;
+
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .key(
+                        schema
+                            .encode_from_value(MessageKind::Key, &json!({"id": 12321}))?
+                            .into(),
+                    )
+                    .value(
+                        schema
+                            .encode_from_value(MessageKind::Value, &json!({"name": "alice"}))?
+                            .into(),
+                    ),
+            )
+            .build()?;
+
+        assert_eq!(
+            json!([{"key": {"id": 12321}, "value": {"name": "alice"}}]),
+            schema.as_json_value(&batch)?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn as_json_value_refuses_a_record_that_is_not_protobuf() -> Result<()> {
+        let schema = Schema::try_from(Bytes::from_static(KEY_VALUE_PROTO))?;
+
+        // A field with the wrong wire type, which is not an empty message but an error.
+        let batch = Batch::builder()
+            .record(
+                Record::builder()
+                    .key(
+                        schema
+                            .encode_from_value(MessageKind::Key, &json!({"id": 1}))?
+                            .into(),
+                    )
+                    .value(Bytes::from_static(&[0x0a, 0xff]).into()),
+            )
+            .build()?;
+
+        assert_matches!(
+            schema.as_json_value(&batch),
+            Err(Error::Api(ErrorCode::InvalidRecord))
+        );
 
         Ok(())
     }

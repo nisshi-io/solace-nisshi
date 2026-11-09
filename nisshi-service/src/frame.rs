@@ -25,13 +25,14 @@ use nisshi_sans_io::{
     Request, RequestInput, Response, SaslAuthenticateRequest, SaslAuthenticateResponse,
     SaslHandshakeRequest,
 };
+use nisshi_storage::read_share::ClientIdentity;
 use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
+use crate::{API_ERRORS, API_REQUESTS, PeerAddressExtension, ProgressBarExtension};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -179,6 +180,19 @@ where
 
         let correlation_id = req.frame.correlation_id()?;
 
+        // The identity of the client that this request comes from, for the read
+        // shares of a storage engine. It scopes the request's task, rather than
+        // going into its extensions: those are shared by the connection's
+        // requests and cannot be replaced, and a fork of them would hide the
+        // state that a handler keeps there for the connection.
+        let identity = ClientIdentity::new(
+            req.extensions
+                .get_ref::<AuthenticationExtension>()
+                .and_then(AuthenticationExtension::principal)
+                .as_deref(),
+            req.frame.client_id()?,
+        );
+
         let req = Q::try_from(req.frame.body)
             .map(|request| RequestInput {
                 request,
@@ -186,11 +200,14 @@ where
             })
             .map_err(Into::into)?;
 
-        self.inner.serve(req).await.map(|response| Frame {
-            size: 0,
-            header: Header::Response { correlation_id },
-            body: response.into(),
-        })
+        identity
+            .scope(self.inner.serve(req))
+            .await
+            .map(|response| Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: response.into(),
+            })
     }
 }
 
@@ -433,6 +450,13 @@ where
             _ = extensions.insert(authentication);
         }
 
+        // A response that fails to encode closes the connection, so the error log names who
+        // the connection belongs to.
+        let client_id = req.client_id()?.map(str::to_owned);
+        let client_host = extensions
+            .get_ref::<PeerAddressExtension>()
+            .map(PeerAddressExtension::client_host);
+
         let Frame { body, .. } = {
             self.inner
                 .serve(FrameInput {
@@ -531,7 +555,14 @@ where
                 API_REQUESTS.add(1, &attributes);
             })
             .inspect_err(|err| {
-                error!(api_key, api_version, ?err);
+                error!(
+                    api_key,
+                    api_version,
+                    correlation_id,
+                    ?client_id,
+                    ?client_host,
+                    ?err
+                );
                 API_ERRORS.add(1, &attributes);
             })
             .map_err(Into::into)
@@ -862,5 +893,111 @@ impl<F> ResponseService<F> {
         E: Send + Sync + 'static,
     {
         Self { response }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nisshi_sans_io::{ApiVersionsResponse, Error as SansIoError};
+    use nisshi_storage::read_share::{ClientAdmission, ClientIdentity, ClientReadShares};
+    use tokio::{
+        sync::Semaphore,
+        time::{Duration, timeout},
+    };
+
+    use super::*;
+
+    /// Takes the one permit of its client's read share and holds it, with a
+    /// permit of an engine limit that has permits to spare.
+    #[derive(Clone)]
+    struct HoldingTheClientShare {
+        shares: ClientReadShares,
+        limit: Arc<Semaphore>,
+        held: Arc<Mutex<Vec<ClientAdmission>>>,
+    }
+
+    impl Default for HoldingTheClientShare {
+        fn default() -> Self {
+            Self {
+                shares: ClientReadShares::default(),
+                limit: Arc::new(Semaphore::new(10)),
+                held: Arc::default(),
+            }
+        }
+    }
+
+    impl Service<RequestInput<ApiVersionsRequest>> for HoldingTheClientShare {
+        type Output = ApiVersionsResponse;
+        type Error = SansIoError;
+
+        async fn serve(
+            &self,
+            _req: RequestInput<ApiVersionsRequest>,
+        ) -> Result<Self::Output, Self::Error> {
+            let admission = timeout(
+                Duration::from_millis(50),
+                self.shares.acquire(1, &self.limit),
+            )
+            .await;
+
+            // A request past its client's share is not the first of the
+            // client, and `None` is a request outside any client.
+            let code = match admission {
+                Err(_) => ErrorCode::RequestTimedOut,
+                Ok(Ok(admission)) => {
+                    let code = if admission.is_within_share() {
+                        ErrorCode::None
+                    } else {
+                        ErrorCode::RequestTimedOut
+                    };
+                    self.held.lock().expect("held").push(admission);
+                    code
+                }
+                Ok(Err(_)) => ErrorCode::UnknownServerError,
+            };
+
+            Ok(ApiVersionsResponse::default().error_code(code.into()))
+        }
+    }
+
+    async fn request(
+        service: &FrameRequestService<HoldingTheClientShare, ApiVersionsRequest>,
+        client_id: &str,
+    ) -> Result<i16, SansIoError> {
+        let frame = Frame {
+            size: 0,
+            header: Header::Request {
+                api_key: ApiVersionsRequest::KEY,
+                api_version: 3,
+                correlation_id: 1,
+                client_id: Some(client_id.into()),
+            },
+            body: ApiVersionsRequest::default().into(),
+        };
+
+        // Each request has the extensions of a connection of its own.
+        let response = service.serve(FrameInput::from(frame)).await?;
+        Ok(ApiVersionsResponse::try_from(response.body)?.error_code)
+    }
+
+    /// A request runs with the identity of its client, so the requests of one
+    /// `client_id` share its read share, over any number of connections, and
+    /// another `client_id` has a share of its own.
+    #[tokio::test]
+    async fn requests_run_in_the_identity_of_their_client() -> Result<(), SansIoError> {
+        let service =
+            FrameRequestLayer::<ApiVersionsRequest>::new().layer(HoldingTheClientShare::default());
+
+        assert_eq!(i16::from(ErrorCode::None), request(&service, "one").await?);
+        assert_eq!(
+            i16::from(ErrorCode::RequestTimedOut),
+            request(&service, "one").await?
+        );
+        assert_eq!(i16::from(ErrorCode::None), request(&service, "two").await?);
+
+        // The identity is not left behind for the next request on the task.
+        assert_eq!(None, ClientIdentity::current());
+
+        Ok(())
     }
 }

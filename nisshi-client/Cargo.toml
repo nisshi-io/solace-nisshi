@@ -21,12 +21,17 @@ nisshi-service.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true
+rsasl.workspace = true
+rustls-native-certs.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
@@ -35,3 +40,4 @@ workspace = true
 [dev-dependencies]
 clap.workspace = true
 dotenv.workspace = true
+rcgen.workspace = true

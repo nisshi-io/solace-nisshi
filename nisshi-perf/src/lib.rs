@@ -33,7 +33,7 @@ use human_units::{
     FormatDuration,
     iec::{Byte, Prefix},
 };
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_sans_io::{
     Ack, ByteSize as _, ErrorCode, ProduceRequest,
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -87,6 +87,17 @@ pub enum Error {
     Url(#[from] url::ParseError),
 }
 
+impl Error {
+    /// Whether the broker refused the login or the TLS connection, or the client refused what
+    /// the broker offered. No producer can produce after that, so the run ends with the error.
+    fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(error) if error.failure_kind() == nisshi_client::FailureKind::Refused
+        )
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
@@ -115,6 +126,7 @@ pub enum CancelKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Perf {
     broker: Url,
+    security: Security,
     topic: String,
     partition: i32,
     batch_size: u32,
@@ -128,6 +140,7 @@ pub struct Perf {
 #[derive(Clone, Debug)]
 pub struct Builder<B, T> {
     broker: B,
+    security: Security,
     topic: T,
     partition: i32,
     batch_size: u32,
@@ -142,6 +155,7 @@ impl Default for Builder<PhantomData<Url>, PhantomData<String>> {
     fn default() -> Self {
         Self {
             broker: Default::default(),
+            security: Default::default(),
             topic: Default::default(),
             partition: Default::default(),
             batch_size: 1,
@@ -155,9 +169,15 @@ impl Default for Builder<PhantomData<Url>, PhantomData<String>> {
 }
 
 impl<B, T> Builder<B, T> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             batch_size: self.batch_size,
@@ -172,6 +192,7 @@ impl<B, T> Builder<B, T> {
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             batch_size: self.batch_size,
@@ -219,6 +240,7 @@ impl Builder<Url, String> {
     pub fn build(self) -> Perf {
         Perf {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             batch_size: self.batch_size,
@@ -313,6 +335,7 @@ impl Perf {
         let mut set = JoinSet::new();
 
         let client = ConnectionManager::builder(self.broker)
+            .security(self.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -335,19 +358,30 @@ impl Perf {
             _ = set.spawn(async move {
                 loop {
                     match producer.rate_limited().await {
-                        Ok(false) | Err(_) => break,
-                        _ => continue,
+                        Ok(false) => return Ok(()),
+                        Err(error) if error.is_refusal() => return Err(error),
+                        Err(_) => return Ok(()),
+                        Ok(true) => continue,
                     }
                 }
             });
         }
 
+        // Ends when every producer has ended, or with the error of the first producer that
+        // ended with one.
         let join_all = async {
             while !set.is_empty() {
                 debug!(len = set.len());
-                _ = set.join_next().await;
+
+                if let Some(Ok(Err(error))) = set.join_next().await {
+                    return Some(error);
+                }
             }
+
+            None
         };
+
+        let mut failure = None;
 
         let duration = self
             .duration
@@ -366,6 +400,12 @@ impl Perf {
 
             completed = join_all => {
                 debug!(?completed);
+
+                if completed.is_some() {
+                    token.cancel();
+                }
+
+                failure = completed;
                 None
             }
 
@@ -398,7 +438,7 @@ impl Perf {
             _ = set.join_next().await;
         }
 
-        Ok(ErrorCode::None)
+        failure.map_or(Ok(ErrorCode::None), Err)
     }
 }
 
@@ -519,9 +559,22 @@ impl Producer {
                 return Ok(false)
             },
 
-            Ok(_) = self.produce(frame) => {
-                PRODUCE_RECORD_COUNT.add(self.batch_size.get() as u64, &attributes);
-                PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+            produced = self.produce(frame) => match produced {
+                Ok(()) => {
+                    PRODUCE_RECORD_COUNT.add(self.batch_size.get() as u64, &attributes);
+                    PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+                }
+
+                // The login or the TLS connection was refused, so no producer can ever produce:
+                // end the run with the error.
+                Err(error) if error.is_refusal() => return Err(error),
+
+                // Any other failure of a request leaves this producer idle until the run ends.
+                Err(error) => {
+                    debug!(?error);
+                    self.token.cancelled().await;
+                    return Ok(false)
+                }
             },
         }
 

@@ -42,17 +42,17 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, inflate_produced,
-    offload,
+    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version, inflate_produced, offload,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -525,12 +525,38 @@ where
         self.storage.delete_records(topics).await
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        self.storage.delete_records_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.storage.delete_topic(topic).await
     }
 
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
         self.storage.brokers().await
+    }
+
+    /// Without a `maximum_delay` the batcher queues nothing, so the decoded batch goes straight
+    /// to the storage. With one, the batch joins a queue and is combined with others, which
+    /// decodes it again: the default drops the decoded batch.
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        if self.maximum_delay.is_none() {
+            return self
+                .storage
+                .produce_inflated(transaction_id, topition, deflated, inflated)
+                .await;
+        }
+
+        drop(inflated);
+
+        self.produce(transaction_id, topition, deflated).await
     }
 
     #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
@@ -644,10 +670,10 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -1233,7 +1259,7 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _max_wait: Duration,
+            _deadline: Instant,
         ) -> Result<Vec<deflated::Batch>> {
             unimplemented!()
         }

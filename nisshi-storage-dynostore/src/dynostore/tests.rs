@@ -45,6 +45,7 @@ mod offset_commit_unknown_partition;
 mod partition_without_producer_state;
 mod ping;
 mod post_write_failure_reason;
+mod produce_inflated;
 mod produce_topic_guard;
 mod produce_write_failure;
 mod producer_detail;
@@ -280,6 +281,7 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         high: Some(66),
         time_index: TimeIndex::complete(),
         producer_epochs: BTreeMap::new(),
+        reclaimed: None,
     })?;
     assert!(!written.contains("timestamps"), "{written}");
     let round_trip: Watermark = serde_json::from_str(&written)?;

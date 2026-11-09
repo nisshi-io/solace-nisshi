@@ -27,7 +27,7 @@ use std::io::{self, Write};
 use tracing::debug;
 use url::Url;
 
-use super::{DEFAULT_BROKER, Outcome};
+use super::{DEFAULT_BROKER, Outcome, client_security::ClientSecurity, output::Output};
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -50,6 +50,14 @@ pub(super) enum Command {
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
+
+        /// Print nothing on success, or the broker's per-user results as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 
     /// Delete a user
@@ -64,6 +72,14 @@ pub(super) enum Command {
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
+
+        /// Print nothing on success, or the broker's per-user results as a JSON array for
+        /// scripts
+        #[arg(long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+
+        #[command(flatten)]
+        security: ClientSecurity,
     },
 }
 
@@ -106,6 +122,18 @@ impl From<&Mechanism> for i8 {
 impl Command {
     const DEFAULT_SALT_LEN: usize = 32;
     const DEFAULT_ITERATIONS: u32 = 2u32.pow(14);
+
+    fn security(&self) -> &ClientSecurity {
+        match self {
+            Command::Create { security, .. } | Command::Delete { security, .. } => security,
+        }
+    }
+
+    fn output(&self) -> Output {
+        match self {
+            Command::Create { output, .. } | Command::Delete { output, .. } => *output,
+        }
+    }
 
     fn broker(&self) -> Url {
         match self {
@@ -164,6 +192,7 @@ impl Command {
 
     pub(super) async fn main(self) -> Result<Outcome> {
         let client = ConnectionManager::builder(self.broker())
+            .security(self.security().build()?)
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -178,6 +207,20 @@ impl Command {
             .call(req)
             .await
             .inspect(|response| debug!(?response))?;
+
+        if self.output() == Output::Json {
+            // The per-user results as the broker sent them, printed whether or not one carries
+            // an error code. The `error: user ...` lines below still go to stderr.
+            // The broker has already acted, so a failure to print, such as a closed pipe, is
+            // ignored: the `error: user ...` lines below must still print and the status stand.
+            _ = writeln!(
+                io::stdout(),
+                "{}",
+                serde_json::to_string(response.results.as_deref().unwrap_or_default())
+                    .map_err(|error| crate::Error::Box(error.into()))?
+            )
+            .inspect_err(|error| debug!(?error));
+        }
 
         Ok(Outcome {
             error_code: report(&response, &mut io::stderr()),

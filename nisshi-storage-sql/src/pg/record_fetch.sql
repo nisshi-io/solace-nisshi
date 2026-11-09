@@ -28,9 +28,18 @@
 -- The fetch runs with the settings in FETCH_PLAN_SETTINGS (pg.rs), which turn off bitmap and
 -- sequential scans, so that this query keeps the ordered scan that the limit relies on. Run it
 -- with them to see the plan that a fetch uses: `run.sh explain` does.
+--
+-- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
+-- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
+-- The header table is probed by its primary key for each candidate, so a record that holds only
+-- headers still spends the budget. The rows that the read returns stop at $5 bytes, but the
+-- read still covers up to $7 rows, and probes the header table once for each.
+-- The headers of the rows that the read returns are fetched afterwards, so their memory follows
+-- the same bound.
 with candidates as (
 select
 
+r.topition,
 r.offset_id,
 r.attributes,
 r.timestamp,
@@ -67,7 +76,14 @@ attributes,
 timestamp,
 k,
 v,
-sum(coalesce(length(k), 0) + coalesce(length(v), 0)) over (order by offset_id) as bytes,
+(sum(
+    coalesce(length(k), 0)
+    + coalesce(length(v), 0)
+    + (select coalesce(sum(coalesce(length(h.k), 0) + coalesce(length(h.v), 0) + 2), 0)
+       from header h
+       where h.topition = candidates.topition
+       and h.offset_id = candidates.offset_id)
+) over (order by offset_id))::bigint as bytes,
 row_number() over (order by offset_id) as ordinal,
 producer_id,
 producer_epoch

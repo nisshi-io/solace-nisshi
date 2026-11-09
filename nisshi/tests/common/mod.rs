@@ -134,9 +134,10 @@ impl Broker {
         }
     }
 
-    /// Starts `nisshi` with `args` and `--broker` set to this broker.
-    fn spawn(&self, args: &[&str]) -> Child {
+    /// Starts `nisshi` with `args` and `--broker` set to this broker, with `env` as its environment.
+    fn spawn(&self, args: &[&str], env: &[(&str, &str)]) -> Child {
         nisshi()
+            .envs(env.iter().copied())
             .args(args)
             .args(["--broker", &self.url])
             .stdin(Stdio::piped())
@@ -148,15 +149,40 @@ impl Broker {
 
     /// Runs `nisshi` with `args` and `--broker` set to this broker, with `stdin` as its input.
     pub(crate) fn run(&self, args: &[&str], stdin: &str) -> Output {
-        let mut process = self.spawn(args);
+        self.run_with_env(args, stdin, &[])
+    }
+
+    /// Runs `nisshi` as [`Broker::run`] does, with `env` as its environment.
+    pub(crate) fn run_with_env(&self, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
+        let mut process = self.spawn(args, env);
         write_stdin(&mut process, stdin);
+        finish(process)
+    }
+
+    /// The URL of the broker, for a command that takes `--broker` before its subcommand, where
+    /// [`Broker::run`] would add it too late.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Runs `nisshi` with `args` and `env`, which name the broker themselves.
+    pub(crate) fn run_unaided(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut process = nisshi()
+            .envs(env.iter().copied())
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("command starts");
+        drop(process.stdin.take());
         finish(process)
     }
 
     /// Runs `nisshi` as [`Broker::run`] does, with the read end of its stdout closed before it
     /// starts, as `nisshi ... | true` does.
     pub(crate) fn run_with_closed_stdout(&self, args: &[&str], stdin: &str) -> Output {
-        let mut process = self.spawn(args);
+        let mut process = self.spawn(args, &[]);
         drop(process.stdout.take());
         write_stdin(&mut process, stdin);
         finish(process)
@@ -174,6 +200,20 @@ impl Drop for Broker {
 pub(crate) fn run(args: &[&str]) -> Output {
     finish(
         nisshi()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("command starts"),
+    )
+}
+
+/// Runs `nisshi` as [`run`] does, with `env` as its environment.
+pub(crate) fn run_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    finish(
+        nisshi()
+            .envs(env.iter().copied())
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

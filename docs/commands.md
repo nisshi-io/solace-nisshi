@@ -3,11 +3,11 @@
 Nisshi is a single statically linked binary containing the following:
 
 - [broker](#broker) — an Apache Kafka®-compatible broker and schema registry
-- [topic](#topic) — create, list or delete topics (development and demos; plaintext only: no TLS or SASL)
-- [user](security.md#authentication) — create, list or delete users (development and demos; plaintext only: no TLS or SASL)
-- [cat](#cat) — consume or produce Avro, JSON or Protobuf messages to a topic (development and demos; plaintext only: no TLS or SASL)
-- generator — generate fake messages for schema-backed topics (development and demos; plaintext only: no TLS or SASL)
-- perf — measure produce and consume throughput against a broker (development and demos; plaintext only: no TLS or SASL)
+- [topic](#topic) — create, list or delete topics
+- [user](security.md#authentication) — create, list or delete users
+- [cat](#cat) — consume or produce Avro, JSON or Protobuf messages to a topic
+- generator — generate fake messages for schema-backed topics (development and demos)
+- perf — measure produce and consume throughput against a broker (development and demos)
 - [proxy](#proxy) — an Apache Kafka®-compatible proxy (development and demos, not production)
 
 ## broker
@@ -15,35 +15,30 @@ Nisshi is a single statically linked binary containing the following:
 The broker subcommand is default if no other command is supplied.
 
 ```shell
-Usage: nisshi [OPTIONS]
-       nisshi <COMMAND>
+Usage: nisshi <COMMAND>
 
 Commands:
   broker     Apache Kafka®-compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
-  cat        Consume or produce Avro, JSON or Protobuf messages to a topic (development and demos)
+  cat        Consume or produce Avro, JSON or Protobuf messages to a topic
   generator  Generate fake messages for schema-backed topics (development and demos)
   perf       Measure produce and consume throughput against a broker (development and demos)
   proxy      Apache Kafka®-compatible proxy (development and demos)
-  topic      Create, list or delete topics managed by the broker (development and demos)
-  user       Create, list or delete users managed by the broker (development and demos)
+  topic      Create, list or delete topics managed by the broker
+  user       Create, list or delete users managed by the broker
   help       Print this message or the help of the given subcommand(s)
 
 Options:
-      --kafka-cluster-id <KAFKA_CLUSTER_ID>
-          All members of the same cluster should use the same id [env: CLUSTER_ID=RvQwrYegSUCkIPkaiAZQlQ] [default: nisshi_cluster]
-      --kafka-listener-url <KAFKA_LISTENER_URL>
-          The broker will listen on this address [env: LISTENER_URL=] [default: tcp://[::]:9092]
-      --kafka-advertised-listener-url <KAFKA_ADVERTISED_LISTENER_URL>
-          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://127.0.0.1:9092] [default: tcp://127.0.0.1:9092]
-      --storage-engine <STORAGE_ENGINE>
-          Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/ [env: STORAGE_ENGINE=s3://nisshi/] [default: memory://nisshi/]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
+  -h, --help     Print help
+  -V, --version  Print version
+
+With no command, nisshi runs the broker. `nisshi broker --help` lists its options.
+Storage engines: dynostore, libsql, postgres
+Data lakes:
 ```
+
+`nisshi` and `nisshi broker` are the same command, and so are `nisshi --listener-url tcp://127.0.0.1:9092` and
+`nisshi broker --listener-url tcp://127.0.0.1:9092`. Run `nisshi broker --help` for the broker's options.
+The broker reads its environment variables, such as `STORAGE_ENGINE`, only when it is the command that runs.
 
 A broker can be started by simply running `nisshi`, all options have defaults. Nisshi pickup any existing environment,
 loading any found in `.env`. An [example.env](../example.env) is provided as part of the distribution
@@ -76,8 +71,6 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```
@@ -158,6 +151,113 @@ Results in the following output:
 |-----------+---------+---------------+-------------+---------------|
 ```
 
+## Output and exit codes
+
+The client tools (`topic`, `cat`, `user`, `generator`, `perf`) are meant to be driven by
+scripts as well as by people. The exit codes below apply to these five tools. `nisshi broker` and
+`nisshi proxy` are servers: they exit with 0 after a clean stop and with 1 when they fail, as
+they always have.
+
+### `--output json`
+
+`--output table` is the default and prints what the command always has: a table, a confirmation
+line, or nothing. `--output json` prints JSON on stdout instead, in the shape of
+`nisshi topic list --output json`: the broker's per-item results as an array, as the broker sent
+them, with its field names.
+
+| Command | `--output json` prints |
+|---------|------------------------|
+| `topic list` | an array of the broker's topics |
+| `topic create`, `topic delete` | an array of the one result for the topic you named |
+| `user create`, `user delete` | an array of the one result for the user you named |
+| `cat produce` | an array of the one partition result, with `base_offset`, `error_code`, `error_message` and `record_errors` |
+| `cat consume` | always JSON, with or without the option: one array of records per batch, on its own line |
+
+The JSON is printed whether or not the broker refused the request, and its `error_code` says
+why. `--silent` hides only the confirmation line, so `--output json` prints even with it. A
+command's log lines and error messages go to stderr, so stdout holds JSON only. `generator` and
+`perf` do not take `--output` yet.
+
+```shell
+$ nisshi topic create taxi --output json
+[{"name":"taxi","topic_id":[...],"error_code":0,...}]
+```
+
+### Exit codes
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | success | The command did what it was asked to. |
+| 1 | failure | Any other failure: an input file that can't be read, a storage failure, a response that makes no sense, a connection that the broker closed, or a request that got no answer in time. After a closed connection or a missing answer the broker may have applied the request, so check before you retry. |
+| 2 | usage error | The command line is wrong, or a TLS or SASL option can't be used. Nothing was sent to a broker. |
+| 3 | broker unreachable | No connection opened: the address does not resolve, or the connection attempt was refused, failed or timed out. |
+| 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login or rejected the TLS connection, or the client refused what the broker offered (a certificate it does not trust). The status does not say whether a retry can succeed. For an error code, read the code: `--output json` prints it. |
+
+`generator` and `perf` keep running when the broker refuses a produce request, so a refused
+produce does not end them with 4. A refused login or TLS connection ends them with 4, because
+nothing can be produced. `nisshi perf consume` is not implemented and ends with 1.
+
+Releases up to 0.8.2 exited with 1 when the broker refused a request or could not be reached. A
+script that tests for `1` should test for non-zero, or for `3` and `4`. The client tools also log
+to stderr now, where they logged to stdout, so a script that searches stdout for an error line no
+longer finds one.
+
+```shell
+nisshi topic create taxi
+case $? in
+  0) echo created ;;
+  3) echo "no broker at tcp://127.0.0.1:9092" ;;
+  4) echo "the broker refused: does the topic exist?" ;;
+esac
+```
+
+## Connecting to a broker with TLS or SASL
+
+`topic`, `user`, `cat`, `generator` and `perf` connect in plaintext and don't log in, unless
+you give them the options below. They share these options, and each reads the matching
+environment variable when the option is absent. The `.env` file is read too.
+
+| Option | Environment variable | |
+| --- | --- | --- |
+| `--tls` | | Connect over TLS, trusting the system's CA certificates (`SSL_CERT_FILE` or `SSL_CERT_DIR` replace them). Each `--tls-*` option below also turns TLS on |
+| `--tls-ca-file <PEM>` | `TLS_CA_FILE` | The CA certificates that sign the broker's certificate, in place of the system's |
+| `--tls-cert-file <PEM>`, `--tls-key-file <PEM>` | `TLS_CERT_FILE`, `TLS_KEY_FILE` | The client certificate chain and private key, for a broker that asks for one. Give both |
+| `--tls-key-passphrase-file <file>` | `TLS_KEY_PASSPHRASE_FILE` | The passphrase of an encrypted PKCS#8 key, as for the broker's `--key-passphrase-file` |
+| `--tls-server-name <name>` | `TLS_SERVER_NAME` | Check the broker's certificate against this name instead of the host of `--broker` |
+| `--tls-no-hostname-check` | | Accept a certificate for another name. The certificate chain is still checked. This is Kafka's empty `ssl.endpoint.identification.algorithm`. Without `--tls-ca-file`, the system's CA certificates sign the chain, so a certificate that any public CA issued for any name passes, and the command prints a warning. Give `--tls-ca-file` with this option |
+| `--sasl-username <name>` | `SASL_USERNAME` | Log in with SASL as this user |
+| | `SASL_PASSWORD` | The password |
+| `--sasl-password-file <file>` | `SASL_PASSWORD_FILE` | A file with the password (a trailing newline is not part of it), in place of `SASL_PASSWORD`. Setting both is an error |
+| `--sasl-mechanism <mechanism>` | `SASL_MECHANISM` | `plain`, `scram-sha-256` or `scram-sha-512` (the default) |
+
+These variable names are the same ones that other Kafka tools and CI setups use. A shell or
+`.env` that already sets `SASL_USERNAME` makes every one of these commands log in, and one that
+sets `TLS_CA_FILE` makes them connect over TLS, even when you pass no option. Unset the variable
+for a command that must connect in plaintext.
+
+There is no option for the password itself, because an option is in your shell history and
+in the process list. `SASL_PASSWORD` and `SASL_USERNAME` together are Kafka's `SASL_SSL` with
+`--tls`, and `SASL_PLAINTEXT` without it.
+
+```shell
+read -rs SASL_PASSWORD && export SASL_PASSWORD
+nisshi topic list --broker tcp://broker.example.com:9092 \
+  --tls-ca-file ca.pem --sasl-username alice --sasl-mechanism scram-sha-256
+```
+
+Nisshi's own broker enables SCRAM-SHA-256 and SCRAM-SHA-512 only. `plain` is for another
+Kafka broker that enables it, and only with TLS, because PLAIN sends the password in clear text.
+The mechanism name is not case sensitive, so Kafka's `SCRAM-SHA-512` works too. A SCRAM login
+stops when the broker asks for fewer than 4096 iterations, which is the minimum that Kafka's
+client enforces, or for more than 65,536, which is four times the most that a Kafka broker
+asks for. A user that `nisshi user create --iterations` made with a count outside that range
+cannot log in with these commands. Each connection
+logs in once, as it opens, and a broker that limits the session lifetime has the command open a
+new connection, which logs in again, a little before the limit. `proxy` has none of these
+options.
+
+If the TLS handshake or the login fails, the command says so, and which option to check.
+
 ## proxy
 
 The `nisshi proxy` command runs a Kafka API proxy in front of an origin broker:
@@ -177,8 +277,6 @@ Options:
           The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
       --otlp-endpoint-url <OTLP_ENDPOINT_URL>
           OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=]
   -h, --help
           Print help
 ```
@@ -196,21 +294,32 @@ reach the proxy listener gets the proxy's access to the origin.
 
 The proxy is for development and demos, not for production, and that includes
 a proxy in front of a broker on PostgreSQL. A Postgres broker limits each
-connection to its share of the Fetch and ListOffsets reads in flight. An
-abandoned read is one that its client no longer waits for, but that the
-database is still running, and it counts against its connection's share until
-the statement ends. So one connection's abandoned reads are limited to its
-share. The proxy takes an origin connection from its pool for each request,
-so behind it the share bounds no single client: one client's abandoned reads
-can spread over many origin connections and take up to the broker's whole
-limit, and other clients' reads then wait. Nisshi does not isolate proxied
-clients from each other here.
+connection, and each client, to its share of the Fetch and ListOffsets reads in
+flight, see [Storage](storage.md). An abandoned read is one that its client no
+longer waits for, but that the database is still running, and it counts against
+its shares until the statement ends. The client share is keyed on the user and
+the `client_id` of the request, and the proxy forwards the `client_id`, so one
+proxied client's abandoned reads are limited to its client share while another
+client waits for the limit, however many origin connections they spread over. The connection share bounds no single
+client behind the proxy, because the proxy takes an origin connection from its
+pool for each request. The proxy does not forward SASL, so the broker sees no
+user, and proxied clients are told apart by `client_id` alone. Clients that
+share a `client_id` share one limit, and a client that changes its `client_id`
+gets a limit of its own.
 
-Behind the proxy, this shows as reads that miss their deadline: Fetch
-responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
+Behind the proxy, a client whose reads already hold its share, while the limit
+is used up, sees reads that miss their deadline:
+Fetch responses with no records, and `REQUEST_TIMED_OUT` for ListOffsets
 partitions. The `nisshi_storage_read_deadline_exceeded` metric rises with
-`stage` set to `queued` and `limit` set to `engine`. A larger `pool_max_size`
-does not fix this, because one client can still take the whole limit.
+`stage` set to `queued` and `wait` set to `client_read_limit`. When `wait` is
+`engine_read_limit`, a larger `pool_max_size` helps. When `wait` is
+`client_read_limit`, the client already held its share and the limit was full,
+whether or not another client waited. Give each instance its own `client.id`,
+set a larger `client_read_share`, or raise `pool_max_size`, which raises the
+limit and the share with it. A larger pool does not stop a client that keeps
+abandoning reads, which can fill any limit while it is alone. With
+`client_read_share=100`, `wait` is `client_read_limit` only when one client holds every
+permit of the limit.
 
 The proxy answers SaslHandshake and SaslAuthenticate itself with
 `ILLEGAL_SASL_STATE`, as a Kafka `PLAINTEXT` listener does, and does not

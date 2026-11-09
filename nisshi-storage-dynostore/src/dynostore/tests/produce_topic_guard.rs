@@ -24,6 +24,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
@@ -91,7 +92,7 @@ async fn fetch_base_offsets(storage: &DynoStore, topition: &Topition) -> Result<
             1,
             1024 * 1024,
             IsolationLevel::ReadUncommitted,
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
         )
         .await?
         .iter()

@@ -66,15 +66,20 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
+    LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential,
+    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
-    deadline, delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes,
-    parse_storage_option, producer_claim,
-    read_share::{FetchReadShare, ListOffsetsReadShare},
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
+    producer_claim,
+    read_deadline::{Missed, QueueWait as _, ReadDeadline, ReadWait},
+    read_share::{
+        ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare,
+        warn_miss_at_client_share,
+    },
 };
 use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, metrics::Counter};
@@ -105,7 +110,10 @@ use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
-    schema::{RecordedSchema, should_create_schema},
+    schema::{
+        Action, Migration, RecordedSchema, Schema, announce_upgrade, check_unversioned_tables,
+        plan, report_upgrade, upgraded_compatibility,
+    },
     sql::{
         consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
         default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
@@ -137,6 +145,27 @@ pub struct Postgres {
     /// How many of `fetch_reads` one connection may hold, see
     /// [`ReadLimits::fetch_per_connection`].
     fetch_reads_per_connection: usize,
+    /// Permits for the DeleteRecords calls in flight across every request,
+    /// see [`delete_records_limit`].
+    delete_records_writes: Arc<Semaphore>,
+    /// How many DeleteRecords calls one request makes at once, at most
+    /// `delete_records_writes`, see
+    /// [`Storage::delete_records_concurrency`].
+    delete_records_per_request: usize,
+    /// The shares of `list_offsets_reads` that clients hold, see
+    /// [`ReadLimits::list_offsets_per_client`].
+    list_offsets_client_shares: ClientReadShares,
+    /// The shares of `fetch_reads` that clients hold, see
+    /// [`ReadLimits::fetch_per_client`].
+    fetch_client_shares: ClientReadShares,
+    /// How many of `list_offsets_reads` one client may hold, over all its
+    /// connections, while another client waits for them, see
+    /// [`ReadLimits::list_offsets_per_client`].
+    list_offsets_reads_per_client: usize,
+    /// How many of `fetch_reads` one client may hold, over all its
+    /// connections, while another client waits for them, see
+    /// [`ReadLimits::fetch_per_client`].
+    fetch_reads_per_client: usize,
     /// How long an abandoned statement's connection stays out of the pool
     /// before it is closed, see [`cancel_and_return`].
     abandoned_statement_bound: Duration,
@@ -210,18 +239,105 @@ impl<C, N, L, P> Builder<C, N, L, P> {
     }
 }
 
-impl Builder<String, i32, Url, Pool> {
+/// What the builder needs to open the pool: the connection config, the TLS connector and the
+/// pool's size, kept until [`Builder::build`] knows the cluster and the node that name the
+/// connections. Building a pool does not connect, so the pool opens its first connection later.
+#[derive(Clone)]
+pub struct PoolParts {
+    /// The operator's settings, without a default `application_name`.
+    config: Config,
+    tls: MakeRustlsConnect,
+    pool_max_size: usize,
+    /// Whether the storage URL, in its query or in `options`, sets `application_name`.
+    named_by_operator: bool,
+    /// The machine's name, which [`application_name`] puts in the name of each connection.
+    host: Option<String>,
+    /// The pool with the plain [`APPLICATION_NAME_PREFIX`] as its name, built where the storage
+    /// URL is parsed, so that an unusable setting fails there.
+    pool: Pool,
+}
+
+impl Debug for PoolParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolParts")
+            .field("config", &self.config)
+            .field("pool_max_size", &self.pool_max_size)
+            .field("named_by_operator", &self.named_by_operator)
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PoolParts {
+    /// Opens a pool of connections that use `config`.
+    fn open(
+        config: Config,
+        tls: MakeRustlsConnect,
+        pool_max_size: usize,
+    ) -> std::result::Result<Pool, deadpool_postgres::BuildError> {
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+
+        Pool::builder(Manager::from_config(config, tls, mgr_config))
+            .max_size(pool_max_size)
+            .runtime(Runtime::Tokio1)
+            .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
+            .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
+            .build()
+    }
+
+    /// The pool for the broker of `cluster`: its connections are named by
+    /// [`application_name`] unless the operator named them.
+    fn pool_of(&self, cluster: &str, node: i32) -> Pool {
+        if self.named_by_operator {
+            return self.pool.clone();
+        }
+
+        let mut config = self.config.clone();
+        _ = config.application_name(application_name(self.host.as_deref(), cluster, node));
+
+        // The only way that opening a pool fails is a timeout without a runtime, and `open` sets
+        // both. The pool that `from_str` built with the same settings stands in, so that this
+        // can never stop the broker.
+        Self::open(config, self.tls.clone(), self.pool_max_size).unwrap_or_else(|err| {
+            error!(?err, "opening the pool with the broker's name failed");
+            self.pool.clone()
+        })
+    }
+}
+
+impl<C, N, L> Builder<C, N, L, PoolParts> {
+    /// Names the connections of the pool `nisshi-<host>-<cluster>`, with `host` instead of the
+    /// name of the machine that this process runs on. A storage URL that sets
+    /// `application_name` still wins.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.pool.host = Some(host.into());
+        self
+    }
+}
+
+impl Builder<String, i32, Url, PoolParts> {
     pub fn build(self) -> Postgres {
+        let pool = self.pool.pool_of(&self.cluster, self.node);
+        let delete_records_limit = delete_records_limit(pool.status().max_size);
+
         Postgres {
             cluster: self.cluster,
             node: self.node,
             advertised_listener: self.advertised_listener,
-            pool: self.pool,
+            pool,
             cancel: self.cancel,
             list_offsets_reads: Arc::new(Semaphore::new(self.read_limits.list_offsets)),
             fetch_reads: Arc::new(Semaphore::new(self.read_limits.fetch)),
             list_offsets_reads_per_connection: self.read_limits.list_offsets_per_connection(),
             fetch_reads_per_connection: self.read_limits.fetch_per_connection(),
+            delete_records_writes: Arc::new(Semaphore::new(delete_records_limit)),
+            delete_records_per_request: DELETE_RECORDS_CONCURRENCY.min(delete_records_limit),
+            list_offsets_client_shares: ClientReadShares::default(),
+            fetch_client_shares: ClientReadShares::default(),
+            list_offsets_reads_per_client: self.read_limits.list_offsets_per_client(),
+            fetch_reads_per_client: self.read_limits.fetch_per_client(),
             abandoned_statement_bound: self.abandoned_statement_bound,
             schemas: self.schemas,
             lake: self.lake,
@@ -247,6 +363,18 @@ const POOL_MAX_SIZE_RANGE: RangeInclusive<usize> = 2..=262_143;
 
 /// The values that [`POOL_MAX_SIZE`] takes, as an error message gives them.
 const POOL_MAX_SIZE_EXPECTED: &str = "a whole number from 2 to 262143";
+
+/// The storage URL option that sets how many of each read limit one client may
+/// hold while another client waits for it, as a percentage, see
+/// [`ReadLimits::list_offsets_per_client`].
+const CLIENT_READ_SHARE: &str = "client_read_share";
+
+/// The range of [`CLIENT_READ_SHARE`]: a percentage.
+const CLIENT_READ_SHARE_RANGE: RangeInclusive<usize> = 1..=100;
+
+/// The values that [`CLIENT_READ_SHARE`] takes, as an error message gives
+/// them.
+const CLIENT_READ_SHARE_EXPECTED: &str = "a whole number from 1 to 100";
 
 /// How many partition reads of each kind this engine has in flight at once,
 /// across every request, counting an abandoned read until its statement has
@@ -275,14 +403,17 @@ struct ReadLimits {
     /// ListOffsets reads that a consumer needs to start or reset. The two
     /// limits together equal the pool, so when slow reads use up both, other
     /// requests wait for a connection. A smaller limit would slow down
-    /// healthy consumers, because a fetch read holds its connection for its
-    /// whole storage budget. A read past this limit waits for a permit, and
-    /// [`FetchService`]'s deadline drops it if the wait lasts too long. One
-    /// connection holds at most [`ReadLimits::fetch_per_connection`] of these
-    /// permits.
-    ///
-    /// [`FetchService`]: nisshi_storage::FetchService
+    /// healthy consumers, because a read for a Fetch can hold its connection
+    /// until its deadline. A read past this limit waits for a permit until its
+    /// deadline. One connection holds at most
+    /// [`ReadLimits::fetch_per_connection`] of these permits.
     fetch: usize,
+
+    /// The percentage of each limit that one client may hold while another
+    /// client waits for it, from [`CLIENT_READ_SHARE`], or `None` for the
+    /// default, which leaves a newcomer a full connection's share. A client
+    /// that is alone may hold the whole limit.
+    client_percent: Option<usize>,
 }
 
 impl ReadLimits {
@@ -292,6 +423,7 @@ impl ReadLimits {
         let limits = Self {
             list_offsets: max_size / 2,
             fetch: max_size / 2,
+            client_percent: None,
         };
         debug_assert!(limits.list_offsets + limits.fetch <= max_size);
         limits
@@ -310,6 +442,49 @@ impl ReadLimits {
     fn fetch_per_connection(self) -> usize {
         FETCH_READS_PER_CONNECTION.min(self.fetch)
     }
+
+    /// Returns how many of the [`ReadLimits::list_offsets`] permits one
+    /// client holds at once, over all its connections, while another client
+    /// waits for them.
+    fn list_offsets_per_client(self) -> usize {
+        self.per_client(self.list_offsets, self.list_offsets_per_connection())
+    }
+
+    /// Returns how many of the [`ReadLimits::fetch`] permits one client holds
+    /// at once, over all its connections, while another client waits for
+    /// them.
+    fn fetch_per_client(self) -> usize {
+        self.per_client(self.fetch, self.fetch_per_connection())
+    }
+
+    /// Returns how many of `limit` one client holds: [`CLIENT_READ_SHARE`]
+    /// percent of it, or by default all but a connection's share, so another
+    /// client's connection always finds `per_connection` permits left. The
+    /// result is never below `per_connection`, so a lone client's single
+    /// request is not slowed, and never above `limit`.
+    fn per_client(self, limit: usize, per_connection: usize) -> usize {
+        self.client_percent
+            .map_or_else(
+                || limit.saturating_sub(per_connection),
+                |percent| limit * percent / 100,
+            )
+            .clamp(per_connection, limit)
+    }
+}
+
+/// How many DeleteRecords calls this engine has in flight at once, across every
+/// request, for a pool of `max_size` connections: a quarter of the pool, and at
+/// least one.
+///
+/// Each call holds a pooled connection for its watermark transaction and its
+/// record `DELETE`, which only the statement timeout bounds. Without this
+/// limit, requests that each make [`DELETE_RECORDS_CONCURRENCY`] calls take the
+/// whole pool with a few requests, and produce and offset commits then wait for
+/// a connection. Kafka Streams sends such requests from every stream thread at
+/// each purge interval. The calls of a request wait for a permit, and a call
+/// still waiting at the request's deadline is not started.
+fn delete_records_limit(max_size: usize) -> usize {
+    (max_size / 4).max(1)
 }
 
 impl Default for ReadLimits {
@@ -364,14 +539,50 @@ const SCHEMA: &str = include_str!("pg/schema.sql");
 /// schema in its `nisshi_schema_version` table.
 const SCHEMA_VERSION: i32 = 1;
 
-// The build fails here when someone changes `SCHEMA_VERSION`. In a database with tables but no
-// recorded version, `ensure_schema` creates only the missing tables, and then records
-// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a database has the
-// tables of version 1.
-const _: () = assert!(SCHEMA_VERSION == 1);
-
 /// The oldest schema version whose broker can use the schema that [`SCHEMA`] creates.
 const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
+
+/// The steps that upgrade a database of an earlier schema version to [`SCHEMA_VERSION`], one for
+/// each version after 1.
+///
+/// A change to [`SCHEMA`] needs a step here that makes the same change to a database of the
+/// version before it, and a new [`SCHEMA_VERSION`]. A step is a file in `pg/migrations/`.
+///
+/// Both this list and the create SQL in `pg/schema.sql` reach the same schema, and nothing
+/// compares the two results while this list is empty. The change that adds the first step must
+/// also add that comparison: a test that builds a database from a frozen version-1 copy of the
+/// DDL plus every step, builds another from the create SQL, and compares their catalogs
+/// (`information_schema.columns` and `pg_indexes`).
+///
+/// A step runs in the transaction that holds the schema lock, so it can't use `create index
+/// concurrently`. The transaction keeps the table locks of every step until the last step
+/// commits, and every request on those tables queues behind them. So each statement of a step
+/// gets the statement timeout of a request: the one in the options of the storage URL, or
+/// [`DEFAULT_STATEMENT_TIMEOUT_MS`] when the URL sets none. It does not get the 5 minutes of the
+/// setup. An operator raises that timeout in the URL for the start of an upgrade. A step must not
+/// change `lock_timeout` or `statement_timeout`, because nothing resets them before the next
+/// step. The sum of every step is not bounded. Each step also gets a [`STEP_LOCK_TIMEOUT`]: an `ALTER TABLE` queues behind a
+/// long reader, and every later request on that table queues behind the `ALTER TABLE`, so a step
+/// that can't get its lock fails and is retried on the next start. A step that rewrites `record`
+/// or takes the lock for long must be split into an expand step and a contract step. A step that
+/// fails rolls the whole upgrade back and stops the broker.
+///
+/// The change that adds the first step must also update the version table and the line about
+/// databases that 0.7.0-pre.3 set up in `docs/storage.md`, which stops being true then.
+const MIGRATIONS: &[Migration] = &[];
+
+/// How long a step of [`MIGRATIONS`] waits for a table lock before it fails.
+const STEP_LOCK_TIMEOUT: &str = "5s";
+
+/// The schema that this release creates, and the way to upgrade each earlier one to it.
+const RELEASE_SCHEMA: Schema = Schema {
+    version: SCHEMA_VERSION,
+    oldest_compatible_version: OLDEST_COMPATIBLE_SCHEMA_VERSION,
+    migrations: MIGRATIONS,
+};
+
+// The build fails here when `SCHEMA_VERSION` and `MIGRATIONS` disagree.
+const _: () = assert!(RELEASE_SCHEMA.is_consistent());
 
 /// The key of the advisory lock that [`Postgres::ensure_schema`] holds. Advisory locks share one
 /// key space per database. The key spells `nisshi`, so that it is unlikely to match another
@@ -414,6 +625,99 @@ const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// resolved address, not the TLS/auth steps that follow it).
 const DEFAULT_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The start of the `application_name` of the broker's connections when the storage URL sets
+/// none, so that `application_name LIKE 'nisshi%'` finds every Nisshi connection in
+/// `pg_stat_activity`. [`application_name`] adds the host and the cluster.
+const APPLICATION_NAME_PREFIX: &str = "nisshi";
+
+/// The longest `application_name` that the server keeps. It cuts a longer name to
+/// `NAMEDATALEN - 1`, which is 63 bytes, without an error.
+const APPLICATION_NAME_MAX_LEN: usize = 63;
+
+/// The name of the machine that this process runs on, from the `HOSTNAME` environment variable
+/// or, where that is not set, from `/etc/hostname`. On Kubernetes it is the name of the pod, and
+/// in a container the container's id or its `--hostname`. `None` when neither gives a name.
+fn local_host_name() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+}
+
+/// Keeps the ASCII letters, digits, `.`, `_` and `-` of `text` and replaces every other
+/// character with `_`, because the server replaces a byte outside printable ASCII with `?` and a
+/// name with a space or a quote is hard to filter on.
+fn sanitised(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            c
+        } else {
+            '_'
+        }
+    })
+}
+
+/// The `application_name` of the broker's connections when the storage URL sets none:
+/// `nisshi-<host>-<cluster>`, or `nisshi-<node>-<cluster>` where the host is not known. A row in
+/// `pg_stat_activity` then names the machine of the broker, which on Kubernetes is its pod, and
+/// the cluster, also where a pooler or proxy hides `client_addr`.
+///
+/// Both parts go through [`sanitised`]. The host comes before the cluster and the name is cut at
+/// [`APPLICATION_NAME_MAX_LEN`], so the cut removes the end of the cluster first, and the end of
+/// the host only when the host alone is longer than the limit allows.
+fn application_name(host: Option<&str>, cluster: &str, node: i32) -> String {
+    let mut name = match host {
+        Some(host) if !host.is_empty() => format!("{APPLICATION_NAME_PREFIX}-"),
+        _ => format!("{APPLICATION_NAME_PREFIX}-{node}"),
+    };
+
+    if let Some(host) = host.filter(|host| !host.is_empty()) {
+        name.extend(sanitised(host));
+    }
+
+    name.push('-');
+    name.extend(sanitised(cluster));
+    name.truncate(APPLICATION_NAME_MAX_LEN);
+
+    name
+}
+
+/// The message of a [`Error::SchemaStepFailed`] whose SQLSTATE is in class `22`, data exception.
+const DATA_EXCEPTION_MESSAGE: &str =
+    "a value in the table is not valid for what the step does with it";
+
+/// Returns the error for a schema upgrade step from `from_version` to `to_version` that failed
+/// with `error`.
+///
+/// A database error becomes [`Error::SchemaStepFailed`], which leaves out the `DETAIL` of the
+/// server's error, because a failed constraint repeats the failing row there. The server's message
+/// of a class `22` error, such as `invalid input syntax for type integer: "..."`, quotes the value
+/// that failed, so [`DATA_EXCEPTION_MESSAGE`] replaces it. A `statement_timeout` keeps the
+/// conversion of [`Error::from`], which carries no `DETAIL`.
+fn schema_step_failure(from_version: i32, to_version: i32, error: tokio_postgres::Error) -> Error {
+    let error = Error::from(error);
+    let Error::TokioPostgres(error) = &error else {
+        return error;
+    };
+    let Some(db_error) = error.as_db_error() else {
+        return Error::TokioPostgres(error.clone());
+    };
+
+    Error::SchemaStepFailed {
+        from_version,
+        to_version,
+        code: db_error.code().code().into(),
+        message: if db_error.code().code().starts_with("22") {
+            DATA_EXCEPTION_MESSAGE.into()
+        } else {
+            db_error.message().into()
+        },
+        table: db_error.table().map(Into::into),
+        constraint: db_error.constraint().map(Into::into),
+    }
+}
+
 /// Merges a default `statement_timeout` into an existing libpq `options` startup string.
 ///
 /// Postgres applies `-c name=value` startup options in order with last-one-wins semantics,
@@ -428,32 +732,45 @@ fn merge_statement_timeout_option(existing: Option<&str>, default_ms: u64) -> St
     }
 }
 
+/// Returns the `name=value` settings of `options`, a libpq options startup
+/// string, in order. The server reads `-c name=value`, `-cname=value` and
+/// `--name=value`, treats `-` in a name as `_` and ignores its case, so the names
+/// returned are lowercase with that done.
+fn option_settings(options: &str) -> impl Iterator<Item = (String, &str)> {
+    let mut tokens = options.split_whitespace();
+
+    std::iter::from_fn(move || {
+        loop {
+            let token = tokens.next()?;
+            let setting = match token {
+                "-c" => tokens.next(),
+                short if short.starts_with("-c") => short.strip_prefix("-c"),
+                long => long.strip_prefix("--"),
+            };
+
+            if let Some((name, value)) = setting.and_then(|setting| setting.split_once('=')) {
+                return Some((name.replace('-', "_").to_ascii_lowercase(), value));
+            }
+        }
+    })
+}
+
 /// Reads the `statement_timeout` that `options`, a libpq options startup
 /// string, sets on each connection: the last one wins, as on the server.
-/// The server reads `-c name=value`, `-cname=value` and `--name=value`.
 ///
 /// Returns `None` when `options` sets no timeout, disables it with `0`, or
 /// sets a value the server rejects, in which case no connection opens.
 fn statement_timeout_option(options: &str) -> Option<Duration> {
-    let mut tokens = options.split_whitespace();
-    let mut statement_timeout = None;
-
-    while let Some(token) = tokens.next() {
-        let setting = match token {
-            "-c" => tokens.next(),
-            short if short.starts_with("-c") => short.strip_prefix("-c"),
-            long => long.strip_prefix("--"),
-        };
-
-        if let Some(value) = setting.and_then(|setting| setting.strip_prefix("statement_timeout="))
-        {
-            statement_timeout = Some(statement_timeout_value(value));
-        }
-    }
-
-    statement_timeout
-        .flatten()
+    option_settings(options)
+        .filter(|(name, _)| name == "statement_timeout")
+        .last()
+        .and_then(|(_, value)| statement_timeout_value(value))
         .filter(|timeout| !timeout.is_zero())
+}
+
+/// Whether `options`, a libpq options startup string, sets `application_name`.
+fn options_set_application_name(options: &str) -> bool {
+    option_settings(options).any(|(name, _)| name == "application_name")
 }
 
 /// Parses a `statement_timeout` value as the server does: a number of
@@ -485,27 +802,58 @@ fn statement_timeout_value(value: &str) -> Option<Duration> {
 /// number in [`POOL_MAX_SIZE_RANGE`], as [`parse_storage_option`] does for
 /// every storage option.
 fn take_pool_max_size(config: &mut String) -> Result<usize> {
-    // A key/value connection string, such as `host=db user=nisshi`, is not a
-    // URL, and sets no storage URL options.
-    let Ok(storage) = Url::parse(config) else {
-        return Ok(DEFAULT_POOL_MAX_SIZE);
-    };
+    take_option(config, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
+    })
+    .map(|size| size.unwrap_or(DEFAULT_POOL_MAX_SIZE))
+}
 
-    let Some(pool_max_size) =
-        parse_storage_option(&storage, POOL_MAX_SIZE, POOL_MAX_SIZE_EXPECTED, |value| {
+/// Removes every [`CLIENT_READ_SHARE`] option from `config`, a connection
+/// URL, and returns the percentage that the last one sets, or `None` when the
+/// URL sets none.
+///
+/// Returns [`Error::InvalidStorageOptionValue`] when any of them is not a
+/// number in [`CLIENT_READ_SHARE_RANGE`].
+fn take_client_read_share(config: &mut String) -> Result<Option<usize>> {
+    take_option(
+        config,
+        CLIENT_READ_SHARE,
+        CLIENT_READ_SHARE_EXPECTED,
+        |value| {
             value
                 .parse()
                 .ok()
-                .filter(|size| POOL_MAX_SIZE_RANGE.contains(size))
-        })?
-    else {
-        return Ok(DEFAULT_POOL_MAX_SIZE);
+                .filter(|percent| CLIENT_READ_SHARE_RANGE.contains(percent))
+        },
+    )
+}
+
+/// Removes every `option` from `config`, a connection URL, and returns what
+/// `parse` makes of the last one's value, or `None` when the URL sets none.
+///
+/// tokio-postgres rejects an option that it does not read, so a storage
+/// option must be removed before it parses the URL.
+fn take_option<T>(
+    config: &mut String,
+    option: &str,
+    expected: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>> {
+    // A key/value connection string, such as `host=db user=nisshi`, is not a
+    // URL, and sets no storage URL options.
+    let Ok(storage) = Url::parse(config) else {
+        return Ok(None);
     };
 
-    // tokio-postgres rejects an option that it does not read, so this option
-    // must go before it parses the URL.
+    let Some(value) = parse_storage_option(&storage, option, expected, parse)? else {
+        return Ok(None);
+    };
+
     let Some((base, query)) = config.split_once('?') else {
-        return Ok(pool_max_size);
+        return Ok(Some(value));
     };
 
     // The retained options keep their bytes, instead of going through
@@ -513,10 +861,10 @@ fn take_pool_max_size(config: &mut String) -> Result<usize> {
     // tokio-postgres reads a `+` as itself.
     let retained = query
         .split('&')
-        .filter(|option| {
-            form_urlencoded::parse(option.as_bytes())
+        .filter(|candidate| {
+            form_urlencoded::parse(candidate.as_bytes())
                 .next()
-                .is_none_or(|(key, _)| key != POOL_MAX_SIZE)
+                .is_none_or(|(key, _)| key != option)
         })
         .collect::<Vec<_>>();
 
@@ -526,10 +874,10 @@ fn take_pool_max_size(config: &mut String) -> Result<usize> {
         format!("{base}?{}", retained.join("&"))
     };
 
-    Ok(pool_max_size)
+    Ok(Some(value))
 }
 
-impl<C, N> FromStr for Builder<C, N, Url, Pool>
+impl<C, N> FromStr for Builder<C, N, Url, PoolParts>
 where
     C: Default,
     N: Default,
@@ -539,11 +887,17 @@ where
     fn from_str(config: &str) -> Result<Self, Self::Err> {
         let mut config = config.to_owned();
         let pool_max_size = take_pool_max_size(&mut config)?;
-        let read_limits = ReadLimits::for_pool(pool_max_size);
+        let client_percent = take_client_read_share(&mut config)?;
+        let read_limits = ReadLimits {
+            client_percent,
+            ..ReadLimits::for_pool(pool_max_size)
+        };
         info!(
             pool_max_size,
             list_offsets_reads = read_limits.list_offsets,
-            fetch_reads = read_limits.fetch
+            fetch_reads = read_limits.fetch,
+            list_offsets_reads_per_client = read_limits.list_offsets_per_client(),
+            fetch_reads_per_client = read_limits.fetch_per_client(),
         );
 
         let mut pg_config = Config::from_str(&config).inspect(|pg_config| debug!(?pg_config))?;
@@ -553,12 +907,15 @@ where
         let abandoned_statement_bound = statement_timeout_option(&options)
             .unwrap_or(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS))
             + ABANDONED_STATEMENT_MARGIN;
+
+        // An operator's own `application_name` wins over the default, whether it is in the URL
+        // or in `options`. The server applies a named `application_name` after `options`, so a
+        // default set here would override one that only `options` sets.
+        let named_by_operator =
+            pg_config.get_application_name().is_some() || options_set_application_name(&options);
+
         _ = pg_config.options(options);
         _ = pg_config.connect_timeout(DEFAULT_POOL_CREATE_TIMEOUT);
-
-        let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        };
 
         let root_store = {
             let mut roots = rustls::RootCertStore::empty();
@@ -576,32 +933,41 @@ where
         .map(|config| config.with_no_client_auth())?;
 
         let tls = MakeRustlsConnect::new(config);
+
+        // The cluster and the node are not known here, so this pool carries the plain prefix as
+        // its name. `Builder::build` opens the pool that names them.
+        let mut default_config = pg_config.clone();
+
+        if !named_by_operator {
+            _ = default_config.application_name(APPLICATION_NAME_PREFIX);
+        }
+
         let cancel = Some(CancelRequests {
-            config: pg_config.clone(),
+            config: default_config.clone(),
             tls: tls.clone(),
         });
 
-        let mgr = Manager::from_config(pg_config, tls, mgr_config);
+        let pool = PoolParts::open(default_config, tls.clone(), pool_max_size)?;
         let advertised_listener = Url::parse("tcp://127.0.0.1/")?;
 
-        Pool::builder(mgr)
-            .max_size(pool_max_size)
-            .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(DEFAULT_POOL_WAIT_TIMEOUT))
-            .create_timeout(Some(DEFAULT_POOL_CREATE_TIMEOUT))
-            .build()
-            .map(|pool| Self {
+        Ok(Self {
+            pool: PoolParts {
+                config: pg_config,
+                tls,
+                pool_max_size,
+                named_by_operator,
+                host: local_host_name(),
                 pool,
-                read_limits,
-                cancel,
-                abandoned_statement_bound,
-                advertised_listener,
-                node: N::default(),
-                cluster: C::default(),
-                schemas: None,
-                lake: None,
-            })
-            .map_err(Into::into)
+            },
+            read_limits,
+            cancel,
+            abandoned_statement_bound,
+            advertised_listener,
+            node: N::default(),
+            cluster: C::default(),
+            schemas: None,
+            lake: None,
+        })
     }
 }
 
@@ -968,11 +1334,11 @@ where
 const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp()";
 
 /// The permits that a read holds while it is in flight: one from its
-/// connection's share, see [`read_share`](nisshi_storage::read_share), and
-/// one from the engine's limit on reads in flight ([`ReadLimits::list_offsets`]
-/// or [`ReadLimits::fetch`]).
+/// connection's share, see [`read_share`](nisshi_storage::read_share), and the
+/// ones from its client's share and the engine's limit on reads in flight
+/// ([`ReadLimits::list_offsets`] or [`ReadLimits::fetch`]).
 ///
-/// An abandoned read keeps both until its statement ends, see
+/// An abandoned read keeps them until its statement ends, see
 /// [`cancel_and_return`].
 #[derive(Debug)]
 // Nothing reads the permits: holding them is the point, and dropping
@@ -981,26 +1347,37 @@ const SETTLE_QUERY: &str = "SELECT transaction_timestamp() = statement_timestamp
 struct ReadPermits {
     /// `None` for a read that runs outside a connection's read share.
     connection_share: Option<OwnedSemaphorePermit>,
-    limit: OwnedSemaphorePermit,
+    /// The permit of the limit, and the one of the client's share. A read
+    /// that runs outside a client's read share holds only the first, and still
+    /// returns it through the client shares, which wake a read that waits for
+    /// a permit of the limit.
+    engine: ClientAdmission,
 }
 
 impl ReadPermits {
     /// Waits for `connection_share`, a permit from the connection's share,
-    /// and then for a permit from `limit`.
+    /// then for a permit from `limit`, and from the share of its client, with
+    /// `client_share` permits, when the read has one, see
+    /// [`ClientReadShares::acquire`].
     ///
-    /// The share comes first, so a connection never waits on `limit` for
-    /// more reads than its share. `limit` is a FIFO queue, and those reads
-    /// would hold places in it ahead of other connections' reads.
+    /// The connection's share comes first, so a connection never waits on
+    /// `limit` for more reads than its share. `limit` is a FIFO queue, and
+    /// those reads would hold places in it ahead of other clients' reads. A
+    /// client's reads beyond its share do not queue for `limit` either, and
+    /// the order is the same for every read, so reads cannot wait on each
+    /// other in a cycle. A permit is returned when it is dropped.
     async fn acquire(
         connection_share: impl Future<Output = Result<Option<OwnedSemaphorePermit>, AcquireError>>,
+        client_shares: &ClientReadShares,
+        client_share: usize,
         limit: &Arc<Semaphore>,
     ) -> Result<Self> {
         let connection_share = connection_share.await?;
-        let limit = deadline::queued(limit.clone().acquire_owned()).await?;
+        let engine = client_shares.acquire(client_share, limit).await?;
 
         Ok(Self {
             connection_share,
-            limit,
+            engine,
         })
     }
 }
@@ -1145,7 +1522,7 @@ fn dynamic_topic_config(name: String, value: Option<String>) -> DescribeConfigsR
         .name(name)
         .value(Some(value.unwrap_or_default()))
         .read_only(false)
-        .is_default(None)
+        .is_default(Some(false))
         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
         .is_sensitive(false)
         .synonyms(Some([].into()))
@@ -1225,7 +1602,7 @@ impl Postgres {
 
     pub fn builder(
         connection: &str,
-    ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, Pool>> {
+    ) -> Result<Builder<PhantomData<String>, PhantomData<i32>, Url, PoolParts>> {
         // Do not log `connection` here: it is the raw, unparsed connection
         // string (e.g. `postgres://user:password@host/db`) and would leak
         // the password in plaintext. `Builder::from_str` below logs the
@@ -1296,6 +1673,8 @@ impl Postgres {
     async fn fetch_read_permits(&self) -> Result<ReadPermits> {
         ReadPermits::acquire(
             FetchReadShare::acquire(self.fetch_reads_per_connection),
+            &self.fetch_client_shares,
+            self.fetch_reads_per_client,
             &self.fetch_reads,
         )
         .await
@@ -1306,14 +1685,19 @@ impl Postgres {
     async fn list_offsets_read_permits(&self) -> Result<ReadPermits> {
         ReadPermits::acquire(
             ListOffsetsReadShare::acquire(self.list_offsets_reads_per_connection),
+            &self.list_offsets_client_shares,
+            self.list_offsets_reads_per_client,
             &self.list_offsets_reads,
         )
         .await
     }
 
-    /// Reads the records of `topition` from `offset` on `c`, in one
-    /// transaction, up to the partition's high watermark or, for
-    /// `ReadCommitted`, its last stable offset.
+    /// Reads the records of `topition` from `offset` on `c`, in one transaction, up to the
+    /// partition's high watermark or, for `ReadCommitted`, its last stable offset.
+    ///
+    /// Returns the batches that it read, and how `read_deadline` stopped the read, if it did.
+    /// `read_deadline` can stop the read during a statement. A read stopped before its commit
+    /// returns no batches. A read stopped at its commit keeps the batches that it assembled.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_on(
         &self,
@@ -1325,18 +1709,23 @@ impl Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        has_deadline_expired: impl Fn() -> bool,
-    ) -> Result<Vec<deflated::Batch>> {
-        let high_watermark = self
-            .offset_stage_on(c, base_topic, topition.partition())
+        read_deadline: &mut ReadDeadline,
+    ) -> Result<(Vec<deflated::Batch>, Option<Missed>)> {
+        let offset_stage = match read_deadline
+            .timeout(self.offset_stage_on(c, base_topic, topition.partition()))
             .await
-            .map(|offset_stage| {
-                if isolation_level == IsolationLevel::ReadCommitted {
-                    offset_stage.last_stable
-                } else {
-                    offset_stage.high_watermark
-                }
-            })?;
+        {
+            Ok(offset_stage) => offset_stage,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
+            if isolation_level == IsolationLevel::ReadCommitted {
+                offset_stage.last_stable
+            } else {
+                offset_stage.high_watermark
+            }
+        })?;
 
         debug!(
             cluster = self.cluster,
@@ -1348,45 +1737,57 @@ impl Postgres {
             max_bytes
         );
 
-        let tx = c.transaction().await?;
+        let tx = match read_deadline.timeout(c.transaction()).await {
+            Ok(tx) => tx?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        };
 
-        tx.batch_execute(FETCH_PLAN_SETTINGS)
+        match read_deadline
+            .timeout(tx.batch_execute(FETCH_PLAN_SETTINGS))
             .await
-            .inspect_err(|err| error!(?err))?;
+        {
+            Ok(settings) => settings.inspect_err(|err| error!(?err))?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
+        }
 
-        let records = if let Some(key) = key_filter {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg_keyed.sql",
-                &[
-                    &self.cluster,
-                    &base_topic,
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &key,
-                    &ROWS_PER_FETCH,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
-        } else {
-            self.tx_prepare_query(
-                &tx,
-                "record_fetch_pg.sql",
-                &[
-                    &self.cluster,
-                    &topition.topic(),
-                    &topition.partition(),
-                    &offset,
-                    &(max_bytes as i64),
-                    &high_watermark,
-                    &ROWS_PER_FETCH,
-                ],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?
+        let records = async {
+            if let Some(key) = key_filter {
+                self.tx_prepare_query(
+                    &tx,
+                    "record_fetch_pg_keyed.sql",
+                    &[
+                        &self.cluster,
+                        &base_topic,
+                        &topition.partition(),
+                        &offset,
+                        &(max_bytes as i64),
+                        &high_watermark,
+                        &key,
+                        &ROWS_PER_FETCH,
+                    ],
+                )
+                .await
+            } else {
+                self.tx_prepare_query(
+                    &tx,
+                    "record_fetch_pg.sql",
+                    &[
+                        &self.cluster,
+                        &topition.topic(),
+                        &topition.partition(),
+                        &offset,
+                        &(max_bytes as i64),
+                        &high_watermark,
+                        &ROWS_PER_FETCH,
+                    ],
+                )
+                .await
+            }
+        };
+
+        let records = match read_deadline.timeout(records).await {
+            Ok(records) => records.inspect_err(|err| error!(?err))?,
+            Err(stopped) => return Ok((vec![], Some(stopped))),
         };
 
         let mut batches = vec![];
@@ -1409,7 +1810,7 @@ impl Postgres {
                     first
                         .try_get::<_, SystemTime>(2)
                         .map_err(Error::from)
-                        .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                        .and_then(|system_time| from_sql_timestamp(&system_time))
                         .inspect_err(|err| error!(?err))?,
                 )
                 .producer_id(
@@ -1434,15 +1835,19 @@ impl Postgres {
                 .map(|record| record.try_get::<_, i64>(0))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
-            for header in self
-                .tx_prepare_query(
+            let header_rows = match read_deadline
+                .timeout(self.tx_prepare_query(
                     &tx,
                     "header_fetch_range.sql",
                     &[&self.cluster, &base_topic, &topition.partition(), &offsets],
-                )
+                ))
                 .await
-                .inspect_err(|err| error!(?err))?
             {
+                Ok(header_rows) => header_rows.inspect_err(|err| error!(?err))?,
+                Err(stopped) => return Ok((vec![], Some(stopped))),
+            };
+
+            for header in header_rows {
                 headers
                     .entry(header.try_get::<_, i64>(0)?)
                     .or_default()
@@ -1467,7 +1872,7 @@ impl Postgres {
                 let timestamp = record
                     .try_get::<_, SystemTime>(2)
                     .map_err(Error::from)
-                    .and_then(|system_time| to_timestamp(&system_time).map_err(Into::into))
+                    .and_then(|system_time| from_sql_timestamp(&system_time))
                     .inspect(|timestamp| debug!(?timestamp))
                     .inspect_err(|err| error!(?err))?;
 
@@ -1551,10 +1956,6 @@ impl Postgres {
                 batch_builder = batch_builder
                     .record(record_builder)
                     .last_offset_delta(offset_delta);
-
-                if has_deadline_expired() {
-                    break;
-                }
             }
 
             batches.push(
@@ -1567,11 +1968,17 @@ impl Postgres {
             batches.push(Batch::builder().build().and_then(TryInto::try_into)?);
         }
 
-        tx.commit().await?;
-
         debug!(batches_len = batches.len());
 
-        Ok(batches)
+        // The transaction only reads, so a rollback has the same effect as a commit. When the
+        // deadline stops the commit before it starts, dropping the transaction rolls it back.
+        match read_deadline.timeout(tx.commit()).await {
+            Ok(committed) => {
+                committed?;
+                Ok((batches, None))
+            }
+            Err(stopped) => Ok((batches, Some(stopped))),
+        }
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -1692,6 +2099,9 @@ impl Postgres {
                     debug!(?row);
 
                     row.try_get::<_, i64>(0).map(Some).and_then(|offset| {
+                        // A record without a timestamp is stored before the epoch, which
+                        // `ListOffsetResponse::timestamp` cannot convert. The service answers -1
+                        // for Earliest and Latest, as Kafka does, so that is harmless here.
                         row.try_get::<_, Option<SystemTime>>(1).map(|timestamp| {
                             debug!(
                                 cluster = self.cluster,
@@ -1720,21 +2130,30 @@ impl Postgres {
     /// Makes sure that the database has the broker's schema before the broker serves a request.
     ///
     /// When the database records no schema version, this function creates the missing tables and
-    /// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
+    /// records [`SCHEMA_VERSION`]. When the database records an older version, it runs the steps
+    /// of [`MIGRATIONS`] that bring the database to [`SCHEMA_VERSION`], in one transaction. It
+    /// leaves existing tables and their data as they are, except for what a step changes.
     ///
-    /// This function runs no DDL on a database that records a version. A database user that cannot
-    /// create tables can therefore start a broker on a database that records a version.
+    /// This function runs no DDL on a database that records a version that it can use as it is.
+    /// A database user that cannot create or alter tables can therefore start a broker on such a
+    /// database.
     pub(crate) async fn ensure_schema(&self) -> Result<()> {
+        self.ensure_schema_of(&RELEASE_SCHEMA, SCHEMA).await
+    }
+
+    /// Makes `ensure_schema` do its work for `schema`, whose new databases start from `create`.
+    async fn ensure_schema_of(&self, schema: &Schema, create: &str) -> Result<()> {
         let mut c = self.connection().await?;
 
         // The broker reads the version without the lock first, because a broker that holds the
         // lock and then stops answering blocks every broker that waits for it. A recorded version
-        // means a complete schema, because the transaction that creates the schema also records
-        // the version.
+        // means a complete schema, because the transaction that creates or upgrades the schema
+        // also records the version.
         {
             let tx = c.transaction().await?;
+            _ = self.pin_search_path_to_cluster_namespace(&tx).await?;
             let recorded = self.recorded_schema(&tx).await?;
-            if !should_create_schema(recorded, SCHEMA_VERSION)? {
+            if plan(recorded, schema)? == Action::Keep {
                 return tx.commit().await.map_err(Into::into);
             }
         }
@@ -1765,7 +2184,8 @@ impl Postgres {
 
         // This lock makes a second broker wait until the first broker commits the schema. The
         // second broker then finds the recorded version. Without the lock, PostgreSQL fails one of
-        // two concurrent `create table if not exists` statements with a unique violation.
+        // two concurrent `create table if not exists` statements with a unique violation, and two
+        // upgrades of one database would run each step twice.
         let locked_at_once = tx
             .query_one(
                 &format!("select pg_try_advisory_xact_lock({SCHEMA_LOCK})"),
@@ -1779,31 +2199,50 @@ impl Postgres {
                 .await?;
         }
 
+        // The search path is pinned before the version is read, so that the version, the steps and
+        // the version update all resolve to the namespace that holds the tables. A stale
+        // `nisshi_schema_version` in another namespace on the path would otherwise make `plan`
+        // return an upgrade of tables that already have its changes.
+        let has_tables = self.pin_search_path_to_cluster_namespace(&tx).await?;
         let recorded = self.recorded_schema(&tx).await?;
-        if !should_create_schema(recorded, SCHEMA_VERSION)? {
+        let action = plan(recorded, schema)?;
+        if action == Action::Keep {
             return tx.commit().await.map_err(Into::into);
         }
 
-        // This query puts only the namespace that holds the existing `cluster` table on the search
-        // path, for this transaction. PostgreSQL calls a namespace a schema. An unqualified `create
-        // table` creates its table in the first namespace on the search path. That namespace can
-        // differ from the one that holds the existing tables. The broker then finds new, empty
-        // tables instead of its data. The query returns a row only when `cluster` exists.
-        let has_tables = tx
-            .query_opt(
-                self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
-                &[],
-            )
-            .await?
-            .is_some();
+        if let (Action::Upgrade(steps), Some(recorded)) = (action, recorded) {
+            // The steps would run on the connection's own search path, which can hold other tables
+            // than the ones that the version describes. Nisshi never records a version without
+            // creating `cluster`, so this database was changed from outside.
+            if !has_tables {
+                let search_path = tx
+                    .query_one("show search_path", &[])
+                    .await?
+                    .try_get::<_, String>(0)?;
+                return Err(Error::MissingClusterTable {
+                    schema_version: recorded.version,
+                    search_path,
+                });
+            }
+
+            announce_upgrade(recorded, steps);
+            let started = Instant::now();
+            self.upgrade_schema(&tx, recorded, steps).await?;
+            tx.commit().await?;
+
+            report_upgrade(recorded, steps, started.elapsed());
+            return Ok(());
+        }
+
+        check_unversioned_tables(has_tables, schema)?;
 
         tx.batch_execute(self.sql_lookup("nisshi_schema_version_create.sql")?)
             .await?;
-        tx.batch_execute(SCHEMA).await?;
+        tx.batch_execute(create).await?;
         _ = tx
             .execute(
                 self.sql_lookup("nisshi_schema_version_insert.sql")?,
-                &[&SCHEMA_VERSION, &OLDEST_COMPATIBLE_SCHEMA_VERSION],
+                &[&schema.version, &schema.oldest_compatible_version],
             )
             .await?;
 
@@ -1811,14 +2250,78 @@ impl Postgres {
 
         if has_tables {
             warn!(
-                schema_version = SCHEMA_VERSION,
+                schema_version = schema.version,
                 "recorded the schema version in a database whose tables an earlier release created"
             );
         } else {
-            info!(schema_version = SCHEMA_VERSION, "created the schema");
+            info!(schema_version = schema.version, "created the schema");
         }
 
         Ok(())
+    }
+
+    /// Runs `steps` in `tx`, which holds the schema lock, and records the version that the last
+    /// one leaves. `recorded` is what the database recorded before the first step.
+    async fn upgrade_schema(
+        &self,
+        tx: &Transaction<'_>,
+        recorded: RecordedSchema,
+        steps: &[Migration],
+    ) -> Result<()> {
+        // The transaction holds the schema lock already, so the lock timeout bounds only the table
+        // locks that the steps take. The statement timeout drops from the setup's 5 minutes to
+        // the timeout of a request, because a step that holds a table lock stalls every request on
+        // that table. `DEFAULT` resets it to the value that the connection started with, which is
+        // the operator's own timeout from the URL or [`DEFAULT_STATEMENT_TIMEOUT_MS`]. The
+        // brokers that wait for the schema lock keep the 5 minutes in their own sessions.
+        tx.batch_execute(&format!(
+            "SET LOCAL lock_timeout = '{STEP_LOCK_TIMEOUT}'; \
+             SET LOCAL statement_timeout TO DEFAULT"
+        ))
+        .await?;
+
+        for step in steps {
+            debug!(to_version = step.to_version);
+            tx.batch_execute(step.sql).await.map_err(|err| {
+                let err = schema_step_failure(recorded.version, step.to_version, err);
+                error!(
+                    from_version = recorded.version,
+                    to_version = step.to_version,
+                    ?err,
+                    "a schema upgrade step failed, so the upgrade is rolled back and the database stays at its earlier version"
+                );
+                err
+            })?;
+        }
+
+        let Some(last) = steps.last() else {
+            return Ok(());
+        };
+
+        _ = tx
+            .execute(
+                self.sql_lookup("nisshi_schema_version_update.sql")?,
+                &[&last.to_version, &upgraded_compatibility(recorded, steps)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Puts only the namespace that holds the existing `cluster` table on the search path of `tx`,
+    /// and returns whether `cluster` exists. PostgreSQL calls a namespace a schema.
+    ///
+    /// An unqualified `create table` creates its table in the first namespace on the search path,
+    /// which can differ from the one that holds the existing tables, and the broker then finds new,
+    /// empty tables instead of its data. An unqualified `alter table` finds the first table of
+    /// that name on the path, so an upgrade needs the pin as much as a creation does.
+    async fn pin_search_path_to_cluster_namespace(&self, tx: &Transaction<'_>) -> Result<bool> {
+        tx.query_opt(
+            self.sql_lookup("pg/search_path_set_to_cluster_namespace.sql")?,
+            &[],
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(Into::into)
     }
 
     /// Returns the schema version that the database records, or `None` when it records none.
@@ -2690,7 +3193,7 @@ impl Postgres {
 
                     let producer_id = transaction_id.and(Some(inflated.producer_id));
                     let producer_epoch = transaction_id.and(Some(inflated.producer_epoch));
-                    let ts = to_system_time(inflated.record_timestamp(record))?;
+                    let ts = to_sql_timestamp(inflated.record_timestamp(record))?;
 
                     let mut row: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(record_column_types.len());
@@ -3876,6 +4379,13 @@ impl Storage for Postgres {
         Ok(topic_uuid)
     }
 
+    fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
+        DeleteRecordsConcurrency::shared(
+            self.delete_records_per_request,
+            Arc::clone(&self.delete_records_writes),
+        )
+    }
+
     #[instrument(skip_all)]
     async fn delete_records(
         &self,
@@ -3886,9 +4396,11 @@ impl Storage for Postgres {
         let mut c = self.connection().await?;
         let mut responses = Vec::with_capacity(topics.len());
 
-        // Each partition commits on its own, so the request holds at most one
-        // watermark row lock at a time. It cannot then deadlock with EndTxn,
-        // and a produce waits only while its own partition advances.
+        // Each partition commits on its own, so a call holds at most one
+        // watermark row lock at a time. It cannot then deadlock with EndTxn
+        // or with the other calls of the same request, which the service runs
+        // concurrently on their own connections, and a produce waits only
+        // while its own partition advances.
         for topic in topics {
             let mut partitions = Vec::with_capacity(topic.partitions.as_ref().map_or(0, Vec::len));
 
@@ -4057,14 +4569,26 @@ impl Storage for Postgres {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
         // The batch is inflated before the transaction starts, so the wait
         // for a decode permit and the decode do not hold a pooled connection
         // or the partition's watermark row lock.
         let inflated = inflate(deflated.clone())
             .await
             .inspect_err(|err| debug!(?err))?;
+
+        self.produce_inflated(transaction_id, topition, deflated, inflated)
+            .await
+    }
+
+    #[instrument(skip_all)]
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Batch,
+    ) -> Result<i64> {
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
 
         let mut c = self.connection().await?;
 
@@ -4097,26 +4621,50 @@ impl Storage for Postgres {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        let started_at = SystemTime::now();
-
-        let has_deadline_expired = || {
-            started_at
-                .elapsed()
-                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
-                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
-                .unwrap_or_default()
-        };
+        let started_at = Instant::now();
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
-        let (base_topic, key_filter): (&str, Option<&str>) =
-            self.topic_with_key(topition.topic()).await?;
+        let Ok(topic) = read_deadline
+            .timeout(self.topic_with_key(topition.topic()))
+            .await
+        else {
+            return Ok(vec![]);
+        };
 
-        let permits = self.fetch_read_permits().await?;
-        let mut connection = deadline::queued(self.abandonable_connection(permits)).await?;
-        let batches = self
+        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
+
+        let connection = async {
+            let permits = self.fetch_read_permits().await?;
+            self.abandonable_connection(permits)
+                .queued_for(ReadWait::EngineConnectionPool)
+                .await
+        };
+
+        let connection = match read_deadline.timeout(connection).await {
+            Ok(connection) => connection,
+            Err(missed) => {
+                // The Fetch service sees only an answer with no records here, so the engine names
+                // the client when its wait for the client's share missed the deadline.
+                if missed == Missed::Queued(ReadWait::ClientReadLimit) {
+                    warn_miss_at_client_share(
+                        topition,
+                        StorageOperation::Fetch,
+                        offset,
+                        started_at,
+                    );
+                }
+
+                return Ok(vec![]);
+            }
+        };
+
+        let mut connection = connection?;
+
+        let fetched = self
             .fetch_on(
                 connection.object_mut()?,
                 topition,
@@ -4126,12 +4674,20 @@ impl Storage for Postgres {
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                has_deadline_expired,
+                &mut read_deadline,
             )
             .await;
-        connection.release();
 
-        batches
+        match &fetched {
+            // The deadline stopped the read during one of its steps, so a statement may still be
+            // running on the connection. Dropping the connection cancels the statement, and
+            // returns the connection to the pool once the statement has ended.
+            Ok((_, Some(Missed::Queued(_) | Missed::Reading))) => drop(connection),
+            // No statement is running, so the connection goes straight back to the pool.
+            Ok((_, Some(Missed::NotStarted) | None)) | Err(_) => connection.release(),
+        }
+
+        fetched.map(|(batches, _)| batches)
     }
 
     #[instrument(skip_all)]
@@ -4141,7 +4697,10 @@ impl Storage for Postgres {
         let base_topic = self.base_topic(topition.topic()).await?;
 
         let permits = self.fetch_read_permits().await?;
-        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
+        let connection = self
+            .abandonable_connection(permits)
+            .queued_for(ReadWait::EngineConnectionPool)
+            .await?;
         let offset_stage = self
             .offset_stage_on(connection.object()?, base_topic, topition.partition())
             .await;
@@ -4366,7 +4925,10 @@ impl Storage for Postgres {
         debug!(cluster = self.cluster, ?isolation_level);
 
         let permits = self.list_offsets_read_permits().await?;
-        let connection = deadline::queued(self.abandonable_connection(permits)).await?;
+        let connection = self
+            .abandonable_connection(permits)
+            .queued_for(ReadWait::EngineConnectionPool)
+            .await?;
         let responses = self
             .list_offsets_on(connection.object()?, isolation_level, offsets)
             .await;
@@ -5636,17 +6198,127 @@ static SQL_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The earliest Kafka timestamp, in milliseconds since the epoch, that a PostgreSQL `timestamp`
+/// can hold: 4713 BC.
+const MIN_SQL_TIMESTAMP_MS: i64 = -210_866_803_200_000;
+
+/// Returns the instant that the record `timestamp`, in milliseconds since the epoch, is stored as.
+///
+/// A producer can send a record with no timestamp, Kafka's `NO_TIMESTAMP`, -1, and Kafka's broker
+/// accepts it: `LogValidator` skips the range check for it, and a `TimestampBeforeMaxMs` of
+/// `Long.MAX_VALUE` leaves no lower bound for any other negative value either. [`to_system_time`]
+/// rejects a negative timestamp, so a negative one is stored as the instant before the epoch that
+/// it names, which a `timestamp` column and a [`SystemTime`] both hold. It is not stored as null,
+/// though the column allows null, because retention tests the timestamp of each record: a null
+/// never expires, while an instant in 1969 expires with the record's append time, as Kafka's does
+/// by the segment's modification time when it has no timestamp.
+///
+/// <https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogValidator.java#L583-L602>
+///
+/// Returns an error for a timestamp that PostgreSQL cannot hold.
+///
+/// Only this write side is checked. The read side of a timestamp before 1601 is unchecked: the
+/// `postgres-types` `FromSql<SystemTime>` conversion and the fetch paths can panic a Windows
+/// broker on a row that a Linux broker wrote (SOL-157762).
+fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
+    if timestamp >= 0 {
+        to_system_time(timestamp).map_err(Into::into)
+    } else if timestamp < MIN_SQL_TIMESTAMP_MS {
+        Err(Error::Message(format!(
+            "timestamp {timestamp} is before the earliest that PostgreSQL stores"
+        )))
+    } else {
+        // `SystemTime - Duration` panics on overflow, and on Windows a `SystemTime` cannot be
+        // earlier than 1601, so a timestamp between `MIN_SQL_TIMESTAMP_MS` and that year must
+        // be an error there. Kafka 3.9.1 accepts such a timestamp on a CreateTime topic with
+        // the default `message.timestamp.before.max.ms`; this broker answers
+        // UNKNOWN_SERVER_ERROR for it, a deliberate difference on Windows only.
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_millis(timestamp.unsigned_abs()))
+            .ok_or_else(|| {
+                Error::Message(format!(
+                    "timestamp {timestamp} is before the earliest that this broker stores"
+                ))
+            })
+    }
+}
+
+/// Returns the Kafka timestamp, in milliseconds since the epoch, of a stored `system_time`.
+/// The inverse of [`to_sql_timestamp`]: an instant before the epoch is a negative timestamp, as
+/// -1 is for a record that was produced without one.
+fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
+    match system_time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(_) => to_timestamp(system_time).map_err(Into::into),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .map(|millis| -millis)
+            .map_err(Into::into),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use futures_util::future;
     use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+    use nisshi_storage::read_share::ClientIdentity;
     use nisshi_storage::{
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
     use rand::distr::Alphanumeric;
     use std::assert_matches;
     use tokio::task::JoinHandle;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
+        for timestamp in [
+            -1,
+            -2,
+            -86_400_000,
+            0,
+            1,
+            1_700_000_000_000,
+            MIN_SQL_TIMESTAMP_MS,
+        ] {
+            assert_eq!(
+                timestamp,
+                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
+                "{timestamp}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A Windows `SystemTime` cannot be earlier than 1601, so the earliest timestamp that
+    /// PostgreSQL holds is an error there, where it round-trips on other platforms.
+    #[cfg(windows)]
+    #[test]
+    fn sql_timestamp_round_trips_a_negative_timestamp() -> Result<()> {
+        for timestamp in [-1, -2, -86_400_000, 0, 1, 1_700_000_000_000] {
+            assert_eq!(
+                timestamp,
+                from_sql_timestamp(&to_sql_timestamp(timestamp)?)?,
+                "{timestamp}"
+            );
+        }
+        assert_matches!(
+            to_sql_timestamp(MIN_SQL_TIMESTAMP_MS),
+            Err(Error::Message(_))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sql_timestamp_refuses_what_postgres_cannot_hold() {
+        assert_matches!(
+            to_sql_timestamp(MIN_SQL_TIMESTAMP_MS - 1),
+            Err(Error::Message(_))
+        );
+        assert_matches!(to_sql_timestamp(i64::MIN), Err(Error::Message(_)));
+    }
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`
     /// service of compose.yaml on its default port.
@@ -5769,6 +6441,192 @@ mod tests {
         );
     }
 
+    /// The server reads `-` in a setting name as `_`, so a dashed spelling
+    /// is the same setting.
+    #[test]
+    fn option_settings_read_every_spelling() {
+        assert!(options_set_application_name("-c application_name=a"));
+        assert!(options_set_application_name("-capplication_name=a"));
+        assert!(options_set_application_name("--application_name=a"));
+        assert!(options_set_application_name("-c application-name=a"));
+        assert!(options_set_application_name("--application-name=a"));
+        assert!(options_set_application_name("-c Application_Name=a"));
+        assert!(options_set_application_name(
+            "-c search_path=foo -c application_name=a"
+        ));
+        assert!(!options_set_application_name(""));
+        assert!(!options_set_application_name(
+            "-c search_path=application_name"
+        ));
+        assert_eq!(
+            Some(Duration::from_secs(2)),
+            statement_timeout_option("-c statement-timeout=2s")
+        );
+    }
+
+    /// The machine's name has no surrounding white space and is not empty,
+    /// or is not known.
+    #[test]
+    fn local_host_name_is_trimmed_or_unknown() {
+        assert!(local_host_name().is_none_or(|host| !host.is_empty() && host == host.trim()));
+    }
+
+    /// The name has the host first and the cluster after it, and the node
+    /// only where the host is not known.
+    #[test]
+    fn application_name_names_the_host_then_the_cluster() {
+        assert_eq!(
+            "nisshi-pod-0.ns-cluster.a_b-c",
+            application_name(Some("pod-0.ns"), "cluster.a_b-c", 111)
+        );
+        assert_eq!("nisshi-111-c", application_name(None, "c", 111));
+        assert_eq!("nisshi-111-c", application_name(Some(""), "c", 111));
+    }
+
+    /// A character that the server would turn into `?`, or that a filter would
+    /// have to quote, becomes `_`, in the host and in the cluster.
+    #[test]
+    fn application_name_replaces_characters_a_filter_cannot_use() {
+        assert_eq!(
+            "nisshi-h_t-a_b_c_d_e_",
+            application_name(Some("h t"), "a b'c\"d\u{e9}e\n", 1)
+        );
+    }
+
+    /// The server keeps 63 bytes of a name. The cluster is cut first, so the
+    /// host stays whole, and the host is cut only where it alone is too long.
+    #[test]
+    fn application_name_is_cut_at_the_servers_limit_and_keeps_the_host() {
+        let host = "h".repeat(40);
+        let name = application_name(Some(&host), &"c".repeat(200), 1);
+
+        assert_eq!(APPLICATION_NAME_MAX_LEN, name.len());
+        assert!(name.starts_with(&format!("nisshi-{host}-c")), "{name}");
+
+        let exact = application_name(Some("h"), &"c".repeat(APPLICATION_NAME_MAX_LEN), 1);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, exact.len());
+
+        let long_host = application_name(Some(&"h".repeat(200)), "cluster", 1);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, long_host.len());
+        assert!(long_host.starts_with("nisshi-hhh"), "{long_host}");
+    }
+
+    /// Reads the `application_name` that the server shows for the connection of
+    /// `storage`.
+    async fn connection_name(storage: &Postgres) -> Result<String> {
+        let connection = storage.connection().await?;
+
+        connection
+            .query_one(
+                "select application_name from pg_stat_activity where pid = pg_backend_pid()",
+                &[],
+            )
+            .await
+            .map(|row| row.get::<_, String>(0))
+            .map_err(Into::into)
+    }
+
+    /// Every connection of the pool is named in `pg_stat_activity` by its host
+    /// and cluster, and a name that the operator sets, in the URL or in
+    /// `options`, wins.
+    #[tokio::test]
+    async fn connections_are_named_in_pg_stat_activity() -> Result<()> {
+        // Only an unreachable database skips the test. A case that fails to connect after
+        // this probe did is a regression of the `options` merge, so it fails the test.
+        let probe = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15))
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        if let Err(err) = probe.connection().await {
+            eprintln!("skipping connections_are_named_in_pg_stat_activity: {err:?}");
+            return Ok(());
+        }
+
+        let cluster = alphanumeric_string(15);
+
+        let cases = [
+            ("", format!("nisshi-pod-0-{cluster}")),
+            ("?application_name=from_url", "from_url".to_owned()),
+            (
+                "?options=-c%20application_name%3Dfrom_options",
+                "from_options".to_owned(),
+            ),
+            (
+                "?options=-c%20application-name%3Dfrom_dashes",
+                "from_dashes".to_owned(),
+            ),
+        ];
+
+        for (query, expected) in cases {
+            let storage = Postgres::builder(&format!("{}{query}", *CONNECTION))?
+                .host("pod-0")
+                .cluster(cluster.clone())
+                .node(111)
+                .build();
+
+            assert_eq!(expected, connection_name(&storage).await?, "for {query:?}");
+        }
+
+        Ok(())
+    }
+
+    /// Brokers of one database that differ in host or in cluster show
+    /// different names, and the name stays within what the server keeps, so
+    /// the server shows exactly the name that was set. A broker whose host is
+    /// not known shows its node.
+    #[tokio::test]
+    async fn brokers_are_told_apart_in_pg_stat_activity() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let brokers = [
+            (Some("pod-0"), cluster.clone()),
+            (Some("pod-1"), cluster.clone()),
+            (Some("pod-0"), alphanumeric_string(15)),
+            (Some("pod-0"), "c".repeat(200)),
+            (None, cluster.clone()),
+        ];
+
+        let mut names = Vec::new();
+
+        for (host, cluster) in brokers {
+            let mut builder = Postgres::builder(&CONNECTION)?;
+
+            if let Some(host) = host {
+                builder = builder.host(host);
+            } else {
+                // The machine that runs the test may have a host name, so leave it unknown.
+                builder.pool.host = None;
+            }
+
+            let storage = builder.cluster(cluster).node(111).build();
+
+            // Only the first case may mean that there is no database. A later case that fails
+            // to connect fails the test.
+            let name = match connection_name(&storage).await {
+                Ok(name) => name,
+                Err(err) if names.is_empty() => {
+                    eprintln!("skipping brokers_are_told_apart_in_pg_stat_activity: {err:?}");
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+
+            assert!(name.starts_with("nisshi-"), "{name}");
+            assert!(name.len() <= APPLICATION_NAME_MAX_LEN, "{name}");
+            names.push(name);
+        }
+
+        let distinct = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), distinct.len(), "{names:?}");
+        assert_eq!(format!("nisshi-pod-0-{cluster}"), names[0]);
+        assert_eq!(format!("nisshi-pod-1-{cluster}"), names[1]);
+        assert_eq!(APPLICATION_NAME_MAX_LEN, names[3].len());
+        assert_eq!(format!("nisshi-111-{cluster}"), names[4]);
+
+        Ok(())
+    }
+
     /// No setting, a disabled timeout and a value the server would reject
     /// all leave the default in place.
     #[test]
@@ -5824,7 +6682,7 @@ mod tests {
     fn pool_builds_with_configured_timeouts() -> Result<()> {
         let builder = Postgres::builder(&CONNECTION)?;
 
-        let timeouts = builder.pool.timeouts();
+        let timeouts = builder.pool.pool.timeouts();
         assert_eq!(timeouts.wait, Some(DEFAULT_POOL_WAIT_TIMEOUT));
         assert_eq!(timeouts.create, Some(DEFAULT_POOL_CREATE_TIMEOUT));
 
@@ -5840,6 +6698,68 @@ mod tests {
             .expect_err("an option that tokio-postgres does not read must be rejected");
 
         assert!(error.to_string().contains("vacuum_into"), "{error}");
+    }
+
+    /// DeleteRecords calls across every request take a quarter of the pool,
+    /// and at least one connection, and one request makes at most
+    /// [`DELETE_RECORDS_CONCURRENCY`] of them at once. The pool of 16 leaves 12
+    /// connections to other work, which four requests that each made four calls
+    /// would take.
+    #[test]
+    fn delete_records_calls_take_a_quarter_of_the_pool() -> Result<()> {
+        for (pool_max_size, limit, per_request) in [(16, 4, 4), (32, 8, 4), (8, 2, 2), (2, 1, 1)] {
+            let storage =
+                Postgres::builder(&format!("{}?pool_max_size={pool_max_size}", *CONNECTION))?
+                    .cluster("sized")
+                    .node(0)
+                    .build();
+
+            let concurrency = storage.delete_records_concurrency();
+
+            assert_eq!(per_request, concurrency.per_request(), "{pool_max_size}");
+            assert_eq!(
+                limit,
+                concurrency
+                    .permits()
+                    .map(|permits| permits.available_permits())
+                    .expect("permits shared across requests"),
+                "{pool_max_size}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Two requests, which ask the same engine, get the same permits, so the
+    /// calls of both together stay within the limit. A clone of the engine, as
+    /// each client connection has, shares them too.
+    #[test]
+    fn delete_records_permits_are_shared_across_requests() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster("shared")
+            .node(0)
+            .build();
+
+        let first = storage.delete_records_concurrency();
+        let second = storage.clone().delete_records_concurrency();
+
+        let (first, second) = (
+            first.permits().expect("permits"),
+            second.permits().expect("permits"),
+        );
+
+        assert!(Arc::ptr_eq(first, second));
+
+        // the calls of one request take permits that another request then lacks
+        let taken = (0..first.available_permits())
+            .map(|_| Arc::clone(first).try_acquire_owned())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Message(error.to_string()))?;
+
+        assert_eq!(0, second.available_permits());
+        assert_eq!(taken.len(), 4);
+
+        Ok(())
     }
 
     /// Without `pool_max_size`, the pool opens at most 16 connections, and
@@ -5878,6 +6798,28 @@ mod tests {
             assert_eq!(
                 Duration::from_secs(120) + ABANDONED_STATEMENT_MARGIN,
                 storage.abandoned_statement_bound
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `client_read_share` in the storage URL reaches the storage's client
+    /// shares. Without the option, a client holds 6 of 8 Fetch reads and 4 of 8
+    /// ListOffsets reads.
+    #[test]
+    fn client_read_share_sets_the_client_shares_of_the_storage() -> Result<()> {
+        for (percent, fetch, list_offsets) in [(50, 4, 4), (100, 8, 8)] {
+            let storage =
+                Postgres::builder(&format!("{}?client_read_share={percent}", *CONNECTION))?
+                    .cluster("shared")
+                    .node(0)
+                    .build();
+
+            assert_eq!(fetch, storage.fetch_reads_per_client, "{percent}%");
+            assert_eq!(
+                list_offsets, storage.list_offsets_reads_per_client,
+                "{percent}%"
             );
         }
 
@@ -6314,6 +7256,137 @@ mod tests {
         Ok(())
     }
 
+    /// One client's reads, over many connections, may hold the whole of
+    /// `ReadLimits::fetch` while no other client waits for it, and the next
+    /// read waits for a permit of its own client's share, not in the limit's
+    /// queue.
+    #[tokio::test]
+    async fn a_lone_client_may_hold_the_whole_fetch_limit() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("greedy"));
+
+        // Each read has a connection of its own, and no connection's share
+        // is used up.
+        let reads = (0..limits.fetch + 1)
+            .map(|_| {
+                let storage = storage.clone();
+                let topition = topition.clone();
+
+                tokio::spawn(
+                    client.clone().scope(
+                        FetchReadShare::default()
+                            .scope(async move { storage.offset_stage(&topition).await }),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(limits.fetch_per_client() < limits.fetch);
+        assert_eq!(
+            limits.fetch,
+            reads_waiting_in_the_pool(&storage, limits.fetch).await
+        );
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        abort_reads(reads).await;
+        assert_eq!(limits.fetch, storage.fetch_reads.available_permits());
+
+        Ok(())
+    }
+
+    /// The same, for ListOffsets reads: `ReadLimits::list_offsets`.
+    #[tokio::test]
+    async fn a_lone_client_may_hold_the_whole_list_offsets_limit() -> Result<()> {
+        let storage = storage_without_connections()?;
+        let topition = Topition::new("shared", 0);
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(None, Some("greedy"));
+
+        let reads = (0..limits.list_offsets + 1)
+            .map(|_| {
+                let storage = storage.clone();
+                let offsets = [(topition.clone(), ListOffset::Latest)];
+
+                tokio::spawn(client.clone().scope(ListOffsetsReadShare::default().scope(
+                    async move {
+                        storage
+                            .list_offsets(IsolationLevel::ReadUncommitted, &offsets)
+                            .await
+                    },
+                )))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(limits.list_offsets_per_client() < limits.list_offsets);
+        assert_eq!(
+            limits.list_offsets,
+            reads_waiting_in_the_pool(&storage, limits.list_offsets).await
+        );
+        assert_eq!(0, storage.list_offsets_reads.available_permits());
+
+        abort_reads(reads).await;
+        assert_eq!(
+            limits.list_offsets,
+            storage.list_offsets_reads.available_permits()
+        );
+
+        Ok(())
+    }
+
+    /// A client's share is all of a limit but a connection's share by
+    /// default, never less than a connection's share, and `client_read_share`
+    /// sets a percentage of the limit, clamped the same way.
+    #[test]
+    fn client_share_follows_the_limit_and_the_setting() {
+        let default = ReadLimits::default();
+        assert_eq!(6, default.fetch_per_client());
+        assert_eq!(
+            default.list_offsets - LIST_OFFSETS_CONCURRENCY,
+            default.list_offsets_per_client()
+        );
+
+        // A pool too small for a spare connection share gives a client the
+        // whole limit.
+        assert_eq!(1, ReadLimits::for_pool(2).fetch_per_client());
+        assert_eq!(4, ReadLimits::for_pool(8).list_offsets_per_client());
+
+        for (percent, fetch) in [(1, 2), (25, 2), (50, 4), (75, 6), (100, 8)] {
+            let limits = ReadLimits {
+                client_percent: Some(percent),
+                ..ReadLimits::default()
+            };
+            assert_eq!(fetch, limits.fetch_per_client(), "{percent}%");
+            assert!(limits.list_offsets_per_client() >= LIST_OFFSETS_CONCURRENCY);
+            assert!(limits.list_offsets_per_client() <= limits.list_offsets);
+        }
+    }
+
+    /// `client_read_share` is removed from the URL like `pool_max_size`, and
+    /// only a percentage is accepted.
+    #[test]
+    fn client_read_share_is_taken_from_the_url() -> Result<()> {
+        let mut config =
+            "postgres://localhost/db?options=a&client_read_share=25&pool_max_size=4".to_owned();
+        assert_eq!(Some(25), take_client_read_share(&mut config)?);
+        assert_eq!("postgres://localhost/db?options=a&pool_max_size=4", config);
+
+        let mut config = "postgres://localhost/db".to_owned();
+        assert_eq!(None, take_client_read_share(&mut config)?);
+
+        for value in ["0", "101", "banana", ""] {
+            let mut config = format!("postgres://localhost/db?client_read_share={value}");
+            assert_matches!(
+                take_client_read_share(&mut config),
+                Err(Error::InvalidStorageOptionValue { option, .. }) if option == CLIENT_READ_SHARE,
+                "{value}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// A connection's abandoned Fetch reads keep their permits from its
     /// share, as well as from `ReadLimits::fetch`, until their statements end. The
     /// connection's next read waits meanwhile, and another connection's
@@ -6388,6 +7461,204 @@ mod tests {
         )
         .await
         .map_err(|_| Error::Message("the connection's share did not come back".into()))??;
+
+        Ok(())
+    }
+
+    /// A client's abandoned Fetch reads keep their permits, from the client's
+    /// share and from `ReadLimits::fetch`, until their statements end, and a
+    /// client past its share waits for it, behind another client that waits
+    /// for the limit. This is the reconnect that the client share exists for:
+    /// a client that is alone may use the whole limit, but once another
+    /// client waits, a permit that frees goes to that client and not to the
+    /// next read of the one that abandons its reads.
+    #[tokio::test]
+    async fn abandoned_fetch_reads_of_a_client_give_way_to_a_waiting_client() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping abandoned_fetch_reads_of_a_client_give_way_to_a_waiting_client: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("reconnecting"));
+        let share_marker = alphanumeric_string(15);
+        let first_extra_marker = alphanumeric_string(15);
+        let second_extra_marker = alphanumeric_string(15);
+
+        // Each read comes from a new connection, so that no connection's share
+        // is used up, only the client's. The reads past the client's share take
+        // the rest of the limit, because nobody waits for it.
+        let abandoned = [
+            (limits.fetch_per_client(), &share_marker),
+            (1, &first_extra_marker),
+            (
+                limits.fetch - limits.fetch_per_client() - 1,
+                &second_extra_marker,
+            ),
+        ];
+        for (reads, marker) in abandoned {
+            for _ in 0..reads {
+                let permits = client
+                    .clone()
+                    .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                    .await?;
+                abandon_sleeping_statement(&storage, permits, marker).await?;
+            }
+        }
+
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        // The client's next read waits for its share, and then another
+        // client's read waits for the limit.
+        let next = tokio::spawn({
+            let storage = storage.clone();
+
+            client.clone().scope(
+                FetchReadShare::default()
+                    .scope(async move { storage.fetch_read_permits().await.map(drop) }),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!next.is_finished(), "the read went ahead of a full limit");
+
+        let other = tokio::spawn({
+            let storage = storage.clone();
+
+            ClientIdentity::new(Some("bob"), Some("polite")).scope(
+                FetchReadShare::default().scope(async move { storage.fetch_read_permits().await }),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!other.is_finished(), "the read went ahead of a full limit");
+
+        // One permit frees. It goes to the client that waits for the limit, and
+        // the read of the client past its share does not take it.
+        assert_eq!(1, cancel_backends(&monitor, &first_extra_marker).await?);
+        // It keeps the permit, so that the limit stays used up.
+        let other_permits = timeout(Duration::from_secs(5), other)
+            .await
+            .map_err(|_| Error::Message("the waiting client did not get the permit".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+        assert!(
+            !next.is_finished(),
+            "the read of the client past its share took the permit that freed"
+        );
+
+        // The rest frees, and so the reads of the client go ahead again.
+        assert_eq!(
+            limits.fetch_per_client(),
+            cancel_backends(&monitor, &share_marker).await?
+        );
+        assert_eq!(
+            limits.fetch - limits.fetch_per_client() - 1,
+            cancel_backends(&monitor, &second_extra_marker).await?
+        );
+        timeout(Duration::from_secs(5), next)
+            .await
+            .map_err(|_| Error::Message("the client's read did not go ahead".into()))?
+            .map_err(|err| Error::Message(err.to_string()))??;
+
+        drop(other_permits);
+        wait_until(&storage, |storage| {
+            storage.fetch_reads.available_permits() == limits.fetch
+        })
+        .await;
+
+        Ok(())
+    }
+
+    /// A Fetch that reaches its deadline while it waits for its client's share answers with no
+    /// records, and the engine logs a warning that names the client, because the Fetch service
+    /// sees nothing but the empty answer.
+    #[tokio::test]
+    async fn fetch_missing_its_deadline_at_the_client_share_names_the_client() -> Result<()> {
+        use std::io::{self, Write};
+
+        #[derive(Clone, Default)]
+        struct WarnLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for WarnLog {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(alphanumeric_string(15).as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .build();
+
+        let monitor = match storage.connection().await {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                eprintln!(
+                    "skipping fetch_missing_its_deadline_at_the_client_share_names_the_client: {err:?}"
+                );
+                return Ok(());
+            }
+        };
+
+        let storage = with_cancel_requests_refused(storage).await?;
+        let limits = ReadLimits::default();
+        let client = ClientIdentity::new(Some("alice"), Some("reporting"));
+        let marker = alphanumeric_string(15);
+
+        // The client abandons as many reads as the limit allows, each from a new connection, so
+        // that its share and the limit are used up.
+        for _ in 0..limits.fetch {
+            let permits = client
+                .clone()
+                .scope(FetchReadShare::default().scope(storage.fetch_read_permits()))
+                .await?;
+            abandon_sleeping_statement(&storage, permits, &marker).await?;
+        }
+        assert_eq!(0, storage.fetch_reads.available_permits());
+
+        let log = WarnLog::default();
+        let writer = log.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        let batches = client
+            .scope(FetchReadShare::default().scope(storage.fetch(
+                &Topition::new("orders", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_millis(300),
+            )))
+            .await?;
+
+        assert!(batches.is_empty(), "{batches:?}");
+
+        let log = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(log.contains("alice"), "{log:?}");
+        assert!(log.contains("reporting"), "{log:?}");
+        assert!(log.contains("client_read_limit"), "{log:?}");
+
+        _ = cancel_backends(&monitor, &marker).await?;
 
         Ok(())
     }
@@ -6798,7 +8069,7 @@ mod tests {
                                 1,
                                 8 * 1024,
                                 IsolationLevel::ReadUncommitted,
-                                Duration::from_secs(5),
+                                Instant::now() + Duration::from_secs(5),
                             )
                             .await
                             .map(drop)
@@ -6970,7 +8241,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await
             .map(drop)
@@ -6982,15 +8253,12 @@ mod tests {
     #[tokio::test]
     async fn fetches_beyond_the_limit_all_finish() -> Result<()> {
         let cluster = alphanumeric_string(15);
-        let storage = Postgres::builder(&CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping fetches_beyond_the_limit_all_finish: {err:?}");
+        let Some(storage) =
+            storage_with_schema("fetches_beyond_the_limit_all_finish", &CONNECTION, &cluster)
+                .await?
+        else {
             return Ok(());
-        }
+        };
 
         let topition = topic_with_one_record(&storage, &cluster).await?;
 
@@ -7112,7 +8380,7 @@ mod tests {
 
     /// Returns storage on a pool of one connection that connects with a
     /// unique `application_name`, a monitor on a pool of its own, and that
-    /// name, or `None` when no server answers.
+    /// name, or `None` when no server answers. The schema is in place.
     async fn storage_on_one_connection(
         cluster: &str,
     ) -> Result<Option<(Postgres, Postgres, String)>> {
@@ -7127,18 +8395,14 @@ mod tests {
         .build();
         storage.pool.resize(1);
 
-        let monitor = Postgres::builder(&CONNECTION)?
-            .cluster(cluster)
-            .node(0)
-            .build();
-
-        match monitor.connection().await {
-            Ok(_) => Ok(Some((storage, monitor, application_name))),
-            Err(err) => {
-                eprintln!("skipping: {err:?}");
-                Ok(None)
-            }
-        }
+        // The tests of this module share one database, and a test that
+        // starts before another one has created the schema fails without
+        // this.
+        Ok(
+            storage_with_schema("storage_on_one_connection", &CONNECTION, cluster)
+                .await?
+                .map(|monitor| (storage, monitor, application_name)),
+        )
     }
 
     /// A fetch dropped while its statement waits has that statement
@@ -7206,6 +8470,107 @@ mod tests {
         let tx = c.transaction().await?;
         assert_eq!(1, tx.query_one("SELECT 1", &[]).await?.get::<_, i32>(0));
         tx.commit().await?;
+
+        Ok(())
+    }
+
+    /// A fetch whose deadline passes while its statement waits returns at that deadline with no
+    /// batches. The engine cancels the statement, so the connection goes back to the pool idle, as
+    /// [`SETTLE_QUERY`] shows, while the lock is still held.
+    ///
+    /// The fetch waits for a lock on `header`, so it waits in its header query, inside its
+    /// transaction and after its record query.
+    #[tokio::test]
+    async fn fetch_stopped_at_its_deadline_cancels_its_statement() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+        let Some((storage, monitor, application_name)) =
+            storage_on_one_connection(&cluster).await?
+        else {
+            return Ok(());
+        };
+
+        let topition = topic_with_one_record(&storage, &cluster).await?;
+
+        let mut locking = monitor.connection().await?;
+
+        // A transaction reads one snapshot of `pg_stat_activity`, so the
+        // test watches the read from outside the locking transaction.
+        let watching = monitor.connection().await?;
+
+        // The test releases the lock before it returns. The timeouts bound
+        // how long the lock holds up other tests when this test stops early.
+        let lock = locking.transaction().await?;
+        lock.batch_execute(concat!(
+            "SET LOCAL lock_timeout = '5s'; ",
+            "SET LOCAL idle_in_transaction_session_timeout = '10s'; ",
+            "LOCK TABLE header IN ACCESS EXCLUSIVE MODE",
+        ))
+        .await?;
+
+        let read_time = Duration::from_millis(500);
+        let started_at = Instant::now();
+
+        let fetched = storage
+            .fetch(
+                &topition,
+                0,
+                1,
+                8 * 1024,
+                IsolationLevel::ReadUncommitted,
+                started_at + read_time,
+            )
+            .await?;
+
+        assert!(fetched.is_empty(), "{fetched:?}");
+
+        // The lock holds for up to 10s, so this bound fails for a fetch that waits for its
+        // statement to end.
+        assert!(
+            started_at.elapsed() < read_time + Duration::from_secs(1),
+            "{:?}",
+            started_at.elapsed()
+        );
+
+        // The loop passes only when the pool's one connection is idle after `SETTLE_QUERY` while
+        // the lock is still held. A connection released with its statement still waiting is back
+        // in the pool while its backend is still active.
+        let give_up = Instant::now() + Duration::from_secs(10);
+        loop {
+            let activity = watching
+                .query_opt(
+                    "SELECT state, query FROM pg_stat_activity WHERE application_name = $1",
+                    &[&application_name],
+                )
+                .await?
+                .map(|row| {
+                    (
+                        row.get::<_, Option<String>>(0),
+                        row.get::<_, Option<String>>(1),
+                    )
+                });
+            let status = storage.pool.status();
+
+            if let Some((Some(state), query)) = &activity
+                && state == "idle"
+                && status.available == 1
+            {
+                assert_eq!(Some(SETTLE_QUERY), query.as_deref());
+                break;
+            }
+
+            assert!(
+                Instant::now() < give_up,
+                "{activity:?} while the lock on header is held, pool {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            ReadLimits::default().fetch,
+            storage.fetch_reads.available_permits()
+        );
+
+        lock.rollback().await?;
 
         Ok(())
     }
@@ -10635,7 +12000,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -10794,7 +12159,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -10902,7 +12267,7 @@ mod tests {
                 1,
                 8 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
             .await?;
 
@@ -10944,15 +12309,11 @@ mod tests {
     async fn storage_with_empty_topic() -> Result<Option<(Postgres, Topition)>> {
         let cluster = alphanumeric_string(15);
 
-        let storage = Postgres::builder(&CONNECTION)?
-            .cluster(cluster.as_str())
-            .node(rng().random_range(0..i32::MAX))
-            .build();
-
-        if let Err(err) = storage.connection().await {
-            eprintln!("skipping: {err:?}");
+        let Some(storage) =
+            storage_with_schema("storage_with_empty_topic", &CONNECTION, &cluster).await?
+        else {
             return Ok(None);
-        }
+        };
 
         storage
             .register_broker(BrokerRegistrationRequest {
@@ -11030,7 +12391,7 @@ mod tests {
                 1,
                 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
             )
         };
 
@@ -11094,7 +12455,7 @@ mod tests {
                 1,
                 5 * 1024 * 1024,
                 IsolationLevel::ReadUncommitted,
-                largest_max_wait,
+                Instant::now() + largest_max_wait,
             ),
         )
         .await
@@ -11434,6 +12795,64 @@ mod tests {
         Ok(())
     }
 
+    /// A record produced without a timestamp stores NO_TIMESTAMP, -1, which is an instant before
+    /// the epoch. Retention reads the append time first, so the record is kept while that has not
+    /// expired, and deleted when it has, as a record with any other old timestamp is.
+    #[tokio::test]
+    async fn retention_keeps_a_record_without_a_timestamp_until_its_append_time_expires()
+    -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        retain_for_one_minute(&storage, &topition).await?;
+
+        let now = now_ms()?;
+
+        produce_at(&storage, &topition, &[-1, -1]).await?;
+        append_times(&storage, &topition, 0, &[now, now]).await?;
+
+        assert_eq!(0, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(vec![0, 1], stored_offsets(&storage, &topition).await?);
+
+        append_times(&storage, &topition, 0, &[now - 600_000, now - 600_000]).await?;
+
+        assert_eq!(2, storage.policy_delete(SystemTime::now()).await?);
+        assert_eq!(
+            Vec::<i64>::new(),
+            stored_offsets(&storage, &topition).await?
+        );
+
+        Ok(())
+    }
+
+    /// A lookup by timestamp never answers a record without one: Kafka's time index holds no entry
+    /// for it either.
+    #[tokio::test]
+    async fn list_offsets_by_timestamp_skips_a_record_without_a_timestamp() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let now = now_ms()?;
+
+        produce_at(&storage, &topition, &[-1, now]).await?;
+
+        let responses = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(
+                    topition.clone(),
+                    ListOffset::Timestamp(SystemTime::UNIX_EPOCH),
+                )],
+            )
+            .await?;
+
+        assert_eq!(Some(1), responses[0].1.offset);
+
+        Ok(())
+    }
+
     /// A keyed fetch of a virtual topic names the topic as `base/key`, and that name has no row in
     /// `topic`. Its records still carry their headers, and the headers read are those of the
     /// records returned, not of the records in between.
@@ -11486,7 +12905,7 @@ mod tests {
                     1,
                     8 * 1024,
                     IsolationLevel::ReadUncommitted,
-                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(5),
                 )
                 .await?,
         )?;
@@ -11563,7 +12982,7 @@ mod tests {
                     1,
                     8 * 1024,
                     IsolationLevel::ReadUncommitted,
-                    Duration::from_secs(5),
+                    Instant::now() + Duration::from_secs(5),
                 )
                 .await?,
         )?;
@@ -11896,6 +13315,744 @@ mod tests {
                 assert_eq!(tables_in_first_on_path, 0);
                 assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
                 assert!(cluster_is_stored(&storage).await?);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that upgrades a database of version 1 to version 2. It adds a table and a row, so
+    /// that a step that runs twice fails on the row, and a step that runs in part leaves the table.
+    const MARKER_SQL: &str = "create table upgrade_marker (id int primary key); \
+                              insert into upgrade_marker (id) values (1);";
+
+    const STEP_TO_2: Migration = Migration {
+        to_version: 2,
+        oldest_compatible_version: 1,
+        breaks_previous_release: false,
+        sql: MARKER_SQL,
+    };
+
+    /// A step that upgrades a database of version 2 to version 3. It needs the table of
+    /// [`STEP_TO_2`], so that it fails when it runs before that step.
+    const STEP_TO_3: Migration = Migration {
+        to_version: 3,
+        oldest_compatible_version: 1,
+        breaks_previous_release: false,
+        sql: "create table upgrade_marker_child \
+              (id int primary key references upgrade_marker (id)); \
+              insert into upgrade_marker_child (id) select id from upgrade_marker;",
+    };
+
+    const UPGRADE_TO_2: &[Migration] = &[STEP_TO_2];
+
+    const SCHEMA_2: Schema = Schema {
+        version: 2,
+        oldest_compatible_version: 1,
+        migrations: UPGRADE_TO_2,
+    };
+
+    const SCHEMA_3: Schema = Schema {
+        version: 3,
+        oldest_compatible_version: 1,
+        migrations: &[STEP_TO_2, STEP_TO_3],
+    };
+
+    /// Returns the number of rows in `table` in `storage`'s database.
+    async fn count(storage: &Postgres, table: &str) -> Result<i64> {
+        storage
+            .connection()
+            .await?
+            .query_one(&format!("select count(*) from {table}"), &[])
+            .await?
+            .try_get::<_, i64>(0)
+            .map_err(Into::into)
+    }
+
+    /// A database of version 1 holds a topic and a record. A release of version 2 must upgrade it
+    /// at startup, keep the data, record version 2, and then produce and fetch.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_a_version_1_database_then_produces_and_fetches() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_a_version_1_database_then_produces_and_fetches",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                register(&storage).await?;
+
+                let topic = alphanumeric_string(15);
+                _ = storage
+                    .create_topic(
+                        CreatableTopic::default()
+                            .name(topic.clone())
+                            .num_partitions(1)
+                            .replication_factor(0)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into())),
+                        false,
+                    )
+                    .await?;
+                let topition = Topition::new(topic, 0);
+
+                let batch = || -> Result<deflated::Batch> {
+                    Batch::builder()
+                        .record(Record::builder().value(Bytes::from_static(b"r").into()))
+                        .build()
+                        .and_then(TryInto::try_into)
+                        .map_err(Into::into)
+                };
+                assert_eq!(0, storage.produce(None, &topition, batch()?).await?);
+                assert_eq!(recorded_version(&storage).await?, Some(1));
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                assert_eq!(count(&storage, "upgrade_marker").await?, 1);
+                assert_eq!(count(&storage, "record").await?, 1);
+
+                assert_eq!(1, storage.produce(None, &topition, batch()?).await?);
+                let fetched = storage
+                    .fetch(
+                        &topition,
+                        0,
+                        0,
+                        1_000_000,
+                        IsolationLevel::ReadUncommitted,
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .await?;
+                assert!(!fetched.is_empty());
+                assert_eq!(count(&storage, "record").await?, 2);
+
+                // The release of version 1, which a rollback runs, finds version 2 with
+                // `oldest_compatible_version` 1, and leaves the database as it is.
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Four brokers of version 2 run `ensure_schema` at the same time on one database of version
+    /// 1. Each one must succeed, and the database must run each step once: a second run of the step
+    /// in `UPGRADE_TO_2` fails on its row.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_once_for_brokers_that_start_together() -> Result<()> {
+        const BROKERS: usize = 4;
+
+        with_empty_database(
+            "ensure_schema_upgrades_once_for_brokers_that_start_together",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                let storages = (0..BROKERS)
+                    .map(|_| database.storage())
+                    .collect::<Result<Vec<_>>>()?;
+
+                for result in future::join_all(
+                    storages
+                        .iter()
+                        .map(|storage| storage.ensure_schema_of(&SCHEMA_2, SCHEMA)),
+                )
+                .await
+                {
+                    result?;
+                }
+
+                assert_eq!(recorded_version(&storages[0]).await?, Some(2));
+                assert_eq!(count(&storages[0], "upgrade_marker").await?, 1);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails must leave the database as it was: version 1, and none of the step's
+    /// earlier statements, so the next start runs the step again.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_an_upgrade_that_fails() -> Result<()> {
+        const BROKEN: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "create table upgrade_marker (id int primary key); \
+                      insert into no_such_table (id) values (1);",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_rolls_back_an_upgrade_that_fails",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                assert_matches!(storage.ensure_schema_of(&BROKEN, SCHEMA).await, Err(_));
+
+                assert_eq!(recorded_version(&storage).await?, Some(1));
+                assert_matches!(count(&storage, "upgrade_marker").await, Err(_));
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+                assert_eq!(recorded_version(&storage).await?, Some(2));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// An earlier release created the tables in this database without recording a version, and
+    /// they may lack tables of version 1. A release of version 2 must refuse the database and
+    /// leave it as it was, so that a release of version 1 can still record its version.
+    #[tokio::test]
+    async fn ensure_schema_refuses_a_database_created_without_a_version_to_upgrade() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_refuses_a_database_created_without_a_version_to_upgrade",
+            async |database| {
+                let storage = database.storage()?;
+                database.execute(SCHEMA).await?;
+                register(&storage).await?;
+
+                assert_matches!(
+                    storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
+                    Err(Error::UnversionedSchema { schema_version: 2 })
+                );
+
+                assert_matches!(count(&storage, "nisshi_schema_version").await, Err(_));
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_version(&storage).await?, Some(SCHEMA_VERSION));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The upgrade must keep a stricter `oldest_compatible_version` that the database already
+    /// records.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_never_lowers_oldest_compatible_version() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_never_lowers_oldest_compatible_version",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                database.record_schema_version(1, 2).await?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                let oldest = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select oldest_compatible_version from nisshi_schema_version",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i32>(0)?;
+                assert_eq!(oldest, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// When an existing deployment keeps its tables in the `public` namespace and the broker's
+    /// search path puts another, empty namespace first, the upgrade must change the tables in
+    /// `public`, as the creation of the version table does.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_the_namespace_that_holds_the_existing_tables() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_the_namespace_that_holds_the_existing_tables",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.execute("create schema first_on_path").await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                let marker_namespaces = storage
+                    .connection()
+                    .await?
+                    .query(
+                        "select schemaname from pg_tables where tablename = 'upgrade_marker'",
+                        &[],
+                    )
+                    .await?
+                    .iter()
+                    .map(|row| row.try_get::<_, String>(0))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                assert_eq!(marker_namespaces, ["public"]);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// Returns the version and the `oldest_compatible_version` that `storage`'s database records.
+    async fn recorded_versions(storage: &Postgres) -> Result<(i32, i32)> {
+        let row = storage
+            .connection()
+            .await?
+            .query_one(
+                "select version, oldest_compatible_version from nisshi_schema_version",
+                &[],
+            )
+            .await?;
+        Ok((row.try_get(0)?, row.try_get(1)?))
+    }
+
+    /// A step that leaves a schema that only version 2 can use must make the database record
+    /// that. The release of version 1 must then refuse the database and change nothing.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_records_the_compatibility_of_its_step() -> Result<()> {
+        const BREAKING: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 2,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 2,
+                breaks_previous_release: true,
+                sql: MARKER_SQL,
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_records_the_compatibility_of_its_step",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                assert_eq!(recorded_versions(&storage).await?, (1, 1));
+
+                storage.ensure_schema_of(&BREAKING, SCHEMA).await?;
+                assert_eq!(recorded_versions(&storage).await?, (2, 2));
+
+                assert_matches!(
+                    storage.ensure_schema().await,
+                    Err(Error::IncompatibleSchema {
+                        recorded_version: 2,
+                        oldest_compatible_version: 2,
+                        schema_version: 1,
+                    })
+                );
+                assert_eq!(recorded_versions(&storage).await?, (2, 2));
+                assert_eq!(count(&storage, "upgrade_marker").await?, 1);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// An upgrade from version 1 to version 3 must run both steps in order, in one transaction,
+    /// and record version 3.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_over_two_steps() -> Result<()> {
+        with_empty_database("ensure_schema_upgrades_over_two_steps", async |database| {
+            let storage = database.storage()?;
+            storage.ensure_schema().await?;
+
+            storage.ensure_schema_of(&SCHEMA_3, SCHEMA).await?;
+
+            assert_eq!(recorded_version(&storage).await?, Some(3));
+            assert_eq!(count(&storage, "upgrade_marker").await?, 1);
+            assert_eq!(count(&storage, "upgrade_marker_child").await?, 1);
+            Ok(())
+        })
+        .await
+    }
+
+    /// A database of version 2 has run the first step already. The upgrade to version 3 must run
+    /// only the second step: the first one fails when it runs again, because its table exists.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_runs_only_the_steps_after_the_recorded_version() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_runs_only_the_steps_after_the_recorded_version",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                storage.ensure_schema_of(&SCHEMA_3, SCHEMA).await?;
+
+                assert_eq!(recorded_version(&storage).await?, Some(3));
+                assert_eq!(count(&storage, "upgrade_marker_child").await?, 1);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// When the second step of an upgrade from version 1 fails, the first step's changes must be
+    /// undone too, and the database must still record version 1.
+    #[tokio::test]
+    async fn ensure_schema_rolls_back_every_step_when_the_last_one_fails() -> Result<()> {
+        const BROKEN_STEP_TO_3: Migration = Migration {
+            sql: "insert into no_such_table (id) values (1);",
+            ..STEP_TO_3
+        };
+        const BROKEN_3: Schema = Schema {
+            migrations: &[STEP_TO_2, BROKEN_STEP_TO_3],
+            ..SCHEMA_3
+        };
+
+        with_empty_database(
+            "ensure_schema_rolls_back_every_step_when_the_last_one_fails",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                assert_matches!(storage.ensure_schema_of(&BROKEN_3, SCHEMA).await, Err(_));
+
+                assert_eq!(recorded_version(&storage).await?, Some(1));
+                assert_matches!(count(&storage, "upgrade_marker").await, Err(_));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A `nisshi_schema_version` table that records an older version sits first on the search
+    /// path, in a namespace that holds none of the tables. The broker must read the version from
+    /// the namespace that holds the tables, so it keeps the database of version 2 and does not
+    /// run the first step again.
+    #[tokio::test]
+    async fn ensure_schema_ignores_a_stale_version_table_earlier_on_the_search_path() -> Result<()>
+    {
+        with_empty_database(
+            "ensure_schema_ignores_a_stale_version_table_earlier_on_the_search_path",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database
+                    .storage()?
+                    .ensure_schema_of(&SCHEMA_2, SCHEMA)
+                    .await?;
+                database.execute("create schema first_on_path").await?;
+                database
+                    .execute(
+                        "create table first_on_path.nisshi_schema_version as \
+                         select 1 as version, 1 as oldest_compatible_version",
+                    )
+                    .await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                let recorded = storage
+                    .connection()
+                    .await?
+                    .query_one("select version from public.nisshi_schema_version", &[])
+                    .await?
+                    .try_get::<_, i32>(0)?;
+                assert_eq!(recorded, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A `nisshi_schema_version` table that records a newer version sits first on the search path.
+    /// The broker must still read the version from the namespace that holds the tables, in the
+    /// read before the lock and in the read under it, so that it does not skip an upgrade that
+    /// the database needs.
+    #[tokio::test]
+    async fn ensure_schema_upgrades_despite_a_stale_newer_version_table_earlier_on_the_search_path()
+    -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrades_despite_a_stale_newer_version_table_earlier_on_the_search_path",
+            async |database| {
+                database.storage()?.ensure_schema().await?;
+                database.execute("create schema first_on_path").await?;
+                database
+                    .execute(
+                        "create table first_on_path.nisshi_schema_version as \
+                         select 2 as version, 1 as oldest_compatible_version",
+                    )
+                    .await?;
+
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20search_path%3Dfirst_on_path%2Cpublic"));
+                let storage = database.storage_at(&url)?;
+
+                storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await?;
+
+                assert_eq!(count(&storage, "public.upgrade_marker").await?, 1);
+                let recorded = storage
+                    .connection()
+                    .await?
+                    .query_one("select version from public.nisshi_schema_version", &[])
+                    .await?
+                    .try_get::<_, i32>(0)?;
+                assert_eq!(recorded, 2);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// The database records a version but has lost its `cluster` table. The steps would then run
+    /// on whatever the connection's search path holds, so the upgrade must stop before it
+    /// changes anything.
+    #[tokio::test]
+    async fn ensure_schema_refuses_an_upgrade_of_a_database_without_its_cluster_table() -> Result<()>
+    {
+        with_empty_database(
+            "ensure_schema_refuses_an_upgrade_of_a_database_without_its_cluster_table",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+                database.execute("drop table cluster cascade").await?;
+
+                assert_matches!(
+                    storage.ensure_schema_of(&SCHEMA_2, SCHEMA).await,
+                    Err(Error::MissingClusterTable {
+                        schema_version: 1,
+                        search_path,
+                    }) if search_path.contains("public")
+                );
+
+                assert_eq!(recorded_versions(&storage).await?, (1, 1));
+                assert_matches!(count(&storage, "upgrade_marker").await, Err(_));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that needs a table lock that another session holds must fail at its lock timeout,
+    /// leave the database at version 1, and not wait for the lock for the setup's 5 minutes.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_fails_when_a_step_cannot_get_its_table_lock() -> Result<()> {
+        const ADDS_COLUMN: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "alter table cluster add column upgrade_column int",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_fails_when_a_step_cannot_get_its_table_lock",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // A reader's lock on `cluster` conflicts with the lock of `alter table`.
+                let holder_storage = database.storage()?;
+                let mut holder = holder_storage.connection().await?;
+                let reading = holder.transaction().await?;
+                reading
+                    .batch_execute("LOCK TABLE cluster IN ACCESS SHARE MODE")
+                    .await?;
+
+                // Without a lock timeout, the step waits for the reader until this timeout fires.
+                let outcome = timeout(
+                    Duration::from_secs(30),
+                    storage.ensure_schema_of(&ADDS_COLUMN, SCHEMA),
+                )
+                .await
+                .map_err(|_| Error::Message("the step waited for its table lock".into()))?;
+                assert_matches!(
+                    outcome,
+                    Err(Error::SchemaStepFailed { from_version: 1, to_version: 2, code, .. })
+                        if *code == *SqlState::LOCK_NOT_AVAILABLE.code()
+                );
+                reading.rollback().await?;
+
+                assert_eq!(recorded_versions(&storage).await?, (1, 1));
+                let columns = storage
+                    .connection()
+                    .await?
+                    .query_one(
+                        "select count(*) from information_schema.columns \
+                         where table_name = 'cluster' and column_name = 'upgrade_column'",
+                        &[],
+                    )
+                    .await?
+                    .try_get::<_, i64>(0)?;
+                assert_eq!(columns, 0);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails on a constraint must report the SQLSTATE, message, table and constraint,
+    /// and must not report the `DETAIL`, which repeats the failing row.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_failure_does_not_report_the_failing_row() -> Result<()> {
+        const ADDS_UNIQUE_INDEX: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "create unique index step_rows_value on step_rows (value)",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_failure_does_not_report_the_failing_row",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // Two equal rows make the unique index fail, and PostgreSQL then puts the value in
+                // the `DETAIL` of its error.
+                database
+                    .execute(
+                        "create table step_rows (value text); \
+                         insert into step_rows values ('payload-in-a-row'), ('payload-in-a-row')",
+                    )
+                    .await?;
+
+                let outcome = storage.ensure_schema_of(&ADDS_UNIQUE_INDEX, SCHEMA).await;
+
+                assert_matches!(
+                    &outcome,
+                    Err(Error::SchemaStepFailed {
+                        from_version: 1,
+                        to_version: 2,
+                        code,
+                        table: Some(table),
+                        constraint: Some(constraint),
+                        ..
+                    }) if **code == *SqlState::UNIQUE_VIOLATION.code()
+                        && &**table == "step_rows"
+                        && &**constraint == "step_rows_value"
+                );
+                assert!(!format!("{outcome:?}").contains("payload-in-a-row"));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step that fails on a value that does not fit its type, SQLSTATE class `22`, must not
+    /// report the value, which the server quotes in its message.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_failure_does_not_quote_a_value_that_does_not_fit() -> Result<()>
+    {
+        const CASTS_TO_INTEGER: Schema = Schema {
+            version: 2,
+            oldest_compatible_version: 1,
+            migrations: &[Migration {
+                to_version: 2,
+                oldest_compatible_version: 1,
+                breaks_previous_release: false,
+                sql: "alter table step_rows alter column value type integer using value::integer",
+            }],
+        };
+
+        with_empty_database(
+            "ensure_schema_upgrade_failure_does_not_quote_a_value_that_does_not_fit",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                database
+                    .execute(
+                        "create table step_rows (value text); \
+                         insert into step_rows values ('payload-in-a-row')",
+                    )
+                    .await?;
+
+                let outcome = storage.ensure_schema_of(&CASTS_TO_INTEGER, SCHEMA).await;
+
+                assert_matches!(
+                    &outcome,
+                    Err(Error::SchemaStepFailed { from_version: 1, to_version: 2, code, message, .. })
+                        if **code == *SqlState::INVALID_TEXT_REPRESENTATION.code()
+                            && &**message == DATA_EXCEPTION_MESSAGE
+                );
+                assert!(!format!("{outcome:?}").contains("payload-in-a-row"));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A schema whose step records the settings that the step runs with in a table.
+    const RECORDS_STEP_SETTINGS: Schema = Schema {
+        version: 2,
+        oldest_compatible_version: 1,
+        migrations: &[Migration {
+            to_version: 2,
+            oldest_compatible_version: 1,
+            breaks_previous_release: false,
+            sql: "create table step_settings as select \
+                  current_setting('statement_timeout') as statement_timeout, \
+                  current_setting('lock_timeout') as lock_timeout",
+        }],
+    };
+
+    /// Returns the `statement_timeout` and `lock_timeout` that the step of
+    /// [`RECORDS_STEP_SETTINGS`] saw.
+    async fn recorded_step_settings(storage: &Postgres) -> Result<(String, String)> {
+        let row = storage
+            .connection()
+            .await?
+            .query_one(
+                "select statement_timeout, lock_timeout from step_settings",
+                &[],
+            )
+            .await?;
+        Ok((row.try_get(0)?, row.try_get(1)?))
+    }
+
+    /// A step must run with the 30s default statement timeout and the step lock timeout, and not
+    /// with the 5 minutes that the setup uses.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_step_runs_with_the_default_statement_timeout() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_step_runs_with_the_default_statement_timeout",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                storage
+                    .ensure_schema_of(&RECORDS_STEP_SETTINGS, SCHEMA)
+                    .await?;
+
+                assert_eq!(
+                    recorded_step_settings(&storage).await?,
+                    ("30s".to_string(), STEP_LOCK_TIMEOUT.to_string())
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// A step must run with the `statement_timeout` that the operator put in the options of the
+    /// storage URL, and not with the default.
+    #[tokio::test]
+    async fn ensure_schema_upgrade_step_runs_with_the_statement_timeout_of_the_url() -> Result<()> {
+        with_empty_database(
+            "ensure_schema_upgrade_step_runs_with_the_statement_timeout_of_the_url",
+            async |database| {
+                let mut url = database.url()?;
+                url.set_query(Some("options=-c%20statement_timeout%3D45000"));
+                let storage = database.storage_at(&url)?;
+                storage.ensure_schema().await?;
+
+                storage
+                    .ensure_schema_of(&RECORDS_STEP_SETTINGS, SCHEMA)
+                    .await?;
+
+                assert_eq!(
+                    recorded_step_settings(&storage).await?,
+                    ("45s".to_string(), STEP_LOCK_TIMEOUT.to_string())
+                );
                 Ok(())
             },
         )

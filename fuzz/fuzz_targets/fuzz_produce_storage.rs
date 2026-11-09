@@ -28,23 +28,27 @@
 
 use std::sync::{Arc, LazyLock};
 
-use fuzz::{check_request, check_response, normalize_request};
 use libfuzzer_sys::fuzz_target;
+use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::ProduceRequest;
 use nisshi_storage::{ProduceService, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
-use rama::Service as _;
+use rama::Service;
 use tokio::runtime::Runtime;
 use url::Url;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().expect("tokio runtime"));
 
-fuzz_target!(|request: ProduceRequest| {
-    RUNTIME.block_on(async {
-        check_request(request.clone()).expect("encode/decode request");
+fuzz_target!(|input: (u16, ProduceRequest)| {
+    let (selector, request) = input;
+    let version = api_version::<ProduceRequest>(selector);
 
+    RUNTIME.block_on(async {
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let mut request = normalize_request(request).expect("normalized request");
+        let Some(mut request) = check_request(request, version).expect("encode/decode request")
+        else {
+            return;
+        };
 
         // A fuzzed CRC almost never matches its batch, and `ProduceService` rejects such a
         // batch before any other check. Give every batch a matching CRC, so that the later
@@ -82,7 +86,11 @@ fuzz_target!(|request: ProduceRequest| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = ProduceService::new(storage).with_validation();
+        // The service is boxed, as the broker boxes it, because the compiler lays out the future
+        // of every step of the produce path in one type otherwise, and overflows its query depth
+        // limit.
+        let service =
+            Service::<ProduceRequest>::boxed(ProduceService::new(storage).with_validation());
 
         match service.serve(request).await {
             // The service returns this error so that the broker closes the connection of an
@@ -90,7 +98,7 @@ fuzz_target!(|request: ProduceRequest| {
             Err(nisshi_storage::Error::AcksZeroProduceFailed { .. }) => {}
             result => {
                 result
-                    .and_then(|response| check_response(response).map_err(Into::into))
+                    .and_then(|response| check_response(response, version).map_err(Into::into))
                     .expect("served and decoded");
             }
         }

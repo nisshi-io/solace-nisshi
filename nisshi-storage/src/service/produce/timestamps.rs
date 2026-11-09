@@ -19,21 +19,22 @@ use std::{
 };
 
 use nisshi_sans_io::{
-    ErrorCode, TimestampType,
+    BatchAttribute, Compression, ErrorCode, TimestampType,
     produce_response::{BatchIndexAndErrorMessage, PartitionProduceResponse},
     record::{deflated, inflated},
 };
 use rama::{Layer, Service};
-use tracing::{error, instrument};
+use tracing::{error, instrument, warn};
 
 use super::{
+    admission::{BUDGET_SPENT, decoded_upper_bound},
     batch_validation::corrupt_batch,
     inflate_produced,
     partition::PartitionProduce,
     rejection::{Rejection, undecodable_batch},
     response,
 };
-use crate::{Result, offload};
+use crate::{Result, decoded_budget::Exhausted, offload};
 
 /// Kafka's wire sentinel for "no timestamp", also the fold-start value
 /// `LogValidator` uses for a batch's running maximum.
@@ -233,15 +234,17 @@ fn producer_log_append_time(
 /// every topic, with the error code that [`undecodable_batch`] gives it.
 ///
 /// Returns the decoded batch, so that the caller does not decode it again, or the [`Rejection`]
-/// for a batch that the client must not store. The timestamp rewrite changes only the header of
-/// `batch`, so the decoded records are those of the rewritten batch. Returns `Err` for a
-/// broker-side failure.
+/// for a batch that the client must not store. The decoded batch matches `batch` after the
+/// timestamps are set, as [`Storage::produce_inflated`](crate::Storage::produce_inflated) requires, so that the storage backend
+/// does not decode the batch again. Returns `Err` for a broker-side failure.
 fn validate_timestamps(
     batch: &mut deflated::Batch,
     timestamp_type: TimestampType,
     now: i64,
 ) -> Result<Result<inflated::Batch, Rejection>> {
-    let inflated = match inflate_produced(&*batch) {
+    // The decode takes a clone, which shares the record bytes with `batch`, so that it clears the
+    // compression bits of the attributes as a backend's own decode of a stored batch does.
+    let mut inflated = match inflate_produced(batch.clone()) {
         Ok(inflated) => inflated,
         Err(error) => return Ok(Err(undecodable_batch(&error))),
     };
@@ -255,7 +258,51 @@ fn validate_timestamps(
         TimestampType::LogAppendTime => stamp_log_append_time(batch, now)?,
     };
 
-    Ok(rejection.map_or(Ok(inflated), Err))
+    if let Some(rejection) = rejection {
+        return Ok(Err(rejection));
+    }
+
+    // The rewrite changed these header fields of `batch`, and only these. The decoded records are
+    // the same.
+    inflated.attributes = BatchAttribute::try_from(batch.attributes)?
+        .compression(Compression::None)
+        .into();
+    inflated.base_timestamp = batch.base_timestamp;
+    inflated.max_timestamp = batch.max_timestamp;
+    inflated.crc = batch.crc;
+
+    // A header rewrite that this copy does not know leaves the stored header and the decoded
+    // batch apart, and a backend that stores the decoded batch's header then stores the wrong one.
+    debug_assert!(
+        headers_agree(batch, &inflated),
+        "the decoded batch's header differs from the stored batch's header: {batch:?} and {inflated:?}"
+    );
+
+    Ok(Ok(inflated))
+}
+
+/// Returns whether `inflated` has every header field of `deflated`, apart from the compression
+/// bits of the attributes, which a decode clears, and the record bytes.
+fn headers_agree(deflated: &deflated::Batch, inflated: &inflated::Batch) -> bool {
+    let without_compression = |attributes: i16| {
+        BatchAttribute::try_from(attributes)
+            .map(|attributes| i16::from(attributes.compression(Compression::None)))
+    };
+
+    deflated.base_offset == inflated.base_offset
+        && deflated.batch_length == inflated.batch_length
+        && deflated.partition_leader_epoch == inflated.partition_leader_epoch
+        && deflated.magic == inflated.magic
+        && deflated.crc == inflated.crc
+        && without_compression(deflated.attributes).ok()
+            == without_compression(inflated.attributes).ok()
+        && deflated.last_offset_delta == inflated.last_offset_delta
+        && deflated.base_timestamp == inflated.base_timestamp
+        && deflated.max_timestamp == inflated.max_timestamp
+        && deflated.producer_id == inflated.producer_id
+        && deflated.producer_epoch == inflated.producer_epoch
+        && deflated.base_sequence == inflated.base_sequence
+        && usize::try_from(deflated.record_count).is_ok_and(|count| count == inflated.records.len())
 }
 
 /// Runs [`validate_timestamps`] on Tokio's blocking thread pool, because it decodes the batch, and
@@ -299,7 +346,11 @@ impl<S> Layer<S> for TimestampLayer {
 /// for the topic's `message.timestamp.type`, with the batch decoded, or answering the partition
 /// with the error code for a batch that the client must not store.
 ///
-/// The service answers `UNKNOWN_SERVER_ERROR` for a broker-side failure.
+/// The service reserves the bytes of the decoded batch from the request's [`Admission`] before it
+/// decodes the batch, and holds them until `inner` returns. It answers `REQUEST_TIMED_OUT` when
+/// the budget stays spent, and `UNKNOWN_SERVER_ERROR` for a broker-side failure.
+///
+/// [`Admission`]: super::Admission
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TimestampService<S> {
     inner: S,
@@ -334,10 +385,41 @@ where
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
 
+        // The reservation is held until the inner service returns, so that the decoded batch is
+        // counted while storage holds it, and dropped on every other path out of this function. A
+        // partition that waits here holds only its compressed batch.
+        let compression = Compression::try_from(batch.attributes).unwrap_or_default();
+        let mut reservation = match request.admission.reserve(decoded_upper_bound(&batch)).await {
+            Ok(reservation) => reservation,
+            Err(Exhausted { requested, waited }) => {
+                warn!(
+                    topic = request.topic,
+                    partition = request.index,
+                    requested,
+                    ?waited,
+                    "decoded-batch budget stayed spent, answering REQUEST_TIMED_OUT"
+                );
+
+                return Ok(
+                    response::partition_error(request.index, ErrorCode::RequestTimedOut)
+                        .error_message(Some(BUDGET_SPENT.into())),
+                );
+            }
+        };
+
         match validate_timestamps_offloaded(batch, request.configuration.timestamp_type(), now)
             .await
         {
             Ok((batch, Ok(inflated))) => {
+                // The decoded size is known now. A compressed batch is charged for its inflated
+                // record bytes as well as its `Record` structures, which is what the decoder
+                // charges, and these bytes are what a few KB of compressed input turns into.
+                reservation.shrink_to(
+                    inflated
+                        .decoded_size(&compression)
+                        .unwrap_or_else(|_| reservation.bytes()),
+                );
+
                 self.inner
                     .serve(request.with_batch((batch, inflated)))
                     .await
@@ -723,6 +805,91 @@ mod validate_timestamps_tests {
         assert_eq!(damaged, batch);
 
         Ok(())
+    }
+
+    /// The batch that [`super::validate_timestamps`] returns is `batch` decoded as a backend
+    /// decodes a stored batch, after the timestamps are set. A backend that gets it through
+    /// [`Storage::produce_inflated`](crate::Storage::produce_inflated) then sees what its own
+    /// decode would give.
+    fn assert_decoded_matches(batch: &deflated::Batch, inflated: &inflated::Batch) -> Result<()> {
+        assert_eq!(&inflated::Batch::try_from(batch.clone())?, inflated);
+
+        Ok(())
+    }
+
+    fn validate_timestamps_ok(
+        batch: &mut deflated::Batch,
+        timestamp_type: TimestampType,
+    ) -> Result<inflated::Batch> {
+        match super::validate_timestamps(batch, timestamp_type, FIXED_NOW)? {
+            Ok(inflated) => Ok(inflated),
+            Err(rejection) => panic!("rejected: {rejection:?}"),
+        }
+    }
+
+    #[test]
+    fn decoded_batch_matches_after_a_create_time_rewrite() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, -1, &[0, 300, 100])?;
+        let before = batch.clone();
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_ne!(
+            before.max_timestamp, batch.max_timestamp,
+            "the header changed"
+        );
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_when_the_header_is_unchanged() -> Result<()> {
+        let mut batch = batch(FIXED_NOW, FIXED_NOW + 7, &[0, 7])?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_after_a_log_append_time_stamp() -> Result<()> {
+        let mut batch = batch(FIXED_NOW - 5_000, FIXED_NOW - 5_000, &[0, 10])?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::LogAppendTime)?;
+
+        assert_eq!(FIXED_NOW, batch.max_timestamp);
+        assert_eq!(FIXED_NOW, inflated.max_timestamp);
+        assert_decoded_matches(&batch, &inflated)
+    }
+
+    #[test]
+    fn decoded_batch_matches_for_a_compressed_batch() -> Result<()> {
+        let mut batch: deflated::Batch = inflated::Batch::builder()
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Gzip)
+                    .into(),
+            )
+            .base_timestamp(FIXED_NOW)
+            .max_timestamp(NO_TIMESTAMP)
+            .last_offset_delta(1)
+            .record(Record::builder().offset_delta(0).timestamp_delta(0))
+            .record(Record::builder().offset_delta(1).timestamp_delta(9))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let inflated = validate_timestamps_ok(&mut batch, TimestampType::CreateTime)?;
+
+        assert_eq!(
+            Compression::Gzip,
+            BatchAttribute::try_from(batch.attributes)?.compression,
+            "the stored batch keeps its codec"
+        );
+        assert_eq!(
+            Compression::None,
+            BatchAttribute::try_from(inflated.attributes)?.compression,
+            "the decoded batch holds no codec"
+        );
+        assert_decoded_matches(&batch, &inflated)
     }
 
     // The test runtime has a single thread. If the rewrite decoded the batch

@@ -68,7 +68,7 @@
 
 #![cfg(feature = "dynostore")]
 
-use crate::common::{alphanumeric_string, memory_storage};
+use crate::common::{alphanumeric_string, block_on_tokio, memory_storage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use nisshi_sans_io::{
@@ -106,6 +106,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
+use tokio::time::Instant;
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 use url::Url;
 
@@ -292,13 +293,15 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             // dropped accept or a silently applied reject shows up here as a
             // record-count mismatch, not just a wrong response code above.
             let topition = Topition::new(topic.clone(), index);
-            let fetched = future::block_on(storage.fetch(
+            // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+            // finished, so traceforge does not schedule it.
+            let fetched = block_on_tokio(storage.fetch(
                 &topition,
                 0,
                 0,
                 i32::MAX as u32,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_millis(1000),
+                Instant::now() + Duration::from_millis(1000),
             ))
             .expect("fetch");
 
@@ -448,10 +451,10 @@ impl Storage for FaultInjectingProduceStorage {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> StorageResult<Vec<deflated::Batch>> {
         self.inner
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
+            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
             .await
     }
 
@@ -822,13 +825,15 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
             // write duplicated by a careless retry) and no fewer (a dropped
             // write never actually retried).
             let topition = Topition::new(topic.clone(), index);
-            let fetched = future::block_on(real_storage.fetch(
+            // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+            // finished, so traceforge does not schedule it.
+            let fetched = block_on_tokio(real_storage.fetch(
                 &topition,
                 0,
                 0,
                 i32::MAX as u32,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_millis(1000),
+                Instant::now() + Duration::from_millis(1000),
             ))
             .expect("fetch");
 

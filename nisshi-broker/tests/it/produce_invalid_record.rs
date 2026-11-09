@@ -317,6 +317,34 @@ async fn unknown_compression_codec(storage: impl Storage + Clone) -> Result<()> 
     assert_nothing_written(&storage, name).await
 }
 
+/// A batch with a producer ID and a negative base sequence is refused before any storage lookup,
+/// as Kafka's `LogValidator` does, so the producer need not exist: no UNKNOWN_PRODUCER_ID, and
+/// no DUPLICATE_SEQUENCE_NUMBER or OUT_OF_ORDER_SEQUENCE_NUMBER for one that does. -1 is the
+/// no-sequence value, which Kafka refuses when the batch has a producer ID.
+async fn negative_base_sequence_with_a_producer_id(storage: impl Storage + Clone) -> Result<()> {
+    let name = &alphanumeric_string(15)[..];
+    create_topic(&storage, name).await?;
+
+    for base_sequence in [-1, -3, i32::MIN] {
+        let batch = from_builder(
+            inflated::Batch::builder()
+                .producer_id(4242)
+                .producer_epoch(0)
+                .base_sequence(base_sequence),
+            b"negative sequence",
+        )?;
+
+        let response = produce(&storage, name, vec![batch]).await?;
+        assert_invalid_record(&response)?;
+        assert_eq!(
+            Some("negative base sequence with a producer ID"),
+            response.error_message.as_deref()
+        );
+    }
+
+    assert_nothing_written(&storage, name).await
+}
+
 /// Kafka allows exactly one batch per partition. Each batch is stored on its
 /// own, so a second batch that failed after the first was stored would report
 /// the partition as failed while the first batch stayed in the log. The
@@ -411,6 +439,15 @@ mod in_memory {
     }
 
     #[tokio::test]
+    async fn negative_base_sequence_with_a_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::negative_base_sequence_with_a_producer_id(
+            storage(StorageType::InMemory, false).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn not_exactly_one_batch() -> Result<()> {
         let _guard = init_tracing()?;
         super::not_exactly_one_batch(storage(StorageType::InMemory, false).await?).await
@@ -461,6 +498,13 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn negative_base_sequence_with_a_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::negative_base_sequence_with_a_producer_id(storage(StorageType::Lite, false).await?)
+            .await
+    }
+
+    #[tokio::test]
     async fn not_exactly_one_batch() -> Result<()> {
         let _guard = init_tracing()?;
         super::not_exactly_one_batch(storage(StorageType::Lite, false).await?).await
@@ -490,6 +534,15 @@ mod pg {
     async fn unknown_compression_codec() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_compression_codec(storage(StorageType::Postgres, false).await?).await
+    }
+
+    #[tokio::test]
+    async fn negative_base_sequence_with_a_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::negative_base_sequence_with_a_producer_id(
+            storage(StorageType::Postgres, false).await?,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -549,6 +602,13 @@ mod turso {
     async fn unknown_compression_codec() -> Result<()> {
         let _guard = init_tracing()?;
         super::unknown_compression_codec(storage(StorageType::Turso, false).await?).await
+    }
+
+    #[tokio::test]
+    async fn negative_base_sequence_with_a_producer_id() -> Result<()> {
+        let _guard = init_tracing()?;
+        super::negative_base_sequence_with_a_producer_id(storage(StorageType::Turso, false).await?)
+            .await
     }
 
     #[tokio::test]

@@ -13,28 +13,36 @@
 // limitations under the License.
 
 //! A [`Storage`] for service tests that holds only topic names, counts the `metadata` calls that
-//! list every topic and those that look up named topics, and records the topics that it creates.
+//! list every topic and those that look up named topics, records the topics that it creates, and
+//! records each batch that it is asked to produce.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
 use async_trait::async_trait;
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
+    create_topics_request::CreatableTopic,
+    delete_groups_response::DeletableGroupResult,
+    delete_records_request::DeleteRecordsTopic,
+    delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
     describe_configs_response::DescribeConfigsResult,
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_response::AbortedTransaction, incremental_alter_configs_request::AlterConfigsResource,
+    fetch_response::AbortedTransaction,
+    incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    metadata_response::MetadataResponseTopic, record::deflated,
+    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
+    record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use tokio::time::Duration;
+use tokio::{sync::Semaphore, time::Duration};
 use url::Url;
 use uuid::Uuid;
 
@@ -60,16 +68,44 @@ pub(crate) enum Listing {
     NamelessTopic,
 }
 
+/// How the `metadata` lookup of named topics answers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum Lookup {
+    /// Answers for each topic that the lookup names.
+    #[default]
+    Named,
+    /// Fails with an error.
+    Error,
+    /// Answers as the `Listing` does, whatever topics the lookup names: the null engine lists every
+    /// topic.
+    Listed,
+}
+
+/// A batch that [`CountingStorage`] was asked to produce, and the method that it was asked with.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Produced {
+    pub(crate) transaction_id: Option<String>,
+    pub(crate) topition: Topition,
+    pub(crate) deflated: deflated::Batch,
+    /// The batch that the caller decoded: `Some` when the call was `produce_inflated`, and `None`
+    /// when it was `produce`.
+    pub(crate) inflated: Option<inflated::Batch>,
+}
+
 /// A [`Storage`] that holds only topic names. Clones share their topics and counts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountingStorage {
     listing: Listing,
+    lookup: Lookup,
     topics: Arc<Mutex<BTreeSet<String>>>,
     created: Arc<Mutex<Vec<String>>>,
     listings: Arc<Mutex<usize>>,
     lookups: Arc<Mutex<usize>>,
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
+    produced: Arc<Mutex<Vec<Produced>>>,
+    produce_gate: Option<Arc<Semaphore>>,
+    parked: Arc<AtomicUsize>,
 }
 
 impl CountingStorage {
@@ -101,6 +137,26 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with the lookup of named topics answering as `lookup`.
+    pub(crate) fn with_lookup(self, lookup: Lookup) -> Self {
+        Self { lookup, ..self }
+    }
+
+    /// Returns this storage, with `produce_inflated` waiting for a permit of `gate` before it
+    /// answers, as an engine waits for a connection. The batch it was given stays held while it
+    /// waits.
+    pub(crate) fn with_produce_gate(self, gate: Arc<Semaphore>) -> Self {
+        Self {
+            produce_gate: Some(gate),
+            ..self
+        }
+    }
+
+    /// The number of `produce_inflated` calls now waiting for the gate.
+    pub(crate) fn parked(&self) -> usize {
+        self.parked.load(Ordering::SeqCst)
+    }
+
     /// Deletes the topic `name`.
     pub(crate) fn delete(&self, name: &str) {
         _ = self.topics.lock().expect("topics").remove(name);
@@ -114,6 +170,11 @@ impl CountingStorage {
     /// The number of `metadata` calls that listed every topic.
     pub(crate) fn listings(&self) -> usize {
         *self.listings.lock().expect("listings")
+    }
+
+    /// The batches that `produce` and `produce_inflated` got, in order.
+    pub(crate) fn produced(&self) -> Vec<Produced> {
+        self.produced.lock().expect("produced").clone()
     }
 
     /// The number of `metadata` calls that looked up named topics.
@@ -143,6 +204,12 @@ impl CountingStorage {
     }
 
     fn lookup(&self, ids: &[TopicId]) -> Result<Vec<MetadataResponseTopic>> {
+        match self.lookup {
+            Lookup::Named => {}
+            Lookup::Error => return Err(Error::Message("lookup failed".into())),
+            Lookup::Listed => return self.list(),
+        }
+
         let topics = self.topics.lock()?;
 
         Ok(ids
@@ -170,7 +237,9 @@ fn existing(name: &str) -> MetadataResponseTopic {
     MetadataResponseTopic::default()
         .error_code(ErrorCode::None.into())
         .name(Some(name.to_owned()))
-        .partitions(Some([].into()))
+        .partitions(Some(
+            [MetadataResponsePartition::default().partition_index(0)].into(),
+        ))
 }
 
 #[async_trait]
@@ -182,7 +251,7 @@ impl Storage for CountingStorage {
         _min_bytes: u32,
         _max_bytes: u32,
         _isolation_level: IsolationLevel,
-        _max_wait: Duration,
+        _deadline: tokio::time::Instant,
     ) -> Result<Vec<deflated::Batch>> {
         unimplemented!()
     }
@@ -239,11 +308,42 @@ impl Storage for CountingStorage {
 
     async fn produce(
         &self,
-        _transaction_id: Option<&str>,
-        _topition: &Topition,
-        _deflated: deflated::Batch,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
     ) -> Result<i64> {
-        unimplemented!()
+        self.produced.lock()?.push(Produced {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.clone(),
+            deflated,
+            inflated: None,
+        });
+
+        Ok(0)
+    }
+
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        if let Some(gate) = &self.produce_gate {
+            _ = self.parked.fetch_add(1, Ordering::SeqCst);
+            let permit = gate.acquire().await;
+            _ = self.parked.fetch_sub(1, Ordering::SeqCst);
+            permit?.forget();
+        }
+
+        self.produced.lock()?.push(Produced {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.clone(),
+            deflated,
+            inflated: Some(inflated),
+        });
+
+        Ok(0)
     }
 
     async fn offset_commit(
@@ -302,7 +402,7 @@ impl Storage for CountingStorage {
         _resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
-        unimplemented!()
+        Ok(DescribeConfigsResult::default().error_code(ErrorCode::None.into()))
     }
 
     async fn describe_topic_partitions(

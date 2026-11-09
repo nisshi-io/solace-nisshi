@@ -1,8 +1,11 @@
 [workspace]
 resolver = "3"
+# fuzz/ is a workspace of its own, so `cargo metadata` here, which FOSSA and
+# cargo-deny read, leaves out libfuzzer-sys.
+exclude = ["fuzz"]
 members = [
-    "fuzz",
     "nisshi",
+    "nisshi-fuzz-harness",
     "nisshi-auth",
     "nisshi-broker",
     "nisshi-cat",
@@ -74,6 +77,9 @@ unused_results = "warn"
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
+# fuzz/Cargo.toml's [dependencies] repeats the bytes, rama, tokio and url
+# requirements; change them there too. Dependabot bumps them only here, so its
+# PR for one of them needs the same change there by hand.
 [workspace.dependencies]
 anyhow = "1.0.94"
 apache-avro = "0.21.0"
@@ -121,7 +127,6 @@ indicatif = "0.18.3"
 jsonschema = "0.60.0"
 lazy_static = "1.4.0"
 libc = "0.2.189"
-libfuzzer-sys = "0.4"
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 lz4 = "1.28.1"
 nanoid = "0.5.0"
@@ -131,6 +136,7 @@ nisshi-broker = { version = "0.8.2", path = "nisshi-broker", default-features = 
 nisshi-cat = { version = "0.8.2", path = "nisshi-cat", default-features = false }
 nisshi-cli = { version = "0.8.2", path = "nisshi-cli", default-features = false }
 nisshi-client = { version = "0.8.2", path = "nisshi-client", default-features = false }
+nisshi-fuzz-harness = { version = "0.8.2", path = "nisshi-fuzz-harness", default-features = false }
 nisshi-generator = { version = "0.8.2", path = "nisshi-generator", default-features = false }
 nisshi-model = { version = "0.8.2", path = "nisshi-model", default-features = false }
 nisshi-otel = { version = "0.8.2", path = "nisshi-otel", default-features = false }
@@ -146,7 +152,7 @@ nisshi-storage-slatedb = { version = "0.8.2", path = "nisshi-storage-slatedb", d
 nisshi-storage-sql = { version = "0.8.2", path = "nisshi-storage-sql", default-features = false }
 nisshi-topic = { version = "0.8.2", path = "nisshi-topic", default-features = false }
 nonzero_ext = "0.3.0"
-num-bigint = "0.4"
+num-bigint = "0.5"
 object_store = { version = "0.14.1", features = ["aws", "gcp"] }
 opentelemetry = "0.33.0"
 opentelemetry-otlp = "0.33.0"
@@ -206,6 +212,9 @@ zstd = "0.14.0"
 
 # Line tables keep file:line in workspace backtraces; full debug info costs
 # disk and link time. Build with `--profile debugging` for a debugger.
+#
+# fuzz/Cargo.toml repeats [profile.dev] and [profile.dev.package."*"] at its
+# end; change them there too.
 [profile.dev]
 debug = "line-tables-only"
 

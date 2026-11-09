@@ -185,13 +185,13 @@ macro_rules! engine {
                 Ok(())
             }
 
-            /// Schema validation runs before the storage engine looks for the partition, so a
-            /// batch that breaks the schema does not reach the partition check.
+            /// Kafka looks up the partition before it validates a record, so a batch that breaks
+            /// the schema gets the unknown-partition error.
             #[tokio::test]
-            async fn a_batch_that_breaks_the_schema_is_an_invalid_record_for_an_unknown_partition()
+            async fn a_batch_that_breaks_the_schema_is_unknown_topic_or_partition_for_an_unknown_partition()
             -> Result<()> {
                 assert_eq!(
-                    ErrorCode::InvalidRecord,
+                    ErrorCode::UnknownTopicOrPartition,
                     produce_person_to_partition(
                         $storage_type,
                         vec![],

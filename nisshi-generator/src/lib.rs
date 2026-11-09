@@ -28,7 +28,7 @@ use std::{
 };
 
 use governor::{InsufficientCapacity, Jitter, Quota, RateLimiter};
-use nisshi_client::{Client, ConnectionManager};
+use nisshi_client::{Client, ConnectionManager, Security};
 use nisshi_otel::meter_provider;
 use nisshi_sans_io::{
     Ack, ByteSize, ErrorCode, ProduceRequest,
@@ -79,6 +79,17 @@ pub enum Error {
     Url(#[from] url::ParseError),
 }
 
+impl Error {
+    /// Whether the broker refused the login or the TLS connection, or the client refused what
+    /// the broker offered. No producer can produce after that, so the run ends with the error.
+    fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(error) if error.failure_kind() == nisshi_client::FailureKind::Refused
+        )
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
@@ -113,6 +124,7 @@ pub enum CancelKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Configuration {
     broker: Url,
+    security: Security,
     topic: String,
     partition: i32,
     schema_registry: Url,
@@ -328,6 +340,7 @@ impl Generate {
         let token = CancellationToken::new();
 
         let client = ConnectionManager::builder(self.configuration.broker)
+            .security(self.configuration.security.clone())
             .client_id(Some(env!("CARGO_PKG_NAME").into()))
             .build()
             .await
@@ -389,25 +402,47 @@ impl Generate {
                                     break
                                 },
 
-                                Ok(_) = produce(client.clone(), topic.clone(), partition,  batch_size.get() as i32, frame) => {
-                                    PRODUCE_RECORD_COUNT.add(batch_size.get() as u64, &attributes);
-                                    PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+                                produced = produce(client.clone(), topic.clone(), partition,  batch_size.get() as i32, frame) => match produced {
+                                    Ok(()) => {
+                                        PRODUCE_RECORD_COUNT.add(batch_size.get() as u64, &attributes);
+                                        PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
+                                    }
+
+                                    // The login or the TLS connection was refused, so no producer
+                                    // can ever produce: end the run with the error.
+                                    Err(error) if error.is_refusal() => return Err(error),
+
+                                    // Any other failure of a request leaves this producer idle
+                                    // until the run ends.
+                                    Err(error) => {
+                                        debug!(?error);
+                                        token.cancelled().await;
+                                        break
+                                    }
                                 },
                             }
                         }
 
-                    }.instrument(span).await;
-
-
+                        Ok::<(), Error>(())
+                    }.instrument(span).await
                 });
         }
 
+        // Ends when every producer has ended, or with the error of the first producer that
+        // ended with one.
         let join_all = async {
             while !set.is_empty() {
                 debug!(len = set.len());
-                _ = set.join_next().await;
+
+                if let Some(Ok(Err(error))) = set.join_next().await {
+                    return Some(error);
+                }
             }
+
+            None
         };
+
+        let mut failure = None;
 
         let duration = self
             .configuration
@@ -427,6 +462,12 @@ impl Generate {
 
             completed = join_all => {
                 debug!(?completed);
+
+                if completed.is_some() {
+                    token.cancel();
+                }
+
+                failure = completed;
                 None
             }
 
@@ -465,7 +506,7 @@ impl Generate {
             _ = set.join_next().await;
         }
 
-        Ok(ErrorCode::None)
+        failure.map_or(Ok(ErrorCode::None), Err)
     }
 
     pub fn builder()
@@ -477,6 +518,7 @@ impl Generate {
 #[derive(Clone, Debug)]
 pub struct Builder<B, T, P, S> {
     broker: B,
+    security: Security,
     topic: T,
     partition: P,
     schema_registry: S,
@@ -494,6 +536,7 @@ impl Default
     fn default() -> Self {
         Self {
             broker: Default::default(),
+            security: Default::default(),
             topic: Default::default(),
             partition: Default::default(),
             schema_registry: Default::default(),
@@ -508,9 +551,15 @@ impl Default
 }
 
 impl<B, T, P, S> Builder<B, T, P, S> {
+    /// How the connection to the broker is secured, by default not at all.
+    pub fn security(self, security: Security) -> Self {
+        Self { security, ..self }
+    }
+
     pub fn broker(self, broker: impl Into<Url>) -> Builder<Url, T, P, S> {
         Builder {
             broker: broker.into(),
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -526,6 +575,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn topic(self, topic: impl Into<String>) -> Builder<B, String, P, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: topic.into(),
             partition: self.partition,
             schema_registry: self.schema_registry,
@@ -541,6 +591,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn partition(self, partition: i32) -> Builder<B, T, i32, S> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition,
             schema_registry: self.schema_registry,
@@ -556,6 +607,7 @@ impl<B, T, P, S> Builder<B, T, P, S> {
     pub fn schema_registry(self, schema_registry: Url) -> Builder<B, T, P, Url> {
         Builder {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry,
@@ -600,6 +652,7 @@ impl Builder<Url, String, i32, Url> {
     pub fn build(self) -> Result<Generate> {
         Generate::try_from(Configuration {
             broker: self.broker,
+            security: self.security,
             topic: self.topic,
             partition: self.partition,
             schema_registry: self.schema_registry,

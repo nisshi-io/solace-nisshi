@@ -24,7 +24,7 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime},
+    time::SystemTime,
 };
 
 use async_trait::async_trait;
@@ -67,10 +67,10 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
     FirstSequence, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
-    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate_produced,
-    max_message_bytes, offload, producer_claim,
+    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
+    inflate_produced, max_message_bytes, offload, producer_claim, read_deadline::ReadDeadline,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -88,7 +88,10 @@ use produced_batches::{ProducedBatches, SequenceCheck};
 use rand::{prelude::*, rng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time_index::TimeIndex;
-use tokio::time::Duration;
+use tokio::{
+    sync::Semaphore,
+    time::{Duration, Instant},
+};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -168,6 +171,27 @@ const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
 /// any small bound gives most of the speed-up.
 const CONCURRENT_GROUP_STATE_READS: usize = 16;
 
+/// How many partitions one `maintain` pass visits at once, to read their watermarks (see
+/// [`DynoStore::reclaim_records`]).
+///
+/// A pass that visits the partitions one after another waits one round trip per partition. On a
+/// degraded store a round trip can wait for the retry timeout of the object store client, so a
+/// cluster with thousands of partitions then needs hours for one pass. A pass that visits them
+/// all at once opens a connection per partition. The limit is a small bound between the two. Its
+/// value is not measured: any small bound gives most of the speed-up.
+const CONCURRENT_RECLAIMS: usize = 16;
+
+/// How many of those partitions list and delete their batch objects at once (see
+/// [`DynoStore::reclaim_records`]).
+///
+/// Each partition deletes through the client that produce and fetch share, and `object_store`
+/// keeps several deletes in flight for each delete stream: about 10 on GCS, and up to 20 on S3
+/// when bulk delete is off. [`CONCURRENT_RECLAIMS`] partitions that delete together can send a
+/// burst of a few hundred requests, which can reach the bucket's write rate limit and slow
+/// produce. Each listing also holds all of a partition's object names in memory. Its value is not
+/// measured: any small bound keeps the burst and the memory low.
+const CONCURRENT_RECLAIM_DELETES: usize = 4;
+
 /// How far below the fetch offset a Fetch starts its second listing, when
 /// its first listing, which starts at the fetch offset, finds no batch at or
 /// below the fetch offset.
@@ -183,14 +207,12 @@ const FETCH_LISTING_FIRST_WINDOW: i64 = 512;
 const FETCH_LISTING_GROWTH: i64 = 8;
 
 /// The batches that a fetch reads from a partition: each batch below
-/// `high_watermark` that ends at or after `offset`, until the batches fill
-/// `max_bytes` or `deadline` passes.
+/// `high_watermark` that ends at or after `offset`, until the batches fill `max_bytes`.
 #[derive(Clone, Copy, Debug)]
 struct FetchBounds {
     offset: i64,
     max_bytes: u32,
     high_watermark: i64,
-    deadline: Option<Instant>,
 }
 
 /// Counts the fetches that list the whole partition, because the listing
@@ -202,6 +224,87 @@ static FETCH_FULL_LISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description(
             "Fetches that listed the whole partition, because the listing near the fetch \
              offset was out of key order or had a gap",
+        )
+        .build()
+});
+
+/// The most `maintain` passes that a partition whose reclaim keeps failing is skipped for (see
+/// [`ReclaimBackoff`]). It counts passes, so the cap scales with the broker's maintenance
+/// interval: at the default 10 minutes, 16 passes is a retry about every 2 hours 40 minutes.
+const MAX_RECLAIM_BACKOFF_PASSES: u32 = 16;
+
+/// The reclaim failures of one partition, as this broker has seen them since it started or the
+/// partition last reclaimed (see [`DynoStore::reclaim_records`]).
+///
+/// A bucket that refuses deletes (a role without `s3:DeleteObject`, S3 Object Lock, a GCS retention
+/// policy) fails the same reclaim on every pass, and each pass lists the whole partition. After a
+/// failure, the partition is skipped for a number of passes that doubles with each consecutive
+/// failure: none after the first, so that a transient error costs one pass, then 1, 2, 4, 8 and
+/// [`MAX_RECLAIM_BACKOFF_PASSES`] at most. A success, or a pass that finds nothing to reclaim,
+/// removes the entry.
+///
+/// The entry keeps the cut (the partition's `low`) that failed, and only that cut waits. A
+/// `DeleteRecords` that moves `low` past it is tried on the next pass, so a cut made after the
+/// bucket was fixed does not wait behind the schedule of an older one. A pass that cannot read the
+/// partition's watermark records no failure and skips nothing: the read is paid on every pass, and
+/// a store outage must not put every partition into backoff. Cleanup of an old cut can lag a fix
+/// of the bucket by up to [`MAX_RECLAIM_BACKOFF_PASSES`] passes, and a restart tries at once.
+///
+/// This lives in the broker's memory and not in the partition's [`Watermark`]. A write to the
+/// bucket that refuses deletes can fail as well, and every broker would then have to write on each
+/// failure. A restart forgets it, and costs one retry, and `Watermark::reclaimed` still decides
+/// what is reclaimed, so the backoff can only delay a reclaim and never skip a cut. Brokers that
+/// share a bucket each keep their own backoff, so a stalled partition costs one listing per broker
+/// per retry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReclaimBackoff {
+    /// The failures in a row.
+    failures: u32,
+
+    /// The passes that remain to skip.
+    skip: u32,
+
+    /// The `low` whose reclaim failed last. Only a pass with this `low` is skipped.
+    cut: Offset,
+}
+
+impl ReclaimBackoff {
+    /// Records one more failure of the reclaim of `cut`, and sets the passes to skip.
+    fn failed(self, cut: Offset) -> Self {
+        let failures = self.failures.saturating_add(1);
+
+        let skip = match failures {
+            0 | 1 => 0,
+            n => 1u32
+                .checked_shl(n - 2)
+                .map_or(MAX_RECLAIM_BACKOFF_PASSES, |passes| {
+                    passes.min(MAX_RECLAIM_BACKOFF_PASSES)
+                }),
+        };
+
+        Self {
+            failures,
+            skip,
+            cut,
+        }
+    }
+}
+
+/// Counts the partitions that `maintain` tried to reclaim batch objects for, by `outcome`:
+/// `reclaimed` (the objects are deleted and the cut is recorded), `delete_failed` (at least one
+/// object was not deleted), `listing_failed`, or `state_failed` (the partition's watermark or
+/// topic could not be read, or the cut could not be recorded), or `backed_off` (the partition
+/// failed on earlier passes, and this pass skipped it, see [`ReclaimBackoff`]). A partition that
+/// stays in a failed outcome has objects that stay in the bucket after a `DeleteRecords` cut, and
+/// shows as failed outcomes that thin out into a steady `backed_off` count.
+///
+/// Every broker visits every partition, so one cut is counted once for each broker.
+static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_reclaimed_partitions")
+        .with_description(
+            "Partitions for which maintain tried to delete the batch objects below a \
+             DeleteRecords cut, by outcome",
         )
         .build()
 });
@@ -298,6 +401,11 @@ pub struct DynoStore {
     /// each reading every batch of the partition.
     backfills: Arc<Mutex<BTreeMap<Topition, Arc<tokio::sync::Mutex<()>>>>>,
     meta: OptiCon<Meta>,
+
+    /// The partitions, by topic ID and index, whose reclaim failed on a recent `maintain` pass (see
+    /// [`ReclaimBackoff`]). The ID keeps a topic that is created again under a deleted topic's
+    /// name from inheriting that topic's backoff.
+    reclaim_backoff: Arc<Mutex<BTreeMap<(Uuid, i32), ReclaimBackoff>>>,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -870,7 +978,7 @@ impl TopicMetadata {
                             .name(config.name.clone())
                             .value(config.value.clone())
                             .read_only(false)
-                            .is_default(None)
+                            .is_default(Some(false))
                             .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
                             .is_sensitive(false)
                             .synonyms(Some([].into()))
@@ -906,6 +1014,16 @@ struct Watermark {
     /// a broker that does not know the key drops it when it writes the document.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     producer_epochs: BTreeMap<ProducerId, ProducerEpoch>,
+    /// The cut that `maintain` last reclaimed the batch objects up to: every object wholly
+    /// below it is gone. `maintain` lists a partition's objects only while this is below
+    /// `low`, so a retry of a failed reclaim is the one listing that remains, and a
+    /// partition with nothing left to reclaim costs no listing.
+    ///
+    /// The key is left out until the first reclaim. A document written before the key
+    /// existed decodes to `None`, and a broker that does not know the key drops it when it
+    /// writes the document, which costs one more reclaim pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reclaimed: Option<i64>,
 }
 
 impl Watermark {
@@ -1089,6 +1207,7 @@ impl DynoStore {
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             backfills: Arc::new(Mutex::new(BTreeMap::new())),
+            reclaim_backoff: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -1230,28 +1349,35 @@ impl DynoStore {
     }
 
     /// Removes the batch objects of one partition that lie entirely below
-    /// `cutoff`, after `DeleteRecords` has committed `cutoff` as the low
-    /// watermark.
+    /// `cutoff`, which `DeleteRecords` has committed as the low watermark.
+    /// `maintain` calls this, so that the request does not list the partition
+    /// (see [`Self::reclaim_records`]).
     ///
-    /// Each failure is logged and skipped, instead of returned, because the
-    /// watermark advance has already taken effect: an error here would report
-    /// a failed request for a delete that succeeded.
+    /// A failed delete does not stop the other deletes. This logs one error
+    /// for the partition, with the number of objects that failed and the first
+    /// error, and the result is `false`, so that the caller tries again on its
+    /// next pass.
     ///
     /// An object is named by the base offset of its batch, and the name does
     /// not hold the end offset. A batch ends before the base offset of the
     /// next batch, so this deletes an object when the next object's base
     /// offset is at or below `cutoff`, without reading either object. The
     /// last object has no successor, so this deletes it only when `cutoff`
-    /// is the `high_watermark` that the cut was checked against. Every batch
+    /// is the `high_watermark` that the caller read before the listing. Every batch
     /// that begins below that high watermark also ends at or below it. Below
     /// the high watermark, the last object can hold records at or above the
     /// cut, so it stays.
     ///
     /// The listing covers this partition's `records/` prefix only, so that a
     /// mistake here cannot remove the objects of another partition.
-    async fn delete_records_batches(&self, topition: &Topition, cutoff: i64, high_watermark: i64) {
+    async fn delete_records_batches(
+        &self,
+        topition: &Topition,
+        cutoff: i64,
+        high_watermark: i64,
+    ) -> bool {
         if cutoff <= 0 {
-            return;
+            return true;
         }
 
         let prefix = records_prefix(&self.cluster, topition);
@@ -1273,8 +1399,14 @@ impl DynoStore {
                 .collect::<Vec<_>>(),
 
             Err(error) => {
-                error!(?error, ?topition, cutoff);
-                return;
+                error!(
+                    ?error,
+                    ?topition,
+                    cutoff,
+                    "listing the batch objects below the cut failed, maintain tries again later"
+                );
+                self.count_reclaim("listing_failed");
+                return false;
             }
         };
 
@@ -1300,11 +1432,328 @@ impl DynoStore {
             .object_store
             .delete_stream(stream::iter(expired).boxed());
 
+        let mut deleted_objects = 0usize;
+        let mut failed_objects = 0usize;
+        let mut first_error = None;
+
         while let Some(outcome) = deleted.next().await {
-            if let Err(error) = outcome {
-                error!(?error, ?topition, cutoff);
+            match outcome {
+                Ok(_) => deleted_objects += 1,
+
+                // Another broker's reclaim of the same partition got there first.
+                Err(object_store::Error::NotFound { .. }) => {
+                    debug!(?topition, cutoff, "batch object already deleted");
+                }
+
+                Err(error) => {
+                    failed_objects += 1;
+                    _ = first_error.get_or_insert(error);
+                }
             }
         }
+
+        let Some(error) = first_error else {
+            debug!(
+                ?topition,
+                cutoff, deleted_objects, "reclaimed the batch objects below the cut"
+            );
+            return true;
+        };
+
+        error!(
+            ?error,
+            ?topition,
+            cutoff,
+            deleted_objects,
+            failed_objects,
+            "deleting the batch objects below the cut failed, maintain tries again later"
+        );
+        self.count_reclaim("delete_failed");
+
+        false
+    }
+
+    /// Counts one partition in [`RECLAIMED_PARTITIONS`] under `outcome`.
+    fn count_reclaim(&self, outcome: &'static str) {
+        RECLAIMED_PARTITIONS.add(
+            1,
+            &[
+                KeyValue::new("cluster", self.cluster.clone()),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+    }
+
+    /// Reclaims, for each partition whose low watermark has moved past
+    /// [`Watermark::reclaimed`], the batch objects below it (see
+    /// [`Self::delete_records_batches`]), and records the cut once the
+    /// reclaim has gone through.
+    ///
+    /// `DeleteRecords` only moves the low watermark, as Kafka's does: Kafka
+    /// advances `logStartOffset` in the request
+    /// ([`Partition.deleteRecordsOnLeader`]), and the `kafka-log-retention`
+    /// task deletes the segments below it later, every
+    /// `log.retention.check.interval.ms` ([`LogManager`]), with the same
+    /// rule as [`Self::delete_records_batches`]: a segment goes when the
+    /// next segment's base offset is at or below the log start offset
+    /// ([`UnifiedLog.deleteLogStartOffsetBreachedSegments`]). A failed or
+    /// interrupted reclaim leaves `reclaimed` behind `low`, so the next call
+    /// retries it.
+    ///
+    /// A failure on one partition is logged and does not stop the others. A
+    /// partition that fails again and again backs off (see [`ReclaimBackoff`]), so a
+    /// bucket that refuses deletes costs a listing every few passes, and not on each.
+    /// A pass costs one read of each partition's watermark, as Kafka's
+    /// retention check visits every log, and one listing for each partition
+    /// with something to reclaim. It visits up to [`CONCURRENT_RECLAIMS`]
+    /// partitions at once, and up to [`CONCURRENT_RECLAIM_DELETES`] of them
+    /// list and delete at once. `maintain` runs the lake's maintenance beside
+    /// it, so the lake's run does not wait for the reclaim within a pass. The
+    /// pass still ends only when the reclaim ends, and the broker skips each
+    /// tick while a pass runs, so a slow reclaim delays the lake's next run.
+    ///
+    /// The topic can be deleted and created again while a partition's objects
+    /// go, and the cut then removes the new topic's objects below it. Kafka's
+    /// topic IDs keep its logs apart, and a name-keyed store has no such
+    /// guard; `DeleteRecords` had the same window when it listed in the
+    /// request.
+    ///
+    /// [`Partition.deleteRecordsOnLeader`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/cluster/Partition.scala#L1682-L1703
+    /// [`LogManager`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LogManager.scala#L626-L631
+    /// [`UnifiedLog.deleteLogStartOffsetBreachedSegments`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1649-L1655
+    async fn reclaim_records(&self) {
+        let topics = match self
+            .meta
+            .with(&self.object_store, |meta| Ok(meta.topics.clone()))
+            .await
+        {
+            Ok(topics) => topics,
+            Err(error) => {
+                error!(
+                    ?error,
+                    "reading the topics to reclaim batch objects failed, maintain tries again on its next pass"
+                );
+                return;
+            }
+        };
+
+        let partitions = topics
+            .values()
+            .flat_map(|metadata| {
+                (0..metadata.topic.num_partitions).map(|partition| {
+                    (
+                        Topition::new(metadata.topic.name.as_str(), partition),
+                        metadata.id,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // A deleted topic's partitions leave the backoff, so the map holds no more
+        // than the partitions that fail now.
+        if let Ok(mut backoff) = self.reclaim_backoff.lock() {
+            let known = partitions
+                .iter()
+                .map(|(topition, topic_id)| (*topic_id, topition.partition()))
+                .collect::<BTreeSet<_>>();
+
+            backoff.retain(|key, _| known.contains(key));
+        }
+
+        let deletes = Semaphore::new(CONCURRENT_RECLAIM_DELETES);
+        let deletes = &deletes;
+
+        stream::iter(partitions)
+            .for_each_concurrent(CONCURRENT_RECLAIMS, |(topition, topic_id)| async move {
+                if let Err(error) = self.reclaim_partition(&topition, &topic_id, deletes).await {
+                    error!(
+                        ?error,
+                        ?topition,
+                        "reading the watermark of a partition failed, maintain tries again on its next pass"
+                    );
+                    self.count_reclaim("state_failed");
+                }
+            })
+            .await;
+    }
+
+    /// Whether this pass skips `topition`, because its reclaim of `cut` failed on earlier
+    /// passes (see [`ReclaimBackoff`]). A cut past the one that failed is not skipped. A skip
+    /// uses up one of the passes to skip.
+    fn skip_backed_off(&self, topic_id: &Uuid, topition: &Topition, cut: Offset) -> bool {
+        let Ok(mut backoff) = self.reclaim_backoff.lock() else {
+            return false;
+        };
+
+        match backoff.get_mut(&(*topic_id, topition.partition())) {
+            Some(entry) if entry.skip > 0 && cut <= entry.cut => {
+                entry.skip -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Removes the backoff of `topition`, when it has nothing to reclaim.
+    fn record_reclaim_settled(&self, topic_id: &Uuid, topition: &Topition) {
+        if let Ok(mut backoff) = self.reclaim_backoff.lock() {
+            _ = backoff.remove(&(*topic_id, topition.partition()));
+        }
+    }
+
+    /// Records the outcome of one reclaim of `topition` up to `cut`: `settled` removes its
+    /// backoff, and a failure extends it.
+    fn record_reclaim(&self, topic_id: &Uuid, topition: &Topition, cut: Offset, settled: bool) {
+        let Ok(mut backoff) = self.reclaim_backoff.lock() else {
+            return;
+        };
+
+        if settled {
+            _ = backoff.remove(&(*topic_id, topition.partition()));
+        } else {
+            let entry = backoff
+                .entry((*topic_id, topition.partition()))
+                .or_default();
+            *entry = entry.failed(cut);
+
+            warn!(
+                ?topition,
+                failures = entry.failures,
+                passes_to_skip = entry.skip,
+                cut,
+                "reclaim failed, the partition's cut waits that many passes"
+            );
+        }
+    }
+
+    /// Reclaims one partition (see [`Self::reclaim_records`]), once it holds a permit of
+    /// `deletes` for its listing and deletes. A failure to read the watermark is the
+    /// error: nothing is known about the partition then, so it records no backoff. A failure
+    /// to handle the objects or the cut is logged, counted and recorded in the backoff, and
+    /// the pass skips a cut that failed on earlier passes, after it reads the watermark.
+    async fn reclaim_partition(
+        &self,
+        topition: &Topition,
+        topic_id: &Uuid,
+        deletes: &Semaphore,
+    ) -> Result<()> {
+        let watermark = self.watermark_without_caching(topition)?;
+
+        // The high watermark is read before the listing, as the cut check in
+        // `delete_records_batches` requires. When a produce has moved it past
+        // the cut but its object is not listed yet (still in flight, or failed
+        // and left a gap), the last listed object below the cut stays, and
+        // the mark below still records the cut. That object lies below the log
+        // start, so no client reads it, and the next `DeleteRecords` or the
+        // topic's deletion removes it.
+        let (low, high, reclaimed) = watermark
+            .with(&self.object_store, |w| Ok((w.low, w.high, w.reclaimed)))
+            .await?;
+
+        let Some(low) = low.filter(|&low| low > 0 && reclaimed.is_none_or(|done| done < low))
+        else {
+            self.record_reclaim_settled(topic_id, topition);
+            return Ok(());
+        };
+
+        if self.skip_backed_off(topic_id, topition, low) {
+            self.count_reclaim("backed_off");
+            return Ok(());
+        }
+
+        let settled = match self
+            .reclaim_cut(
+                topition,
+                topic_id,
+                &watermark,
+                low,
+                high.unwrap_or(0),
+                deletes,
+            )
+            .await
+        {
+            Ok(settled) => settled,
+
+            Err(error) => {
+                error!(
+                    ?error,
+                    ?topition,
+                    "recording the cut of a partition failed, maintain tries again later"
+                );
+                self.count_reclaim("state_failed");
+                false
+            }
+        };
+
+        self.record_reclaim(topic_id, topition, low, settled);
+
+        Ok(())
+    }
+
+    /// Deletes the batch objects of `topition` below `low` and records the cut. The result
+    /// is `true` when the partition has nothing left to reclaim, and `false` when its
+    /// objects could not be deleted.
+    async fn reclaim_cut(
+        &self,
+        topition: &Topition,
+        topic_id: &Uuid,
+        watermark: &OptiCon<Watermark>,
+        low: Offset,
+        high: Offset,
+        deletes: &Semaphore,
+    ) -> Result<bool> {
+        let deleted = {
+            let _permit = deletes.acquire().await.ok();
+
+            self.delete_records_batches(topition, low, high).await
+        };
+
+        if !deleted {
+            return Ok(false);
+        }
+
+        // The topic can have been deleted while the objects went, and
+        // writing the document then would bring back a watermark for it.
+        // This narrows that window and does not close it: `create_topic`
+        // clears the mark, which covers a document that survives.
+        if self
+            .topic_metadata(&TopicId::Name(topition.topic.clone()))
+            .await?
+            .is_none_or(|metadata| &metadata.id != topic_id)
+        {
+            return Ok(true);
+        }
+
+        watermark
+            .with_mut(&self.object_store, |w| {
+                w.reclaimed = w.reclaimed.max(Some(low));
+                Ok(())
+            })
+            .await?;
+
+        self.count_reclaim("reclaimed");
+
+        Ok(true)
+    }
+
+    /// Returns the handle that this broker already caches for `topition`'s watermark document,
+    /// or, when it has none, a new handle that the broker does not keep.
+    ///
+    /// [`Self::reclaim_records`] reads every partition of the cluster. A cached handle would
+    /// stay in this broker for each partition that its clients never use, and for each topic
+    /// that another broker deletes, because `delete_topic` drops cached handles only on the
+    /// broker that runs it. A handle that is not cached reads the whole document on each call,
+    /// where a cached handle sends a conditional request.
+    fn watermark_without_caching(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
+        self.watermarks
+            .lock()
+            .map(|locked| {
+                locked
+                    .get(topition)
+                    .cloned()
+                    .unwrap_or_else(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+            })
+            .map_err(Into::into)
     }
 
     /// Returns [`Self::watermark_for`] `topition`, after it ensures, on the
@@ -1683,6 +2132,9 @@ impl DynoStore {
     /// cuts a later batch at `max_bytes`, which leaves the client a partial
     /// batch to drop.
     ///
+    /// The read stops when `read_deadline` passes, and returns the batches
+    /// that it has read.
+    ///
     /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
     async fn read_fetched_batches(
         &self,
@@ -1690,12 +2142,15 @@ impl DynoStore {
         bounds: FetchBounds,
         mut base_offsets: BoxStream<'static, Result<i64>>,
         requires_contiguous: bool,
+        read_deadline: &mut ReadDeadline,
     ) -> Result<Option<Vec<deflated::Batch>>> {
         let mut batches = vec![];
         let mut bytes_left = u64::from(bounds.max_bytes);
         let mut next_base_offset = None;
 
-        while let Some(base_offset) = base_offsets.try_next().await? {
+        while let Ok(listed) = read_deadline.timeout(base_offsets.try_next()).await
+            && let Some(base_offset) = listed?
+        {
             if requires_contiguous && next_base_offset.is_some_and(|next| base_offset != next) {
                 return Ok(None);
             }
@@ -1704,9 +2159,16 @@ impl DynoStore {
                 break;
             }
 
+            let Ok(read) = read_deadline
+                .timeout(self.read_batch(topition, base_offset))
+                .await
+            else {
+                break;
+            };
+
             // A batch deleted after the listing leaves no last offset, so the
             // batch after it is not checked.
-            let Some(mut batch) = self.read_batch(topition, base_offset).await? else {
+            let Some(mut batch) = read? else {
                 next_base_offset = None;
                 continue;
             };
@@ -1728,17 +2190,6 @@ impl DynoStore {
             }
 
             bytes_left -= size;
-
-            // The deadline ends a fetch only after it has a batch, because a
-            // fetch that answers empty when its listing is slow answers empty
-            // on every retry, and the consumer never moves (#797). The Fetch
-            // service bounds the whole read with a deadline of its own.
-            if bounds
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
         }
 
         Ok(Some(batches))
@@ -1750,13 +2201,19 @@ impl DynoStore {
         &self,
         topition: &Topition,
         bounds: FetchBounds,
+        read_deadline: &mut ReadDeadline,
     ) -> Result<Vec<deflated::Batch>> {
-        let mut base_offsets = self
+        let listing = self
             .batch_stream(topition, 0)
             .map_ok(|(base_offset, _)| base_offset)
             .try_filter(|&base_offset| ready(base_offset < bounds.high_watermark))
-            .try_collect::<BTreeSet<_>>()
-            .await?;
+            .try_collect::<BTreeSet<_>>();
+
+        let Ok(base_offsets) = read_deadline.timeout(listing).await else {
+            return Ok(vec![]);
+        };
+
+        let mut base_offsets = base_offsets?;
 
         let holding = base_offsets
             .range(..=bounds.offset)
@@ -1771,6 +2228,7 @@ impl DynoStore {
             bounds,
             stream::iter(wanted.into_iter().map(Ok)).boxed(),
             false,
+            read_deadline,
         )
         .await
         .map(Option::unwrap_or_default)
@@ -2607,391 +3065,31 @@ impl DynoStore {
             })
             .map_err(unretriable_after_write)
     }
-}
 
-#[async_trait]
-impl Storage for DynoStore {
-    async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        Ok(())
+    /// Returns `inflated` when the lake reads it, and drops it otherwise.
+    ///
+    /// [`Self::produce_with`] first reads the partition from the object store. The produce drops a
+    /// decoded batch that nothing reads only after that request, so a batch kept until then is
+    /// held, up to [`MAX_DECODED_BATCH_BYTES`], for the length of an object store round trip. We
+    /// drop it before that request instead.
+    ///
+    /// [`MAX_DECODED_BATCH_BYTES`]: nisshi_sans_io::record::MAX_DECODED_BATCH_BYTES
+    fn inflated_if_read(&self, inflated: inflated::Batch) -> Option<inflated::Batch> {
+        self.lake.is_some().then_some(inflated)
     }
 
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        let _ = resource;
-
-        match ConfigResource::from(resource.resource_type) {
-            ConfigResource::Group => Ok(AlterConfigsResourceResponse::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some("".into()))
-                .resource_type(resource.resource_type)
-                .resource_name(resource.resource_name)),
-            ConfigResource::ClientMetric => Ok(AlterConfigsResourceResponse::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some("".into()))
-                .resource_type(resource.resource_type)
-                .resource_name(resource.resource_name)),
-            ConfigResource::BrokerLogger => Ok(AlterConfigsResourceResponse::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some("".into()))
-                .resource_type(resource.resource_type)
-                .resource_name(resource.resource_name)),
-            ConfigResource::Broker => Ok(AlterConfigsResourceResponse::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some("".into()))
-                .resource_type(resource.resource_type)
-                .resource_name(resource.resource_name)),
-            ConfigResource::Topic => self
-                .meta
-                .with_mut(&self.object_store, |meta| {
-                    meta.alter_topic(
-                        resource.resource_name.as_str(),
-                        resource.configs.as_deref().unwrap_or_default(),
-                    )
-                })
-                .await
-                .map(|()| {
-                    AlterConfigsResourceResponse::default()
-                        .error_code(ErrorCode::None.into())
-                        .error_message(Some("".into()))
-                        .resource_type(resource.resource_type)
-                        .resource_name(resource.resource_name)
-                }),
-            ConfigResource::Unknown => Ok(AlterConfigsResourceResponse::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some("".into()))
-                .resource_type(resource.resource_type)
-                .resource_name(resource.resource_name)),
-        }
-    }
-
-    #[instrument(skip_all, fields(topic = %topic.name))]
-    async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
-        match self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                if meta.topics.contains_key(topic.name.as_str()) {
-                    return Err(Error::Api(ErrorCode::TopicAlreadyExists));
-                }
-
-                let id = Uuid::now_v7();
-                debug!(%id);
-
-                let td = TopicMetadata {
-                    id,
-                    topic: topic.clone(),
-                };
-
-                assert_eq!(None, meta.topics.insert(topic.name.clone(), td));
-                Ok(id)
-            })
-            .await
-        {
-            Ok(id) => {
-                for partition in 0..topic.num_partitions {
-                    let topition = Topition::new(topic.name.as_str(), partition);
-
-                    let watermark = self.watermark_for(&topition)?;
-
-                    watermark
-                        .with_mut(&self.object_store, |watermark| {
-                            _ = watermark.high.take();
-                            _ = watermark.low.take();
-                            watermark.time_index = TimeIndex::complete();
-
-                            Ok(())
-                        })
-                        .await?;
-                }
-
-                Ok(id)
+    /// Returns `inflated`, or decodes `deflated` on the blocking pool when the caller passed none.
+    async fn decoded(
+        inflated: Option<inflated::Batch>,
+        deflated: &deflated::Batch,
+    ) -> Result<inflated::Batch> {
+        match inflated {
+            Some(inflated) => Ok(inflated),
+            None => {
+                let deflated = deflated.clone();
+                offload(move || inflate_produced(&deflated)).await
             }
-
-            error @ Err(_) => error,
         }
-    }
-
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        debug!(?topics);
-
-        let mut responses = vec![];
-
-        for topic in topics {
-            let mut partition_responses = vec![];
-
-            if let Some(ref partitions) = topic.partitions {
-                let metadata = self
-                    .topic_metadata(&TopicId::Name(topic.name.clone()))
-                    .await?;
-
-                for partition in partitions {
-                    let (error_code, low_watermark) = match &metadata {
-                        None => (
-                            ErrorCode::UnknownTopicOrPartition,
-                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
-                        ),
-
-                        Some(metadata)
-                            if partition.partition_index < 0
-                                || partition.partition_index >= metadata.topic.num_partitions =>
-                        {
-                            (
-                                ErrorCode::UnknownTopicOrPartition,
-                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
-                            )
-                        }
-
-                        Some(_) => {
-                            let topition =
-                                Topition::new(topic.name.as_str(), partition.partition_index);
-
-                            let watermark = self.watermarks.lock().map(|mut locked| {
-                                locked
-                                    .entry(topition.to_owned())
-                                    .or_insert_with(|| {
-                                        OptiCon::<Watermark>::new(self.cluster.as_str(), &topition)
-                                    })
-                                    .to_owned()
-                            })?;
-
-                            // Resolve and validate the requested offset against the
-                            // *current* watermark, and commit it atomically: `with_mut`
-                            // re-runs this closure against the latest value on a
-                            // concurrent-write conflict (e.g. a produce racing this
-                            // delete), so the cutoff is always computed from the value
-                            // actually being persisted.
-                            let (error_code, cutoff, high_watermark) = watermark
-                                .with_mut(&self.object_store, |w| {
-                                    let stage = OffsetStage {
-                                        last_stable: w.high.unwrap_or(0),
-                                        high_watermark: w.high.unwrap_or(0),
-                                        log_start: w.low.unwrap_or(0),
-                                    };
-
-                                    match delete_records_cutoff(partition.offset, &stage) {
-                                        Err(error_code) => Ok((
-                                            error_code,
-                                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
-                                            stage.high_watermark,
-                                        )),
-
-                                        Ok(cutoff) => {
-                                            w.low = Some(cutoff);
-                                            Ok((ErrorCode::None, cutoff, stage.high_watermark))
-                                        }
-                                    }
-                                })
-                                .await?;
-
-                            if error_code == ErrorCode::None {
-                                // Best-effort physical cleanup of batches now fully
-                                // below the new low watermark. Failing to reclaim
-                                // storage here does not undo the watermark advance
-                                // above: the logical delete has already taken effect,
-                                // same as Kafka's own segment reclaim lagging behind
-                                // a logStartOffset bump.
-                                self.delete_records_batches(&topition, cutoff, high_watermark)
-                                    .await;
-                            }
-
-                            (error_code, cutoff)
-                        }
-                    };
-
-                    partition_responses.push(
-                        DeleteRecordsPartitionResult::default()
-                            .partition_index(partition.partition_index)
-                            .low_watermark(low_watermark)
-                            .error_code(error_code.into()),
-                    );
-                }
-            }
-
-            responses.push(
-                DeleteRecordsTopicResult::default()
-                    .name(topic.name.clone())
-                    .partitions(Some(partition_responses)),
-            );
-        }
-
-        Ok(responses)
-    }
-
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        if let Some(metadata) = self.topic_metadata(topic).await? {
-            // Metadata is removed *last*, only once both cleanups below
-            // have actually succeeded. Storage paths are keyed by topic
-            // name, not a UUID, so if metadata were removed first (as it
-            // used to be) and a later step then failed, a retry would find
-            // no metadata, report `UnknownTopicOrPartition` without
-            // retrying anything, and leave the partition's record objects
-            // orphaned at that name-keyed path forever - permanently
-            // blocking any topic later recreated with the same name
-            // (`PutMode::Create` colliding with the orphan). Leaving
-            // metadata in place until cleanup is confirmed done means a
-            // retry after a transient failure here finds the topic again
-            // and finishes the job; `delete_stream` over an
-            // already-emptied prefix is a no-op, so retrying the whole
-            // sequence is safe.
-
-            // Both sweeps below build a key prefix from the name. A name
-            // with "/" or an empty name can only predate CreateTopics' name
-            // check. A sweep whose prefix can reach another topic's objects
-            // is skipped, and the objects stay.
-            //
-            // The resolved name is checked, not the request's, because a
-            // delete by id carries no name until `topic_metadata` resolves it.
-            let name = metadata.topic.name.as_str();
-
-            // The data sweep deletes everything under the topic's key
-            // segment, which holds the whole name, "/" included. The empty
-            // name drops out of the key, so its prefix is every topic's data.
-            let data_prefix_is_shared = name.is_empty();
-
-            // The offsets sweep matches whole segments after `offsets/`, so a
-            // name with no empty segment does not reach the keys of the plain
-            // name it starts with; only a name that `Path::from` collapses
-            // onto another ("a/", "/a", "a//b", "") is skipped.
-            let offsets_prefix_is_shared = name.split('/').any(str::is_empty);
-
-            if data_prefix_is_shared {
-                warn!(
-                    name,
-                    topic_id = %metadata.id,
-                    location = %topic_prefix(&self.cluster, name),
-                    "topic deleted, but its data was left in place: \
-                     its name is not a safe key prefix"
-                );
-            } else {
-                if name.contains('/') {
-                    warn!(
-                        name,
-                        topic_id = %metadata.id,
-                        location = %Path::from(format!(
-                            "clusters/{}/topics/{}/partitions",
-                            self.cluster, name
-                        )),
-                        "topic deleted, but objects under the keys its name \
-                         had before it was stored as one segment were left in place"
-                    );
-                }
-
-                let prefix = topic_prefix(&self.cluster, name);
-
-                let locations = self
-                    .object_store
-                    .list(Some(&prefix))
-                    .map_ok(|m| m.location)
-                    .boxed();
-
-                _ = self
-                    .object_store
-                    .delete_stream(locations)
-                    .try_collect::<Vec<Path>>()
-                    .await?;
-            }
-
-            if offsets_prefix_is_shared {
-                warn!(
-                    name,
-                    topic_id = %metadata.id,
-                    location = format!(
-                        "clusters/{}/groups/consumers/<group>/{}",
-                        self.cluster,
-                        Path::from(format!("offsets/{}/partitions", name))
-                    ),
-                    "topic deleted, but its committed offsets were left in place: \
-                     its name is not a safe key prefix"
-                );
-            } else {
-                let prefix = self.group_consumers_prefix();
-
-                let topic_name = metadata.topic.name.clone();
-                let prefix_clone = prefix.clone();
-                let locations = self
-                    .object_store
-                    .list(Some(&prefix))
-                    .filter_map(move |m| {
-                        let prefix = prefix_clone.clone();
-                        let topic_name = topic_name.clone();
-                        async move {
-                            m.map_or(None, |m| {
-                                debug!(?m.location);
-
-                                m.location.prefix_match(&prefix).and_then(|mut i| {
-                                    // skip over the consumer group name
-                                    _ = i.next();
-
-                                    let sub = Path::from_iter(i);
-                                    debug!(?sub);
-
-                                    if sub.prefix_matches(&Path::from(format!(
-                                        "offsets/{}/partitions/",
-                                        topic_name
-                                    ))) {
-                                        Some(Ok(m.location.clone()))
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                        }
-                    })
-                    .boxed();
-
-                _ = self
-                    .object_store
-                    .delete_stream(locations)
-                    .try_collect::<Vec<Path>>()
-                    .await?;
-            }
-
-            self.meta
-                .with_mut(&self.object_store, |meta| {
-                    _ = meta.topics.remove(metadata.topic.name.as_str());
-                    Ok(())
-                })
-                .await?;
-
-            // The broker keeps a cached watermark for each partition that it
-            // reads, so it drops the topic's watermarks here, and creating
-            // and deleting topics through it does not grow its cache. This
-            // cleanup is per broker: with several brokers on one object
-            // store, another broker that read the topic keeps its entries
-            // until it restarts. That broker never reads those entries again,
-            // because Fetch, ListOffsets and Produce check the partition
-            // against the metadata before they read its watermark.
-            self.watermarks
-                .lock()?
-                .retain(|topition, _| topition.topic != metadata.topic.name);
-
-            Ok(ErrorCode::None)
-        } else {
-            Ok(ErrorCode::UnknownTopicOrPartition)
-        }
-    }
-
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        let broker_id = self.node;
-        let host = self
-            .advertised_listener
-            .host_str()
-            .unwrap_or("0.0.0.0")
-            .into();
-        let port = self.advertised_listener.port().unwrap_or(9092).into();
-        let rack = None;
-
-        Ok(vec![
-            DescribeClusterBroker::default()
-                .broker_id(broker_id)
-                .host(host)
-                .port(port)
-                .rack(rack),
-        ])
     }
 
     /// Appends `deflated` to `topition`, and returns the base offset of the batch.
@@ -3015,11 +3113,14 @@ impl Storage for DynoStore {
     /// not have.
     ///
     /// [`UnifiedLog.append`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L905-L912
-    async fn produce(
+    async fn produce_with(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
+        // Decoded by the caller, as `Storage::produce_inflated` requires, or `None` to decode here,
+        // for the backends that need it.
+        inflated: Option<inflated::Batch>,
     ) -> Result<i64> {
         // Checked before any key is built, so a produce to a topic or
         // partition that does not exist writes nothing, as in Kafka.
@@ -3071,19 +3172,18 @@ impl Storage for DynoStore {
                     .inspect_err(|err| debug!(?err))?;
 
                 if batch_attribute.control {
+                    drop(inflated);
                     None
                 } else {
-                    let inflated = {
-                        let deflated = deflated.clone();
-                        offload(move || inflate_produced(&deflated))
-                    }
-                    .await
-                    .inspect(|inflated| debug!(?inflated))
-                    .inspect_err(|err| debug!(?err))?;
+                    let inflated = Self::decoded(inflated, &deflated)
+                        .await
+                        .inspect(|inflated| debug!(?inflated))
+                        .inspect_err(|err| debug!(?err))?;
 
                     Some(inflated)
                 }
             } else {
+                drop(inflated);
                 None
             };
 
@@ -3185,13 +3285,15 @@ impl Storage for DynoStore {
             // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
             // although nothing was stored.
             let inflated = if !attributes.control && self.lake.is_some() {
-                let deflated = deflated.clone();
-
-                offload(move || inflate_produced(&deflated))
+                let inflated = Self::decoded(inflated, &deflated)
                     .await
-                    .inspect_err(|err| debug!(?err))
-                    .map(Some)?
+                    .inspect_err(|err| debug!(?err))?;
+
+                Some(inflated)
             } else {
+                // Not decoded here, so a batch that the caller decoded is not held across the
+                // writes below.
+                drop(inflated);
                 None
             };
 
@@ -3423,6 +3525,414 @@ impl Storage for DynoStore {
             Ok(offset)
         }
     }
+}
+
+#[async_trait]
+impl Storage for DynoStore {
+    async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
+        Ok(())
+    }
+
+    async fn incremental_alter_resource(
+        &self,
+        resource: AlterConfigsResource,
+    ) -> Result<AlterConfigsResourceResponse> {
+        let _ = resource;
+
+        match ConfigResource::from(resource.resource_type) {
+            ConfigResource::Group => Ok(AlterConfigsResourceResponse::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some("".into()))
+                .resource_type(resource.resource_type)
+                .resource_name(resource.resource_name)),
+            ConfigResource::ClientMetric => Ok(AlterConfigsResourceResponse::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some("".into()))
+                .resource_type(resource.resource_type)
+                .resource_name(resource.resource_name)),
+            ConfigResource::BrokerLogger => Ok(AlterConfigsResourceResponse::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some("".into()))
+                .resource_type(resource.resource_type)
+                .resource_name(resource.resource_name)),
+            ConfigResource::Broker => Ok(AlterConfigsResourceResponse::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some("".into()))
+                .resource_type(resource.resource_type)
+                .resource_name(resource.resource_name)),
+            ConfigResource::Topic => self
+                .meta
+                .with_mut(&self.object_store, |meta| {
+                    meta.alter_topic(
+                        resource.resource_name.as_str(),
+                        resource.configs.as_deref().unwrap_or_default(),
+                    )
+                })
+                .await
+                .map(|()| {
+                    AlterConfigsResourceResponse::default()
+                        .error_code(ErrorCode::None.into())
+                        .error_message(Some("".into()))
+                        .resource_type(resource.resource_type)
+                        .resource_name(resource.resource_name)
+                }),
+            ConfigResource::Unknown => Ok(AlterConfigsResourceResponse::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some("".into()))
+                .resource_type(resource.resource_type)
+                .resource_name(resource.resource_name)),
+        }
+    }
+
+    #[instrument(skip_all, fields(topic = %topic.name))]
+    async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+        match self
+            .meta
+            .with_mut(&self.object_store, |meta| {
+                if meta.topics.contains_key(topic.name.as_str()) {
+                    return Err(Error::Api(ErrorCode::TopicAlreadyExists));
+                }
+
+                let id = Uuid::now_v7();
+                debug!(%id);
+
+                let td = TopicMetadata {
+                    id,
+                    topic: topic.clone(),
+                };
+
+                assert_eq!(None, meta.topics.insert(topic.name.clone(), td));
+                Ok(id)
+            })
+            .await
+        {
+            Ok(id) => {
+                for partition in 0..topic.num_partitions {
+                    let topition = Topition::new(topic.name.as_str(), partition);
+
+                    let watermark = self.watermark_for(&topition)?;
+
+                    watermark
+                        .with_mut(&self.object_store, |watermark| {
+                            _ = watermark.high.take();
+                            _ = watermark.low.take();
+                            // A document that outlived a deleted topic must not hand its
+                            // reclaim mark to the new one, or `maintain` would skip the
+                            // new topic's cuts below it.
+                            _ = watermark.reclaimed.take();
+                            watermark.time_index = TimeIndex::complete();
+
+                            Ok(())
+                        })
+                        .await?;
+                }
+
+                Ok(id)
+            }
+
+            error @ Err(_) => error,
+        }
+    }
+
+    async fn delete_records(
+        &self,
+        topics: &[DeleteRecordsTopic],
+    ) -> Result<Vec<DeleteRecordsTopicResult>> {
+        debug!(?topics);
+
+        let mut responses = vec![];
+
+        for topic in topics {
+            let mut partition_responses = vec![];
+
+            if let Some(ref partitions) = topic.partitions {
+                let metadata = self
+                    .topic_metadata(&TopicId::Name(topic.name.clone()))
+                    .await?;
+
+                for partition in partitions {
+                    let (error_code, low_watermark) = match &metadata {
+                        None => (
+                            ErrorCode::UnknownTopicOrPartition,
+                            DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                        ),
+
+                        Some(metadata)
+                            if partition.partition_index < 0
+                                || partition.partition_index >= metadata.topic.num_partitions =>
+                        {
+                            (
+                                ErrorCode::UnknownTopicOrPartition,
+                                DELETE_RECORDS_INVALID_LOW_WATERMARK,
+                            )
+                        }
+
+                        Some(_) => {
+                            let topition =
+                                Topition::new(topic.name.as_str(), partition.partition_index);
+
+                            let watermark = self.watermarks.lock().map(|mut locked| {
+                                locked
+                                    .entry(topition.to_owned())
+                                    .or_insert_with(|| {
+                                        OptiCon::<Watermark>::new(self.cluster.as_str(), &topition)
+                                    })
+                                    .to_owned()
+                            })?;
+
+                            // Resolve and validate the requested offset against the
+                            // *current* watermark, and commit it atomically: `with_mut`
+                            // re-runs this closure against the latest value on a
+                            // concurrent-write conflict (e.g. a produce racing this
+                            // delete), so the cutoff is always computed from the value
+                            // actually being persisted.
+                            let (error_code, cutoff) = watermark
+                                .with_mut(&self.object_store, |w| {
+                                    let stage = OffsetStage {
+                                        last_stable: w.high.unwrap_or(0),
+                                        high_watermark: w.high.unwrap_or(0),
+                                        log_start: w.low.unwrap_or(0),
+                                    };
+
+                                    match delete_records_cutoff(partition.offset, &stage) {
+                                        Err(error_code) => {
+                                            Ok((error_code, DELETE_RECORDS_INVALID_LOW_WATERMARK))
+                                        }
+
+                                        Ok(cutoff) => {
+                                            w.low = Some(cutoff);
+                                            Ok((ErrorCode::None, cutoff))
+                                        }
+                                    }
+                                })
+                                .await?;
+
+                            // The request moves the low watermark and no more.
+                            // `maintain` deletes the batch objects below it (see
+                            // `reclaim_records`), so that this request makes a bounded
+                            // number of object store calls however many objects the
+                            // partition holds.
+                            (error_code, cutoff)
+                        }
+                    };
+
+                    partition_responses.push(
+                        DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(low_watermark)
+                            .error_code(error_code.into()),
+                    );
+                }
+            }
+
+            responses.push(
+                DeleteRecordsTopicResult::default()
+                    .name(topic.name.clone())
+                    .partitions(Some(partition_responses)),
+            );
+        }
+
+        Ok(responses)
+    }
+
+    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
+        if let Some(metadata) = self.topic_metadata(topic).await? {
+            // Metadata is removed *last*, only once both cleanups below
+            // have actually succeeded. Storage paths are keyed by topic
+            // name, not a UUID, so if metadata were removed first (as it
+            // used to be) and a later step then failed, a retry would find
+            // no metadata, report `UnknownTopicOrPartition` without
+            // retrying anything, and leave the partition's record objects
+            // orphaned at that name-keyed path forever - permanently
+            // blocking any topic later recreated with the same name
+            // (`PutMode::Create` colliding with the orphan). Leaving
+            // metadata in place until cleanup is confirmed done means a
+            // retry after a transient failure here finds the topic again
+            // and finishes the job; `delete_stream` over an
+            // already-emptied prefix is a no-op, so retrying the whole
+            // sequence is safe.
+
+            // Both sweeps below build a key prefix from the name. A name
+            // with "/" or an empty name can only predate CreateTopics' name
+            // check. A sweep whose prefix can reach another topic's objects
+            // is skipped, and the objects stay.
+            //
+            // The resolved name is checked, not the request's, because a
+            // delete by id carries no name until `topic_metadata` resolves it.
+            let name = metadata.topic.name.as_str();
+
+            // The data sweep deletes everything under the topic's key
+            // segment, which holds the whole name, "/" included. The empty
+            // name drops out of the key, so its prefix is every topic's data.
+            let data_prefix_is_shared = name.is_empty();
+
+            // The offsets sweep matches whole segments after `offsets/`, so a
+            // name with no empty segment does not reach the keys of the plain
+            // name it starts with; only a name that `Path::from` collapses
+            // onto another ("a/", "/a", "a//b", "") is skipped.
+            let offsets_prefix_is_shared = name.split('/').any(str::is_empty);
+
+            if data_prefix_is_shared {
+                warn!(
+                    name,
+                    topic_id = %metadata.id,
+                    location = %topic_prefix(&self.cluster, name),
+                    "topic deleted, but its data was left in place: \
+                     its name is not a safe key prefix"
+                );
+            } else {
+                if name.contains('/') {
+                    warn!(
+                        name,
+                        topic_id = %metadata.id,
+                        location = %Path::from(format!(
+                            "clusters/{}/topics/{}/partitions",
+                            self.cluster, name
+                        )),
+                        "topic deleted, but objects under the keys its name \
+                         had before it was stored as one segment were left in place"
+                    );
+                }
+
+                let prefix = topic_prefix(&self.cluster, name);
+
+                let locations = self
+                    .object_store
+                    .list(Some(&prefix))
+                    .map_ok(|m| m.location)
+                    .boxed();
+
+                _ = self
+                    .object_store
+                    .delete_stream(locations)
+                    .try_collect::<Vec<Path>>()
+                    .await?;
+            }
+
+            if offsets_prefix_is_shared {
+                warn!(
+                    name,
+                    topic_id = %metadata.id,
+                    location = format!(
+                        "clusters/{}/groups/consumers/<group>/{}",
+                        self.cluster,
+                        Path::from(format!("offsets/{}/partitions", name))
+                    ),
+                    "topic deleted, but its committed offsets were left in place: \
+                     its name is not a safe key prefix"
+                );
+            } else {
+                let prefix = self.group_consumers_prefix();
+
+                let topic_name = metadata.topic.name.clone();
+                let prefix_clone = prefix.clone();
+                let locations = self
+                    .object_store
+                    .list(Some(&prefix))
+                    .filter_map(move |m| {
+                        let prefix = prefix_clone.clone();
+                        let topic_name = topic_name.clone();
+                        async move {
+                            m.map_or(None, |m| {
+                                debug!(?m.location);
+
+                                m.location.prefix_match(&prefix).and_then(|mut i| {
+                                    // skip over the consumer group name
+                                    _ = i.next();
+
+                                    let sub = Path::from_iter(i);
+                                    debug!(?sub);
+
+                                    if sub.prefix_matches(&Path::from(format!(
+                                        "offsets/{}/partitions/",
+                                        topic_name
+                                    ))) {
+                                        Some(Ok(m.location.clone()))
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        }
+                    })
+                    .boxed();
+
+                _ = self
+                    .object_store
+                    .delete_stream(locations)
+                    .try_collect::<Vec<Path>>()
+                    .await?;
+            }
+
+            self.meta
+                .with_mut(&self.object_store, |meta| {
+                    _ = meta.topics.remove(metadata.topic.name.as_str());
+                    Ok(())
+                })
+                .await?;
+
+            // The broker keeps a cached watermark for each partition that it
+            // reads, so it drops the topic's watermarks here, and creating
+            // and deleting topics through it does not grow its cache. This
+            // cleanup is per broker: with several brokers on one object
+            // store, another broker that read the topic keeps its entries
+            // until it restarts. That broker never reads those entries again,
+            // because Fetch, ListOffsets and Produce check the partition
+            // against the metadata before they read its watermark.
+            self.watermarks
+                .lock()?
+                .retain(|topition, _| topition.topic != metadata.topic.name);
+
+            Ok(ErrorCode::None)
+        } else {
+            Ok(ErrorCode::UnknownTopicOrPartition)
+        }
+    }
+
+    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
+        let broker_id = self.node;
+        let host = self
+            .advertised_listener
+            .host_str()
+            .unwrap_or("0.0.0.0")
+            .into();
+        let port = self.advertised_listener.port().unwrap_or(9092).into();
+        let rack = None;
+
+        Ok(vec![
+            DescribeClusterBroker::default()
+                .broker_id(broker_id)
+                .host(host)
+                .port(port)
+                .rack(rack),
+        ])
+    }
+
+    /// Appends `deflated` to `topition`, decoding the batch here when the backend needs it.
+    async fn produce(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<i64> {
+        self.produce_with(transaction_id, topition, deflated, None)
+            .await
+    }
+
+    /// Appends `deflated` to `topition`, with the batch that the caller decoded, so that the
+    /// backend does not decode it again.
+    async fn produce_inflated(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Result<i64> {
+        let inflated = self.inflated_if_read(inflated);
+
+        self.produce_with(transaction_id, topition, deflated, inflated)
+            .await
+    }
 
     async fn fetch(
         &self,
@@ -3431,11 +3941,15 @@ impl Storage for DynoStore {
         _min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        max_wait: Duration,
+        deadline: Instant,
     ) -> Result<Vec<deflated::Batch>> {
-        let deadline = Instant::now().checked_add(max_wait);
+        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
+        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
+            return Ok(vec![]);
+        };
+
+        let high_watermark = offset_stage.map(|offset_stage| {
             if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
@@ -3453,7 +3967,13 @@ impl Storage for DynoStore {
             offset,
             max_bytes,
             high_watermark,
-            deadline,
+        };
+
+        let Ok(holding) = read_deadline
+            .timeout(self.batch_stream_holding(topition, offset))
+            .await
+        else {
+            return Ok(vec![]);
         };
 
         // A batch key zero-pads its base offset, so key order is offset
@@ -3464,9 +3984,9 @@ impl Storage for DynoStore {
         // cannot give without listing in key order. Otherwise the fetch lists
         // the whole partition and sorts it, at a cost that grows with the
         // partition (#684).
-        if let Some(base_offsets) = self.batch_stream_holding(topition, offset).await?
+        if let Some(base_offsets) = holding?
             && let Some(batches) = self
-                .read_fetched_batches(topition, bounds, base_offsets, true)
+                .read_fetched_batches(topition, bounds, base_offsets, true, &mut read_deadline)
                 .await?
         {
             return Ok(batches);
@@ -3487,7 +4007,8 @@ impl Storage for DynoStore {
             );
         }
 
-        self.fetch_from_full_listing(topition, bounds).await
+        self.fetch_from_full_listing(topition, bounds, &mut read_deadline)
+            .await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -5163,16 +5684,21 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
-        if let Some(ref lake) = self.lake {
-            return lake
-                .maintain()
+        let lake = async {
+            let Some(ref lake) = self.lake else {
+                return Ok(());
+            };
+
+            lake.maintain()
                 .await
                 .inspect(|maintain| debug!(?maintain))
                 .inspect_err(|err| debug!(?err))
-                .map_err(Into::into);
-        }
+                .map_err(Into::into)
+        };
 
-        Ok(())
+        let ((), lake) = tokio::join!(self.reclaim_records(), lake);
+
+        lake
     }
 
     async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {

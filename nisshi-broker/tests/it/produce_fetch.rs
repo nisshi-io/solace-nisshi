@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{collections::BTreeMap, time::Duration};
+use tokio::time::Instant;
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
 use bytes::Bytes;
@@ -115,7 +116,7 @@ where
             min_bytes,
             max_bytes as u32,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| {
@@ -343,7 +344,7 @@ where
             min_bytes,
             max_bytes as u32,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| {
@@ -573,7 +574,7 @@ where
             min_bytes,
             max_bytes as u32,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| {
@@ -711,7 +712,14 @@ where
 
     // Fetch the base topic — all six records
     let all_records = sc
-        .fetch(&topition, offset, min_bytes, max_bytes, isolation, max_wait)
+        .fetch(
+            &topition,
+            offset,
+            min_bytes,
+            max_bytes,
+            isolation,
+            Instant::now() + max_wait,
+        )
         .await
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?all_records);
@@ -726,7 +734,7 @@ where
             min_bytes,
             max_bytes,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
@@ -745,7 +753,7 @@ where
             min_bytes,
             max_bytes,
             isolation,
-            max_wait,
+            Instant::now() + max_wait,
         )
         .await
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
@@ -827,7 +835,7 @@ where
                 1,
                 max_bytes,
                 IsolationLevel::ReadUncommitted,
-                Duration::from_millis(500),
+                Instant::now() + Duration::from_millis(500),
             )
             .await?
         {
@@ -927,7 +935,14 @@ where
     // All six records are returned — nisshi.virtual is not set so the "/" is
     // treated as part of the topic name with no key filtering applied.
     let all_records = sc
-        .fetch(&topition, offset, min_bytes, max_bytes, isolation, max_wait)
+        .fetch(
+            &topition,
+            offset,
+            min_bytes,
+            max_bytes,
+            isolation,
+            Instant::now() + max_wait,
+        )
         .await
         .and_then(|batches| collect_records(batches).map_err(Into::into))?;
     debug!(?all_records);

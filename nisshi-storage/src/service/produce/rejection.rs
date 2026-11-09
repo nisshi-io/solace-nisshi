@@ -48,6 +48,8 @@ impl Rejection {
             topic,
             partition,
             producer_id = batch.producer_id,
+            producer_epoch = batch.producer_epoch,
+            base_sequence = batch.base_sequence,
             attributes = batch.attributes,
             record_count = batch.record_count,
             last_offset_delta = batch.last_offset_delta,
@@ -102,6 +104,18 @@ pub(super) fn storage_error_code(error: &Error) -> ErrorCode {
         | Error::MessageTooLarge { .. } => ErrorCode::MessageTooLarge,
         error => error.error_code(ErrorCode::KafkaStorageError),
     }
+}
+
+/// Returns whether `error_code` answers a batch that the steps of a partition rejected before
+/// storage.
+pub(super) fn is_rejection(error_code: ErrorCode) -> bool {
+    matches!(
+        error_code,
+        ErrorCode::CorruptMessage
+            | ErrorCode::InvalidRecord
+            | ErrorCode::InvalidTimestamp
+            | ErrorCode::MessageTooLarge
+    )
 }
 
 /// The rejection for a client batch that [`inflate_produced`](super::inflate_produced) did not decode,
@@ -168,5 +182,67 @@ mod tests {
             ErrorCode::KafkaStorageError,
             storage_error_code(&Error::from(std::io::Error::other("connection reset")))
         );
+    }
+
+    mod log {
+        use std::{
+            io,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing::Level;
+
+        use super::*;
+
+        /// The log lines written at `warn` or above.
+        #[derive(Clone, Default)]
+        struct WarnLog(Arc<Mutex<Vec<u8>>>);
+
+        impl io::Write for WarnLog {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// An operator can tell a producer ID without sequencing (-1) from a corrupt batch
+        /// (`i32::MIN`) by the sequence and epoch in the warn that `log` writes.
+        #[test]
+        fn the_rejection_warn_names_the_base_sequence_and_producer_epoch() {
+            let log = WarnLog::default();
+            let writer = log.clone();
+            let batch = deflated::Batch {
+                producer_id: 7,
+                producer_epoch: 3,
+                base_sequence: i32::MIN,
+                ..Default::default()
+            };
+
+            tracing::subscriber::with_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(Level::WARN)
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+                || {
+                    Rejection::new(
+                        ErrorCode::InvalidRecord,
+                        "negative base sequence with a producer ID",
+                    )
+                    .log("orders", 0, &batch)
+                },
+            );
+
+            let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+            assert!(
+                text.contains(&format!("base_sequence={}", i32::MIN)),
+                "{text}"
+            );
+            assert!(text.contains("producer_epoch=3"), "{text}");
+        }
     }
 }

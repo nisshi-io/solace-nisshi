@@ -32,8 +32,8 @@ use bytes::Bytes;
 use nisshi_broker::{Error, Result, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{ErrorCode, sync_group_request::SyncGroupRequestAssignment};
 use nisshi_storage::{
-    LatencyIntroducingStorage, Request, RequestChannelService, RequestStorageService, Storage,
-    bounded_channel,
+    ChannelRequest, LatencyIntroducingStorage, Request, RequestChannelService,
+    RequestStorageService, Storage, bounded_channel,
 };
 use rama::Service as _;
 use rand::{prelude::*, rng};
@@ -80,7 +80,12 @@ where
     let service = RequestStorageService::new(LatencyIntroducingStorage::new(storage));
 
     _ = tokio::spawn(async move {
-        while let Some((request, reply)) = receiver.recv().await {
+        while let Some(ChannelRequest {
+            request,
+            response: reply,
+            ..
+        }) = receiver.recv().await
+        {
             if matches!(request, Request::UpdateGroup { .. }) {
                 _ = writes.fetch_add(1, Ordering::SeqCst);
             }
