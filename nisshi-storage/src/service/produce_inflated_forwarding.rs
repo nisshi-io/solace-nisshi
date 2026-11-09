@@ -269,10 +269,10 @@ async fn batcher_without_a_delay_forwards_the_decoded_batch() -> Result<()> {
     through(ProduceRequestBatcher::new(storage.clone()), &storage).await
 }
 
-/// With a delay the batcher combines queued batches, which decodes them again, so it drops the
-/// decoded batch and produces the bytes as before.
+/// With a delay the batcher holds the decoded batch in its queue. The default batch is
+/// idempotent, so the flush writes it as sent, and passes the held decoded batch on.
 #[tokio::test]
-async fn batcher_with_a_delay_drops_the_decoded_batch() -> Result<()> {
+async fn batcher_with_a_delay_forwards_the_decoded_batch_that_it_held() -> Result<()> {
     let storage = storage();
 
     _ = ProduceRequestBatcher::new(storage.clone())
@@ -287,7 +287,10 @@ async fn batcher_with_a_delay_drops_the_decoded_batch() -> Result<()> {
 
     let produced = storage.produced();
     assert_eq!(1, produced.len());
-    assert_eq!(None, produced[0].inflated);
+    assert!(
+        produced[0].inflated.is_some(),
+        "the batcher dropped the decoded batch that it held"
+    );
 
     Ok(())
 }

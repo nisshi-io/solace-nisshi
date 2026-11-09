@@ -724,12 +724,12 @@ impl Storage for RequestChannelService {
 
         let Ok(permit) = self.tx.try_reserve() else {
             drop(inflated);
-            produce_path::fallback();
+            produce_path::fallback(produce_path::Stage::Channel);
 
             return self.produce(transaction_id, topition, deflated).await;
         };
 
-        produce_path::direct();
+        produce_path::direct(produce_path::Stage::Channel);
 
         let request = Request::Produce {
             transaction_id: transaction_id.map(|s| s.to_string()),
