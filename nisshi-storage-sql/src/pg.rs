@@ -115,11 +115,11 @@ use crate::{
         plan, report_upgrade, upgraded_compatibility,
     },
     sql::{
-        consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        topic_configuration_select, topic_configuration_select_keys, topic_select,
-        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
-        txn_produce_partition_select, watermark_select_for_write,
+        ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, topic_configuration_select,
+        topic_configuration_select_keys, topic_select, txn_offset_commit_tp_select_pending,
+        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
 
@@ -607,12 +607,6 @@ const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
 /// that produced it.
 const FETCH_PLAN_SETTINGS: &str =
     "SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = off";
-
-/// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
-/// fetch service reads again from the last offset it received, so a limit that ends a read early
-/// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
-/// offset and the high watermark.
-const ROWS_PER_FETCH: i64 = 10_000;
 
 /// How long a caller waits for a free pooled connection before failing fast with a retriable
 /// error, rather than queuing indefinitely while the pool is exhausted.

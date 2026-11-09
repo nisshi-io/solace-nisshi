@@ -36,6 +36,12 @@ use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
 
+/// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
+/// fetch service reads again from the last offset it received, so a limit that ends a read early
+/// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
+/// offset and the high watermark.
+pub(crate) const ROWS_PER_FETCH: i64 = 10_000;
+
 pub(crate) struct Cache(pub BTreeMap<&'static str, String>);
 
 impl Deref for Cache {

@@ -13,7 +13,14 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, blob) as
+-- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, blob, integer) as
+-- A fetch reads at most $8 rows past the fetch offset (ROWS_PER_FETCH). The running byte total
+-- below covers every row that this query reads, so without the limit, one fetch costs as much as
+-- the whole backlog between the fetch offset and the high watermark, however few rows the client
+-- can take. The limit also bounds the header probes, which run once for each row that the limit
+-- keeps. The fetch service reads again from the last offset that it received, so a limit that
+-- ends a read early costs one more query.
+--
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
 -- The header table is probed by its primary key for each record, so a record that holds only
@@ -63,7 +70,10 @@ and t.name = $2
 and tp.partition = $3
 and r.offset_id >= $4
 and r.offset_id < $6
-and r.k = $7) sized_rows)
+and r.k = $7
+
+order by r.offset_id
+limit $8) sized_rows)
 
 -- The query returns the first row even when that row alone is larger than $5, so that a consumer
 -- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first

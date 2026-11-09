@@ -14,7 +14,7 @@
 -- limitations under the License.
 
 -- prepare record_fetch (text, text, integer, integer, integer, integer, bigint) as
--- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH in pg.rs, 10000). The running byte total below is
+-- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH in sql.rs, 10000). The running byte total below is
 -- computed over every row that this query reads, so without the limit, one fetch costs as much
 -- as the whole backlog between the fetch offset and the high watermark, however few rows the
 -- client can take. The fetch service reads again from the last offset that it received, so a

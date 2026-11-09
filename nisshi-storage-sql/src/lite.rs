@@ -19,9 +19,10 @@ use crate::{
         plan, report_upgrade, upgraded_compatibility,
     },
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
         txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -3490,6 +3491,7 @@ impl Storage for Delegate {
                         (max_bytes as i64),
                         high_watermark,
                         key_bytes,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
@@ -3504,6 +3506,7 @@ impl Storage for Delegate {
                         offset,
                         (max_bytes as i64),
                         high_watermark,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
@@ -5988,7 +5991,7 @@ mod tests {
     use std::assert_matches;
     use std::thread;
 
-    use nisshi_sans_io::Compression;
+    use nisshi_sans_io::{Compression, create_topics_request::CreatableTopicConfig};
     use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
     use tokio::{fs::remove_file, task::yield_now};
@@ -6780,6 +6783,241 @@ mod tests {
             records > 0,
             "the fetch kept none of the records that it read before its deadline"
         );
+
+        Ok(())
+    }
+
+    /// Opens an engine on a database file in a temporary directory and creates a topic of one
+    /// partition on it, a virtual topic when `keyed`. Returns the engine, the partition that
+    /// records are produced to and the one that a fetch reads: a keyed fetch reads the records
+    /// with the key `k` of the virtual topic.
+    async fn fetch_engine_with_topic(
+        keyed: bool,
+    ) -> Result<(tempfile::TempDir, ArcDynStorage, Topition, Topition)> {
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir)?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!(
+                "file:///{}?mode=direct",
+                relative.display()
+            ))?)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        keyed
+                            .then(|| {
+                                CreatableTopicConfig::default()
+                                    .name(topic_config::VIRTUAL.to_owned())
+                                    .value(Some("true".into()))
+                            })
+                            .into_iter()
+                            .collect(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let produced = Topition::new(topic, 0);
+        let fetched = if keyed {
+            Topition::new(format!("{topic}/k"), 0)
+        } else {
+            produced.clone()
+        };
+
+        Ok((temp_dir, engine, produced, fetched))
+    }
+
+    /// Stores `count` records, 1,000 to a batch because a batch of headers can exceed the
+    /// message size limit. Each has the key `k` and the value `a`, and a 1 byte header key and a
+    /// 99 byte header value when `with_header`. A record then costs 104 bytes against a fetch's
+    /// `max_bytes`: 1 for the key, 1 for the value, 2 for the header's framing and 100 for the
+    /// header.
+    async fn produce_keyed_records(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        count: i64,
+        with_header: bool,
+    ) -> Result<()> {
+        const RECORDS_PER_BATCH: i64 = 1_000;
+
+        for first in (0..count).step_by(usize::try_from(RECORDS_PER_BATCH)?) {
+            let in_batch = RECORDS_PER_BATCH.min(count - first);
+
+            let batch = (0..in_batch)
+                .fold(inflated::Batch::builder(), |builder, delta| {
+                    let record = Record::builder()
+                        .key(Some(Bytes::from_static(b"k")))
+                        .value(Some(Bytes::from_static(b"a")))
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX));
+
+                    builder.record(if with_header {
+                        record.header(
+                            Header::builder()
+                                .key(Bytes::from_static(b"h"))
+                                .value(Bytes::from(vec![0; 99])),
+                        )
+                    } else {
+                        record
+                    })
+                })
+                .last_offset_delta(i32::try_from(in_batch - 1)?)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, topition, batch).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offsets of the records that one engine read of `topition` from `offset`
+    /// returns within `max_bytes`.
+    async fn fetched_offsets(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+    ) -> Result<Vec<i64>> {
+        engine
+            .fetch(
+                topition,
+                offset,
+                1,
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?
+            .into_iter()
+            .try_fold(Vec::new(), |mut offsets, batch| {
+                let batch = inflated::Batch::try_from(batch)?;
+
+                offsets.extend(
+                    batch
+                        .records
+                        .iter()
+                        .map(|record| batch.base_offset + i64::from(record.offset_delta)),
+                );
+
+                Ok(offsets)
+            })
+    }
+
+    /// One engine read returns at most `ROWS_PER_FETCH` rows, and a read from the last offset that
+    /// it returned gets the rest, with no gap and no repeat. Without the limit, each read covers
+    /// every row between its offset and the high watermark, so a consumer that is far behind pays
+    /// for its whole backlog on every read. The test covers the statement of an ordinary topic and
+    /// the statement of a virtual topic.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, false).await?;
+
+            assert_eq!(
+                (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+                "one read must stop at the row limit, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, ROWS_PER_FETCH, u32::MAX).await?,
+                "a read from the last offset must return the rest, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The row limit applies to records that have headers, and a record's headers still count
+    /// toward `max_bytes` when the limit ends the read. A record costs 104 bytes, so a budget of
+    /// 1041 bytes returns 10 of them.
+    #[tokio::test]
+    async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
+    {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true).await?;
+
+            assert_eq!(
+                (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, u32::MAX).await?,
+                "the row limit counts from the fetch offset, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (40..50).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, 1041).await?,
+                "the byte budget must count the headers, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A read over more rows than the limit still returns the first record when that record
+    /// alone is larger than `max_bytes` (KIP-74), so that a consumer gets past it.
+    #[tokio::test]
+    async fn fetch_returns_the_first_record_larger_than_max_bytes_within_a_bounded_read()
+    -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true).await?;
+
+            for offset in [0, ROWS_PER_FETCH - 1, ROWS_PER_FETCH] {
+                assert_eq!(
+                    vec![offset],
+                    fetched_offsets(&engine, &fetched, offset, 50).await?,
+                    "fetch at {offset}, keyed: {keyed}",
+                );
+            }
+        }
 
         Ok(())
     }

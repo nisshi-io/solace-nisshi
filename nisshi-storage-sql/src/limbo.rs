@@ -27,9 +27,10 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
         txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -1867,6 +1868,7 @@ impl Storage for Engine {
                     offset,
                     (max_bytes as i64),
                     high_watermark,
+                    ROWS_PER_FETCH,
                 ),
             )
             .await
@@ -4525,6 +4527,68 @@ mod tests {
         Ok(())
     }
 
+    /// A fetch statement returns at most `ROWS_PER_FETCH` rows, and a read from the last offset
+    /// that it returned gets the rest, with no gap and no repeat. Each record has a header of 99
+    /// bytes, so the statement runs its header probe for the rows that it keeps, and costs a
+    /// record 103 bytes with its key. The statements run here, on the Turso engine, because it
+    /// rejects some SQL that SQLite takes, and a row limit inside a derived table is one such
+    /// construct.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_numbered_records(&connection, RECORDS).await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            let fetch_from = |offset, max_bytes| {
+                fetched_offsets_from(&connection, statement, key, offset, max_bytes, RECORDS)
+            };
+
+            assert_eq!(
+                (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetch_from(0, i64::MAX).await?,
+                "{statement}: one read must stop at the row limit",
+            );
+
+            assert_eq!(
+                (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+                fetch_from(ROWS_PER_FETCH, i64::MAX).await?,
+                "{statement}: a read from the last offset must return the rest",
+            );
+
+            assert_eq!(
+                (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetch_from(40, i64::MAX).await?,
+                "{statement}: the row limit counts from the fetch offset",
+            );
+
+            // A record costs 103 bytes, so a budget of 1031 bytes holds 10 of them.
+            assert_eq!(
+                (40..50).collect::<Vec<_>>(),
+                fetch_from(40, 1031).await?,
+                "{statement}: the byte budget must count the headers",
+            );
+
+            // The first record is exempt from the budget (KIP-74), also when the row limit
+            // cuts the read short.
+            for offset in [0, ROWS_PER_FETCH - 1, ROWS_PER_FETCH] {
+                assert_eq!(
+                    vec![offset],
+                    fetch_from(offset, 50).await?,
+                    "{statement}: a first record larger than the budget, at {offset}",
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// The fetch statements count a record's headers toward `max_bytes`: three records with a
     /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
     /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
@@ -4689,6 +4753,33 @@ mod tests {
         Ok(())
     }
 
+    /// Stores `count` records at offsets 0 and up of partition 0, each with the key `k`, no value
+    /// and one header with a 1 byte key and a 99 byte value.
+    async fn insert_numbered_records(connection: &Connection, count: i64) -> Result<()> {
+        _ = connection.execute("begin", ()).await?;
+
+        for offset in 0..count {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+
+            _ = connection
+                .execute(
+                    "insert into header (topition, offset_id, ordinal, k, v)
+                        values (1, ?1, 0, x'68', ?2)",
+                    vec![Value::from(offset), Value::Blob(vec![0; 99])],
+                )
+                .await?;
+        }
+
+        _ = connection.execute("commit", ()).await?;
+
+        Ok(())
+    }
+
     /// Returns the offsets that `statement` selects when it reads partition 0 from offset 0
     /// within `max_bytes`, up to a high watermark of 3. `key` is the key that a keyed statement
     /// filters on.
@@ -4698,15 +4789,30 @@ mod tests {
         key: Option<&[u8]>,
         max_bytes: i64,
     ) -> Result<Vec<i64>> {
+        fetched_offsets_from(connection, statement, key, 0, max_bytes, 3).await
+    }
+
+    /// Returns the offsets that `statement` selects when it reads partition 0 from `offset`
+    /// within `max_bytes`, up to `high_watermark`, with the row limit that a fetch binds. `key`
+    /// is the key that a keyed statement filters on.
+    async fn fetched_offsets_from(
+        connection: &Connection,
+        statement: &str,
+        key: Option<&[u8]>,
+        offset: i64,
+        max_bytes: i64,
+        high_watermark: i64,
+    ) -> Result<Vec<i64>> {
         let mut params = vec![
             Value::from("c"),
             Value::from("t"),
             Value::from(0),
-            Value::from(0),
+            Value::from(offset),
             Value::from(max_bytes),
-            Value::from(3),
+            Value::from(high_watermark),
         ];
         params.extend(key.map(|key| Value::Blob(key.to_vec())));
+        params.push(Value::from(ROWS_PER_FETCH));
 
         let sql = sql_lookup(statement)?;
         let mut rows = connection.prepare(&sql).await?.query(params).await?;
