@@ -36,7 +36,7 @@ use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Object, Pool, PoolError, RecyclingMethod, Runtime,
     TimeoutType, Transaction,
 };
-use futures::{StreamExt as _, pin_mut};
+use futures::pin_mut;
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
@@ -2001,15 +2001,15 @@ impl Postgres {
         // `query_raw` returns once the server has accepted the statement, and its stream yields
         // each row as the server sends it, so the read sends each record before the next row
         // arrives.
-        let started_at = SystemTime::now();
+        let started_at = Instant::now();
         let rows = tx
             .query_raw(&prepared, params.iter().copied())
             .await
             .inspect_err(|err| metrics::failed(sql, &self.cluster, err))?;
-        let statement = FetchStatementMetrics::started(sql, &self.cluster, started_at);
+        let mut statement = FetchStatementMetrics::started(sql, &self.cluster, started_at);
         pin_mut!(rows);
 
-        while let Some(row) = rows.next().await {
+        while let Some(row) = statement.next_row(&mut rows).await {
             let row = match row {
                 Ok(row) => row,
                 // An error from the server ends the statement.
@@ -6061,10 +6061,7 @@ mod tests {
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::metrics::{
         InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
-        data::{
-            AggregatedMetrics, HistogramDataPoint, MetricData, ResourceMetrics, ScopeMetrics,
-            SumDataPoint,
-        },
+        data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint},
     };
     use rand::distr::Alphanumeric;
     use std::{
@@ -13703,11 +13700,12 @@ mod tests {
     }
 
     /// How often `nisshi_sql_requests` counted a statement, and how many durations
-    /// `nisshi_sql_duration` recorded for it.
+    /// `nisshi_sql_duration` recorded for it, with their total in milliseconds.
     #[derive(Debug)]
     struct StatementCounts {
         requests: u64,
         durations: u64,
+        duration_millis: u64,
     }
 
     /// Returns the counts that `exporter` holds for the statement `sql` with the `outcome`
@@ -13731,6 +13729,7 @@ mod tests {
         let mut counts = StatementCounts {
             requests: 0,
             durations: 0,
+            duration_millis: 0,
         };
 
         let metrics = exporter.get_finished_metrics().unwrap_or_default();
@@ -13754,11 +13753,13 @@ mod tests {
                     "nisshi_sql_duration",
                     AggregatedMetrics::U64(MetricData::Histogram(histogram)),
                 ) => {
-                    counts.durations += histogram
+                    for point in histogram
                         .data_points()
                         .filter(|point| matches(&mut point.attributes()))
-                        .map(HistogramDataPoint::count)
-                        .sum::<u64>();
+                    {
+                        counts.durations += point.count();
+                        counts.duration_millis += point.sum();
+                    }
                 }
                 _ => {}
             }
@@ -13767,9 +13768,10 @@ mod tests {
         counts
     }
 
-    /// The records statement of a fetch counts in `nisshi_sql_requests` with the `outcome`
-    /// `completed` when it sends all of its rows, and `stopped` when the caller drops the read
-    /// before then. Only a completed statement records a duration in `nisshi_sql_duration`.
+    /// The records statement of a fetch counts in `nisshi_sql_requests` and `nisshi_sql_duration`
+    /// with the `outcome` `completed` when it sends all of its rows, and `stopped` when the caller
+    /// drops the read before then. The duration leaves out the time that the read waits for room in
+    /// its channel.
     #[tokio::test]
     async fn fetch_statement_counts_its_outcome() -> Result<()> {
         // The exporter must be installed before the storage creates its first SQL metric.
@@ -13820,8 +13822,15 @@ mod tests {
         let completed = statement_counts(&exporter, sql, "completed");
         assert_eq!((1, 1), (completed.requests, completed.durations));
 
+        // The stopped read waited 5 seconds for room in its channel, and none of that wait is
+        // database time.
         let stopped = statement_counts(&exporter, sql, "stopped");
-        assert_eq!((1, 0), (stopped.requests, stopped.durations));
+        assert_eq!((1, 1), (stopped.requests, stopped.durations));
+        assert!(
+            stopped.duration_millis < 5_000,
+            "{} ms",
+            stopped.duration_millis
+        );
 
         Ok(())
     }
@@ -13941,7 +13950,7 @@ mod tests {
         cut.store(true, atomic::Ordering::Relaxed);
 
         let fetched = storage
-            .fetch_until_deadline(
+            .fetch_until_deadline_or_failure(
                 &topition,
                 0,
                 1,

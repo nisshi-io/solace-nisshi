@@ -14,7 +14,13 @@
 
 //! The metrics of the statements that the PostgreSQL storage engine runs.
 
-use std::{sync::LazyLock, time::SystemTime};
+use std::{
+    sync::LazyLock,
+    time::{Duration, SystemTime},
+};
+
+use futures::{Stream, StreamExt as _};
+use tokio::time::Instant;
 
 use nisshi_storage::{METER, StorageOperation};
 use opentelemetry::{
@@ -137,39 +143,54 @@ fn count(started_at: SystemTime, attributes: &[KeyValue]) {
     SQL_REQUESTS.add(1, attributes);
 }
 
-/// Counts the records statement of a fetch in `nisshi_sql_requests`, with an `outcome` attribute
-/// of `completed` or `stopped`, and the duration of a completed statement in
-/// `nisshi_sql_duration`.
+/// Counts the records statement of a fetch in `nisshi_sql_requests`, and records the time that
+/// PostgreSQL spent on it in `nisshi_sql_duration`, each with an `outcome` attribute of `completed`
+/// or `stopped`.
 ///
 /// The statement counts as `stopped` when the guard is dropped before
 /// [`FetchStatementMetrics::completed`] or [`FetchStatementMetrics::failed`] runs. A caller that
 /// stops a read at its deadline drops the read, so `Drop` is the only code that runs then.
 ///
-/// A stopped statement records no duration, because its time ends at the drop, which would put the
-/// deadline into the latency of the statements that completed. The duration of a completed
-/// statement includes the time that the read waits for room in its channel.
+/// The duration is database time only: the time that the statement took to start, and each wait
+/// for its next row through [`FetchStatementMetrics::next_row`]. It leaves out the time that the
+/// read waits for room in its channel, which the broker spends, not PostgreSQL. A stopped
+/// statement's duration ends at the drop, so a read stopped while it waits for a slow row still
+/// shows that wait.
 pub(super) struct FetchStatementMetrics {
     sql: String,
     cluster: String,
-    started_at: SystemTime,
+    database_time: Duration,
+    waiting_for_row_since: Option<Instant>,
     counted: bool,
 }
 
 impl FetchStatementMetrics {
-    /// Returns the guard of the statement `sql` on `cluster`, which started at `started_at`.
-    pub(super) fn started(sql: &str, cluster: &str, started_at: SystemTime) -> Self {
+    /// Returns the guard of the statement `sql` on `cluster`, which started at `started_at` and
+    /// has just been accepted by the server.
+    pub(super) fn started(sql: &str, cluster: &str, started_at: Instant) -> Self {
         Self {
             sql: sql.to_owned(),
             cluster: cluster.to_owned(),
-            started_at,
+            database_time: started_at.elapsed(),
+            waiting_for_row_since: None,
             counted: false,
         }
     }
 
+    /// Returns the next row of `rows`, and adds the wait for it to the statement's database time.
+    pub(super) async fn next_row<S>(&mut self, rows: &mut S) -> Option<S::Item>
+    where
+        S: Stream + Unpin,
+    {
+        self.waiting_for_row_since = Some(Instant::now());
+        let row = rows.next().await;
+        self.end_wait_for_row();
+        row
+    }
+
     /// Counts the statement as `completed`: it sent all of its rows.
     pub(super) fn completed(mut self) {
-        count(self.started_at, &self.attributes("completed"));
-        self.counted = true;
+        self.count("completed");
     }
 
     /// Drops the guard without counting the statement. A statement that fails counts in
@@ -178,19 +199,34 @@ impl FetchStatementMetrics {
         self.counted = true;
     }
 
-    fn attributes(&self, outcome: &'static str) -> [KeyValue; 3] {
-        [
+    fn end_wait_for_row(&mut self) {
+        if let Some(waiting_since) = self.waiting_for_row_since.take() {
+            self.database_time += waiting_since.elapsed();
+        }
+    }
+
+    fn count(&mut self, outcome: &'static str) {
+        self.end_wait_for_row();
+
+        let attributes = [
             KeyValue::new("sql", self.sql.clone()),
             KeyValue::new("cluster_id", self.cluster.clone()),
             KeyValue::new("outcome", outcome),
-        ]
+        ];
+
+        SQL_DURATION.record(
+            u64::try_from(self.database_time.as_millis()).unwrap_or(u64::MAX),
+            &attributes,
+        );
+        SQL_REQUESTS.add(1, &attributes);
+        self.counted = true;
     }
 }
 
 impl Drop for FetchStatementMetrics {
     fn drop(&mut self) {
         if !self.counted {
-            SQL_REQUESTS.add(1, &self.attributes("stopped"));
+            self.count("stopped");
         }
     }
 }

@@ -27,8 +27,11 @@
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
 -- The query sizes each candidate from the headers that its lookup returns, so a record that holds
--- only headers still spends the budget. The rows that the read returns stop at $5 bytes, but the
--- read still covers up to $8 rows, and looks up the headers of each.
+-- only headers still spends the budget. The query returns rows only until they reach $5 bytes, but
+-- it looks up the headers of every candidate, up to $8 of them, and reads each header value in
+-- full, including the large values that PostgreSQL stores out of line. Summing length() for each
+-- candidate, and looking up headers only for the returned rows, would read fewer values, but it
+-- measured slower when many records match the key, and no faster when few do.
 with candidates as (
 select
 
