@@ -21,11 +21,6 @@ name: release
 # release-override from another user. GitHub asks for approval again on a re-run,
 # and the deployment log records who approved.
 #
-# To skip only the FOSSA licensing block, set the FOSSA_LICENSING_BLOCK
-# repository variable to false (see guardian-scan.yaml) before pushing the
-# tag. A run reads it when it starts, and "Re-run failed jobs" keeps the
-# value it read, so after the tag is pushed the override is the way through.
-#
 # The file name stays release.yml: the crates.io trusted publisher is bound
 # to it.
 permissions:
