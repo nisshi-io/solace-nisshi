@@ -71,7 +71,18 @@ cat > "$WORK/bench-flat" <<'EOF'
 #!/usr/bin/env bash
 echo "summary: 1000" > "$FAKE_PROFILE"
 EOF
-chmod +x "$WORK/bin/valgrind" "$WORK/bench" "$WORK/bench-flat"
+# A binary that crashes, and one whose profile has no summary line.
+printf '#!/usr/bin/env bash\necho "simulated crash" >&2\nexit 1\n' > "$WORK/bench-crash"
+cat > "$WORK/bench-nosummary" <<'EOF'
+#!/usr/bin/env bash
+echo "events: Ir" > "$FAKE_PROFILE"
+EOF
+# A binary whose first run has a summary and whose second does not.
+cat > "$WORK/bench-half" <<'EOF'
+#!/usr/bin/env bash
+if [ "$2" = 1 ]; then echo "summary: 1000" > "$FAKE_PROFILE"; else echo "events: Ir" > "$FAKE_PROFILE"; fi
+EOF
+chmod +x "$WORK/bin/valgrind" "$WORK/bench" "$WORK/bench-flat" "$WORK/bench-crash" "$WORK/bench-nosummary" "$WORK/bench-half"
 
 # measure: each row is the cost of one pass, without the 1000 of startup.
 export PATH="$WORK/bin:$PATH" COST_all=5000 COST_18=300 COST_0=1200
@@ -82,6 +93,9 @@ else
   fail_count=$((fail_count + 1)); echo "FAIL - measure subtracts the startup cost:"; sed 's/^/       /' "$WORK/measured.tsv"
 fi
 check "measure fails when a second pass costs nothing" fail "did not cost more" measure "$WORK/bench-flat" "$WORK/flat.tsv"
+check "measure fails when the binary crashes" fail "simulated crash" measure "$WORK/bench-crash" "$WORK/crash.tsv" 18
+check "measure fails without a summary line" fail "no summary line" measure "$WORK/bench-nosummary" "$WORK/nosummary.tsv"
+check "measure fails when only the second profile lacks a summary" fail "no summary line" measure "$WORK/bench-half" "$WORK/half.tsv"
 check "measure needs an output file" fail "usage" measure "$WORK/bench"
 
 printf 'all\t10000\n18\t1000\n0\t2000\n' > "$WORK/base.tsv"
@@ -91,6 +105,7 @@ printf 'all\t10600\n18\t1000\n0\t2000\n' > "$WORK/slower.tsv"
 printf 'all\t9000\n18\t900\n0\t1800\n' > "$WORK/faster.tsv"
 printf 'all\t10000\n18\t1000\n0\t2000\n99\t500\n' > "$WORK/added.tsv"
 printf 'all\t10000\n0\t2000\n' > "$WORK/removed.tsv"
+printf 'all\t10000\n18\t0\n' > "$WORK/zero-base.tsv"
 printf 'all\t1000000\n' > "$WORK/big-base.tsv"
 printf 'all\t1060000\n' > "$WORK/big-slower.tsv"
 printf 'all\t1020000\n' > "$WORK/big-small.tsv"
@@ -108,6 +123,7 @@ check "a large row under the threshold passes with the defaults" pass "+2.00%" c
 check "fewer instructions pass" pass "-10.00%" compare "$WORK/base.tsv" "$WORK/faster.tsv"
 check "an added key has no percentage" pass "| 99 | - | 500 | n/a |" compare "$WORK/base.tsv" "$WORK/added.tsv"
 check "a removed key has no percentage" pass "| 18 | 1000 | - | n/a |" compare "$WORK/base.tsv" "$WORK/removed.tsv"
+check "a zero base row has no percentage" pass "| 18 | 0 | 1000 | n/a |" compare "$WORK/zero-base.tsv" "$WORK/base.tsv"
 check "unknown subcommand" fail "usage" nonsense
 
 printf '\n%d passed, %d failed\n' "$pass_count" "$fail_count"

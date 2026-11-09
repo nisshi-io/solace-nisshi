@@ -608,14 +608,20 @@ jobs:
   # the head and on its base, per API key, under callgrind. Wall-clock time on a
   # shared runner is too noisy for that, and the instruction count is not.
   #
-  # Report-only: ci-gate does not need this job, and the compare step continues
-  # on error, so a regression writes a warning and a table to the step summary
-  # and fails nothing. To enforce it, add the job to ci-gate's `needs` and its
-  # TIER_B list, and remove `continue-on-error` from the compare step.
+  # Report-only: ci-gate does not need this job, and the job continues on
+  # error, so a failure anywhere in it (a regression, a build, the valgrind
+  # install, the timeout) keeps the run's conclusion `success`. That matters
+  # because tier-c.yml's `edge-gate` publishes only after a successful
+  # merge-queue run, and release.yml's `ci` job covers a `v*` tag. A regression
+  # writes a warning and a table to the step summary. To enforce it, add the
+  # job to ci-gate's `needs`, its TIER_B list and its MAY_SKIP list (the job
+  # is skipped on a push to main), and remove `continue-on-error` from the job
+  # and from the compare step.
   bench-instructions:
     if: *tier_b_off_main
     needs: [changes]
     runs-on: ubuntu-latest
+    continue-on-error: true
     # Both builds are cold: this job restores no cache, like build-storage.
     timeout-minutes: 45
     steps:
@@ -645,10 +651,15 @@ jobs:
       - name: Measure the instructions
         run: |
           set -euo pipefail
-          # The head's binary lists the keys, because the base's may not have the flag.
-          mapfile -t keys < <(target/release/bench --list-api-keys)
-          bash .github/scripts/bench-instructions.sh measure target/release/bench "$RUNNER_TEMP/head.tsv" "${keys[@]}"
-          bash .github/scripts/bench-instructions.sh measure base/target/release/bench "$RUNNER_TEMP/base.tsv" "${keys[@]}"
+          # Each binary measures the keys it lists, so a fixture that a change adds or
+          # removes is a row on one side only. The base may predate the flag: it then
+          # measures the head's keys.
+          head_list=$(target/release/bench --list-api-keys)
+          base_list=$(base/target/release/bench --list-api-keys 2> /dev/null) || base_list=$head_list
+          mapfile -t head_keys <<< "$head_list"
+          mapfile -t base_keys <<< "$base_list"
+          bash .github/scripts/bench-instructions.sh measure target/release/bench "$RUNNER_TEMP/head.tsv" "${head_keys[@]}"
+          bash .github/scripts/bench-instructions.sh measure base/target/release/bench "$RUNNER_TEMP/base.tsv" "${base_keys[@]}"
       - name: Compare the head with the base
         continue-on-error: true
         run: |

@@ -36,8 +36,13 @@ instructions() {
     rm -f "$out" "$log"
     return 1
   fi
-  awk '/^summary:/ { print $2; found = 1; exit } END { exit !found }' "$out"
+  local status=0
+  awk '/^summary:/ { print $2; found = 1; exit } END { exit !found }' "$out" || status=$?
   rm -f "$out" "$log"
+  if [ "$status" -ne 0 ]; then
+    echo "::error::no summary line in the callgrind profile: bench --iterations $iterations $*" >&2
+  fi
+  return "$status"
 }
 
 # steady_state <binary> <bench arguments>... - prints the instructions of one
@@ -45,8 +50,14 @@ instructions() {
 steady_state() {
   local binary="$1" once twice
   shift
-  once=$(instructions "$binary" 1 "$@")
-  twice=$(instructions "$binary" 2 "$@")
+  # A command substitution runs without `set -e`, so each failure is returned
+  # by hand: otherwise a crashed run would count as zero instructions.
+  once=$(instructions "$binary" 1 "$@") || return 1
+  twice=$(instructions "$binary" 2 "$@") || return 1
+  if ! [[ "$once" =~ ^[0-9]+$ && "$twice" =~ ^[0-9]+$ ]]; then
+    echo "::error::unreadable instruction counts (\"$once\", \"$twice\"): bench $*" >&2
+    return 1
+  fi
   if [ "$twice" -le "$once" ]; then
     echo "::error::two passes ($twice) did not cost more than one ($once): bench $*" >&2
     return 1
@@ -59,10 +70,10 @@ measure() {
   shift 2
   # Assign before printing: a failure inside the argument of printf would not
   # stop the script.
-  count=$(steady_state "$binary")
+  count=$(steady_state "$binary") || exit 1
   printf 'all\t%s\n' "$count" > "$output"
   for key in "$@"; do
-    count=$(steady_state "$binary" --api-key "$key")
+    count=$(steady_state "$binary" --api-key "$key") || exit 1
     printf '%s\t%s\n' "$key" "$count" >> "$output"
   done
 }
@@ -77,6 +88,7 @@ compare() {
     awk -F '\t' -v threshold="$threshold" -v minimum="$minimum" '
       {
         if ($2 == "-" || $3 == "-") { printf "0\t%s\t%s\t%s\tn/a\t\n", $1, $2, $3; next }
+        if ($2 == 0) { printf "0\t%s\t%s\t%s\tn/a\t\n", $1, $2, $3; next }
         pct = ($3 - $2) * 100 / $2
         flag = (pct > threshold && $3 - $2 > minimum) ? "regression" : ""
         printf "%f\t%s\t%s\t%s\t%+.2f%%\t%s\n", pct, $1, $2, $3, pct, flag
