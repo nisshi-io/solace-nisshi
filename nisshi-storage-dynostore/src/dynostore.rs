@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     future::ready,
+    ops::Range,
     str::FromStr,
     sync::{
         Arc, LazyLock, Mutex,
@@ -157,9 +158,11 @@ const EMPTY_GROUP_SENTINEL: &str = "%empty";
 /// produce that overruns this margin is indexed past, and nothing rebuilds
 /// a complete index.
 ///
-/// The age is the difference between two write times that the store
-/// reports, the batch object's and the watermark document's, so the
-/// broker's clock does not enter into it.
+/// The backfill measures the age as the difference between two write times
+/// that the store reports, the batch object's and the watermark document's,
+/// so the broker's clock does not enter into it. A fetch that reaches a gap
+/// measures the age of the batch after it on the broker's clock instead (see
+/// [`DynoStore::offset_past_gap`]).
 const BATCH_SETTLED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// How many group state objects a `ListGroups` reads from the object store at once.
@@ -311,18 +314,44 @@ static RECLAIMED_PARTITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// starts inside a batch list the whole partition.
 static FETCH_FULL_LISTING_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Counts the fetches that skip base offsets that have no batch object, to the next batch below
-/// the high watermark.
+/// Counts the fetches that skip base offsets that have no batch object, by why the fetch skips
+/// them (see [`SkippedGap`]).
 static FETCH_GAP_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_fetch_gap_skipped")
-        .with_description(
-            "Fetches that skipped base offsets with no batch object: a produce that failed or \
-             is still writing its batch, or a deleted batch; each one listed the partition after \
-             the gap",
-        )
+        .with_description(format!(
+            "Fetches that skipped base offsets with no batch object, by reason: \
+                 failed_produce (a produce recorded its failure), settled (a broker stopped \
+                 before it recorded a failed produce, and the batch after the gap is older than \
+                 {} seconds; each such fetch lists the partition after the gap) or \
+                 below_log_start (DeleteRecords removed the batches during the fetch)",
+            BATCH_SETTLED_AFTER.as_secs()
+        ))
         .build()
 });
+
+/// Why a fetch skips base offsets that have no batch object (see [`DynoStore::offset_past_gap`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SkippedGap {
+    /// A produce took the offsets, failed to write its batch object, and recorded the failure.
+    FailedProduce,
+    /// No failed produce is recorded for the gap, and the batch after the gap is older than
+    /// [`BATCH_SETTLED_AFTER`], so no produce can still be writing a batch into the gap.
+    Settled,
+    /// The offsets are below the partition's log start.
+    BelowLogStart,
+}
+
+impl SkippedGap {
+    /// Returns the value of the `reason` attribute of `nisshi_fetch_gap_skipped`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FailedProduce => "failed_produce",
+            Self::Settled => "settled",
+            Self::BelowLogStart => "below_log_start",
+        }
+    }
+}
 
 /// Whether this process has logged a warning for a fetch that skipped a gap. Each later one logs
 /// at debug, because every fetch that crosses a gap skips it again.
@@ -1004,6 +1033,7 @@ impl TopicMetadata {
     }
 }
 
+/// The document that a partition stores as `watermark.json`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
@@ -1038,9 +1068,64 @@ struct Watermark {
     /// writes the document, which costs one more reclaim pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reclaimed: Option<i64>,
+    /// The offsets of each produce that took them and failed to write its batch object, as a map
+    /// from the start of each range to its exclusive end. A fetch skips them (see
+    /// [`DynoStore::offset_past_gap`]).
+    ///
+    /// A broker that does not know this key drops it when it writes the document.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    failed_produces: BTreeMap<i64, i64>,
 }
 
 impl Watermark {
+    /// The most ranges that [`Watermark::failed_produces`] holds, to bound the size of the
+    /// document that every produce reads and writes.
+    ///
+    /// Over the limit, the lowest range goes, and a fetch takes it as a gap with no recorded failed
+    /// produce. That costs a consumer a wait only if the batch after the range is younger than
+    /// [`BATCH_SETTLED_AFTER`], so only when more than this many ranges that are not contiguous
+    /// fail within that time. Contiguous failed produces merge into one range.
+    const MAX_FAILED_PRODUCES: usize = 64;
+
+    /// Records `offsets` as a produce that failed to write its batch object, merged with each
+    /// recorded range contiguous with it, and forgets each recorded range below the log start.
+    fn record_failed_produce(&mut self, Range { mut start, mut end }: Range<i64>) {
+        if let Some((&before_start, &before_end)) = self.failed_produces.range(..start).next_back()
+            && before_end == start
+        {
+            _ = self.failed_produces.remove(&before_start);
+            start = before_start;
+        }
+
+        if let Some(after_end) = self.failed_produces.remove(&end) {
+            end = after_end;
+        }
+
+        _ = self.failed_produces.insert(start, end);
+        self.forget_failed_produces_below_log_start();
+
+        if self.failed_produces.len() > Self::MAX_FAILED_PRODUCES {
+            _ = self.failed_produces.pop_first();
+        }
+    }
+
+    /// Forgets each recorded failed produce that ends at or below the log start.
+    fn forget_failed_produces_below_log_start(&mut self) {
+        let log_start = self.low.unwrap_or(0);
+
+        self.failed_produces.retain(|_, &mut end| end > log_start);
+    }
+
+    /// Returns the end of the recorded failed produce that holds `offset`, or `None` when no
+    /// recorded failed produce holds it.
+    fn failed_produce_end(&self, offset: i64) -> Option<i64> {
+        self.failed_produces
+            .range(..=offset)
+            .next_back()
+            .map(|(_, &end)| end)
+            .filter(|&end| end > offset)
+    }
+
     /// The most producers whose epoch [`Watermark::producer_epochs`] holds for one partition.
     ///
     /// When a new producer goes over this limit, the partition forgets the producer with the
@@ -2030,13 +2115,13 @@ impl DynoStore {
     /// `Ok(None)` when the object does not exist.
     ///
     /// A missing object is a batch that was deleted after the LIST returned it, so a caller can
-    /// skip it. The errors are those of [`DynoStore::batch_at`].
+    /// skip it. The errors are those of [`DynoStore::batch_with_base_offset`].
     async fn read_batch(
         &self,
         topition: &Topition,
         base_offset: i64,
     ) -> Result<Option<deflated::Batch>> {
-        let batch = self.batch_at(topition, base_offset).await?;
+        let batch = self.batch_with_base_offset(topition, base_offset).await?;
 
         if batch.is_none() {
             warn!(
@@ -2054,7 +2139,7 @@ impl DynoStore {
     /// Any other failure, such as a transient GET error, returns `KAFKA_STORAGE_ERROR`, as Kafka
     /// does when it cannot read a log. A caller that skipped the batch instead would answer as if
     /// the log had no records there, and the client could not tell.
-    async fn batch_at(
+    async fn batch_with_base_offset(
         &self,
         topition: &Topition,
         base_offset: i64,
@@ -2075,96 +2160,73 @@ impl DynoStore {
             .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))
     }
 
-    /// Returns the base offset of the last batch of `topition` at or below `offset`, from listings
-    /// that start below `offset`. Returns `None` when a listing descends, or when a listing from
-    /// offset 0 finds no batch at or below `offset`.
+    /// Finds the base offset of the batch of `topition` that contains `fetch_offset`, or returns
+    /// `None` if no batch starts at or below `fetch_offset`. If `fetch_offset` is in a gap, it
+    /// finds the last batch before the gap.
     ///
-    /// Each listing starts further below `offset` than the one before, until one finds a batch at
-    /// or below it (see [`FETCH_LISTING_FIRST_WINDOW`]), so the cost depends on the size of the
-    /// batch that holds `offset`, and not on the size of the partition.
-    async fn listed_holding_base_offset(
+    /// Each listing starts further below `fetch_offset` than the one before, until one finds a
+    /// batch at or below it (see [`FETCH_LISTING_FIRST_WINDOW`]), so the cost depends on the size
+    /// of the batch that holds `fetch_offset`, and not on the size of the partition. When a
+    /// listing descends, or a listing from offset 0 finds no batch at or below `fetch_offset`, the
+    /// function lists the whole partition instead.
+    async fn find_base_offset_for_batch_containing(
         &self,
         topition: &Topition,
-        offset: i64,
+        fetch_offset: i64,
     ) -> Result<Option<i64>> {
         let mut window = FETCH_LISTING_FIRST_WINDOW;
 
-        loop {
-            let start_offset = offset.saturating_sub(window).max(0);
+        'windows: loop {
+            let start_offset = fetch_offset.saturating_sub(window).max(0);
 
             let mut listing = self
                 .batch_stream(topition, start_offset)
                 .map_ok(|(base_offset, _)| base_offset);
 
-            let mut holding = None;
+            let mut last_base_offset = None;
 
             while let Some(base_offset) = listing.try_next().await? {
-                if holding.is_some_and(|holding| base_offset <= holding) {
-                    return Ok(None);
+                if last_base_offset.is_some_and(|last_base_offset| base_offset <= last_base_offset)
+                {
+                    break 'windows;
                 }
 
-                if base_offset > offset {
+                if base_offset > fetch_offset {
                     break;
                 }
 
-                holding = Some(base_offset);
+                last_base_offset = Some(base_offset);
             }
 
-            if holding.is_some() {
-                return Ok(holding);
+            if last_base_offset.is_some() {
+                return Ok(last_base_offset);
             }
 
             // From the log start up, each offset has a batch at or below it,
             // unless the partition holds no batch objects. A listing from
-            // offset 0 that finds none is out of key order, or `offset` is
+            // offset 0 that finds none is out of key order, or `fetch_offset` is
             // below the log start, and the full listing answers both.
             if start_offset == 0 {
-                return Ok(None);
+                break;
             }
 
             window = window.saturating_mul(FETCH_LISTING_GROWTH);
         }
+
+        let base_offsets = self.full_listing(topition, fetch_offset).await?;
+        Ok(base_offsets.last().copied())
     }
 
-    /// Returns the base offset of the batch of `topition` that holds the fetch offset of `bounds`,
-    /// or of the first batch after it, or `None` when the partition has no such batch below its
-    /// high watermark.
-    async fn holding_base_offset(
-        &self,
-        topition: &Topition,
-        bounds: FetchBounds,
-    ) -> Result<Option<i64>> {
-        if let Some(holding) = self
-            .listed_holding_base_offset(topition, bounds.offset)
-            .await?
-        {
-            return Ok(Some(holding));
-        }
-
-        let base_offsets = self
-            .full_listing(topition, bounds.offset, bounds.high_watermark)
-            .await?;
-
-        Ok(base_offsets
-            .range(..=bounds.offset)
-            .next_back()
-            .or_else(|| base_offsets.range(bounds.offset..).next())
-            .copied())
-    }
-
-    /// Sends the batches of `topition` within `bounds` through `data`, in offset order, from the
-    /// batch at `base_offset`. `first_batch` is that batch, if the caller has read it already.
+    /// Sends the batches of `topition` within `bounds` through `data`, in offset order, starting
+    /// with the batch at `base_offset`. `first_batch` is that batch, if the caller has read it.
     ///
-    /// The read takes each batch after the first by its key. A produce gives each batch the offsets
-    /// right after the previous batch's, so the next batch's base offset is the previous batch's
-    /// last offset plus one, and each batch that this sends follows the one before it, whatever
-    /// order the store lists keys in. The read lists the partition only when no batch has that key,
-    /// because a produce that failed left a gap, or because the batch was deleted.
+    /// Each batch starts right after the previous batch's last offset, so the read gets the next
+    /// batch by that base offset, without a listing. If no batch has that base offset,
+    /// [`Self::offset_past_gap`] decides whether the read skips the gap or stops.
     ///
-    /// The batch that fills `max_bytes` is sent whole, wherever it is. Kafka returns a first batch
-    /// larger than `max_bytes` whole, so that a consumer always gets a record
-    /// ([`ReplicaManager.readFromLog`]), and cuts a later batch at `max_bytes`, which leaves the
-    /// client a partial batch to drop.
+    /// The batch that reaches `max_bytes` is sent whole. Kafka also sends a first batch whole, so
+    /// that a consumer always gets a record ([`ReplicaManager.readFromLog`]), but it cuts a later
+    /// batch at `max_bytes`, and the client drops the partial batch.
     ///
     /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
     async fn send_batches_from(
@@ -2180,12 +2242,12 @@ impl DynoStore {
         while base_offset < bounds.high_watermark {
             let batch = match first_batch.take() {
                 Some(batch) => Some(batch),
-                None => self.batch_at(topition, base_offset).await?,
+                None => self.batch_with_base_offset(topition, base_offset).await?,
             };
 
             let Some(mut batch) = batch else {
                 match self
-                    .base_offset_after_gap(topition, base_offset, bounds.high_watermark)
+                    .offset_past_gap(topition, base_offset, bounds.high_watermark)
                     .await?
                 {
                     Some(next) => {
@@ -2218,83 +2280,144 @@ impl DynoStore {
         Ok(())
     }
 
-    /// Returns the base offset of the first batch of `topition` after `gap_start_offset`, a base
-    /// offset that has no batch object, or `None` when no batch lies after it below
-    /// `high_watermark`.
+    /// Returns the offset that the fetch reads next if it skips the gap at `gap_start`, or
+    /// `None` if the fetch must stop at the gap.
     ///
-    /// This lists the keys after `gap_start_offset` and takes the lowest one below
-    /// `high_watermark`: a key at or above it is a batch that a produce wrote after this read took
-    /// its high watermark. It reads the whole listing instead of taking its first key, because a
-    /// store can list keys out of order. A gap at the end of the partition, while a produce writes
-    /// its batch object, costs only the few keys after it. A gap that a failed produce left in the
-    /// middle of the partition stays, and costs a listing of the rest of the partition on every
-    /// fetch that crosses it.
-    async fn base_offset_after_gap(
+    /// The fetch stops at a gap if a produce can still be writing a batch into it, because a
+    /// consumer that skipped the gap would never read that batch.
+    async fn offset_past_gap(
         &self,
         topition: &Topition,
-        gap_start_offset: i64,
+        gap_start: i64,
         high_watermark: i64,
     ) -> Result<Option<i64>> {
-        let next = self
-            .batch_stream(topition, gap_start_offset + 1)
-            .map_ok(|(base_offset, _)| base_offset)
-            .try_filter(|&base_offset| ready(base_offset < high_watermark))
-            .try_fold(None, |lowest: Option<i64>, base_offset| {
-                ready(Ok(Some(
-                    lowest.map_or(base_offset, |lowest| lowest.min(base_offset)),
-                )))
+        let (log_start, failed_produce_end) = self
+            .watermark_for(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok((
+                    watermark.low.unwrap_or(0),
+                    watermark.failed_produce_end(gap_start),
+                ))
             })
             .await?;
 
-        if let Some(next) = next {
-            FETCH_GAP_SKIPPED.add(
-                1,
-                &[
-                    KeyValue::new("cluster", self.cluster.clone()),
-                    KeyValue::new("topic", topition.topic().to_owned()),
-                ],
-            );
-
-            if FETCH_GAP_SKIPPED_WARNED.swap(true, Ordering::Relaxed) {
-                debug!(
-                    ?topition,
-                    gap_start_offset, next, "fetch skips base offsets that have no batch object"
-                );
-            } else {
-                warn!(
-                    ?topition,
-                    gap_start_offset,
-                    next,
-                    "fetch skips base offsets that have no batch object, because a produce failed \
-                     or is still writing their batch, or the batch was deleted; every fetch that \
-                     crosses this gap lists the partition after it; later ones log at debug and \
-                     count in nisshi_fetch_gap_skipped"
-                );
-            }
+        if let Some(next_offset) = failed_produce_end {
+            self.skipped_gap(topition, gap_start, next_offset, SkippedGap::FailedProduce);
+            return Ok(Some(next_offset));
         }
 
-        Ok(next)
+        let Some((next_offset, written)) = self
+            .first_batch_after_gap(topition, gap_start, high_watermark)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // The gap's produce took its offsets before the produce of the batch after the gap, so it
+        // has finished once that batch is older than `BATCH_SETTLED_AFTER`.
+        //
+        // We measure the age on the broker's clock, so the margin also covers clock skew between
+        // the broker and the store. We do not measure it against the watermark document's write
+        // time, because that document stops changing when produces stop, and the gap would
+        // never settle.
+        let settled = SystemTime::now()
+            .duration_since(written)
+            .is_ok_and(|age| age >= BATCH_SETTLED_AFTER);
+
+        let reason = if gap_start < log_start {
+            SkippedGap::BelowLogStart
+        } else if settled {
+            SkippedGap::Settled
+        } else {
+            debug!(
+                ?topition,
+                gap_start,
+                next_offset,
+                "fetch stops at base offsets that have no batch object, because a produce can \
+                 still be writing their batch"
+            );
+            return Ok(None);
+        };
+
+        self.skipped_gap(topition, gap_start, next_offset, reason);
+        Ok(Some(next_offset))
     }
 
-    /// Returns the base offsets of `topition`'s batches below `high_watermark`, from a listing of
-    /// the whole partition, in order, for a fetch at `offset`.
-    async fn full_listing(
+    /// Returns the base offset and the write time of the first batch of `topition` after
+    /// `gap_start`, or `None` when no batch lies after it below `high_watermark`.
+    async fn first_batch_after_gap(
         &self,
         topition: &Topition,
-        offset: i64,
+        gap_start: i64,
         high_watermark: i64,
-    ) -> Result<BTreeSet<i64>> {
+    ) -> Result<Option<(i64, SystemTime)>> {
+        // Nothing records where the batch after a gap starts, so this lists the rest of the
+        // partition after `gap_start`. A store can list keys out of order, so this takes the
+        // lowest base offset instead of the first one listed.
+        self.batch_stream(topition, gap_start + 1)
+            .try_filter(|&(base_offset, _)| ready(base_offset < high_watermark))
+            .try_fold(None, |lowest: Option<(i64, SystemTime)>, listed| {
+                ready(Ok(Some(match lowest {
+                    Some(lowest) if lowest.0 <= listed.0 => lowest,
+                    _ => listed,
+                })))
+            })
+            .await
+    }
+
+    /// Counts and logs a fetch that skips the offsets `gap_start..next_offset`, which no batch
+    /// object holds, for `reason`.
+    fn skipped_gap(
+        &self,
+        topition: &Topition,
+        gap_start: i64,
+        next_offset: i64,
+        reason: SkippedGap,
+    ) {
+        FETCH_GAP_SKIPPED.add(
+            1,
+            &[
+                KeyValue::new("cluster", self.cluster.clone()),
+                KeyValue::new("topic", topition.topic().to_owned()),
+                KeyValue::new("reason", reason.as_str()),
+            ],
+        );
+
+        if FETCH_GAP_SKIPPED_WARNED.swap(true, Ordering::Relaxed) {
+            debug!(
+                ?topition,
+                gap_start,
+                next_offset,
+                reason = reason.as_str(),
+                "fetch skips base offsets that have no batch object"
+            );
+        } else {
+            warn!(
+                ?topition,
+                gap_start,
+                next_offset,
+                reason = reason.as_str(),
+                "fetch skips base offsets that have no batch object; later ones log at debug and \
+                 count in nisshi_fetch_gap_skipped"
+            );
+        }
+    }
+
+    /// Returns the base offsets of `topition`'s batches at or below `fetch_offset`, from a listing
+    /// of the whole partition, in order.
+    async fn full_listing(&self, topition: &Topition, fetch_offset: i64) -> Result<BTreeSet<i64>> {
         FETCH_FULL_LISTING.add(1, &[KeyValue::new("cluster", self.cluster.clone())]);
 
         if FETCH_FULL_LISTING_WARNED.swap(true, Ordering::Relaxed) {
             debug!(
                 ?topition,
-                offset, "fetch lists the whole partition to find the batch that holds the offset"
+                offset = fetch_offset,
+                "fetch lists the whole partition to find the batch that holds the offset"
             );
         } else {
             warn!(
                 ?topition,
-                offset,
+                offset = fetch_offset,
                 "fetch lists the whole partition to find the batch that holds the fetch offset; \
                  a store that lists keys out of order makes every fetch inside a batch do this, \
                  and so does a fetch below the first batch; later ones log at debug and count in \
@@ -2304,7 +2427,7 @@ impl DynoStore {
 
         self.batch_stream(topition, 0)
             .map_ok(|(base_offset, _)| base_offset)
-            .try_filter(|&base_offset| ready(base_offset < high_watermark))
+            .try_filter(|&base_offset| ready(base_offset <= fetch_offset))
             .try_collect::<BTreeSet<_>>()
             .await
     }
@@ -3167,6 +3290,32 @@ impl DynoStore {
         }
     }
 
+    /// Records `offsets` of `topition` as a failed produce (see [`Watermark::failed_produces`]).
+    /// It only logs a failure to record, because the produce has already failed.
+    async fn record_failed_produce(&self, topition: &Topition, offsets: Range<i64>) {
+        let recorded = match self.watermark_for(topition) {
+            Ok(watermark) => {
+                watermark
+                    .with_mut(&self.object_store, |watermark| {
+                        watermark.record_failed_produce(offsets.clone());
+                        Ok(())
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+
+        match recorded {
+            Ok(()) => debug!(?topition, ?offsets, "recorded a failed produce"),
+            Err(error) => warn!(
+                ?error,
+                ?topition,
+                ?offsets,
+                "could not record a failed produce"
+            ),
+        }
+    }
+
     /// Appends `deflated` to `topition`, and returns the base offset of the batch.
     ///
     /// The produce takes its offsets in the watermark document of the
@@ -3175,8 +3324,10 @@ impl DynoStore {
     /// fails, the client gets an error and the taken offsets hold no batch.
     /// The produce does not move the high watermark back, because a rollback
     /// is another conditional write that can fail in the same way, and a
-    /// concurrent produce can already hold the next offset. A fetch skips the
-    /// gap, and the time index backfill settles it as a failed produce after
+    /// concurrent produce can already hold the next offset. The produce
+    /// records the gap in the watermark document instead (see
+    /// [`Self::record_failed_produce`]), and a fetch skips a recorded gap. The
+    /// time index backfill settles the gap as a failed produce after
     /// `BATCH_SETTLED_AFTER`. `ListOffsets` reports a high watermark past the
     /// gap.
     ///
@@ -3472,135 +3623,155 @@ impl DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
-            if let Some(transaction_id) = transaction_id
-                && attributes.transaction
-            {
-                self.meta
-                    .with_mut(&self.object_store, |meta| {
-                        // The check before the write is a read that can go stale. This one
-                        // runs on the version of `meta.json` that the write below replaces,
-                        // so it decides, and the bookkeeping never adds a partition itself.
-                        //
-                        // A refusal here leaves the offset reserved above empty. The lake
-                        // write runs after this update, so a refused batch does not reach a
-                        // lake table.
-                        if !deflated.is_control() {
-                            meta.ensure_partition_in_transaction(
-                                transaction_id,
-                                deflated.producer_id,
-                                deflated.producer_epoch,
-                                topition,
-                            )?;
-                        }
+            let offsets = offset..offset + i64::from(deflated.last_offset_delta) + 1;
 
-                        if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
-                            debug!(?transaction);
-
-                            if let Some(txn_detail) =
-                                transaction.epochs.get_mut(&deflated.producer_epoch)
-                            {
-                                debug!(?txn_detail);
-
-                                let offset_end = offset + deflated.last_offset_delta as i64;
-
-                                _ = txn_detail
-                                    .produces
-                                    .get_mut(&topition.topic)
-                                    .and_then(|partitions| partitions.get_mut(&topition.partition))
-                                    .map(|entry| {
-                                        let range = entry.get_or_insert(TxnProduceOffset {
-                                            offset_start: offset,
-                                            offset_end,
-                                        });
-
-                                        // The start only moves down (a defensive
-                                        // guard: the high watermark never falls, so
-                                        // the recorded bound is normally at or below
-                                        // every attempt's offset). It is not raised
-                                        // from the lower bound that
-                                        // `record_transaction_start` wrote: an attempt
-                                        // can hold a lower offset that it has not
-                                        // recorded yet. A concurrent retry of a batch
-                                        // can raise the high watermark after the first
-                                        // attempt did, and record its range first. The
-                                        // first attempt's records still go in the log
-                                        // (it then answers DUPLICATE_SEQUENCE_NUMBER),
-                                        // and raising the start to the retry's offset
-                                        // would let the last stable offset pass them.
-                                        if offset < range.offset_start {
-                                            range.offset_start = offset;
-                                        }
-
-                                        if offset_end > range.offset_end {
-                                            range.offset_end = offset_end;
-                                        }
-                                    });
+            let written = async {
+                if let Some(transaction_id) = transaction_id
+                    && attributes.transaction
+                {
+                    self.meta
+                        .with_mut(&self.object_store, |meta| {
+                            // The check before the write is a read that can go stale. This one
+                            // runs on the version of `meta.json` that the write below replaces,
+                            // so it decides, and the bookkeeping never adds a partition itself.
+                            //
+                            // A refusal here leaves the offset reserved above empty. The lake
+                            // write runs after this update, so a refused batch does not reach a
+                            // lake table.
+                            if !deflated.is_control() {
+                                meta.ensure_partition_in_transaction(
+                                    transaction_id,
+                                    deflated.producer_id,
+                                    deflated.producer_epoch,
+                                    topition,
+                                )?;
                             }
-                        }
 
-                        Ok(())
-                    })
+                            if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
+                                debug!(?transaction);
+
+                                if let Some(txn_detail) =
+                                    transaction.epochs.get_mut(&deflated.producer_epoch)
+                                {
+                                    debug!(?txn_detail);
+
+                                    let offset_end = offset + deflated.last_offset_delta as i64;
+
+                                    _ = txn_detail
+                                        .produces
+                                        .get_mut(&topition.topic)
+                                        .and_then(|partitions| {
+                                            partitions.get_mut(&topition.partition)
+                                        })
+                                        .map(|entry| {
+                                            let range = entry.get_or_insert(TxnProduceOffset {
+                                                offset_start: offset,
+                                                offset_end,
+                                            });
+
+                                            // The start only moves down (a defensive
+                                            // guard: the high watermark never falls, so
+                                            // the recorded bound is normally at or below
+                                            // every attempt's offset). It is not raised
+                                            // from the lower bound that
+                                            // `record_transaction_start` wrote: an attempt
+                                            // can hold a lower offset that it has not
+                                            // recorded yet. A concurrent retry of a batch
+                                            // can raise the high watermark after the first
+                                            // attempt did, and record its range first. The
+                                            // first attempt's records still go in the log
+                                            // (it then answers DUPLICATE_SEQUENCE_NUMBER),
+                                            // and raising the start to the retry's offset
+                                            // would let the last stable offset pass them.
+                                            if offset < range.offset_start {
+                                                range.offset_start = offset;
+                                            }
+
+                                            if offset_end > range.offset_end {
+                                                range.offset_end = offset_end;
+                                            }
+                                        });
+                                }
+                            }
+
+                            Ok(())
+                        })
+                        .await
+                        .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
+                        .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+                }
+
+                if let Some(ref lake) = self.lake
+                    && let Some(ref inflated) = inflated
+                {
+                    lake.store(
+                        topition.topic(),
+                        topition.partition(),
+                        offset,
+                        inflated,
+                        config,
+                    )
+                    .await
+                    .inspect(|store| debug!(?store))
+                    .inspect_err(|err| debug!(?err))?;
+                }
+
+                let location = batch_path(&self.cluster, topition, offset);
+
+                let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
+
+                _ = self
+                    .object_store
+                    .put_opts(
+                        &location,
+                        payload,
+                        PutOptions {
+                            mode: PutMode::Create,
+                            attributes: Attributes::new(),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+                    .inspect_err(|error| {
+                        error!(
+                            ?error,
+                            transaction_id,
+                            ?topition,
+                            offset,
+                            ?location,
+                            ?idempotent
+                        )
+                    })
+                    .map_err(|error| {
+                        let error = Error::from(error);
+
+                        // Every transient error of this write answers UNKNOWN_SERVER_ERROR for an
+                        // idempotent batch, also one where the store refused the write, such as a
+                        // throttle. The error does not tell whether the write completed, and a
+                        // retry of a stored batch stores it twice. A HEAD request on `location`
+                        // would tell, and this code does not send one.
+                        if idempotent.is_some() {
+                            unretriable_after_write(error)
+                        } else {
+                            error
+                        }
+                    })?;
+
+                Ok::<_, Error>(location)
             }
+            .await;
 
-            if let Some(ref lake) = self.lake
-                && let Some(ref inflated) = inflated
-            {
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    inflated,
-                    config,
-                )
-                .await
-                .inspect(|store| debug!(?store))
-                .inspect_err(|err| debug!(?err))?;
-            }
-
-            let location = batch_path(&self.cluster, topition, offset);
-
-            let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
-
-            _ = self
-                .object_store
-                .put_opts(
-                    &location,
-                    payload,
-                    PutOptions {
-                        mode: PutMode::Create,
-                        attributes: Attributes::new(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                .inspect_err(|error| {
-                    error!(
-                        ?error,
-                        transaction_id,
-                        ?topition,
-                        offset,
-                        ?location,
-                        ?idempotent
-                    )
-                })
-                .map_err(|error| {
-                    let error = Error::from(error);
-
-                    // Every transient error of this write answers UNKNOWN_SERVER_ERROR for an
-                    // idempotent batch, also one where the store refused the write, such as a
-                    // throttle. The error does not tell whether the write completed, and a
-                    // retry of a stored batch stores it twice. A HEAD request on `location`
-                    // would tell, and this code does not send one.
-                    if idempotent.is_some() {
-                        unretriable_after_write(error)
-                    } else {
-                        error
-                    }
-                })?;
+            let location = match written {
+                Ok(location) => location,
+                Err(error) => {
+                    // A failed PUT can still have stored the batch. Recording its offsets as a
+                    // failed produce is still safe, because `send_batches_from` reads a stored
+                    // batch before it reads this record.
+                    self.record_failed_produce(topition, offsets).await;
+                    return Err(error);
+                }
+            };
 
             if let Some(idempotent) = idempotent {
                 self.advance_idempotent_sequence(
@@ -3793,6 +3964,7 @@ impl Storage for DynoStore {
 
                                         Ok(cutoff) => {
                                             w.low = Some(cutoff);
+                                            w.forget_failed_produces_below_log_start();
                                             Ok((ErrorCode::None, cutoff))
                                         }
                                     }
@@ -4057,15 +4229,17 @@ impl Storage for DynoStore {
             high_watermark,
         };
 
-        // A consumer that reads in order fetches from the offset after the last batch that it
-        // received, which is the base offset of the next batch, so the fetch reads that batch by
-        // its key, without a listing. Only a fetch offset inside a batch needs a listing.
-        let (base_offset, first_batch) = match self.batch_at(topition, offset).await? {
+        // A consumer that reads in order fetches the base offset of the next batch, so try that
+        // batch first. Only a fetch offset that is not a base offset needs a listing.
+        let (base_offset, first_batch) = match self.batch_with_base_offset(topition, offset).await?
+        {
             Some(batch) => (offset, Some(batch)),
-            None => match self.holding_base_offset(topition, bounds).await? {
-                Some(base_offset) => (base_offset, None),
-                None => return Ok(()),
-            },
+            None => (
+                self.find_base_offset_for_batch_containing(topition, offset)
+                    .await?
+                    .unwrap_or(offset),
+                None,
+            ),
         };
 
         self.send_batches_from(topition, bounds, base_offset, first_batch, &mut data)
