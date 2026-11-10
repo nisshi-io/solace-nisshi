@@ -282,6 +282,7 @@ fn watermark_decodes_pre_time_index_documents() -> Result<()> {
         time_index: TimeIndex::complete(),
         producer_epochs: BTreeMap::new(),
         reclaimed: None,
+        failed_produces: BTreeMap::new(),
     })?;
     assert!(!written.contains("timestamps"), "{written}");
     let round_trip: Watermark = serde_json::from_str(&written)?;
@@ -319,6 +320,116 @@ fn watermark_producer_epochs_round_trip() -> Result<()> {
     assert_eq!(BTreeMap::from([(7, 3)]), round_trip.producer_epochs);
 
     Ok(())
+}
+
+#[test]
+fn watermark_without_failed_produces_decodes_to_an_empty_map() -> Result<()> {
+    use super::Watermark;
+
+    let watermark: Watermark = serde_json::from_str(r#"{"low":6,"high":66}"#)?;
+    assert!(watermark.failed_produces.is_empty());
+
+    let written = serde_json::to_string(&watermark)?;
+    assert!(!written.contains("failed_produces"), "{written}");
+
+    Ok(())
+}
+
+#[test]
+fn watermark_failed_produces_round_trip() -> Result<()> {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    watermark.record_failed_produce(10..20);
+
+    let round_trip: Watermark = serde_json::from_str(&serde_json::to_string(&watermark)?)?;
+    assert_eq!(BTreeMap::from([(10, 20)]), round_trip.failed_produces);
+
+    Ok(())
+}
+
+#[test]
+fn watermark_finds_the_failed_produce_that_holds_an_offset() {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    watermark.record_failed_produce(10..20);
+    watermark.record_failed_produce(30..31);
+
+    assert_eq!(None, watermark.failed_produce_end(9));
+    assert_eq!(Some(20), watermark.failed_produce_end(10));
+    assert_eq!(Some(20), watermark.failed_produce_end(19));
+    assert_eq!(None, watermark.failed_produce_end(20));
+    assert_eq!(None, watermark.failed_produce_end(29));
+    assert_eq!(Some(31), watermark.failed_produce_end(30));
+    assert_eq!(None, watermark.failed_produce_end(31));
+}
+
+#[test]
+fn watermark_forgets_failed_produces_below_the_log_start() {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    watermark.record_failed_produce(10..20);
+    watermark.record_failed_produce(30..40);
+    assert_eq!(
+        BTreeMap::from([(10, 20), (30, 40)]),
+        watermark.failed_produces
+    );
+
+    // The cut ends the first range exactly, and falls inside the second.
+    watermark.low = Some(35);
+    watermark.forget_failed_produces_below_log_start();
+    assert_eq!(BTreeMap::from([(30, 40)]), watermark.failed_produces);
+
+    // A produce can fail after DeleteRecords has moved the log start past its offsets. No fetch
+    // can reach its range, so the watermark does not keep it.
+    watermark.low = Some(70);
+    watermark.forget_failed_produces_below_log_start();
+    watermark.record_failed_produce(50..60);
+    assert_eq!(BTreeMap::new(), watermark.failed_produces);
+}
+
+#[test]
+fn watermark_merges_contiguous_failed_produces() {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    watermark.record_failed_produce(10..20);
+    watermark.record_failed_produce(20..30);
+
+    // The produce at 30 records its failure last, and is contiguous with a range on each side.
+    watermark.record_failed_produce(40..50);
+    watermark.record_failed_produce(30..40);
+
+    watermark.record_failed_produce(60..70);
+
+    assert_eq!(
+        BTreeMap::from([(10, 50), (60, 70)]),
+        watermark.failed_produces
+    );
+}
+
+#[test]
+fn watermark_forgets_the_lowest_failed_produce_over_the_limit() {
+    use super::Watermark;
+
+    let mut watermark = Watermark::default();
+    let last = i64::try_from(Watermark::MAX_FAILED_PRODUCES).unwrap_or(i64::MAX);
+
+    // One range more than the limit, each one offset long and apart from the others, so that no
+    // two ranges merge.
+    for base_offset in 0..=last {
+        watermark.record_failed_produce(base_offset * 10..base_offset * 10 + 1);
+    }
+
+    assert_eq!(
+        Watermark::MAX_FAILED_PRODUCES,
+        watermark.failed_produces.len()
+    );
+    assert_eq!(None, watermark.failed_produce_end(0));
+    assert_eq!(Some(11), watermark.failed_produce_end(10));
+    assert_eq!(Some(last * 10 + 1), watermark.failed_produce_end(last * 10));
 }
 
 #[test]

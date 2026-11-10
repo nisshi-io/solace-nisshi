@@ -24,22 +24,23 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
-    StreamExt as _,
+    StreamExt as _, TryStreamExt as _,
     stream::{self, BoxStream},
 };
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel,
     create_topics_request::CreatableTopic,
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{Error, Result, Storage as _, Topition};
+use nisshi_storage::{Error, Result, Storage as _, TopicId, Topition};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
@@ -47,8 +48,12 @@ use object_store::{
 };
 
 use crate::dynostore::{
-    DynoStore, FETCH_LISTING_FIRST_WINDOW, batch_path,
-    tests::{failing_object_store::FailingObjectStore, init_tracing},
+    BATCH_SETTLED_AFTER, DynoStore, FETCH_LISTING_FIRST_WINDOW, batch_path,
+    tests::{
+        failing_object_store::FailingObjectStore,
+        held_put_store::{self, HeldPutStore},
+        init_tracing,
+    },
 };
 
 /// An object store that counts the listings of batch objects and the batch
@@ -76,6 +81,42 @@ struct Listing {
     stall_batch_reads_after: Arc<AtomicUsize>,
     /// Reads of batch objects, in total.
     batch_reads: Arc<AtomicUsize>,
+    /// How long before its real write time the store reports each object's write time.
+    backdate: Backdate,
+}
+
+/// How long before its real write time an object store reports each object's write time. The
+/// clones of a `Backdate` share one value, so a test can change it after it gives a clone to the
+/// store.
+#[derive(Clone, Debug, Default)]
+struct Backdate(Arc<Mutex<Duration>>);
+
+impl Backdate {
+    /// Sets the backdate to `backdate`, in place of the backdate before.
+    fn set(&self, backdate: Duration) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = backdate;
+        }
+    }
+
+    /// Returns `meta` with its write time moved back by the backdate.
+    fn apply(&self, mut meta: ObjectMeta) -> ObjectMeta {
+        let backdate = self.0.lock().map_or(Duration::ZERO, |backdate| *backdate);
+
+        // `last_modified` is a chrono time, which subtracts a chrono `TimeDelta` and not a
+        // `Duration`, so the subtraction goes through `SystemTime`.
+        meta.last_modified = (SystemTime::from(meta.last_modified) - backdate).into();
+        meta
+    }
+
+    /// Returns `listing` with the write time of each object moved back by the backdate.
+    fn apply_to_listing(
+        &self,
+        listing: BoxStream<'static, Result<ObjectMeta, object_store::Error>>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        let backdate = self.clone();
+        listing.map_ok(move |meta| backdate.apply(meta)).boxed()
+    }
 }
 
 impl Listing {
@@ -115,6 +156,12 @@ impl Listing {
 
     fn list_last_two_swapped(&self) {
         self.last_two_swapped.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the store report each object's write time `backdate` before its real write time, as
+    /// if `backdate` had passed since each write. Each call replaces the backdate before it.
+    fn backdate_writes(&self, backdate: Duration) {
+        self.backdate.set(backdate);
     }
 
     /// Stalls every read of a batch object after the first `batch_count`: each later read waits
@@ -168,9 +215,8 @@ impl Listing {
             let listed_batches = listed_batches.clone();
 
             async move {
-                if object
-                    .as_ref()
-                    .is_ok_and(|meta| meta.location.as_ref().ends_with(".batch"))
+                if let Ok(meta) = &object
+                    && meta.location.as_ref().ends_with(".batch")
                 {
                     _ = listed_batches.fetch_add(1, Ordering::SeqCst);
                 }
@@ -230,7 +276,9 @@ impl ObjectStore for Listing {
             std::future::pending::<()>().await;
         }
 
-        self.inner.get_opts(location, options).await
+        let mut result = self.inner.get_opts(location, options).await?;
+        result.meta = self.backdate.apply(result.meta);
+        Ok(result)
     }
 
     fn delete_stream(
@@ -245,11 +293,12 @@ impl ObjectStore for Listing {
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         if !lists_batches(prefix) {
-            return self.inner.list(prefix);
+            return self.backdate.apply_to_listing(self.inner.list(prefix));
         }
 
         _ = self.full_lists.fetch_add(1, Ordering::SeqCst);
-        self.shape(self.inner.list(prefix))
+        self.backdate
+            .apply_to_listing(self.shape(self.inner.list(prefix)))
     }
 
     fn list_with_offset(
@@ -258,21 +307,32 @@ impl ObjectStore for Listing {
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         if !lists_batches(prefix) {
-            return self.inner.list_with_offset(prefix, offset);
+            return self
+                .backdate
+                .apply_to_listing(self.inner.list_with_offset(prefix, offset));
         }
 
         if let Ok(mut start_after) = self.start_after.lock() {
             start_after.push(offset.to_owned());
         }
 
-        self.shape(self.inner.list_with_offset(prefix, offset))
+        self.backdate
+            .apply_to_listing(self.shape(self.inner.list_with_offset(prefix, offset)))
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
-        self.inner.list_with_delimiter(prefix).await
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+
+        result.objects = result
+            .objects
+            .into_iter()
+            .map(|meta| self.backdate.apply(meta))
+            .collect();
+
+        Ok(result)
     }
 
     async fn copy_opts(
@@ -290,7 +350,13 @@ impl ObjectStore for Listing {
 async fn partition(name: &str) -> Result<(DynoStore, Listing, Topition)> {
     let listing = Listing::default();
     let storage = DynoStore::new("nisshi", 111, listing.clone())?;
+    let topition = create_partition(&storage, name).await?;
 
+    Ok((storage, listing, topition))
+}
+
+/// Creates a one-partition topic named `name` in `storage`, and returns the partition.
+async fn create_partition(storage: &DynoStore, name: &str) -> Result<Topition> {
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -303,7 +369,7 @@ async fn partition(name: &str) -> Result<(DynoStore, Listing, Topition)> {
         )
         .await?;
 
-    Ok((storage, listing, Topition::new(name, 0)))
+    Ok(Topition::new(name, 0))
 }
 
 /// Produces `batches` batches of `records_per_batch` records each.
@@ -625,16 +691,27 @@ async fn out_of_order_listing_after_the_holding_batch_lists_nothing_more() -> Re
 }
 
 /// A fetch below the first batch of the partition, such as one whose batch
-/// was deleted after the fetch read the log start, returns from the first
-/// batch.
+/// was deleted after the fetch read the log start, returns from the first batch.
 #[tokio::test]
 async fn fetch_below_the_first_batch_returns_from_the_first_batch() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let (storage, _, topition) =
-        partition("fetch_below_the_first_batch_returns_from_the_first_batch").await?;
+    let name = "fetch_below_the_first_batch_returns_from_the_first_batch";
+    let (storage, _, topition) = partition(name).await?;
     produce(&storage, &topition, 3, 1).await?;
 
+    // DeleteRecords moves the log start to 1, and `maintain` would delete the batch at 0 later.
+    // This deletes it at once.
+    _ = storage
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(name.into())
+            .partitions(Some(
+                [DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(1)]
+                .into(),
+            ))])
+        .await?;
     storage
         .object_store
         .delete(&batch_path(&storage.cluster, &topition, 0))
@@ -648,14 +725,14 @@ async fn fetch_below_the_first_batch_returns_from_the_first_batch() -> Result<()
     Ok(())
 }
 
-/// A fetch skips a gap, such as one that a failed produce leaves, and returns the batches around
-/// it: the batch that holds the fetch offset, or the first batch after the gap for an offset
-/// inside it.
+/// A fetch skips a settled gap, such as one that a broker leaves when it stops between its offset
+/// write and its batch write, and returns the batches around it: the batch that holds the fetch
+/// offset, or the first batch after the gap for an offset inside it.
 #[tokio::test]
 async fn fetch_skips_a_gap_to_the_batch_after_it() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let (storage, _, topition) = partition("fetch_skips_a_gap_to_the_batch_after_it").await?;
+    let (storage, listing, topition) = partition("fetch_skips_a_gap_to_the_batch_after_it").await?;
     produce(&storage, &topition, 3, 10).await?;
     produce(&storage, &topition, 1, 1).await?;
 
@@ -663,6 +740,7 @@ async fn fetch_skips_a_gap_to_the_batch_after_it() -> Result<(), Error> {
         .object_store
         .delete(&batch_path(&storage.cluster, &topition, 10))
         .await?;
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
 
     assert_eq!(
         vec![0, 20, 30],
@@ -681,8 +759,233 @@ async fn fetch_skips_a_gap_to_the_batch_after_it() -> Result<(), Error> {
     Ok(())
 }
 
-/// A fetch that crosses a gap on a store that lists keys out of order goes on from the first
-/// batch after the gap, not from the first batch that the store lists.
+/// A fetch stops at the offsets of a produce that is still writing its batch, even when a later
+/// produce to the partition has already written its own batch. The fetch returns the first batch
+/// once it lands. A consumer that skipped past those offsets would never read their records.
+#[tokio::test]
+async fn fetch_stops_at_a_produce_that_is_still_writing_its_batch() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = HeldPutStore::new(held_put_store::is_batch);
+    let storage = DynoStore::new("nisshi", 111, store.clone())?;
+    let topition = create_partition(
+        &storage,
+        "fetch_stops_at_a_produce_that_is_still_writing_its_batch",
+    )
+    .await?;
+    produce(&storage, &topition, 1, 10).await?;
+
+    // Produce A takes offsets 10 to 19, and waits at the write of its batch object.
+    let held = store.hold_next_put();
+    let produce_a = tokio::spawn({
+        let storage = storage.clone();
+        let topition = topition.clone();
+        async move { produce(&storage, &topition, 1, 10).await }
+    });
+    held.wait_until_held().await?;
+
+    // Produce B takes offsets 20 to 29, and writes its batch object.
+    produce(&storage, &topition, 1, 10).await?;
+
+    assert!(
+        fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME)
+            .await?
+            .is_empty()
+    );
+
+    held.release();
+    produce_a
+        .await
+        .map_err(|error| Error::Message(error.to_string()))??;
+
+    assert_eq!(
+        vec![10, 20],
+        fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A fetch skips the offsets of a produce that failed to write its batch at once, because the
+/// produce recorded its failure, although the batch after them was written just now.
+#[tokio::test]
+async fn fetch_skips_the_offsets_of_a_failed_produce_at_once() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = FailingObjectStore::failing_put_on_demand(InMemory::new());
+    let storage = DynoStore::new("nisshi", 111, store.clone())?;
+    let topition = create_partition(
+        &storage,
+        "fetch_skips_the_offsets_of_a_failed_produce_at_once",
+    )
+    .await?;
+    produce(&storage, &topition, 1, 10).await?;
+
+    // The produce takes offsets 10 to 19, and fails to write its batch object.
+    store.fail_next_put(|location, _| held_put_store::is_batch(location));
+    assert!(produce(&storage, &topition, 1, 10).await.is_err());
+
+    produce(&storage, &topition, 2, 10).await?;
+
+    assert_eq!(
+        vec![0, 20, 30],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+    assert_eq!(
+        vec![20, 30],
+        fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A fetch that skips a failed produce's offsets reads the batch of the next produce, also when
+/// that produce stored its batch and still reported a failure, which recorded its offsets too.
+#[tokio::test]
+async fn fetch_reads_a_stored_batch_whose_produce_reported_a_failure() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = FailingObjectStore::failing_put_on_demand(InMemory::new());
+    let storage = DynoStore::new("nisshi", 111, store.clone())?;
+    let topition = create_partition(
+        &storage,
+        "fetch_reads_a_stored_batch_whose_produce_reported_a_failure",
+    )
+    .await?;
+    produce(&storage, &topition, 1, 10).await?;
+
+    // The produce of offsets 10 to 19 writes no batch.
+    store.fail_next_put(|location, _| held_put_store::is_batch(location));
+    assert!(produce(&storage, &topition, 1, 10).await.is_err());
+
+    // The produce of offsets 20 to 29 stores its batch, and its put still reports an error.
+    store.fail_next_put_after_it_stores(|location, _| held_put_store::is_batch(location));
+    assert!(produce(&storage, &topition, 1, 10).await.is_err());
+
+    produce(&storage, &topition, 1, 10).await?;
+
+    assert_eq!(
+        vec![0, 20, 30],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A topic created again under the name of a deleted topic starts with no failed produces, also
+/// when a produce of the deleted topic recorded its failure after the deletion.
+#[tokio::test]
+async fn a_recreated_topic_has_no_failed_produces_of_the_deleted_topic() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new("nisshi", 111, InMemory::new())?;
+    let name = "a_recreated_topic_has_no_failed_produces_of_the_deleted_topic";
+    let topition = create_partition(&storage, name).await?;
+
+    _ = storage.delete_topic(&TopicId::Name(name.into())).await?;
+    storage.record_failed_produce(&topition, 10..20).await;
+    _ = create_partition(&storage, name).await?;
+
+    let failed_produces = storage
+        .watermark_for(&topition)?
+        .with(&storage.object_store, |watermark| {
+            Ok(watermark.failed_produces.clone())
+        })
+        .await?;
+
+    assert!(failed_produces.is_empty(), "{failed_produces:?}");
+
+    Ok(())
+}
+
+/// A fetch stops at a gap with no recorded failed produce while the batch after it is younger than
+/// [`BATCH_SETTLED_AFTER`], because a produce can still be writing the gap's batch, and skips the
+/// gap once that batch is older.
+#[tokio::test]
+async fn fetch_skips_a_gap_with_no_recorded_failure_only_once_it_settles() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("fetch_skips_a_gap_with_no_recorded_failure_only_once_it_settles").await?;
+    produce(&storage, &topition, 3, 10).await?;
+
+    // The produce at 10 took its offsets and stopped before it wrote its batch or recorded its
+    // failure, as a broker that stops between the two writes does.
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 10))
+        .await?;
+
+    assert_eq!(
+        vec![0],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+    assert!(
+        fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME)
+            .await?
+            .is_empty()
+    );
+
+    // A minute short of settled, the batch after the gap is still too young to skip the gap.
+    listing.backdate_writes(BATCH_SETTLED_AFTER - Duration::from_secs(60));
+
+    assert!(
+        fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME)
+            .await?
+            .is_empty()
+    );
+
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
+
+    assert_eq!(
+        vec![0, 20],
+        fetch_base_offsets(&storage, &topition, 0, MAX_BYTES, READ_TIME).await?
+    );
+    assert_eq!(
+        vec![20],
+        fetch_base_offsets(&storage, &topition, 10, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// A fetch that reaches a gap with no recorded failed produce lists only the first keys after the
+/// gap on a store that lists keys in order, however many batches follow the gap.
+#[tokio::test]
+async fn gap_lookup_lists_only_the_first_keys_after_the_gap() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("gap_lookup_lists_only_the_first_keys_after_the_gap").await?;
+    produce(&storage, &topition, 50, 10).await?;
+
+    // The produce at 10 took its offsets and stopped before it wrote its batch or recorded its
+    // failure.
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 10))
+        .await?;
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
+
+    listing.reset_counts();
+    assert_eq!(
+        vec![20],
+        fetch_base_offsets(&storage, &topition, 10, 1, READ_TIME).await?
+    );
+
+    // The gap's lookup listed two keys, and the lookup of the batch that holds offset 10 listed
+    // the batch at 0 and the first key above 10.
+    assert!(
+        listing.listed_batches() <= 4,
+        "listed {} batches",
+        listing.listed_batches()
+    );
+
+    Ok(())
+}
+
+/// A fetch that crosses a settled gap on a store that lists keys out of order goes on from the
+/// first batch after the gap, not from the first batch that the store lists.
 #[tokio::test]
 async fn gap_in_an_out_of_order_listing_goes_on_from_the_next_batch() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -698,6 +1001,7 @@ async fn gap_in_an_out_of_order_listing_goes_on_from_the_next_batch() -> Result<
 
     // The listing after the gap returns the batch at 30 before the batch at 20.
     listing.list_in_descending_order();
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
 
     assert_eq!(
         vec![0, 20, 30],
