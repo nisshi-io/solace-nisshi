@@ -1097,10 +1097,17 @@ mod unreadable_groups {
             min_bytes: u32,
             max_bytes: u32,
             isolation: IsolationLevel,
-            deadline: tokio::time::Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            fetched_sender: nisshi_storage::FetchedSender,
+        ) -> Result<()> {
             self.storage
-                .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+                .fetch(
+                    topition,
+                    offset,
+                    min_bytes,
+                    max_bytes,
+                    isolation,
+                    fetched_sender,
+                )
                 .await
         }
 

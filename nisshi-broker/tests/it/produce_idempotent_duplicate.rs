@@ -19,6 +19,7 @@
 //! with `OUT_OF_ORDER_SEQUENCE_NUMBER`. Clients count a duplicate as delivered,
 //! so a new batch answered as one would be acknowledged and lost.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, time::Duration};
 use tokio::time::Instant;
 
@@ -119,7 +120,7 @@ where
         while offset < high_watermark {
             let batches = self
                 .storage
-                .fetch(
+                .fetch_until_deadline(
                     &self.topition,
                     offset,
                     1,
@@ -127,7 +128,8 @@ where
                     IsolationLevel::ReadUncommitted,
                     Instant::now() + Duration::from_millis(500),
                 )
-                .await?;
+                .await
+                .map(|read| read.batches)?;
 
             let Some(last) = batches.last() else {
                 break;
