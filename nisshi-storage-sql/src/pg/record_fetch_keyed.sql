@@ -132,8 +132,8 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-s.k,
-s.v,
+s.k as key,
+s.v as value,
 s.producer_id,
 s.producer_epoch,
 

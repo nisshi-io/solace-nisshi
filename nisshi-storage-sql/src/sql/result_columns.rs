@@ -15,6 +15,7 @@
 //! The index of each column in a query's result, found by the column's name.
 
 use nisshi_storage::{Error, Result};
+use tracing::error;
 
 /// The column names of one query's result, in order, as the engine's driver reports them.
 #[derive(Clone, Debug)]
@@ -54,6 +55,25 @@ impl ResultColumns {
         )
     }
 
+    /// Returns the column names of `statement`, libSQL's prepared statement of `query`.
+    #[cfg(all(test, feature = "libsql"))]
+    pub(crate) fn libsql_statement(query: &'static str, statement: &libsql::Statement) -> Self {
+        Self::new(
+            query,
+            statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect(),
+        )
+    }
+
+    /// Returns the column names of `statement`, Turso's prepared statement of `query`.
+    #[cfg(all(test, feature = "turso"))]
+    pub(crate) fn turso_statement(query: &'static str, statement: &turso::Statement) -> Self {
+        Self::new(query, statement.column_names())
+    }
+
     /// Returns the column names of `rows`, Turso's result of `query`.
     #[cfg(feature = "turso")]
     pub(crate) fn turso(query: &'static str, rows: &turso::Rows) -> Self {
@@ -68,6 +88,13 @@ impl ResultColumns {
     /// Returns the index of the column `name`. Returns [`Error::MissingColumn`] if the result does
     /// not have that column, and [`Error::DuplicateColumn`] if it has more than one.
     pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
+        // The reader logs a column error at error level, because the error means that the query
+        // and its row do not match, and a caller can answer it with a Kafka error code that does
+        // not show it.
+        self.find_index(name).inspect_err(|err| error!(?err))
+    }
+
+    fn find_index(&self, name: &'static str) -> Result<usize> {
         let mut indexes = self
             .names
             .iter()

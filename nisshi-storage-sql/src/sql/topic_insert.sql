@@ -18,4 +18,4 @@ insert into topic
 select c.id, $2, $3, $4, $5, false
 from cluster c
 where c.name = $1
-returning topic.uuid
+returning topic.uuid as uuid

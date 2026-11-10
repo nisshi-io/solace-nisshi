@@ -15,20 +15,43 @@
 //! Reads a column's value from a row of each SQL driver: the only driver-specific code that a
 //! query module's `RowReader` uses.
 
+use bytes::Bytes;
 use nisshi_storage::{Error, Result};
 use serde_json::Value;
+use std::time::SystemTime;
+use uuid::Uuid;
 
 /// A row of one SQL driver's result, read by column index.
 ///
 /// Each method reads one kind of value that the queries store, and returns `None` for a null and
-/// an error for a value of another kind. Each method reads the value from the row once.
-/// [`FromColumn`] reads each Rust type that a query module declares through these methods.
+/// an error for a value of another kind. Each method reads the value from the row once, so that a
+/// large value, such as a record's key, is copied at most once. [`FromColumn`] reads each Rust type
+/// that a query module declares through these methods.
 pub(crate) trait DriverRow {
     /// Returns the integer at `index`, widened to `i64`.
     fn integer(&self, index: usize) -> Result<Option<i64>>;
 
+    /// Returns the boolean at `index`. SQLite stores a boolean as the integer 0 or 1.
+    fn boolean(&self, index: usize) -> Result<Option<bool>>;
+
     /// Returns the text at `index`.
     fn text(&self, index: usize) -> Result<Option<String>>;
+
+    /// Returns the bytes at `index`.
+    fn bytes(&self, index: usize) -> Result<Option<Bytes>>;
+
+    /// Returns the array of bytes at `index`, each element of which can be null. Only PostgreSQL
+    /// has an array type, so on libSQL and Turso every value but a null is an error.
+    fn bytes_array(&self, index: usize) -> Result<Option<Vec<Option<Bytes>>>>;
+
+    /// Returns the UUID at `index`. SQLite stores a UUID as its text.
+    fn uuid(&self, index: usize) -> Result<Option<Uuid>>;
+
+    /// Returns the time at `index`. SQLite stores a time as milliseconds since the Unix epoch.
+    fn timestamp(&self, index: usize) -> Result<Option<SystemTime>>;
+
+    /// Returns the time at `index` as a Kafka timestamp. SQLite stores a time as that count.
+    fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>>;
 
     /// Returns the JSON document at `index`, or the error from parsing it.
     ///
@@ -37,6 +60,39 @@ pub(crate) trait DriverRow {
     /// the result. PostgreSQL rejects an invalid `json` value when it is stored, and
     /// tokio-postgres decodes the document itself, so a decode failure there is a read error.
     fn json(&self, index: usize) -> Result<Option<serde_json::Result<Value>>>;
+}
+
+/// A time read as a Kafka timestamp: milliseconds since the Unix epoch, negative before it.
+///
+/// The read does not go through [`SystemTime`], because a Windows [`SystemTime`] cannot hold an
+/// instant before 1601, and a broker on another platform can have stored one. On PostgreSQL a
+/// fraction of a millisecond is dropped toward zero, and an infinity reads as the finite value of
+/// its eight bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KafkaTimestamp(pub(crate) i64);
+
+impl KafkaTimestamp {
+    /// Returns the instant that this timestamp names.
+    ///
+    /// A record that its producer sent without a timestamp stores Kafka's `NO_TIMESTAMP`, -1. A
+    /// negative count is the instant before the epoch that it names, so each engine reads the same
+    /// record as the same instant. Returns an error for an instant that a `SystemTime` can't hold
+    /// on this platform, such as one before 1601 on Windows.
+    pub(crate) fn system_time(self) -> Result<SystemTime> {
+        let Self(millis) = self;
+
+        if millis >= 0 {
+            nisshi_sans_io::to_system_time(millis).map_err(Into::into)
+        } else {
+            SystemTime::UNIX_EPOCH
+                .checked_sub(std::time::Duration::from_millis(millis.unsigned_abs()))
+                .ok_or_else(|| {
+                    Error::Message(format!(
+                        "timestamp {millis} is before the earliest that this platform holds"
+                    ))
+                })
+        }
+    }
 }
 
 /// A cursor over one SQL driver's result, which returns each of its rows as a [`DriverRow`], in
@@ -65,6 +121,41 @@ pub(crate) trait FromColumn: Sized {
     fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
         Self::from_nullable_column(row, index)?.ok_or(Error::UnexpectedNull)
     }
+
+    /// The kind of stored value that this type reads.
+    #[cfg(test)]
+    const KIND: ColumnKind;
+}
+
+/// A kind of stored value, which one [`DriverRow`] method reads.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColumnKind {
+    Integer,
+    Boolean,
+    Text,
+    Bytes,
+    BytesArray,
+    Uuid,
+    Timestamp,
+    KafkaTimestamp,
+    Json,
+}
+
+/// A column of a row that [`sql_row!`] declares: the column's name, and the kind of value that
+/// its field reads.
+#[cfg(test)]
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(
+        dead_code,
+        reason = "only the PostgreSQL test reads a column's declared kind"
+    )
+)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeclaredColumn {
+    pub(crate) name: &'static str,
+    pub(crate) kind: ColumnKind,
 }
 
 impl<T: FromColumn> FromColumn for Option<T> {
@@ -75,12 +166,18 @@ impl<T: FromColumn> FromColumn for Option<T> {
     fn from_column<R: DriverRow>(row: &R, index: usize) -> Result<Self> {
         T::from_nullable_column(row, index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = T::KIND;
 }
 
 impl FromColumn for i64 {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.integer(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
 }
 
 impl FromColumn for i32 {
@@ -90,6 +187,9 @@ impl FromColumn for i32 {
             .transpose()
             .map_err(Into::into)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
 }
 
 impl FromColumn for i16 {
@@ -99,30 +199,96 @@ impl FromColumn for i16 {
             .transpose()
             .map_err(Into::into)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Integer;
+}
+
+impl FromColumn for bool {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.boolean(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Boolean;
 }
 
 impl FromColumn for String {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.text(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Text;
+}
+
+impl FromColumn for Bytes {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.bytes(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Bytes;
+}
+
+impl FromColumn for Vec<Option<Bytes>> {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.bytes_array(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::BytesArray;
+}
+
+impl FromColumn for Uuid {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.uuid(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Uuid;
+}
+
+impl FromColumn for SystemTime {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.timestamp(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Timestamp;
+}
+
+impl FromColumn for KafkaTimestamp {
+    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
+        row.kafka_timestamp(index)
+    }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::KafkaTimestamp;
 }
 
 impl FromColumn for serde_json::Result<Value> {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.json(index)
     }
+
+    #[cfg(test)]
+    const KIND: ColumnKind = ColumnKind::Json;
 }
 
 #[cfg(feature = "postgres")]
 mod postgres {
-    use super::DriverRow;
+    use super::{DriverRow, KafkaTimestamp};
+    use crate::pg::{CheckedSystemTime, POSTGRES_EPOCH_SECONDS};
+    use bytes::Bytes;
     use nisshi_storage::Result;
     use serde_json::Value;
-    use std::error::Error as StdError;
+    use std::{error::Error as StdError, time::SystemTime};
     use tokio_postgres::{
         Row,
         types::{FromSql, Type},
     };
+    use uuid::Uuid;
 
     /// A `smallint`, `integer` or `bigint`, widened to `i64`.
     ///
@@ -145,6 +311,41 @@ mod postgres {
         }
     }
 
+    impl<'a> FromSql<'a> for KafkaTimestamp {
+        fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+            let microseconds = i64::from_be_bytes(raw.try_into()?);
+
+            // The sum is an `i128`, because the microseconds of a late timestamp plus the epoch
+            // offset exceed `i64::MAX`.
+            let milliseconds =
+                (i128::from(microseconds) + i128::from(POSTGRES_EPOCH_SECONDS) * 1_000_000) / 1_000;
+
+            Ok(Self(i64::try_from(milliseconds)?))
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
+        }
+    }
+
+    #[cfg(test)]
+    impl super::ColumnKind {
+        /// Returns whether the [`DriverRow`] method for this kind reads a column of type `ty`.
+        pub(crate) fn postgres_accepts(self, ty: &Type) -> bool {
+            match self {
+                Self::Integer => Integer::accepts(ty),
+                Self::Boolean => bool::accepts(ty),
+                Self::Text => String::accepts(ty),
+                Self::Bytes => <&[u8]>::accepts(ty),
+                Self::BytesArray => <Vec<Option<&[u8]>>>::accepts(ty),
+                Self::Uuid => Uuid::accepts(ty),
+                Self::Timestamp => CheckedSystemTime::accepts(ty),
+                Self::KafkaTimestamp => KafkaTimestamp::accepts(ty),
+                Self::Json => Value::accepts(ty),
+            }
+        }
+    }
+
     impl DriverRow for Row {
         fn integer(&self, index: usize) -> Result<Option<i64>> {
             self.try_get::<_, Option<Integer>>(index)
@@ -152,7 +353,44 @@ mod postgres {
                 .map_err(Into::into)
         }
 
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
         fn text(&self, index: usize) -> Result<Option<String>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
+            self.try_get::<_, Option<&[u8]>>(index)
+                .map(|bytes| bytes.map(Bytes::copy_from_slice))
+                .map_err(Into::into)
+        }
+
+        fn bytes_array(&self, index: usize) -> Result<Option<Vec<Option<Bytes>>>> {
+            self.try_get::<_, Option<Vec<Option<&[u8]>>>>(index)
+                .map(|array| {
+                    array.map(|array| {
+                        array
+                            .into_iter()
+                            .map(|bytes| bytes.map(Bytes::copy_from_slice))
+                            .collect()
+                    })
+                })
+                .map_err(Into::into)
+        }
+
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.try_get(index).map_err(Into::into)
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
+            self.try_get::<_, Option<CheckedSystemTime>>(index)
+                .map(|time| time.map(|CheckedSystemTime(time)| time))
+                .map_err(Into::into)
+        }
+
+        fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>> {
             self.try_get(index).map_err(Into::into)
         }
 
@@ -162,13 +400,133 @@ mod postgres {
                 .map_err(Into::into)
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::KafkaTimestamp;
+        use crate::pg::MIN_SQL_TIMESTAMP_MS;
+        use nisshi_storage::{Error, Result};
+        use std::{assert_matches, time::SystemTime};
+        use tokio_postgres::types::{FromSql, Type};
+
+        /// The Kafka timestamp that a `timestamp` column of `microseconds` from 2000-01-01 reads as.
+        fn read_kafka_timestamp(microseconds: i64) -> Result<i64> {
+            KafkaTimestamp::from_sql(&Type::TIMESTAMP, &microseconds.to_be_bytes())
+                .map(|KafkaTimestamp(timestamp)| timestamp)
+                .map_err(|err| Error::Message(err.to_string()))
+        }
+
+        #[test]
+        fn kafka_timestamp_counts_milliseconds_from_the_unix_epoch() -> Result<()> {
+            const EPOCH_MICROSECONDS: i64 = 946_684_800_000_000;
+
+            // 2000-01-01 is 946_684_800_000 milliseconds after the Unix epoch.
+            assert_eq!(946_684_800_000, read_kafka_timestamp(0)?);
+            assert_eq!(946_684_801_000, read_kafka_timestamp(1_000_000)?);
+            // The Unix epoch itself, and one millisecond on each side of it.
+            assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS)?);
+            assert_eq!(1, read_kafka_timestamp(-EPOCH_MICROSECONDS + 1_000)?);
+            assert_eq!(-1, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1_000)?);
+
+            Ok(())
+        }
+
+        #[test]
+        fn kafka_timestamp_truncates_toward_zero() -> Result<()> {
+            const EPOCH_MICROSECONDS: i64 = 946_684_800_000_000;
+
+            assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS + 999)?);
+            // Before the Unix epoch the result rounds up, where a floor division gives -1 and -2.
+            assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1)?);
+            assert_eq!(0, read_kafka_timestamp(-EPOCH_MICROSECONDS - 999)?);
+            assert_eq!(-1, read_kafka_timestamp(-EPOCH_MICROSECONDS - 1_999)?);
+            assert_eq!(-2, read_kafka_timestamp(-EPOCH_MICROSECONDS - 2_000)?);
+
+            Ok(())
+        }
+
+        #[test]
+        fn kafka_timestamp_reads_the_bounds_of_the_timestamp_column() -> Result<()> {
+            // 4713 BC and 294276 AD, the bounds of PostgreSQL's `timestamp`.
+            assert_eq!(
+                MIN_SQL_TIMESTAMP_MS,
+                read_kafka_timestamp(-211_813_488_000_000_000)?
+            );
+            assert_eq!(
+                9_224_318_015_999_999,
+                read_kafka_timestamp(9_223_371_331_199_999_999)?
+            );
+
+            // -infinity and infinity are `i64::MIN` and `i64::MAX`, and read as ordinary values.
+            // The sum with the epoch offset of `i64::MAX` does not fit in an `i64`.
+            assert_eq!(-9_222_425_352_054_775, read_kafka_timestamp(i64::MIN)?);
+            assert_eq!(9_224_318_721_654_775, read_kafka_timestamp(i64::MAX)?);
+
+            Ok(())
+        }
+
+        /// Reads the same value as the `postgres-types` conversion to a `SystemTime` and back, on a
+        /// platform where that conversion does not panic.
+        #[cfg(not(windows))]
+        #[test]
+        fn kafka_timestamp_equals_the_read_through_system_time() -> Result<()> {
+            fn through_system_time(microseconds: i64) -> Result<i64> {
+                let system_time =
+                    SystemTime::from_sql(&Type::TIMESTAMP, &microseconds.to_be_bytes())
+                        .map_err(|err| Error::Message(err.to_string()))?;
+
+                match system_time.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(after) => Ok(i64::try_from(after.as_millis())?),
+                    Err(before) => Ok(-i64::try_from(before.duration().as_millis())?),
+                }
+            }
+
+            for microseconds in [
+                i64::MIN,
+                i64::MIN + 1,
+                -211_813_488_000_000_000,
+                -12_591_158_400_000_001,
+                -12_591_158_400_000_000,
+                -946_684_800_000_001,
+                -946_684_800_000_000,
+                -946_684_799_999_999,
+                -1_999,
+                -1,
+                0,
+                1,
+                999,
+                1_000,
+                1_700_000_000_000_000,
+                9_223_371_331_199_999_999,
+                i64::MAX - 1,
+                i64::MAX,
+            ] {
+                assert_eq!(
+                    through_system_time(microseconds)?,
+                    read_kafka_timestamp(microseconds)?,
+                    "{microseconds}"
+                );
+            }
+
+            Ok(())
+        }
+
+        #[test]
+        fn kafka_timestamp_refuses_a_value_that_is_not_eight_bytes() {
+            assert_matches!(KafkaTimestamp::from_sql(&Type::TIMESTAMP, &[0; 4]), Err(_));
+            assert_matches!(KafkaTimestamp::from_sql(&Type::TIMESTAMP, &[0; 9]), Err(_));
+        }
+    }
 }
 
 #[cfg(feature = "libsql")]
 mod libsql {
-    use super::{DriverRow, DriverRowCursor};
+    use super::{DriverRow, DriverRowCursor, KafkaTimestamp};
+    use bytes::Bytes;
     use libsql::{Row, Rows, Value};
-    use nisshi_storage::Result;
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
+    use std::time::SystemTime;
+    use uuid::Uuid;
 
     /// Returns the value at `index` of `row`, or `None` for a null.
     ///
@@ -181,6 +539,33 @@ mod libsql {
         }
     }
 
+    /// Returns the error for `value`, which has the wrong kind for its column.
+    fn unexpected_value(value: Value) -> Error {
+        Error::UnexpectedSqliteValue(match value {
+            Value::Null => SqliteValueSummary::Null,
+            Value::Integer(integer) => SqliteValueSummary::Integer(integer),
+            Value::Real(real) => SqliteValueSummary::Real(real),
+            Value::Text(text) => SqliteValueSummary::Text { length: text.len() },
+            Value::Blob(blob) => SqliteValueSummary::Blob { length: blob.len() },
+        })
+    }
+
+    /// Returns the integer in `value`, or an error for a value of another kind.
+    fn integer_of(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(integer) => Ok(integer),
+            value => Err(unexpected_value(value)),
+        }
+    }
+
+    /// Returns the text in `value`, or an error for a value of another kind.
+    fn text_of(value: Value) -> Result<String> {
+        match value {
+            Value::Text(text) => Ok(text),
+            value => Err(unexpected_value(value)),
+        }
+    }
+
     impl DriverRowCursor for Rows {
         type Row = Row;
 
@@ -191,21 +576,52 @@ mod libsql {
 
     impl DriverRow for Row {
         fn integer(&self, index: usize) -> Result<Option<i64>> {
-            nullable_value(self, index)?
-                .map(|value| match value {
-                    Value::Integer(integer) => Ok(integer),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+            nullable_value(self, index)?.map(integer_of).transpose()
+        }
+
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            self.integer(index)?
+                .map(|integer| match integer {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    integer => Err(unexpected_value(Value::Integer(integer))),
                 })
                 .transpose()
         }
 
         fn text(&self, index: usize) -> Result<Option<String>> {
+            nullable_value(self, index)?.map(text_of).transpose()
+        }
+
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
             nullable_value(self, index)?
                 .map(|value| match value {
-                    Value::Text(text) => Ok(text),
-                    _ => Err(libsql::Error::InvalidColumnType.into()),
+                    Value::Blob(blob) => Ok(Bytes::from(blob)),
+                    value => Err(unexpected_value(value)),
                 })
                 .transpose()
+        }
+
+        fn bytes_array(&self, index: usize) -> Result<Option<Vec<Option<Bytes>>>> {
+            nullable_value(self, index)?
+                .map(|value| Err(unexpected_value(value)))
+                .transpose()
+        }
+
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.text(index)?
+                .map(|text| Uuid::parse_str(&text).map_err(Into::into))
+                .transpose()
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
+            self.kafka_timestamp(index)?
+                .map(KafkaTimestamp::system_time)
+                .transpose()
+        }
+
+        fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>> {
+            self.integer(index).map(|millis| millis.map(KafkaTimestamp))
         }
 
         fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
@@ -217,9 +633,47 @@ mod libsql {
 
 #[cfg(feature = "turso")]
 mod turso {
-    use super::{DriverRow, DriverRowCursor};
-    use nisshi_storage::Result;
-    use turso::{Row, Rows};
+    use super::{DriverRow, DriverRowCursor, KafkaTimestamp};
+    use bytes::Bytes;
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
+    use std::time::SystemTime;
+    use turso::{Row, Rows, Value};
+    use uuid::Uuid;
+
+    /// Returns the value at `index` of `row`, or `None` for a null.
+    fn nullable_value(row: &Row, index: usize) -> Result<Option<Value>> {
+        match row.get_value(index)? {
+            Value::Null => Ok(None),
+            value => Ok(Some(value)),
+        }
+    }
+
+    /// Returns the error for `value`, which has the wrong kind for its column.
+    fn unexpected_value(value: Value) -> Error {
+        Error::UnexpectedSqliteValue(match value {
+            Value::Null => SqliteValueSummary::Null,
+            Value::Integer(integer) => SqliteValueSummary::Integer(integer),
+            Value::Real(real) => SqliteValueSummary::Real(real),
+            Value::Text(text) => SqliteValueSummary::Text { length: text.len() },
+            Value::Blob(blob) => SqliteValueSummary::Blob { length: blob.len() },
+        })
+    }
+
+    /// Returns the integer in `value`, or an error for a value of another kind.
+    fn integer_of(value: Value) -> Result<i64> {
+        match value {
+            Value::Integer(integer) => Ok(integer),
+            value => Err(unexpected_value(value)),
+        }
+    }
+
+    /// Returns the text in `value`, or an error for a value of another kind.
+    fn text_of(value: Value) -> Result<String> {
+        match value {
+            Value::Text(text) => Ok(text),
+            value => Err(unexpected_value(value)),
+        }
+    }
 
     impl DriverRowCursor for Rows {
         type Row = Row;
@@ -231,11 +685,52 @@ mod turso {
 
     impl DriverRow for Row {
         fn integer(&self, index: usize) -> Result<Option<i64>> {
-            self.get(index).map_err(Into::into)
+            nullable_value(self, index)?.map(integer_of).transpose()
+        }
+
+        fn boolean(&self, index: usize) -> Result<Option<bool>> {
+            self.integer(index)?
+                .map(|integer| match integer {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    integer => Err(unexpected_value(Value::Integer(integer))),
+                })
+                .transpose()
         }
 
         fn text(&self, index: usize) -> Result<Option<String>> {
-            self.get(index).map_err(Into::into)
+            nullable_value(self, index)?.map(text_of).transpose()
+        }
+
+        fn bytes(&self, index: usize) -> Result<Option<Bytes>> {
+            nullable_value(self, index)?
+                .map(|value| match value {
+                    Value::Blob(blob) => Ok(Bytes::from(blob)),
+                    value => Err(unexpected_value(value)),
+                })
+                .transpose()
+        }
+
+        fn bytes_array(&self, index: usize) -> Result<Option<Vec<Option<Bytes>>>> {
+            nullable_value(self, index)?
+                .map(|value| Err(unexpected_value(value)))
+                .transpose()
+        }
+
+        fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
+            self.text(index)?
+                .map(|text| Uuid::parse_str(&text).map_err(Into::into))
+                .transpose()
+        }
+
+        fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
+            self.kafka_timestamp(index)?
+                .map(KafkaTimestamp::system_time)
+                .transpose()
+        }
+
+        fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>> {
+            self.integer(index).map(|millis| millis.map(KafkaTimestamp))
         }
 
         fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
@@ -247,10 +742,18 @@ mod turso {
 
 #[cfg(test)]
 mod tests {
-    use super::super::result_columns::ResultColumns;
-    use nisshi_storage::{Error, Result};
+    use super::{
+        super::{QueryRow, result_columns::ResultColumns},
+        KafkaTimestamp,
+    };
+    use bytes::Bytes;
+    use nisshi_storage::{Error, Result, SqliteValueSummary};
     use serde_json::json;
-    use std::assert_matches;
+    use std::{
+        assert_matches,
+        time::{Duration, SystemTime},
+    };
+    use uuid::Uuid;
 
     /// A query that reads one column of each kind that [`DriverRow`](super::DriverRow) reads.
     mod probe {
@@ -267,6 +770,53 @@ mod tests {
             }
         }
     }
+
+    /// A query that reads one column of each kind that SQLite stores in another form than
+    /// PostgreSQL does.
+    /// A query that reads one array of bytes, which only PostgreSQL stores.
+    mod array_probe {
+        sql_row! {
+            #[derive(Debug)]
+            pub(crate) struct Row {
+                headers: Option<Vec<Option<bytes::Bytes>>>,
+            }
+        }
+    }
+
+    mod converted_probe {
+        sql_row! {
+            #[derive(Debug)]
+            pub(crate) struct Row {
+                flag: bool,
+                payload: bytes::Bytes,
+                id: uuid::Uuid,
+                time: std::time::SystemTime,
+            }
+        }
+    }
+
+    /// The UUID in the `id` column of each converted probe query.
+    const CONVERTED_PROBE_ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+
+    /// The converted probe queries in one driver's SQL dialect.
+    struct ConvertedProbeSql {
+        /// Returns one row: true, the bytes 1 and 2, [`CONVERTED_PROBE_ID`], and 1.5 seconds after
+        /// the Unix epoch.
+        in_order: &'static str,
+    }
+
+    #[cfg(any(feature = "libsql", feature = "turso"))]
+    const SQLITE_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
+        in_order: "select 1 as flag, x'0102' as payload, \
+                   '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
+    };
+
+    #[cfg(feature = "postgres")]
+    const POSTGRES_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
+        in_order: r"select true as flag, '\x0102'::bytea as payload,
+                    '67e55044-10b1-426f-9247-bb680e5fe0c8'::uuid as id,
+                    '1970-01-01 00:00:01.5'::timestamp as time",
+    };
 
     /// The probe queries in one driver's SQL dialect.
     struct ProbeSql {
@@ -316,8 +866,8 @@ mod tests {
 
     /// Runs probe queries through one driver.
     trait ProbeDriver {
-        /// Runs `sql`, and reads each row of its result with [`probe::RowReader`].
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>>;
+        /// Runs `sql`, and reads each row of its result as `T`.
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>>;
     }
 
     #[cfg(feature = "postgres")]
@@ -338,19 +888,19 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     impl ProbeDriver for Postgres {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let (client, connection) =
                 tokio_postgres::connect(&crate::pg::tests::CONNECTION, tokio_postgres::NoTls)
                     .await?;
             let connection = tokio::spawn(connection);
 
             let statement = client.prepare(sql).await?;
-            let reader = probe::RowReader::new(&ResultColumns::postgres(probe::QUERY, &statement))?;
+            let reader = T::reader(&ResultColumns::postgres(probe::QUERY, &statement))?;
             let rows = client
                 .query(&statement, &[])
                 .await?
                 .iter()
-                .map(|row| reader.read_row(row))
+                .map(|row| T::read(&reader, row))
                 .collect();
 
             drop(client);
@@ -364,17 +914,17 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     impl ProbeDriver for Libsql {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let connection = libsql::Builder::new_local(":memory:")
                 .build()
                 .await?
                 .connect()?;
             let mut rows = connection.query(sql, ()).await?;
-            let reader = probe::RowReader::new(&ResultColumns::libsql(probe::QUERY, &rows))?;
+            let reader = T::reader(&ResultColumns::libsql(probe::QUERY, &rows))?;
 
             let mut probes = vec![];
             while let Some(row) = rows.next().await? {
-                probes.push(reader.read_row(&row)?);
+                probes.push(T::read(&reader, &row)?);
             }
             Ok(probes)
         }
@@ -385,25 +935,25 @@ mod tests {
 
     #[cfg(feature = "turso")]
     impl ProbeDriver for Turso {
-        async fn probe_rows(sql: &str) -> Result<Vec<probe::Row>> {
+        async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>> {
             let connection = turso::Builder::new_local(":memory:")
                 .build()
                 .await?
                 .connect()?;
             let mut rows = connection.query(sql, ()).await?;
-            let reader = probe::RowReader::new(&ResultColumns::turso(probe::QUERY, &rows))?;
+            let reader = T::reader(&ResultColumns::turso(probe::QUERY, &rows))?;
 
             let mut probes = vec![];
             while let Some(row) = rows.next().await? {
-                probes.push(reader.read_row(&row)?);
+                probes.push(T::read(&reader, &row)?);
             }
             Ok(probes)
         }
     }
 
     /// Returns the one row of `sql`'s result.
-    async fn probe_row<D: ProbeDriver>(sql: &str) -> Result<probe::Row> {
-        let mut rows = D::probe_rows(sql).await?;
+    async fn probe_row<D: ProbeDriver, T: QueryRow>(sql: &str) -> Result<T> {
+        let mut rows = D::probe_rows::<T>(sql).await?;
         assert_eq!(1, rows.len(), "{sql}");
         Ok(rows.remove(0))
     }
@@ -412,7 +962,7 @@ mod tests {
     /// order gives the engine the same values.
     async fn reordered_select_reads_the_same_values<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         for query in [sql.in_order, sql.reordered] {
-            let row = probe_row::<D>(query).await?;
+            let row = probe_row::<D, probe::Row>(query).await?;
 
             assert_eq!(3, row.epoch, "{query}");
             assert_eq!(Some(7), row.high, "{query}");
@@ -427,7 +977,7 @@ mod tests {
     /// found even when the result is empty.
     async fn renamed_column_is_missing_without_rows<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         assert_matches!(
-            D::probe_rows(sql.renamed_without_rows).await,
+            D::probe_rows::<probe::Row>(sql.renamed_without_rows).await,
             Err(Error::MissingColumn { query: probe::QUERY, column: "name", found })
                 if found.contains(&"nom".to_owned())
         );
@@ -437,7 +987,7 @@ mod tests {
     /// A result with two columns of one name is an error, instead of a read of the first of them.
     async fn duplicate_column_is_an_error<D: ProbeDriver>(sql: &ProbeSql) -> Result<()> {
         assert_matches!(
-            D::probe_rows(sql.name_twice).await,
+            D::probe_rows::<probe::Row>(sql.name_twice).await,
             Err(Error::DuplicateColumn {
                 query: probe::QUERY,
                 column: "name"
@@ -455,7 +1005,7 @@ mod tests {
             (sql.epoch_overflows, "epoch"),
         ] {
             assert_matches!(
-                D::probe_rows(query).await,
+                D::probe_rows::<probe::Row>(query).await,
                 Err(Error::UnreadableColumn { query: probe::QUERY, column: found, .. }) if found == column,
                 "{query}"
             );
@@ -467,9 +1017,93 @@ mod tests {
     /// what it does to the rest of the result.
     async fn invalid_json_is_kept_in_the_row<D: ProbeDriver>() -> Result<()> {
         let row =
-            probe_row::<D>("select 3 as epoch, 7 as high, 'a' as name, '{' as detail").await?;
+            probe_row::<D, probe::Row>("select 3 as epoch, 7 as high, 'a' as name, '{' as detail")
+                .await?;
         assert_matches!(row.detail, Some(Err(_)));
         Ok(())
+    }
+
+    /// Each driver reads a boolean, bytes, a UUID and a time from the form that its engine stores
+    /// them in, so a field has one Rust type on every engine.
+    async fn converted_columns_read_their_stored_forms<D: ProbeDriver>(
+        sql: &ConvertedProbeSql,
+    ) -> Result<()> {
+        let row = probe_row::<D, converted_probe::Row>(sql.in_order).await?;
+
+        assert!(row.flag);
+        assert_eq!(Bytes::from_static(&[1, 2]), row.payload);
+        assert_eq!(Uuid::parse_str(CONVERTED_PROBE_ID)?, row.id);
+        assert_eq!(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1500),
+            row.time
+        );
+        Ok(())
+    }
+
+    /// On libSQL and Turso, a boolean other than 0 or 1, and a time stored as text, are errors
+    /// that name the column, instead of values read as some other boolean or time. The broker
+    /// stores only 0, 1 and integer milliseconds. The error keeps a text value's length, not the
+    /// text.
+    async fn sqlite_rejects_other_stored_forms<D: ProbeDriver>() -> Result<()> {
+        for (query, column, summary) in [
+            (
+                "select 2 as flag, x'0102' as payload, \
+                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
+                "flag",
+                SqliteValueSummary::Integer(2),
+            ),
+            (
+                "select 1 as flag, x'0102' as payload, \
+                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, \
+                 '1970-01-01 00:00:01.500' as time",
+                "time",
+                // The length of '1970-01-01 00:00:01.500'.
+                SqliteValueSummary::Text { length: 23 },
+            ),
+        ] {
+            assert_matches!(
+                D::probe_rows::<converted_probe::Row>(query).await,
+                Err(Error::UnreadableColumn { column: found, source, .. })
+                    if found == column
+                        && matches!(*source, Error::UnexpectedSqliteValue(found) if found == summary),
+                "{query}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_converted_columns_read_their_stored_forms() -> Result<()> {
+        if !Postgres::is_reachable("postgres_converted_columns_read_their_stored_forms").await {
+            return Ok(());
+        }
+
+        converted_columns_read_their_stored_forms::<Postgres>(&POSTGRES_CONVERTED).await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_converted_columns_read_their_stored_forms() -> Result<()> {
+        converted_columns_read_their_stored_forms::<Libsql>(&SQLITE_CONVERTED).await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_rejects_other_stored_forms() -> Result<()> {
+        sqlite_rejects_other_stored_forms::<Libsql>().await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_converted_columns_read_their_stored_forms() -> Result<()> {
+        converted_columns_read_their_stored_forms::<Turso>(&SQLITE_CONVERTED).await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_rejects_other_stored_forms() -> Result<()> {
+        sqlite_rejects_other_stored_forms::<Turso>().await
     }
 
     #[cfg(feature = "postgres")]
@@ -570,5 +1204,73 @@ mod tests {
     #[tokio::test]
     async fn turso_invalid_json_is_kept_in_the_row() -> Result<()> {
         invalid_json_is_kept_in_the_row::<Turso>().await
+    }
+
+    /// A stored -1, a record without a timestamp, reads as the millisecond before the epoch, and
+    /// a timestamp after the epoch reads as itself.
+    #[test]
+    fn kafka_timestamp_reads_a_negative_timestamp_before_the_epoch() -> Result<()> {
+        assert_eq!(
+            SystemTime::UNIX_EPOCH - Duration::from_millis(1),
+            KafkaTimestamp(-1).system_time()?
+        );
+        assert_eq!(
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_234),
+            KafkaTimestamp(1_234).system_time()?
+        );
+
+        Ok(())
+    }
+
+    /// PostgreSQL reads each element of a `bytea[]`, a null element as `None`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_bytes_array_reads_each_element() -> Result<()> {
+        if !Postgres::is_reachable("postgres_bytes_array_reads_each_element").await {
+            return Ok(());
+        }
+
+        let row = probe_row::<Postgres, array_probe::Row>(
+            "select array['\\x0102'::bytea, null] as headers",
+        )
+        .await?;
+
+        assert_eq!(
+            Some(vec![Some(Bytes::from_static(&[1, 2])), None]),
+            row.headers
+        );
+        Ok(())
+    }
+
+    /// On libSQL and Turso, an array of bytes reads a null as `None`, and any other value as an
+    /// error that names the column, because SQLite stores no arrays.
+    async fn sqlite_bytes_array_is_only_null<D: ProbeDriver>() -> Result<()> {
+        assert!(
+            probe_row::<D, array_probe::Row>("select null as headers")
+                .await?
+                .headers
+                .is_none()
+        );
+        assert_matches!(
+            D::probe_rows::<array_probe::Row>("select x'0102' as headers").await,
+            Err(Error::UnreadableColumn { column: "headers", source, .. })
+                if matches!(
+                    *source,
+                    Error::UnexpectedSqliteValue(SqliteValueSummary::Blob { length: 2 })
+                )
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_bytes_array_is_only_null() -> Result<()> {
+        sqlite_bytes_array_is_only_null::<Libsql>().await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_bytes_array_is_only_null() -> Result<()> {
+        sqlite_bytes_array_is_only_null::<Turso>().await
     }
 }

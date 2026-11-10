@@ -12,26 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `consumer_offset_select_by_group.sql` query and the names of the columns that the engines
-//! read from its result. A change to the query's `select` list must keep these names.
+//! The query that reads every committed offset of a consumer group, one row for each partition.
 //!
-//! The query takes two parameters: `$1` the cluster's name and `$2` the group's name. It returns
-//! one row for each partition that the group committed an offset for.
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the group's name.
+
+use super::Query;
 
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "consumer_offset_select_by_group.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("consumer_offset_select_by_group.sql");
 
-/// The topic's name.
-pub(crate) const TOPIC: &str = "topic";
-
-/// The partition's index.
-pub(crate) const PARTITION: &str = "partition";
-
-/// The committed offset.
-pub(crate) const COMMITTED_OFFSET: &str = "committed_offset";
-
-/// The leader epoch of the commit. It is null when the commit did not give one.
-pub(crate) const LEADER_EPOCH: &str = "leader_epoch";
-
-/// The metadata of the commit. It is null when the commit did not give any.
-pub(crate) const METADATA: &str = "metadata";
+sql_row! {
+    /// The committed offset of a consumer group on one partition.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The topic's name.
+        topic: String,
+        /// The partition's index.
+        partition: i32,
+        /// The committed offset.
+        committed_offset: i64,
+        /// The leader epoch of the commit, or `None` when the commit did not give one.
+        leader_epoch: Option<i32>,
+        /// The metadata of the commit, or `None` when the commit did not give any.
+        metadata: Option<String>,
+    }
+}

@@ -20,4 +20,4 @@ from cluster c, topic t
 where c.name = $1
 and t.name = $2
 and t.cluster = c.id
-returning topition.id;
+returning topition.id as id;
