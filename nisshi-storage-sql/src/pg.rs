@@ -78,6 +78,7 @@ use nisshi_storage::{
     read_deadline::{QueueWait as _, ReadWait},
     read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
 };
+use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use serde_json::Value;
 #[cfg(unix)]
@@ -104,7 +105,7 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
-use self::metrics::FetchStatementMetrics;
+use self::metrics::{FetchStatementMetrics, POOL_REPLACED};
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
@@ -725,15 +726,6 @@ const RECYCLE_QUERY: &str = "SELECT CASE WHEN pg_is_in_recovery() \
 /// The text that [`RECYCLE_QUERY`] puts in its error when the session is read-only. The server's
 /// message quotes it inside an `invalid input syntax for type integer` error.
 const READ_ONLY_MESSAGE: &str = "connection is read-only";
-
-/// The number of pooled connections that the pool dropped before use, by the stage that dropped
-/// them and the reason.
-static POOL_REPLACED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("nisshi_sql_pool_replaced")
-        .with_description("The number of pooled connections dropped before use")
-        .build()
-});
 
 /// Where a pooled connection failed [`ReadOnlyCheck::run`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8387,7 +8379,12 @@ mod tests {
             let permits = storage.fetch_read_permits().await?;
             assert_eq!(available - 1, storage.fetch_reads.available_permits());
 
-            assert!(storage.abandonable_connection(permits).await.is_err());
+            assert!(
+                storage
+                    .abandonable_connection(permits, StorageOperation::Fetch)
+                    .await
+                    .is_err()
+            );
             assert_eq!(available, storage.fetch_reads.available_permits());
         }
 

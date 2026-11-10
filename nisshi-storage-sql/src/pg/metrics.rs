@@ -60,6 +60,15 @@ static SQL_STATEMENTS_ABANDONED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The number of pooled connections that the pool dropped before use, by the stage that dropped
+/// them and the reason.
+pub(super) static POOL_REPLACED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_sql_pool_replaced")
+        .with_description("The number of pooled connections dropped before use")
+        .build()
+});
+
 /// Counts the statement `sql` on `cluster`, which started at `started_at`, as completed.
 pub(super) fn completed(sql: &str, cluster: &str, started_at: SystemTime) {
     count(
