@@ -37,5 +37,14 @@ on conflict (producer_epoch, topition)
 
 do update set
 
-sequence = producer_detail.sequence + $6,
+-- The next sequence wraps to 0 after 2147483647, as [`DefaultRecordBatch.incrementSequence`]
+-- does, and $6 is the number of records that the batch adds. The condition compares against a
+-- difference and not a sum, because the sum overflows a PostgreSQL integer.
+--
+-- [`DefaultRecordBatch.incrementSequence`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L556-L560
+sequence = case
+when producer_detail.sequence > 2147483647 - $6
+then $6 - (2147483647 - producer_detail.sequence) - 1
+else producer_detail.sequence + $6
+end,
 last_updated = excluded.last_updated
