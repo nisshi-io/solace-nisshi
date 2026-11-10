@@ -571,3 +571,50 @@ async fn request_channel_counts_its_produce_path_only_with_a_decoded_batch() -> 
 
     Ok(())
 }
+
+/// The batcher counts its produce path only when it tries for a share of the decoded limit: a
+/// produce that carries a decoded batch, with a delay, for a batch the queue would hold.
+///
+/// This test pins the count that the batcher records.
+#[tokio::test]
+async fn batcher_counts_its_produce_path_only_when_it_reserves() -> Result<()> {
+    let (provider, exporter) = install_exporter();
+
+    // The default batch is idempotent, so a storage that drops the decoded batch takes no share.
+    let dropping = ProduceRequestBatcher::new(storage())
+        .with_maximum_delay(Some(Duration::from_millis(1)))
+        .with_hold_decoded(false);
+    let topition = Topition::new("abc", 0);
+    _ = dropping
+        .produce(None, &topition, deflated::Batch::default())
+        .await?;
+    _ = dropping
+        .produce_inflated(
+            None,
+            &topition,
+            deflated::Batch::default(),
+            inflated::Batch::default(),
+        )
+        .await?;
+
+    let holding = storage();
+    through_both(
+        ProduceRequestBatcher::new(holding.clone())
+            .with_maximum_delay(Some(Duration::from_millis(1))),
+        &holding,
+    )
+    .await?;
+
+    assert_eq!(
+        vec![(
+            vec![
+                ("path".to_owned(), "direct".to_owned()),
+                ("stage".to_owned(), "batcher".to_owned())
+            ],
+            1
+        )],
+        recorded(&provider, &exporter, "nisshi_storage_produce_path")
+    );
+
+    Ok(())
+}
