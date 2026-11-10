@@ -22,7 +22,7 @@ Each row has a `meta` column with the record's partition (`meta.partition`) and 
 
 - Avro and Protocol Buffers: the record's timestamp, in microseconds, as a timestamp without a
   time zone.
-- JSON Schema: the timestamp of the record's batch, as an RFC 3339 string in UTC.
+- JSON Schema: the record's timestamp, as an RFC 3339 string in UTC.
 
 ## Removing records from a topic
 
