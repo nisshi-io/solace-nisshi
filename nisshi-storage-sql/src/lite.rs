@@ -7391,6 +7391,63 @@ mod tests {
         Ok(())
     }
 
+    /// A record without a timestamp stores NO_TIMESTAMP, -1. Retention ages it from when the
+    /// broker appended it, so a sweep deletes it once `retention.ms` has passed since then, and
+    /// keeps a record appended within `retention.ms` in the same sweep.
+    #[tokio::test]
+    async fn retention_ages_a_record_without_a_timestamp_from_its_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "retention-record-without-timestamp-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        execute_on(
+            db_file,
+            "insert into topic_configuration (topic, name, value) \
+             select id, 'retention.ms', '600000' from topic where name = 't'",
+            (),
+        )
+        .await?;
+
+        for _ in 0..2 {
+            let batch = inflated::Batch::builder()
+                .base_timestamp(-1)
+                .max_timestamp(-1)
+                .record(Record::builder().value(Some(Bytes::from_static(b"a"))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        // Offset 0 was appended an hour ago, which is longer than the retention. A sweep that
+        // aged it by the sweep time, which is also its age now, would keep it.
+        execute_on(
+            db_file,
+            "update record set created_at = datetime('now', '-1 hour') where offset_id = 0",
+            (),
+        )
+        .await?;
+
+        engine.maintain(SystemTime::now()).await?;
+
+        let mut rows = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?
+            .query("select offset_id from record order by offset_id", ())
+            .await?;
+
+        let mut stored = vec![];
+        while let Some(row) = rows.next().await? {
+            stored.push(row.get::<i64>(0)?);
+        }
+
+        assert_eq!(vec![1], stored);
+
+        Ok(())
+    }
+
     async fn scratch_connection() -> Result<(tempfile::TempDir, managed::Object<ConnectionManager>)>
     {
         let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;

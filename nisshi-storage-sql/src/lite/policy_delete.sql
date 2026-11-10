@@ -54,6 +54,10 @@ ancient as (
     -- by created_at, the time that the broker appended it, in UTC seconds. Kafka applies the same
     -- rule to any negative timestamp, so this query does too.
     --
+    -- created_at follows k and v in the row, so reading it for a record with a negative timestamp
+    -- reads the whole row, including the overflow pages of a large value. A record with any other
+    -- timestamp does not read created_at.
+    --
     -- [LogSegment.largestTimestamp]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L855-L860
     where $2 - case
         when r.timestamp < 0 then cast(strftime('%s', r.created_at) as integer) * 1000
