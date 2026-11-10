@@ -88,6 +88,65 @@ fn elapsed_millis(start: SystemTime) -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+impl<G> SemaphoreProxy<G>
+where
+    G: Storage + Clone,
+{
+    /// Produces `deflated` to the storage while the proxy holds its permit. Both produce methods
+    /// call this, so that each produce takes the permit, records the wait and opens its span in
+    /// one place.
+    ///
+    /// A produce that has to wait for the permit drops `inflated` before it waits, so the one
+    /// decoded batch that the proxy holds is the batch of the produce that has the permit. The
+    /// storage then decodes the waiting produce's batch again.
+    #[instrument(name = "produce", skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
+
+        let (_permit, inflated) = match inflated {
+            Some(inflated) => match self.semaphore.try_acquire() {
+                Ok(permit) => {
+                    produce_path::direct(produce_path::Stage::Semaphore);
+                    (permit, Some(inflated))
+                }
+
+                Err(_) => {
+                    drop(inflated);
+                    produce_path::fallback(produce_path::Stage::Semaphore);
+                    (self.semaphore.acquire().await?, None)
+                }
+            },
+
+            None => (self.semaphore.acquire().await?, None),
+        };
+
+        SEMAPHORE_ACQUIRE_DURATION.record(
+            elapsed_millis(start),
+            &[StorageOperation::Produce.attribute()],
+        );
+
+        match inflated {
+            Some(inflated) => {
+                self.storage
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => {
+                self.storage
+                    .produce(transaction_id, topition, deflated)
+                    .await
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl<G> Storage for SemaphoreProxy<G>
 where
@@ -171,26 +230,16 @@ where
         self.storage.brokers().await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        let _permit = self.semaphore.acquire().await.inspect(|_| {
-            SEMAPHORE_ACQUIRE_DURATION.record(
-                elapsed_millis(start),
-                &[StorageOperation::Produce.attribute()],
-            )
-        })?;
-        self.storage
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -198,25 +247,7 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        // A produce that waits for the permit holds only its compressed bytes, so the one decoded
-        // batch that the proxy holds is the batch of the produce that has the permit. The produce
-        // then reaches the storage without the decoded batch, which decodes it again.
-        let start = SystemTime::now();
-        let Ok(_permit) = self.semaphore.try_acquire() else {
-            drop(inflated);
-            produce_path::fallback(produce_path::Stage::Semaphore);
-
-            return self.produce(transaction_id, topition, deflated).await;
-        };
-
-        produce_path::direct(produce_path::Stage::Semaphore);
-        SEMAPHORE_ACQUIRE_DURATION.record(
-            elapsed_millis(start),
-            &[StorageOperation::Produce.attribute()],
-        );
-
-        self.storage
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
     }
 

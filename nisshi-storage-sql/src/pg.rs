@@ -4295,6 +4295,54 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
     Ok((current, version))
 }
 
+impl Postgres {
+    /// Writes `deflated` to `topition` in one transaction, with `inflated` as its decoded records,
+    /// or with the records that this decodes from `deflated` when the caller passed none. Both
+    /// produce methods call this, so that each produce decodes and writes in one place.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<Batch>,
+    ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a pooled connection
+        // or the partition's watermark row lock.
+        let inflated = match inflated {
+            Some(inflated) => inflated,
+            None => inflate(deflated.clone())
+                .await
+                .inspect_err(|err| debug!(?err))?,
+        };
+
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
+
+        let mut c = self.connection().await?;
+
+        // This transaction is READ COMMITTED, regardless of the server's default isolation level.
+        // `produce_in_tx` checks an idempotent batch after it waits for the partition's watermark
+        // lock, and the check must see the batch that the lock's previous holder committed during
+        // the wait. Each statement of a READ COMMITTED transaction sees every commit made before
+        // the statement started. A REPEATABLE READ transaction sees only the commits made before
+        // its first statement, which ran before the wait.
+        let tx = c
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+
+        let high = self
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(high)
+    }
+}
+
 #[async_trait]
 impl Storage for Postgres {
     #[instrument(skip_all)]
@@ -4603,25 +4651,16 @@ impl Storage for Postgres {
         }
     }
 
-    #[instrument(skip_all)]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // The batch is inflated before the transaction starts, so the wait
-        // for a decode permit and the decode do not hold a pooled connection
-        // or the partition's watermark row lock.
-        let inflated = inflate(deflated.clone())
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
-        self.produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
-    #[instrument(skip_all)]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -4629,29 +4668,8 @@ impl Storage for Postgres {
         deflated: deflated::Batch,
         inflated: Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
-        let mut c = self.connection().await?;
-
-        // This transaction is READ COMMITTED, regardless of the server's default isolation level.
-        // `produce_in_tx` checks an idempotent batch after it waits for the partition's watermark
-        // lock, and the check must see the batch that the lock's previous holder committed during
-        // the wait. Each statement of a READ COMMITTED transaction sees every commit made before
-        // the statement started. A REPEATABLE READ transaction sees only the commits made before
-        // its first statement, which ran before the wait.
-        let tx = c
-            .build_transaction()
-            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-            .start()
-            .await?;
-
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
-            .await?;
-
-        tx.commit().await?;
-
-        Ok(high)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
+            .await
     }
 
     #[instrument(skip_all)]
