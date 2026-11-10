@@ -111,6 +111,13 @@ build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,sl
 # listed in .github/scripts/check-storage-deps.sh.
 check-storage-deps: (storage-deps "dynostore") (storage-deps "libsql") (storage-deps "postgres") (storage-deps "slatedb") (storage-deps "turso")
 
+# Fails if a workspace package's rust-version differs from the channel in
+# rust-toolchain.toml. ci.yml's rust-version job runs the same check.
+check-rust-version:
+    cargo metadata --no-deps --format-version 1 \
+      | jq -r '.packages[] | "\(.name) \(.rust_version // "")"' \
+      | bash .github/scripts/check-rust-version.sh rust-toolchain.toml
+
 [private]
 storage-deps feature:
     #!/usr/bin/env bash

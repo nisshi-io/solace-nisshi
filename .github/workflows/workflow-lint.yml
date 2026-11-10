@@ -70,6 +70,9 @@ jobs:
       # ci.yml runs check-storage-deps.sh only in the merge queue, on real
       # dependency trees that should pass, so its failure paths are tested here.
       - run: bash .github/scripts/check-storage-deps.test.sh
+      # ci.yml runs check-rust-version.sh only on the workspace's real
+      # manifests, which should pass, so its failure paths are tested here.
+      - run: bash .github/scripts/check-rust-version.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
@@ -77,7 +80,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: zizmor@1.30.1
       # GH_TOKEN enables zizmor's online audits (e.g. known-vulnerable-actions,

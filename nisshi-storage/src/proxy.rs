@@ -36,7 +36,7 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use opentelemetry::metrics::Histogram;
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::sync::Semaphore;
 use tracing::instrument;
 use url::Url;
 use uuid::Uuid;
@@ -46,8 +46,10 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version, produce_path,
-    service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
+    UpdateError, Version,
+    fetched::FetchedSender,
+    produce_path,
+    service::read_deadline::{QueueWait as _, ReadWait},
 };
 
 static SEMAPHORE_ACQUIRE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
@@ -84,6 +86,65 @@ fn elapsed_millis(start: SystemTime) -> u64 {
     start
         .elapsed()
         .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+impl<G> SemaphoreProxy<G>
+where
+    G: Storage + Clone,
+{
+    /// Produces `deflated` to the storage while the proxy holds its permit. Both produce methods
+    /// call this, so that each produce takes the permit, records the wait and opens its span in
+    /// one place.
+    ///
+    /// A produce that has to wait for the permit drops `inflated` before it waits, so the one
+    /// decoded batch that the proxy holds is the batch of the produce that has the permit. The
+    /// storage then decodes the waiting produce's batch again.
+    #[instrument(name = "produce", skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
+
+        let (_permit, inflated) = match inflated {
+            Some(inflated) => match self.semaphore.try_acquire() {
+                Ok(permit) => {
+                    produce_path::direct(produce_path::Stage::Semaphore);
+                    (permit, Some(inflated))
+                }
+
+                Err(_) => {
+                    drop(inflated);
+                    produce_path::fallback(produce_path::Stage::Semaphore);
+                    (self.semaphore.acquire().await?, None)
+                }
+            },
+
+            None => (self.semaphore.acquire().await?, None),
+        };
+
+        SEMAPHORE_ACQUIRE_DURATION.record(
+            elapsed_millis(start),
+            &[StorageOperation::Produce.attribute()],
+        );
+
+        match inflated {
+            Some(inflated) => {
+                self.storage
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => {
+                self.storage
+                    .produce(transaction_id, topition, deflated)
+                    .await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -169,26 +230,16 @@ where
         self.storage.brokers().await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        let _permit = self.semaphore.acquire().await.inspect(|_| {
-            SEMAPHORE_ACQUIRE_DURATION.record(
-                elapsed_millis(start),
-                &[StorageOperation::Produce.attribute()],
-            )
-        })?;
-        self.storage
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -196,25 +247,7 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        // A produce that waits for the permit holds only its compressed bytes, so the one decoded
-        // batch that the proxy holds is the batch of the produce that has the permit. The produce
-        // then reaches the storage without the decoded batch, which decodes it again.
-        let start = SystemTime::now();
-        let Ok(_permit) = self.semaphore.try_acquire() else {
-            drop(inflated);
-            produce_path::fallback(produce_path::Stage::Semaphore);
-
-            return self.produce(transaction_id, topition, deflated).await;
-        };
-
-        produce_path::direct(produce_path::Stage::Semaphore);
-        SEMAPHORE_ACQUIRE_DURATION.record(
-            elapsed_millis(start),
-            &[StorageOperation::Produce.attribute()],
-        );
-
-        self.storage
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
     }
 
@@ -225,30 +258,31 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         let start = SystemTime::now();
 
-        let Ok(permit) = ReadDeadline::new(StorageOperation::Fetch, deadline)
-            .timeout(
-                self.semaphore
-                    .acquire()
-                    .queued_for(ReadWait::ExclusiveEngineAccess),
-            )
+        let _permit = self
+            .semaphore
+            .acquire()
+            .queued_for(ReadWait::ExclusiveEngineAccess)
             .await
-        else {
-            return Ok(vec![]);
-        };
-
-        let _permit = permit.inspect(|_| {
-            SEMAPHORE_ACQUIRE_DURATION.record(
-                elapsed_millis(start),
-                &[StorageOperation::Fetch.attribute()],
-            )
-        })?;
+            .inspect(|_| {
+                SEMAPHORE_ACQUIRE_DURATION.record(
+                    elapsed_millis(start),
+                    &[StorageOperation::Fetch.attribute()],
+                )
+            })?;
 
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -657,13 +691,15 @@ mod tests {
     use nisshi_sans_io::{IsolationLevel, record::deflated};
     use tokio::{
         task::yield_now,
-        time::{Duration, Instant, advance},
+        time::{Duration, Instant, sleep},
     };
 
     use super::SemaphoreProxy;
     use crate::{
         Result, Storage, Topition,
         decoded_batch_probe::probe,
+        fetched::FetchUntilDeadline as _,
+        read_deadline::{ReadWait, TimedOut},
         service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };
 
@@ -780,19 +816,22 @@ mod tests {
         Ok(())
     }
 
-    /// A read that waits for the permit gives storage the same deadline that it was given, so the
-    /// time spent waiting counts against that deadline.
+    /// The time that a read waits for the permit counts against its deadline: a read that gets
+    /// the permit after 200ms, and then never gets an answer, stops at its 500ms deadline, as a
+    /// read that reached storage.
     #[tokio::test(start_paused = true)]
-    async fn fetch_keeps_its_deadline_after_waiting_for_the_permit() -> Result<()> {
+    async fn fetch_spends_its_deadline_while_it_waits_for_the_permit() -> Result<()> {
         let (tx, mut rx) = bounded_channel(1);
         let proxy = SemaphoreProxy::new(RequestChannelService::new(tx));
 
         let permit = proxy.semaphore.clone().acquire_owned().await?;
-        let tp = Topition::new("abc", 0);
-        let deadline = Instant::now() + Duration::from_millis(500);
 
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(500);
+
+        let tp = Topition::new("abc", 0);
         let (offset, min_bytes, max_bytes) = (0, 1, 1024);
-        let read = proxy.fetch(
+        let read = proxy.fetch_until_deadline(
             &tp,
             offset,
             min_bytes,
@@ -802,32 +841,27 @@ mod tests {
         );
 
         let release = async {
-            advance(Duration::from_millis(200)).await;
+            sleep(Duration::from_millis(200)).await;
             drop(permit);
         };
 
-        let answer = async {
+        // Storage starts the read and keeps it, but never sends anything or answers.
+        let held = async {
             let ChannelRequest {
                 request,
-                response: reply,
-                ..
+                response,
+                started,
             } = rx.recv().await.expect("a fetch request");
 
-            let Request::Fetch { deadline, .. } = request else {
-                panic!("{request:?}");
-            };
+            started.send(()).expect("the reader");
 
-            reply
-                .send(Ok(Response::Fetch(Ok(vec![]))))
-                .expect("the reader");
-
-            deadline
+            (request, response)
         };
 
-        let (fetched, (), received) = tokio::join!(read, release, answer);
+        let (read, (), _held) = tokio::join!(read, release, held);
 
-        assert!(fetched?.is_empty());
-        assert_eq!(deadline, received);
+        assert_eq!(Some(TimedOut::Reading), read?.timed_out);
+        assert_eq!(Duration::from_millis(500), started_at.elapsed());
 
         Ok(())
     }
@@ -844,8 +878,8 @@ mod tests {
         let deadline = started_at + Duration::from_millis(500);
 
         let (offset, min_bytes, max_bytes) = (0, 1, 1024);
-        let fetched = proxy
-            .fetch(
+        let read = proxy
+            .fetch_until_deadline(
                 &Topition::new("abc", 0),
                 offset,
                 min_bytes,
@@ -855,7 +889,10 @@ mod tests {
             )
             .await?;
 
-        assert!(fetched.is_empty());
+        assert_eq!(
+            Some(TimedOut::Queued(ReadWait::ExclusiveEngineAccess)),
+            read.timed_out
+        );
         assert_eq!(Duration::from_millis(500), started_at.elapsed());
         assert!(rx.try_recv().is_err(), "the read reached storage");
 

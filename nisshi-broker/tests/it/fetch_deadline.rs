@@ -15,6 +15,7 @@
 //! The deadline contract of [`Storage::fetch`] that the fetch service relies on, on each storage
 //! engine.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -78,7 +79,7 @@ where
     let started_at = Instant::now();
 
     let batches = storage
-        .fetch(
+        .fetch_until_deadline(
             topition,
             0,
             0,
@@ -86,7 +87,8 @@ where
             IsolationLevel::ReadUncommitted,
             deadline,
         )
-        .await?;
+        .await
+        .map(|read| read.batches)?;
 
     Ok((batches, started_at.elapsed()))
 }

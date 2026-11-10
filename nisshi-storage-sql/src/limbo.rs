@@ -39,7 +39,7 @@ use bytes::Bytes;
 use chrono::NaiveDateTime;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
+    ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -67,12 +67,12 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
-    DeleteRecordsConcurrency, Error, GroupDetail, ListOffsetRequest, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch,
-    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate, max_message_bytes, producer_claim, read_deadline::ReadDeadline,
+    DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
+    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1444,6 +1444,42 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
     Ok((current, version))
 }
 
+impl Engine {
+    /// Writes `deflated` to `topition` in one transaction, with `inflated` as its decoded records,
+    /// or with the records that this decodes from `deflated` when the caller passed none. Both
+    /// produce methods call this, so that each produce decodes and writes in one place.
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = match inflated {
+            Some(inflated) => inflated,
+            None => inflate(deflated.clone())
+                .await
+                .inspect_err(|err| debug!(?err))?,
+        };
+
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
+
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let high = self
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
+            .await?;
+
+        tx.commit().await.map_err(Into::into).and(Ok(high))
+    }
+}
+
 #[async_trait]
 impl Storage for Engine {
     /// A Turso connection has no busy handler, so a write that finds another
@@ -1785,14 +1821,7 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // The batch is inflated before the transaction starts, so the wait
-        // for a decode permit and the decode do not hold a connection or the
-        // database write lock.
-        let inflated = inflate(deflated.clone())
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
-        self.produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
@@ -1803,18 +1832,8 @@ impl Storage for Engine {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
-            .await?;
-
-        tx.commit().await.map_err(Into::into).and(Ok(high))
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
+            .await
     }
 
     async fn fetch(
@@ -1824,23 +1843,17 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: tokio::time::Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
-        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+        let offset_stage = self.offset_stage(topition).await?;
 
-        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
-            return Ok(vec![]);
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            offset_stage.last_stable
+        } else {
+            offset_stage.high_watermark
         };
-
-        let high_watermark = offset_stage.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
 
         debug!(
             cluster = self.cluster,
@@ -1852,14 +1865,10 @@ impl Storage for Engine {
             max_bytes
         );
 
-        let Ok(c) = read_deadline.timeout(self.connection()).await else {
-            return Ok(vec![]);
-        };
+        let c = self.connection().await?;
 
-        let c = c?;
-
-        let records = async {
-            c.query(
+        let mut records = c
+            .query(
                 &sql_lookup("record_fetch.sql")?,
                 (
                     self.cluster.as_str(),
@@ -1873,26 +1882,12 @@ impl Storage for Engine {
             )
             .await
             .inspect_err(|err| error!(?err))
-            .map_err(Error::from)
-        };
+            .map_err(Error::from)?;
 
-        let Ok(records) = read_deadline.timeout(records).await else {
-            return Ok(vec![]);
-        };
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
-        let mut records = records?;
-
-        let mut batches = vec![];
-
-        let Ok(first) = read_deadline.timeout(records.next()).await else {
-            return Ok(vec![]);
-        };
-
-        if let Some(row) = first? {
-            let offset_delta = 0;
-            let timestamp_delta = 0;
-
-            let base_offset = row
+        while let Some(row) = records.next().await? {
+            let offset = row
                 .get_value(0)
                 .map_err(Into::into)
                 .and_then(|value| {
@@ -1901,105 +1896,25 @@ impl Storage for Engine {
                         .copied()
                         .ok_or(Error::UnexpectedValue(value))
                 })
-                .inspect(|base_offset| debug!(base_offset))
+                .inspect(|offset| debug!(offset))
                 .inspect_err(|err| error!(?err))?;
 
-            let Ok(headers) = read_deadline
-                .timeout(self.record_headers(&c, topition, base_offset))
-                .await
-            else {
-                return Ok(vec![]);
-            };
+            let headers = self
+                .record_headers(&c, topition, offset)
+                .await?
+                .into_iter()
+                .map(Into::into)
+                .collect();
 
-            let record_builder = headers?.into_iter().fold(
-                Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(
-                        row.get_value(3)
-                            .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    )
-                    .value(
-                        row.get_value(4)
-                            .map(|o| o.as_blob().map(|blob| Bytes::copy_from_slice(blob)))
-                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    ),
-                |record_builder, header| record_builder.header(header.into()),
-            );
-
-            let mut batch_builder = inflated::Batch::builder()
-                .base_offset(base_offset)
-                .attributes(
-                    row.get_value(1)
-                        .map(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .map(|attributes| attributes as i32)
-                        })
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))? as i16,
-                )
-                .base_timestamp(
-                    row.get_value(2)
-                        .map_err(Error::from)
-                        .and_then(LiteTimestamp::millis)
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    row.get_value(6)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(i16::try_from(
-                    row.get_value(7)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?)
-                .record(record_builder)
-                .last_offset_delta(offset_delta);
-
-            loop {
-                // Turso returns from a step that waits for I/O, so the timer of `read_deadline`
-                // can stop the read between I/O steps. The read keeps each record that it
-                // finished.
-                let Ok(next) = read_deadline.timeout(records.next()).await else {
-                    break;
-                };
-
-                let Some(row) = next? else {
-                    break;
-                };
-
-                let offset = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                // The read takes the record's headers before it starts a new batch for the record,
-                // so that each batch it starts holds at least one record.
-                let Ok(headers) = read_deadline
-                    .timeout(self.record_headers(&c, topition, offset))
-                    .await
-                else {
-                    break;
-                };
-
-                let headers = headers?;
-
-                let attributes = row
+            data.send_record(FetchedRecord {
+                offset,
+                timestamp: row
+                    .get_value(2)
+                    .map_err(Error::from)
+                    .and_then(LiteTimestamp::millis)
+                    .inspect(|timestamp| debug!(?timestamp))
+                    .inspect_err(|err| error!(?err))?,
+                attributes: row
                     .get_value(1)
                     .map(|value| {
                         value
@@ -2008,109 +1923,36 @@ impl Storage for Engine {
                             .map(|attributes| attributes as i16)
                     })
                     .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_id = row
+                    .inspect_err(|err| error!(?err))?,
+                producer_id: row
                     .get_value(6)
                     .map(|value| value.as_integer().copied())
                     .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-
-                let producer_epoch = i16::try_from(
+                    .inspect_err(|err| error!(?err))?,
+                producer_epoch: i16::try_from(
                     row.get_value(7)
                         .map(|value| value.as_integer().copied())
                         .map(|producer_epoch| producer_epoch.unwrap_or(-1))
                         .inspect_err(|err| error!(?err))?,
-                )?;
-
-                let timestamp = row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::millis)
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
-                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
-                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
-                // produce request, so one batch cannot hold two such times.
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
-                        && timestamp != batch_builder.base_timestamp)
-                {
-                    batches.push(
-                        batch_builder
-                            .max_timestamp_of_records()
-                            .build()
-                            .and_then(TryInto::try_into)?,
-                    );
-
-                    batch_builder = inflated::Batch::builder()
-                        .base_offset(
-                            row.get_value(0)
-                                .map_err(Into::into)
-                                .and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .copied()
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(timestamp)
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = timestamp - batch_builder.base_timestamp;
-
-                let record_builder = headers.into_iter().fold(
-                    Record::builder()
-                        .offset_delta(offset_delta)
-                        .timestamp_delta(timestamp_delta)
-                        .key(
-                            row.get_value(3)
-                                .map(|value| value.as_blob().cloned())
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .value(
-                            row.get_value(4)
-                                .map(|value| value.as_blob().cloned())
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        ),
-                    |record_builder, header| record_builder.header(header.into()),
-                );
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
-            }
-
-            batches.push(
-                batch_builder
-                    .max_timestamp_of_records()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
-        } else {
-            batches.push(
-                inflated::Batch::builder()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
+                )?,
+                key: row
+                    .get_value(3)
+                    .map(|value| value.as_blob().cloned())
+                    .map(|o| o.map(Bytes::from))
+                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?,
+                value: row
+                    .get_value(4)
+                    .map(|value| value.as_blob().cloned())
+                    .map(|o| o.map(Bytes::from))
+                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
+                    .inspect_err(|err| error!(?err))?,
+                headers,
+            })
+            .await?;
         }
 
-        Ok(batches)
+        Ok(())
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

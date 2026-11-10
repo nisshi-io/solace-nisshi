@@ -1091,6 +1091,7 @@ mod cleanup_policy {
     };
 
     use super::*;
+    use nisshi_storage::fetched::FetchUntilDeadline as _;
 
     async fn topic_with_policy(engine: &Engine, name: &str, configs: &[(&str, &str)]) -> Topition {
         let topic = CreatableTopic::default()
@@ -1129,7 +1130,7 @@ mod cleanup_policy {
 
     async fn fetch_all(engine: &Engine, topition: &Topition) -> Vec<Batch> {
         engine
-            .fetch(
+            .fetch_until_deadline(
                 topition,
                 0,
                 1,
@@ -1138,6 +1139,7 @@ mod cleanup_policy {
                 Instant::now() + Duration::from_secs(5),
             )
             .await
+            .map(|read| read.batches)
             .unwrap()
     }
 

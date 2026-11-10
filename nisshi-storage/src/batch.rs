@@ -45,7 +45,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use tracing::{debug, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -55,7 +55,7 @@ use crate::{
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version, inflate_produced, offload, produce_path,
+    Version, fetched::FetchedSender, inflate_produced, offload, produce_path,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -434,7 +434,7 @@ where
     /// Sets a decoded-size limit below [`MAX_DECODED_BATCH_BYTES`], so that a test can fill a run
     /// with small batches.
     #[cfg(test)]
-    fn with_decoded_limit(self, decoded_limit: usize) -> Self {
+    pub(crate) fn with_decoded_limit(self, decoded_limit: usize) -> Self {
         Self {
             decoded_limit,
             ..self
@@ -689,22 +689,75 @@ impl<G> ProduceRequestBatcher<G>
 where
     G: Storage + Clone,
 {
-    /// Queues `deflated` until a flush writes it, and waits for the flush. `decoded` is the batch
-    /// that the caller decoded, held with the request.
+    /// Returns `inflated` with its share of the decoded limit, for the queue to hold with the
+    /// request, or `None` when the queue holds the request as bytes only.
+    ///
+    /// A batch that would take the queues over the decoded limit is dropped, and the flush
+    /// decodes its bytes.
+    fn decoded_to_hold(
+        &self,
+        deflated: &deflated::Batch,
+        inflated: inflated::Batch,
+    ) -> Option<Decoded> {
+        // An idempotent producer's queue is written as sent, so nothing but the inner storage
+        // reads the held batch. Drop it now when that storage drops it too.
+        if deflated.is_idempotent() && !self.hold_decoded {
+            return None;
+        }
+
+        let decoded = BatchAttribute::try_from(deflated.attributes)
+            .and_then(|attributes| inflated.decoded_size(&attributes.compression))
+            .ok()
+            .and_then(|size| Reservation::take(&self.decoded_held, size, self.decoded_limit))
+            .map(|reservation| {
+                produce_path::direct(produce_path::Stage::Batcher);
+
+                Decoded {
+                    batch: inflated,
+                    _reservation: reservation,
+                }
+            });
+
+        if decoded.is_none() {
+            produce_path::fallback(produce_path::Stage::Batcher);
+        }
+
+        decoded
+    }
+
+    /// Queues `deflated` until a flush writes it, and waits for the flush. Both produce methods
+    /// call this, so that each produce opens its span in one place. `inflated` is the batch that
+    /// the caller decoded, if any.
+    ///
+    /// Without a `maximum_delay` the batcher queues nothing, so `inflated` goes straight to the
+    /// storage. With one, the request holds `inflated` in its queue while the decoded batches
+    /// that the queues hold stay within the decoded limit, so that the flush does not decode the
+    /// bytes again.
     #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce_with(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
-        decoded: Option<Decoded>,
+        inflated: Option<inflated::Batch>,
     ) -> Result<i64> {
         let Some(maximum_delay) = self.maximum_delay else {
-            return self
-                .storage
-                .produce(transaction_id, topition, deflated)
-                .await;
+            return match inflated {
+                Some(inflated) => {
+                    self.storage
+                        .produce_inflated(transaction_id, topition, deflated, inflated)
+                        .await
+                }
+
+                None => {
+                    self.storage
+                        .produce(transaction_id, topition, deflated)
+                        .await
+                }
+            };
         };
+
+        let decoded = inflated.and_then(|inflated| self.decoded_to_hold(&deflated, inflated));
 
         let start = SystemTime::now();
 
@@ -849,12 +902,6 @@ where
         self.storage.brokers().await
     }
 
-    /// Without a `maximum_delay` the batcher queues nothing, so the decoded batch goes straight
-    /// to the storage. With one, the batch joins a queue until a flush, and the queue holds the
-    /// decoded batch with it, so that the flush does not decode the bytes again, as long as the
-    /// decoded batches that the queues hold stay within the decoded limit. A batch that would
-    /// take the queues over the limit is dropped, and the flush decodes its bytes, as it did before
-    /// this method kept the decoded batch.
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -862,41 +909,7 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        if self.maximum_delay.is_none() {
-            return self
-                .storage
-                .produce_inflated(transaction_id, topition, deflated, inflated)
-                .await;
-        }
-
-        // An idempotent producer's queue is written as sent, so nothing but the inner storage
-        // reads the held batch. Drop it now when that storage drops it too.
-        if deflated.is_idempotent() && !self.hold_decoded {
-            drop(inflated);
-
-            return self
-                .produce_with(transaction_id, topition, deflated, None)
-                .await;
-        }
-
-        let decoded = BatchAttribute::try_from(deflated.attributes)
-            .and_then(|attributes| inflated.decoded_size(&attributes.compression))
-            .ok()
-            .and_then(|size| Reservation::take(&self.decoded_held, size, self.decoded_limit))
-            .map(|reservation| {
-                produce_path::direct(produce_path::Stage::Batcher);
-
-                Decoded {
-                    batch: inflated,
-                    _reservation: reservation,
-                }
-            });
-
-        if decoded.is_none() {
-            produce_path::fallback(produce_path::Stage::Batcher);
-        }
-
-        self.produce_with(transaction_id, topition, deflated, decoded)
+        self.produce_with(transaction_id, topition, deflated, Some(inflated))
             .await
     }
 
@@ -917,10 +930,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -1530,8 +1550,8 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            _deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            _fetched: FetchedSender,
+        ) -> Result<()> {
             unimplemented!()
         }
 

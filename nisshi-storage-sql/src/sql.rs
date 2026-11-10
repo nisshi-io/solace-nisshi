@@ -15,6 +15,7 @@
 pub(crate) mod consumer_group_select;
 pub(crate) mod consumer_offset_select;
 pub(crate) mod consumer_offset_select_by_group;
+pub(crate) mod pg_record_fetch;
 pub(crate) mod producer_epochs_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
@@ -135,10 +136,6 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/header_delete_by_topic.sql"),
         ),
         ("header_fetch.sql", include_sql!("sql/header_fetch.sql")),
-        (
-            "header_fetch_range.sql",
-            include_sql!("sql/header_fetch_range.sql"),
-        ),
         ("header_insert.sql", include_sql!("sql/header_insert.sql")),
         (
             "list_earliest_offset.sql",
@@ -192,10 +189,6 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         (
             "nisshi_schema_version_insert.sql",
             include_sql!("sql/nisshi_schema_version_insert.sql"),
-        ),
-        (
-            "nisshi_schema_version_update.sql",
-            include_sql!("sql/nisshi_schema_version_update.sql"),
         ),
         (
             "nisshi_schema_version_select.sql",
@@ -278,9 +271,9 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             "record_fetch_keyed.sql",
             include_sql!("sql/record_fetch_keyed.sql"),
         ),
-        ("record_fetch_pg.sql", include_sql!("pg/record_fetch.sql")),
+        (pg_record_fetch::QUERY, include_sql!("pg/record_fetch.sql")),
         (
-            "record_fetch_pg_keyed.sql",
+            pg_record_fetch::KEYED_QUERY,
             include_sql!("pg/record_fetch_keyed.sql"),
         ),
         ("record_insert.sql", include_sql!("sql/record_insert.sql")),

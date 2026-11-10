@@ -20,6 +20,7 @@
 //! These tests use only the `Storage` trait and the raw bucket, so they
 //! compile against the code before the fix and fail there at runtime.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
@@ -86,7 +87,7 @@ async fn keys(bucket: &InMemory) -> Result<Vec<String>, Error> {
 
 async fn fetch_base_offsets(storage: &DynoStore, topition: &Topition) -> Result<Vec<i64>, Error> {
     Ok(storage
-        .fetch(
+        .fetch_until_deadline(
             topition,
             0,
             1,
@@ -94,7 +95,8 @@ async fn fetch_base_offsets(storage: &DynoStore, topition: &Topition) -> Result<
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_secs(5),
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
         .iter()
         .map(|batch| batch.base_offset)
         .collect())

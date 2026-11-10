@@ -9,6 +9,7 @@ is at [docs.nisshi.io](https://docs.nisshi.io/).
 - [Commands](commands.md) — the `broker`, `topic`, `cat` and `proxy` commands
 - [Topic configuration](topic-configuration.md) — the topic settings Nisshi supports
 - [Schema registry](schema-registry.md) — validating topics with Avro, JSON Schema or Protocol Buffers
+- [Data lake](data-lake.md) — where the broker writes Iceberg, Delta Lake and Parquet output, and how to remove data from it
 - [Securing a broker](security.md) — TLS, outbound TLS, and SASL SCRAM authentication
 - [Metrics](metrics.md) — exporting metrics over OTLP
 - [Compatibility and feature status](compatibility.md) — the Kafka APIs, storage engine features and Kafka clients that are supported

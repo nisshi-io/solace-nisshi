@@ -121,7 +121,9 @@ if one is configured, to the storage engine when it builds it. On produce, the e
 each record against the topic's schema and rejects one that doesn't match. With a lake writer
 (`broker parquet`, `broker iceberg` or `broker delta`, behind the `parquet`, `iceberg` and `delta`
 features), it also writes each record to the topic's table. [Schema registry](docs/schema-registry.md)
-describes the schema files.
+describes the schema files. The lake writer only adds records: DeleteRecords, retention and
+compaction change the topic and leave its table as it is, as [Data lake](docs/data-lake.md)
+describes.
 
 ## Tests
 

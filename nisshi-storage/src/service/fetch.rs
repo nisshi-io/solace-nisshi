@@ -28,9 +28,10 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
+    fetched::FetchUntilDeadline as _,
     service::{
-        read_deadline::{Missed, ReadDeadline, ReadWait},
-        read_share::{FetchReadShare, warn_miss_at_client_share},
+        read_deadline::{ReadDeadline, ReadWait, TimedOut},
+        read_share::{FetchReadShare, warn_timeout_at_client_share},
     },
 };
 use validation::ValidatedFetchRequest;
@@ -97,18 +98,18 @@ const FETCH_DEADLINE_OVERHEAD: Duration = Duration::from_secs(5);
 /// A read that was never started logs at debug: once a slow backend has
 /// spent the read deadline, every partition after it is not started, and a
 /// warning for each of them would blame partitions that were never read.
-fn missed(
+fn log_timed_out(
     tp: &Topition,
     operation: StorageOperation,
     offset: i64,
-    missed: Missed,
+    timed_out: TimedOut,
     started_at: Instant,
 ) {
-    let stage = missed.stage();
-    let wait = missed.wait();
+    let stage = timed_out.stage();
+    let wait = timed_out.wait();
 
-    match missed {
-        Missed::NotStarted => {
+    match timed_out {
+        TimedOut::NotStarted => {
             debug!(
                 ?tp,
                 %operation,
@@ -118,13 +119,11 @@ fn missed(
                 "fetch read not started"
             )
         }
-        // The log names the client, see `warn_miss_at_client_share`. A storage engine logs it
-        // itself when its read misses the deadline during the wait for the share, so this arm
-        // covers the reads that the service makes, such as the offset stage.
-        Missed::Queued(ReadWait::ClientReadLimit) => {
-            warn_miss_at_client_share(tp, operation, offset, started_at)
+        // The log names the client, see `warn_timeout_at_client_share`.
+        TimedOut::Queued(ReadWait::ClientReadLimit) => {
+            warn_timeout_at_client_share(tp, operation, offset, started_at)
         }
-        Missed::Queued(_) | Missed::Reading => {
+        TimedOut::Queued(_) | TimedOut::Reading => {
             warn!(
                 ?tp,
                 %operation,
@@ -145,9 +144,7 @@ fn missed(
 /// so one partition that never answers delays the rest of the request by
 /// that half, rather than holding it until the client gives up. The half is
 /// taken of the time left now, so a partition that answers quickly leaves
-/// its unused share to those after it. A partition whose offset stage is
-/// read again after its records takes a fresh half for that read, so it
-/// can spend up to three quarters of the time left in all.
+/// its unused share to those after it.
 fn next_partition_deadline(fetch_deadline: Instant, left: usize) -> Instant {
     if left <= 1 {
         fetch_deadline
@@ -272,10 +269,14 @@ where
     /// limits only how long a Fetch waits for new records ([ReplicaManager.scala#L1523-L1563]). A
     /// read that reaches the partition deadline answers with what it finished.
     ///
+    /// A read that fails after the partition has records sets `read_failed`, and the partition
+    /// answers with those records. A read that fails before the partition has records answers the
+    /// partition with an error code, and the other partitions of the Fetch are still answered.
+    ///
     /// [ReplicaManager.scala#L1523-L1563]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1523-L1563
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, min_bytes, isolation, fetch_partition),
+        skip(self, min_bytes, isolation, fetch_partition, read_failed),
         fields(partition = fetch_partition.partition)
     )]
     async fn fetch_partition(
@@ -287,6 +288,7 @@ where
         isolation: IsolationLevel,
         topic: &str,
         fetch_partition: &FetchPartition,
+        read_failed: &mut bool,
     ) -> Result<PartitionData>
     where
         G: Storage,
@@ -305,15 +307,22 @@ where
         // isolation level, as in Kafka.
         let offset_stage =
             match ReadDeadline::new(StorageOperation::OffsetStage, partition_deadline)
-                .timeout(self.storage.offset_stage(&tp))
+                .run_until_deadline(self.storage.offset_stage(&tp))
                 .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
                     return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
                 }
-                Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
+                Ok(Ok(offset_stage)) => offset_stage,
+                Ok(Err(error)) => {
+                    error!(?tp, ?error, "offset stage read failed");
+                    return Ok(Self::unknown_offsets(
+                        partition_index,
+                        error.error_code(ErrorCode::KafkaStorageError),
+                    ));
+                }
                 Err(reason) => {
-                    missed(
+                    log_timed_out(
                         &tp,
                         StorageOperation::OffsetStage,
                         fetch_offset,
@@ -357,9 +366,9 @@ where
         // [LocalLog.scala#L368-L371]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/LocalLog.scala#L368-L371
         let ahead_of_cached_high_watermark = fetch_offset > offset_stage.high_watermark();
 
-        let offset_stage = if ahead_of_cached_high_watermark {
+        let mut offset_stage = if ahead_of_cached_high_watermark {
             match ReadDeadline::new(StorageOperation::CurrentOffsetStage, partition_deadline)
-                .timeout(self.storage.current_offset_stage(&tp))
+                .run_until_deadline(self.storage.current_offset_stage(&tp))
                 .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
@@ -370,7 +379,7 @@ where
                 }
                 Ok(current) => current.inspect_err(|error| error!(?error, ?tp))?,
                 Err(reason) => {
-                    missed(
+                    log_timed_out(
                         &tp,
                         StorageOperation::CurrentOffsetStage,
                         fetch_offset,
@@ -414,8 +423,6 @@ where
 
         let mut offset = fetch_offset;
 
-        let mut stalled = false;
-
         loop {
             if *max_bytes == 0 {
                 break;
@@ -423,30 +430,86 @@ where
 
             debug!(offset);
 
-            let read = self.storage.fetch(
-                &tp,
-                offset,
-                min_bytes,
-                *max_bytes,
-                isolation,
-                partition_deadline,
-            );
-
-            let fetched = ReadDeadline::new(StorageOperation::Fetch, partition_deadline)
-                .start(read)
+            let read = self
+                .storage
+                .fetch_until_deadline_or_failure(
+                    &tp,
+                    offset,
+                    min_bytes,
+                    *max_bytes,
+                    isolation,
+                    partition_deadline,
+                )
                 .await;
 
-            if fetched.is_ok() && Instant::now() >= partition_deadline {
+            let read = match read {
+                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
+                }
+                // An earlier read of this partition returned records, so the partition answers
+                // with them instead of with the read's error code. The consumer's next Fetch then
+                // starts after them.
+                Err(error) if !batches.is_empty() => {
+                    error!(?tp, offset, ?error, "fetch read failed after earlier reads");
+                    *read_failed = true;
+                    break;
+                }
+                // Kafka answers a failed read in the partition's error code, and still answers
+                // the other partitions of the Fetch ([`ReplicaManager.readFromLog`]).
+                //
+                // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+                Err(error) => {
+                    error!(?tp, offset, ?error, "fetch read failed");
+                    return Ok(Self::unknown_offsets(
+                        partition_index,
+                        error.error_code(ErrorCode::KafkaStorageError),
+                    ));
+                }
+                Ok(read) => read,
+            };
+
+            if let Some(error) = &read.failed {
+                *read_failed = true;
+
+                // The read failed after its last record, so the next Fetch starts there.
+                let failed_at = read
+                    .batches
+                    .iter()
+                    .map(|batch| batch.max_offset() + 1)
+                    .max()
+                    .unwrap_or(offset);
+                let records: u32 = read.batches.iter().map(|batch| batch.record_count).sum();
+
+                error!(
+                    ?tp,
+                    offset,
+                    failed_at,
+                    records,
+                    ?error,
+                    "fetch read failed after it sent records"
+                );
+            }
+
+            // The reported offsets must bound every record in `batches`. Offsets only grow, so
+            // the maximum of each offset bounds the records of every read. The loop does not
+            // replace the stage with the read's, because a read can send an older stage than the
+            // one that the service read before the loop.
+            if let Some(read_offset_stage) = read.offsets {
+                offset_stage = OffsetStage {
+                    last_stable: offset_stage.last_stable.max(read_offset_stage.last_stable),
+                    high_watermark: offset_stage
+                        .high_watermark
+                        .max(read_offset_stage.high_watermark),
+                    log_start: offset_stage.log_start.max(read_offset_stage.log_start),
+                };
+            }
+
+            if let Some(reason) = read.timed_out {
                 // A partition whose reads returned nothing by its deadline makes no progress for
                 // its consumer, so it warns. A read cut short with batches still moves the
                 // consumer on, so it logs at debug.
-                if batches.is_empty() && matches!(&fetched, Ok(Ok(read)) if read.is_empty()) {
-                    warn!(
-                        ?tp,
-                        offset,
-                        elapsed = ?started_at.elapsed(),
-                        "fetch read stopped at its deadline with no records"
-                    );
+                if batches.is_empty() && read.batches.is_empty() {
+                    log_timed_out(&tp, StorageOperation::Fetch, offset, reason, started_at);
                 } else {
                     debug!(
                         ?tp,
@@ -455,32 +518,16 @@ where
                         "fetch read stopped at its deadline"
                     );
                 }
-
-                stalled = true;
             }
 
-            let fetched = match fetched {
-                Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
-                }
-                Ok(fetched) => fetched,
-                Err(reason) => {
-                    missed(&tp, StorageOperation::Fetch, offset, reason, started_at);
-                    stalled = true;
-                    break;
-                }
-            };
+            let mut fetched = read.batches;
 
-            let mut fetched = fetched
-                .inspect(|r| debug!(?tp, ?offset, ?r))
-                .inspect_err(|error| error!(?tp, ?error))?;
+            debug!(?tp, ?offset, ?fetched);
 
             *max_bytes =
                 u32::try_from(fetched.byte_size()).map(|bytes| max_bytes.saturating_sub(bytes))?;
 
-            debug!(?offset, ?fetched, max_bytes);
-
-            if fetched.is_empty() || fetched.first().is_some_and(|batch| batch.record_count == 0) {
+            if fetched.is_empty() {
                 break;
             }
 
@@ -498,80 +545,35 @@ where
             batches.append(&mut fetched);
 
             // The loop ends at the partition deadline instead of starting another read, because a
-            // read started after the deadline returns no batches and counts as a missed read.
-            if Instant::now() >= partition_deadline {
+            // read started after the deadline returns no batches and counts as timed out.
+            if read.timed_out.is_some() || Instant::now() >= partition_deadline {
+                break;
+            }
+
+            // The loop ends after a failed read instead of starting another, so that it does not
+            // send more reads to storage that is failing.
+            if read.failed.is_some() {
                 break;
             }
         }
 
-        // While there are no records, or they end at or below the stage read
-        // before the fetch (a consumer catching up), that stage answers
-        // the client: its offsets only grow, and the next fetch reads them
-        // again. The bound is the one the engine reads to: the last stable
-        // offset under ReadCommitted, which a transaction completing during
-        // the fetch can move, and the high watermark otherwise. Records past
-        // it were written or committed since, so the stage is read again,
-        // so that the answer covers them.
-        let covered_to = match isolation {
-            IsolationLevel::ReadCommitted => offset_stage.last_stable(),
-            IsolationLevel::ReadUncommitted => offset_stage.high_watermark(),
-        };
-
-        let offset_stage = if batches.is_empty() || offset <= covered_to {
-            offset_stage
-        } else if stalled {
-            // A read that stalled, or that reached its partition deadline, is not followed by
-            // another read of the same partition.
-            Self::covering(offset_stage, offset, isolation)
-        } else {
-            // The read of the records finished before its partition deadline, so it did not
-            // stall, and this read of the offset stage gets a fresh partition deadline.
-            match ReadDeadline::new(
-                StorageOperation::OffsetStage,
-                next_partition_deadline(fetch_deadline, left),
-            )
-            .timeout(self.storage.offset_stage(&tp))
-            .await
-            {
-                Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
-                }
-                Ok(offset_stage) => offset_stage.inspect_err(|error| error!(?error, ?tp))?,
-                Err(reason) => {
-                    missed(
-                        &tp,
-                        StorageOperation::OffsetStage,
-                        offset,
-                        reason,
-                        started_at,
-                    );
-                    Self::covering(offset_stage, offset, isolation)
-                }
-            }
-        };
+        // Each engine bounds the records that it sends by the offset stage that it sent first, so
+        // the stage already covers `offset`, the offset after the last record. The assertion makes
+        // an engine that breaks that contract fail its tests. In a release build, the service
+        // raises the high watermark, so a client never receives one below its records. It leaves
+        // the last stable offset alone, because raising it would tell a `ReadCommitted` client
+        // that records of an open transaction are committed.
+        if !batches.is_empty() {
+            debug_assert!(
+                offset_stage.covers(offset, isolation),
+                "{tp:?}: a read sent records up to {offset} past the offsets that it sent: \
+                 {offset_stage:?}"
+            );
+            offset_stage = offset_stage.with_high_watermark_at_least(offset);
+        }
 
         Ok(Self::partition_data(partition_index, offset_stage, batches))
             .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
-    }
-
-    /// `offset_stage`, read before the records, raised to cover records
-    /// that reach past it when the stage could not be read again in time.
-    ///
-    /// The high watermark is at least `next`, the offset after the last
-    /// record returned. Under `ReadCommitted` the engine returns only
-    /// committed records, so the last stable offset is at least `next` too.
-    /// Unlike Kafka, which answers a remote read that runs out of time with
-    /// the offsets it already holds, nisshi holds only the stage it read
-    /// before the records, so the answer can lag a write made since.
-    fn covering(offset_stage: OffsetStage, next: i64, isolation: IsolationLevel) -> OffsetStage {
-        OffsetStage {
-            high_watermark: offset_stage.high_watermark.max(next),
-            last_stable: match isolation {
-                IsolationLevel::ReadCommitted => offset_stage.last_stable.max(next),
-                IsolationLevel::ReadUncommitted => offset_stage.last_stable,
-            },
-            log_start: offset_stage.log_start,
-        }
     }
 
     fn partition_data(
@@ -730,6 +732,7 @@ where
         isolation: IsolationLevel,
         fetch: &FetchTopic,
         is_first_non_empty: &mut bool,
+        read_failed: &mut bool,
     ) -> Result<FetchableTopicResponse> {
         let metadata = self.storage.metadata(Some(&[fetch.into()])).await?;
 
@@ -790,6 +793,7 @@ where
                         isolation,
                         name,
                         fetch_partition,
+                        read_failed,
                     )
                     .await?;
 
@@ -896,6 +900,7 @@ where
                 // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
                 let mut round_max_bytes = max_bytes;
                 let mut is_first_non_empty = true;
+                let mut read_failed = false;
 
                 let mut left = topics
                     .iter()
@@ -913,6 +918,7 @@ where
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
+                            &mut read_failed,
                         )
                         .await?;
 
@@ -939,6 +945,24 @@ where
 
                 if answers_without_waiting(&responses) {
                     debug!(?iteration, "partition error, not waiting for min_bytes");
+                    break;
+                }
+
+                // A partition whose read failed after it sent records answers with those records
+                // and no error code. Kafka answers a failed read with the partition's error code and
+                // no records ([`ReplicaManager.readFromLog`]). We keep the records, because each one
+                // was complete when the engine sent it, and the consumer's next Fetch starts at the
+                // failure and gets its error code. The Fetch answers now instead of reading the
+                // failing partition again in another round, as Kafka answers at once when the read
+                // of a partition fails ([`ReplicaManager.fetchMessages`]).
+                //
+                // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+                // [`ReplicaManager.fetchMessages`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
+                if read_failed {
+                    debug!(
+                        ?iteration,
+                        "partition read failed, not waiting for min_bytes"
+                    );
                     break;
                 }
 
@@ -1120,32 +1144,21 @@ impl ByteSize for FetchableTopicResponse {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
+        future::pending,
+        mem, slice,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        time::SystemTime,
     };
 
-    use async_trait::async_trait;
     use bytes::Bytes;
     use nisshi_sans_io::{
-        ConfigResource, ErrorCode, FetchRequest, IsolationLevel, ListOffset, RequestInput,
-        ScramMechanism,
-        create_topics_request::CreatableTopic,
-        delete_groups_response::DeletableGroupResult,
-        delete_records_request::DeleteRecordsTopic,
-        delete_records_response::DeleteRecordsTopicResult,
-        describe_cluster_response::DescribeClusterBroker,
-        describe_configs_response::DescribeConfigsResult,
-        describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
+        ErrorCode, FetchRequest, IsolationLevel, RequestInput,
         fetch_request::{FetchPartition, FetchTopic},
-        fetch_response::{AbortedTransaction, PartitionData},
-        incremental_alter_configs_request::AlterConfigsResource,
-        incremental_alter_configs_response::AlterConfigsResourceResponse,
+        fetch_response::PartitionData,
         metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
-        txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use opentelemetry::global;
     use opentelemetry_sdk::metrics::{
@@ -1155,19 +1168,15 @@ mod tests {
     use rama::{Layer as _, Service as _, extensions::Extensions};
     use tokio::{
         sync::OwnedSemaphorePermit,
-        time::{Duration, Instant, advance},
+        time::{Duration, Instant},
     };
-    use url::Url;
-    use uuid::Uuid;
 
-    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, Missed, ReadWait, fetch_deadline};
+    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, ReadWait, TimedOut, fetch_deadline};
     use crate::{
-        BrokerRegistrationRequest, CommittedOffset, Error, FetchValidationLayer, GroupDetail,
-        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
-        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version,
+        Error, FetchValidationLayer, OffsetStage, Result, StorageOperation, Topition,
+        fetched::FetchedSender,
         read_share::{ClientIdentity, FetchReadShare},
+        storage_double::storage_double,
     };
 
     /// A batch at `base_offset` holding one record per entry in `deltas`,
@@ -1191,251 +1200,6 @@ mod tests {
             .map_err(Into::into)
     }
 
-    /// Implements [`Storage`] for a double with the methods given,
-    /// leaving those the doubles here never call unimplemented.
-    macro_rules! storage_double {
-        ($double:ty { $($method:item)* }) => {
-            #[async_trait]
-            impl Storage for $double {
-                $($method)*
-
-                async fn register_broker(
-                    &self,
-                    _broker_registration: BrokerRegistrationRequest,
-                ) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-                    unimplemented!()
-                }
-
-                async fn create_topic(&self, _topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
-                    unimplemented!()
-                }
-
-                async fn delete_records(
-                    &self,
-                    _topics: &[DeleteRecordsTopic],
-                ) -> Result<Vec<DeleteRecordsTopicResult>> {
-                    unimplemented!()
-                }
-
-                async fn delete_topic(&self, _topic: &TopicId) -> Result<ErrorCode> {
-                    unimplemented!()
-                }
-
-                async fn incremental_alter_resource(
-                    &self,
-                    _resource: AlterConfigsResource,
-                ) -> Result<AlterConfigsResourceResponse> {
-                    unimplemented!()
-                }
-
-                async fn produce(
-                    &self,
-                    _transaction_id: Option<&str>,
-                    _topition: &Topition,
-                    _deflated: deflated::Batch,
-                ) -> Result<i64> {
-                    unimplemented!()
-                }
-
-                async fn offset_commit(
-                    &self,
-                    _group: &str,
-                    _retention: Option<Duration>,
-                    _offsets: &[(Topition, OffsetCommitRequest)],
-                ) -> Result<Vec<(Topition, ErrorCode)>> {
-                    unimplemented!()
-                }
-
-                async fn committed_offset_topitions(
-                    &self,
-                    _group_id: &str,
-                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-                    unimplemented!()
-                }
-
-                async fn pending_txn_offsets(&self, _group_id: &str) -> Result<BTreeSet<Topition>> {
-                    unimplemented!()
-                }
-
-                async fn offset_fetch(
-                    &self,
-                    _group_id: Option<&str>,
-                    _topics: &[Topition],
-                    _require_stable: Option<bool>,
-                ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-                    unimplemented!()
-                }
-
-                async fn list_offsets(
-                    &self,
-                    _isolation_level: IsolationLevel,
-                    _offsets: &[(Topition, ListOffset)],
-                ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-                    unimplemented!()
-                }
-
-                async fn describe_config(
-                    &self,
-                    _name: &str,
-                    _resource: ConfigResource,
-                    _keys: Option<&[String]>,
-                ) -> Result<DescribeConfigsResult> {
-                    unimplemented!()
-                }
-
-                async fn describe_topic_partitions(
-                    &self,
-                    _topics: Option<&[TopicId]>,
-                    _partition_limit: i32,
-                    _cursor: Option<Topition>,
-                ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-                    unimplemented!()
-                }
-
-                async fn list_groups(&self) -> Result<Vec<NamedGroupDetail>> {
-                    unimplemented!()
-                }
-
-                async fn delete_groups(
-                    &self,
-                    _group_ids: Option<&[String]>,
-                ) -> Result<Vec<DeletableGroupResult>> {
-                    unimplemented!()
-                }
-
-                async fn describe_groups(
-                    &self,
-                    _group_ids: Option<&[String]>,
-                    _include_authorized_operations: bool,
-                ) -> Result<Vec<NamedGroupDetail>> {
-                    unimplemented!()
-                }
-
-                async fn group_with_version(
-                    &self,
-                    _group_id: &str,
-                ) -> Result<Option<(GroupDetail, Version)>> {
-                    unimplemented!()
-                }
-
-                async fn update_group(
-                    &self,
-                    _group_id: &str,
-                    _detail: GroupDetail,
-                    _version: Option<Version>,
-                ) -> Result<Version, UpdateError<GroupDetail>> {
-                    unimplemented!()
-                }
-
-                async fn init_producer(
-                    &self,
-                    _transaction_id: Option<&str>,
-                    _transaction_timeout_ms: i32,
-                    _producer_id: Option<i64>,
-                    _producer_epoch: Option<i16>,
-                ) -> Result<ProducerIdResponse> {
-                    unimplemented!()
-                }
-
-                async fn txn_add_offsets(
-                    &self,
-                    _transaction_id: &str,
-                    _producer_id: i64,
-                    _producer_epoch: i16,
-                    _group_id: &str,
-                ) -> Result<ErrorCode> {
-                    unimplemented!()
-                }
-
-                async fn txn_add_partitions(
-                    &self,
-                    _partitions: TxnAddPartitionsRequest,
-                ) -> Result<TxnAddPartitionsResponse> {
-                    unimplemented!()
-                }
-
-                async fn txn_offset_commit(
-                    &self,
-                    _offsets: TxnOffsetCommitRequest,
-                ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-                    unimplemented!()
-                }
-
-                async fn txn_end(
-                    &self,
-                    _transaction_id: &str,
-                    _producer_id: i64,
-                    _producer_epoch: i16,
-                    _committed: bool,
-                ) -> Result<ErrorCode> {
-                    unimplemented!()
-                }
-
-                async fn maintain(&self, _now: SystemTime) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn aborted_transactions(
-                    &self,
-                    _topition: &Topition,
-                    _offset: i64,
-                    _last_stable_offset: i64,
-                ) -> Result<Vec<AbortedTransaction>> {
-                    unimplemented!()
-                }
-
-                async fn cluster_id(&self) -> Result<String> {
-                    unimplemented!()
-                }
-
-                async fn node(&self) -> Result<i32> {
-                    unimplemented!()
-                }
-
-                async fn advertised_listener(&self) -> Result<Url> {
-                    unimplemented!()
-                }
-
-                async fn ping(&self) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn delete_user_scram_credential(
-                    &self,
-                    _user: &str,
-                    _mechanism: ScramMechanism,
-                ) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn upsert_user_scram_credential(
-                    &self,
-                    _user: &str,
-                    _mechanism: ScramMechanism,
-                    _credential: ScramCredential,
-                ) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn user_scram_credential(
-                    &self,
-                    _user: &str,
-                    _mechanism: ScramMechanism,
-                ) -> Result<Option<ScramCredential>> {
-                    unimplemented!()
-                }
-            }
-        };
-    }
-
     /// Storage whose `fetch` replays scripted responses and stops each read at its deadline. It
     /// records each call. Each read of the offset stage raises its last stable offset and high
     /// watermark by `stage_growth`, as writes during a fetch would, so a test can tell which read
@@ -1443,10 +1207,13 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Scripted {
         responses: Arc<Mutex<Vec<Vec<deflated::Batch>>>>,
-        calls: Arc<Mutex<Vec<ScriptedCall>>>,
-        /// Makes the first call advance the paused clock to its deadline before it answers, like
-        /// an engine that spends its whole deadline assembling one truncated batch.
-        first_call_runs_to_its_deadline: bool,
+        /// The offset that each call to `fetch` read from.
+        call_offsets: Arc<Mutex<Vec<i64>>>,
+        /// Makes the first call send its batches and then never return, like an engine that spends
+        /// its whole deadline assembling one truncated batch.
+        first_call_stalls: bool,
+        /// Makes the second call fail before it sends anything.
+        second_call_fails: bool,
         offset_stage: OffsetStage,
         offset_stage_reads: Arc<AtomicUsize>,
         stage_growth: i64,
@@ -1470,19 +1237,13 @@ mod tests {
         current_offset_stage_reads: Arc<AtomicUsize>,
     }
 
-    /// One call to [`Scripted`]'s `fetch`.
-    #[derive(Clone, Debug, PartialEq)]
-    struct ScriptedCall {
-        offset: i64,
-        deadline: Instant,
-    }
-
     impl Scripted {
         fn new(responses: Vec<Vec<deflated::Batch>>, offset_stage: OffsetStage) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(responses)),
-                calls: Arc::new(Mutex::new(vec![])),
-                first_call_runs_to_its_deadline: false,
+                call_offsets: Arc::new(Mutex::new(vec![])),
+                first_call_stalls: false,
+                second_call_fails: false,
                 offset_stage,
                 offset_stage_reads: Arc::new(AtomicUsize::new(0)),
                 stage_growth: 0,
@@ -1500,12 +1261,8 @@ mod tests {
             self.current_offset_stage_reads.load(Ordering::SeqCst)
         }
 
-        fn calls(&self) -> Vec<ScriptedCall> {
-            self.calls.lock().expect("calls").clone()
-        }
-
         fn call_offsets(&self) -> Vec<i64> {
-            self.calls().into_iter().map(|call| call.offset).collect()
+            self.call_offsets.lock().expect("call offsets").clone()
         }
 
         fn offset_stage_reads(&self) -> usize {
@@ -1521,12 +1278,12 @@ mod tests {
             _min_bytes: u32,
             _max_bytes: u32,
             _isolation_level: IsolationLevel,
-            deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            fetched_sender: FetchedSender,
+        ) -> Result<()> {
             let calls = {
-                let mut calls = self.calls.lock()?;
-                calls.push(ScriptedCall { offset, deadline });
-                calls.len()
+                let mut call_offsets = self.call_offsets.lock()?;
+                call_offsets.push(offset);
+                call_offsets.len()
             };
 
             if self
@@ -1534,6 +1291,10 @@ mod tests {
                 .is_some_and(|unknown_from| calls >= unknown_from)
             {
                 return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+            }
+
+            if calls == 2 && self.second_call_fails {
+                return Err(Error::Message("the read failed".into()));
             }
 
             let response = {
@@ -1548,11 +1309,18 @@ mod tests {
                 responses.remove(0)
             };
 
-            if calls == 1 && self.first_call_runs_to_its_deadline {
-                advance(deadline.saturating_duration_since(Instant::now())).await;
+            // The future holds a sender of its own, so the read keeps the channel open while it
+            // waits. A read that closed the channel would end its caller's read at once.
+            let reader_stopped = fetched_sender.reader_stopped();
+
+            let offset_stage = covering_stage(self.offset_stage, &response);
+            send_batches(fetched_sender, offset_stage, response).await?;
+
+            if calls == 1 && self.first_call_stalls {
+                reader_stopped.await;
             }
 
-            Ok(response)
+            Ok(())
         }
 
         async fn current_offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
@@ -1629,6 +1397,7 @@ mod tests {
                     .partition(0)
                     .fetch_offset(fetch_offset)
                     .partition_max_bytes(max_bytes as i32),
+                &mut false,
             )
             .await
     }
@@ -1663,27 +1432,25 @@ mod tests {
         // The test reads one partition, so its partition deadline is the fetch deadline.
         let deadline = fetch_deadline(Instant::now(), max_wait);
 
-        // The first read takes until the deadline and returns one truncated batch. Each later read
-        // would return one record.
+        // The first read sends one truncated batch and then runs until the deadline. Each later
+        // read would return one record.
         let responses = (0..10_000)
             .map(|offset| batch(offset, &[0]).map(|batch| vec![batch]))
             .collect::<Result<Vec<_>>>()?;
 
         let storage = Scripted {
-            first_call_runs_to_its_deadline: true,
+            first_call_stalls: true,
             ..Scripted::new(responses, OFFSET_STAGE)
         };
 
         let batches = fetch_partition(storage.clone(), max_wait, 1024 * 1024).await?;
 
+        assert_eq!(deadline, Instant::now());
         assert_eq!(1, batches.len());
         assert_eq!(0, batches[0].base_offset);
         assert_eq!(
-            vec![ScriptedCall {
-                offset: 0,
-                deadline
-            }],
-            storage.calls(),
+            vec![0],
+            storage.call_offsets(),
             "storage was called again after the deadline"
         );
 
@@ -1706,6 +1473,45 @@ mod tests {
 
         assert_eq!(1, batches.len());
         assert_eq!(vec![0, 4], storage.call_offsets());
+
+        Ok(())
+    }
+
+    /// A read that fails without records, after an earlier read of the partition returned
+    /// records, ends the partition's reads, and the partition answers with the earlier records.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_an_earlier_read_answers_with_its_records() -> Result<()> {
+        // The partition has a record at offset 2, which the failed second read would have
+        // returned.
+        let responses = vec![vec![batch(0, &[0, 1])?], vec![batch(2, &[0])?]];
+
+        let storage = Scripted {
+            second_call_fails: true,
+            ..Scripted::new(responses, OFFSET_STAGE)
+        };
+
+        let partition = fetch_partition_at(
+            storage.clone(),
+            Duration::from_millis(100),
+            1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            0,
+        )
+        .await?;
+        let batches = partition
+            .records
+            .map(|frame| frame.batches)
+            .unwrap_or_default();
+
+        assert_eq!(
+            vec![(0, 1)],
+            batches
+                .iter()
+                .map(|batch| (batch.base_offset, batch.max_offset()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(OFFSET_STAGE.high_watermark, partition.high_watermark);
+        assert_eq!(vec![0, 2], storage.call_offsets());
 
         Ok(())
     }
@@ -1758,9 +1564,9 @@ mod tests {
             );
             assert!(partition.records.is_none(), "fetch at {fetch_offset}");
             assert!(
-                storage.calls().is_empty(),
+                storage.call_offsets().is_empty(),
                 "fetch at {fetch_offset} reached storage: {:?}",
-                storage.calls()
+                storage.call_offsets()
             );
         }
 
@@ -1799,9 +1605,9 @@ mod tests {
                 "fetch at {fetch_offset}"
             );
             assert!(
-                storage.calls().is_empty(),
+                storage.call_offsets().is_empty(),
                 "fetch at {fetch_offset} reached storage: {:?}",
-                storage.calls()
+                storage.call_offsets()
             );
         }
 
@@ -1886,7 +1692,7 @@ mod tests {
             ErrorCode::OffsetOutOfRange,
             ErrorCode::try_from(partition.error_code)?
         );
-        assert!(storage.calls().is_empty());
+        assert!(storage.call_offsets().is_empty());
 
         // only the fetch that was served counts: the second one is rejected
         assert_eq!(
@@ -1923,7 +1729,7 @@ mod tests {
         assert_eq!(Some(-1), partition.log_start_offset);
         assert!(partition.records.is_none());
         assert_eq!(1, storage.current_offset_stage_reads());
-        assert!(storage.calls().is_empty());
+        assert!(storage.call_offsets().is_empty());
 
         Ok(())
     }
@@ -1949,7 +1755,7 @@ mod tests {
             ErrorCode::try_from(partition.error_code)?
         );
         assert_eq!(1, storage.current_offset_stage_reads());
-        assert!(storage.calls().is_empty());
+        assert!(storage.call_offsets().is_empty());
 
         Ok(())
     }
@@ -1978,7 +1784,7 @@ mod tests {
             ErrorCode::OffsetOutOfRange,
             ErrorCode::try_from(partition.error_code)?
         );
-        assert!(storage.calls().is_empty());
+        assert!(storage.call_offsets().is_empty());
 
         // This stops the test from passing because no counter was captured.
         assert_eq!(
@@ -2080,24 +1886,17 @@ mod tests {
         Ok(())
     }
 
-    /// A fetch whose records end at or below the high watermark read for
-    /// the bounds check (none at all, as for an idle consumer on every long
-    /// poll, or a consumer catching up) reads the offset stage once, for
-    /// both the check and the answer. A fetch whose records reach past that
-    /// high watermark reads the stage again, so that the answer covers them.
-    /// The stage grows by 10 on each read, so the answered offsets show
-    /// which read answered.
+    /// A fetch response never contains a record past the high watermark that it reports, even
+    /// when a producer writes after the service first reads the offset stage. The service takes
+    /// the stage from the read of the records, so it reads the offset stage only once.
     #[tokio::test(start_paused = true)]
-    async fn offset_stage_reads() -> Result<()> {
-        const GROWTH: i64 = 10;
-
+    async fn reported_bounds_cover_returned_records() -> Result<()> {
         struct Case {
             name: &'static str,
             responses: Vec<Vec<deflated::Batch>>,
             stage: OffsetStage,
             isolation: IsolationLevel,
             fetch_offset: i64,
-            reads: usize,
         }
 
         let cases = [
@@ -2107,7 +1906,6 @@ mod tests {
                 stage: OFFSET_STAGE,
                 isolation: IsolationLevel::ReadUncommitted,
                 fetch_offset: 1_000,
-                reads: 1,
             },
             Case {
                 name: "catching up",
@@ -2115,7 +1913,6 @@ mod tests {
                 stage: OFFSET_STAGE,
                 isolation: IsolationLevel::ReadUncommitted,
                 fetch_offset: 0,
-                reads: 1,
             },
             // records up to offset 3, past a high watermark of 1
             Case {
@@ -2128,7 +1925,6 @@ mod tests {
                 },
                 isolation: IsolationLevel::ReadUncommitted,
                 fetch_offset: 0,
-                reads: 2,
             },
             // the last record is at 999, so the next offset is the high
             // watermark, which covers it
@@ -2138,7 +1934,6 @@ mod tests {
                 stage: OFFSET_STAGE,
                 isolation: IsolationLevel::ReadUncommitted,
                 fetch_offset: 996,
-                reads: 1,
             },
             // the last record is at 1,000, one past what the high watermark
             // covers
@@ -2148,11 +1943,10 @@ mod tests {
                 stage: OFFSET_STAGE,
                 isolation: IsolationLevel::ReadUncommitted,
                 fetch_offset: 997,
-                reads: 2,
             },
-            // under ReadCommitted, records past the last stable offset read
-            // before the fetch (a transaction completed meanwhile) read the
-            // stage again, though they end below the high watermark
+            // under ReadCommitted, a transaction commits during the fetch, so
+            // the records end past the last stable offset that the service
+            // read first, though they end below the high watermark
             Case {
                 name: "committed during the fetch",
                 responses: vec![vec![batch(0, &[0, 3])?], vec![]],
@@ -2163,7 +1957,6 @@ mod tests {
                 },
                 isolation: IsolationLevel::ReadCommitted,
                 fetch_offset: 0,
-                reads: 2,
             },
             // under ReadCommitted, a fetch between the last stable offset
             // and the high watermark returns nothing, and the first read
@@ -2178,15 +1971,11 @@ mod tests {
                 },
                 isolation: IsolationLevel::ReadCommitted,
                 fetch_offset: 700,
-                reads: 1,
             },
         ];
 
         for case in cases {
-            let storage = Scripted {
-                stage_growth: GROWTH,
-                ..Scripted::new(case.responses, case.stage)
-            };
+            let storage = Scripted::new(case.responses, case.stage);
 
             let partition = fetch_partition_at(
                 storage.clone(),
@@ -2197,24 +1986,9 @@ mod tests {
             )
             .await?;
 
-            assert_eq!(case.reads, storage.offset_stage_reads(), "{}", case.name);
+            assert_eq!(1, storage.offset_stage_reads(), "{}", case.name);
 
-            // the answer comes from the last read
-            let growth = GROWTH * i64::try_from(case.reads - 1)?;
-            assert_eq!(
-                case.stage.high_watermark + growth,
-                partition.high_watermark,
-                "{}",
-                case.name
-            );
-            assert_eq!(
-                Some(case.stage.last_stable + growth),
-                partition.last_stable_offset,
-                "{}",
-                case.name
-            );
-
-            // the answered bound covers every record returned
+            // the offset after the last record that the response returns
             let next_offset = partition
                 .records
                 .iter()
@@ -2223,14 +1997,15 @@ mod tests {
                 .max();
 
             if let Some(next_offset) = next_offset {
-                let covered_to = match case.isolation {
+                let reported_bound = match case.isolation {
                     IsolationLevel::ReadCommitted => partition.last_stable_offset,
                     IsolationLevel::ReadUncommitted => Some(partition.high_watermark),
                 };
 
                 assert!(
-                    covered_to.is_some_and(|covered_to| next_offset <= covered_to),
-                    "{}: records end at {next_offset}, answer covers {covered_to:?}",
+                    reported_bound.is_some_and(|reported_bound| next_offset <= reported_bound),
+                    "{}: records end at {next_offset}, but the response reports a bound of \
+                     {reported_bound:?}",
                     case.name
                 );
             }
@@ -2239,21 +2014,60 @@ mod tests {
         Ok(())
     }
 
+    /// The offset stage of every partition of [`Partitions`].
+    const PARTITION_STAGE: OffsetStage = OffsetStage {
+        last_stable: 1_000,
+        high_watermark: 1_000,
+        log_start: 0,
+    };
+
+    /// Returns `offset_stage` raised to cover `batches`, as an engine reads it when a producer
+    /// wrote the batches after the service read its own stage.
+    fn covering_stage(offset_stage: OffsetStage, batches: &[deflated::Batch]) -> OffsetStage {
+        let next = batches
+            .iter()
+            .map(|batch| batch.max_offset() + 1)
+            .max()
+            .unwrap_or_default();
+
+        OffsetStage {
+            last_stable: offset_stage.last_stable.max(next),
+            high_watermark: offset_stage.high_watermark.max(next),
+            log_start: offset_stage.log_start,
+        }
+    }
+
+    /// Sends `offset_stage`, and then each of `batches`, through `fetched_sender`.
+    async fn send_batches(
+        fetched_sender: FetchedSender,
+        offset_stage: OffsetStage,
+        batches: Vec<deflated::Batch>,
+    ) -> Result<()> {
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+
+        for batch in batches {
+            data.send_batch(batch).await?;
+        }
+
+        Ok(())
+    }
+
     /// What one storage read of a partition does, in [`Partitions`].
     #[derive(Clone, Debug)]
     enum Read {
-        /// Returns this batch, or nothing when the read starts at its deadline or after it.
+        /// Returns this batch.
         Batch(deflated::Batch),
-
         /// Returns nothing.
         Empty,
-
-        /// Returns no batches at its deadline.
+        /// Never returns, so its caller drops it at its partition deadline.
         Stall,
-
-        /// Returns this batch the given time after its deadline: an engine stops at its deadline,
-        /// and its response can take a moment longer to reach the caller.
-        Assemble(deflated::Batch, Duration),
+        /// Sends this batch, and then never returns, so its caller drops it at its partition
+        /// deadline.
+        SendThenStall(deflated::Batch),
+        /// Sends this batch, and then fails.
+        SendThenFail(deflated::Batch),
+        /// Fails before it sends anything.
+        Fail,
     }
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -2262,7 +2076,33 @@ mod tests {
         topic: String,
         partition: i32,
         max_bytes: u32,
-        deadline: Instant,
+    }
+
+    /// When one storage read of a partition ended, as [`Partitions`] saw it: when it returned, or
+    /// when its caller dropped it.
+    #[derive(Clone, Debug)]
+    struct ReadEnd {
+        topic: String,
+        partition: i32,
+        ended_at: Instant,
+    }
+
+    /// Records the end of one storage read of a partition when it is dropped, so that a read that
+    /// its caller drops at its deadline records that time.
+    struct ReadEndRecorder {
+        read_ends: Arc<Mutex<Vec<ReadEnd>>>,
+        topic: String,
+        partition: i32,
+    }
+
+    impl Drop for ReadEndRecorder {
+        fn drop(&mut self) {
+            self.read_ends.lock().expect("read ends").push(ReadEnd {
+                topic: mem::take(&mut self.topic),
+                partition: self.partition,
+                ended_at: Instant::now(),
+            });
+        }
     }
 
     /// The reads of each partition, by topic and partition.
@@ -2285,7 +2125,11 @@ mod tests {
         /// Partitions of [`TOPIC`] that the metadata lists, and whose
         /// offset stage read answers [`ErrorCode::UnknownTopicOrPartition`].
         deleted: Arc<Mutex<BTreeSet<i32>>>,
+        /// Partitions of [`TOPIC`] whose offset stage read fails with an error that has no Kafka
+        /// error code.
+        failing_offset_stages: Arc<Mutex<BTreeSet<i32>>>,
         calls: Arc<Mutex<Vec<Call>>>,
+        read_ends: Arc<Mutex<Vec<ReadEnd>>>,
         /// Whether each offset stage read takes a permit from its read
         /// share and keeps it in `kept_read_shares`, as an abandoned read
         /// keeps its permit until its statement ends.
@@ -2339,6 +2183,16 @@ mod tests {
             self
         }
 
+        /// Makes each offset stage read of `partition` of [`TOPIC`] fail.
+        fn fail_offset_stage(self, partition: i32) -> Self {
+            _ = self
+                .failing_offset_stages
+                .lock()
+                .expect("failing offset stages")
+                .insert(partition);
+            self
+        }
+
         fn calls(&self, partition: i32) -> Vec<Call> {
             self.calls
                 .lock()
@@ -2346,6 +2200,18 @@ mod tests {
                 .iter()
                 .filter(|call| call.topic == TOPIC && call.partition == partition)
                 .cloned()
+                .collect()
+        }
+
+        /// Returns when each storage read of `partition` of [`TOPIC`] ended, in the order in which
+        /// the reads ended.
+        fn read_ends(&self, partition: i32) -> Vec<Instant> {
+            self.read_ends
+                .lock()
+                .expect("read ends")
+                .iter()
+                .filter(|end| end.topic == TOPIC && end.partition == partition)
+                .map(|end| end.ended_at)
                 .collect()
         }
 
@@ -2386,14 +2252,19 @@ mod tests {
             _min_bytes: u32,
             max_bytes: u32,
             _isolation_level: IsolationLevel,
-            deadline: Instant,
-        ) -> Result<Vec<deflated::Batch>> {
+            fetched_sender: FetchedSender,
+        ) -> Result<()> {
             self.calls.lock()?.push(Call {
                 topic: topition.topic().into(),
                 partition: topition.partition(),
                 max_bytes,
-                deadline,
             });
+
+            let _read_end = ReadEndRecorder {
+                read_ends: self.read_ends.clone(),
+                topic: topition.topic().into(),
+                partition: topition.partition(),
+            };
 
             let read = {
                 let mut scripts = self.scripts.lock()?;
@@ -2409,17 +2280,33 @@ mod tests {
             };
 
             match read {
-                Read::Batch(_) if Instant::now() >= deadline => Ok(vec![]),
-                Read::Batch(batch) => Ok(vec![batch]),
-                Read::Empty => Ok(vec![]),
-                Read::Stall => {
-                    tokio::time::sleep_until(deadline).await;
-                    Ok(vec![])
+                Read::Batch(batch) => {
+                    let batches = vec![batch];
+                    let offset_stage = covering_stage(PARTITION_STAGE, &batches);
+                    send_batches(fetched_sender, offset_stage, batches).await
                 }
-                Read::Assemble(batch, late) => {
-                    tokio::time::sleep_until(deadline + late).await;
-                    Ok(vec![batch])
+                Read::Empty => Ok(()),
+                Read::Stall => pending().await,
+                Read::SendThenStall(batch) => {
+                    let mut data = fetched_sender
+                        .send_offsets(covering_stage(PARTITION_STAGE, slice::from_ref(&batch)))
+                        .await?;
+                    data.send_batch(batch).await?;
+
+                    // The read keeps its sender while it stalls. A read that dropped its sender
+                    // would send nothing more, so its caller would stop waiting at once.
+                    pending::<()>().await;
+                    drop(data);
+                    Ok(())
                 }
+                Read::SendThenFail(batch) => {
+                    let mut data = fetched_sender
+                        .send_offsets(covering_stage(PARTITION_STAGE, slice::from_ref(&batch)))
+                        .await?;
+                    data.send_batch(batch).await?;
+                    Err(Error::Message("the read failed".into()))
+                }
+                Read::Fail => Err(Error::Message("the read failed".into())),
             }
         }
 
@@ -2454,11 +2341,16 @@ mod tests {
                 return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
             }
 
-            Ok(OffsetStage {
-                last_stable: 1_000,
-                high_watermark: 1_000,
-                log_start: 0,
-            })
+            if topition.topic() == TOPIC
+                && self
+                    .failing_offset_stages
+                    .lock()?
+                    .contains(&topition.partition())
+            {
+                return Err(Error::Message("the offset stage read failed".into()));
+            }
+
+            Ok(PARTITION_STAGE)
         }
 
         /// Lists each scripted topic with partitions up to its highest
@@ -2633,8 +2525,8 @@ mod tests {
         }
     }
 
-    /// Returns what `missed` logs at `warn` or above for a read of a request from `identity`.
-    async fn warning_for(identity: ClientIdentity, stage: Missed) -> String {
+    /// Returns what `log_timed_out` logs at `warn` or above for a read of a request from `identity`.
+    async fn warning_for(identity: ClientIdentity, stage: TimedOut) -> String {
         let log = WarnLog::default();
         let writer = log.clone();
 
@@ -2647,7 +2539,7 @@ mod tests {
                         .with_writer(move || writer.clone())
                         .finish(),
                     || {
-                        super::missed(
+                        super::log_timed_out(
                             &Topition::new("orders", 0),
                             StorageOperation::Fetch,
                             0,
@@ -2662,19 +2554,22 @@ mod tests {
         String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8")
     }
 
-    /// A read that missed its deadline waiting for its client's share names the client in the
-    /// log, and not in the metric, so that an operator can tell a client that abandons reads from
-    /// a consumer group that shares one `client_id`. A miss at another stage does not blame the
-    /// client.
+    /// A read that timed out waiting for its client's share names the client in the log, and not
+    /// in the metric, so that an operator can tell a client that abandons reads from a consumer
+    /// group that shares one `client_id`. A timeout at another stage does not blame the client.
     #[tokio::test]
-    async fn a_miss_at_the_client_share_names_the_client() {
+    async fn a_timeout_at_the_client_share_names_the_client() {
         let identity = ClientIdentity::new(Some("alice"), Some("reporting"));
 
-        let log = warning_for(identity.clone(), Missed::Queued(ReadWait::ClientReadLimit)).await;
+        let log = warning_for(
+            identity.clone(),
+            TimedOut::Queued(ReadWait::ClientReadLimit),
+        )
+        .await;
         assert!(log.contains("reporting"), "{log:?}");
         assert!(log.contains("alice"), "{log:?}");
 
-        let log = warning_for(identity, Missed::Queued(ReadWait::ConnectionReadLimit)).await;
+        let log = warning_for(identity, TimedOut::Queued(ReadWait::ConnectionReadLimit)).await;
         assert!(!log.contains("reporting"), "{log:?}");
         assert!(log.contains("fetch read deadline exceeded"), "{log:?}");
     }
@@ -2730,17 +2625,19 @@ mod tests {
     /// none, engines read nothing or one record.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_partition_does_not_starve_the_rest() -> Result<()> {
+        // Partitions 1 and 3 send their batch and then run until their partition deadline, so the
+        // test can read their partition deadlines from when they ended.
         let storage = Partitions::new([
             (0, vec![Read::Stall]),
-            (1, vec![Read::Batch(batch(0, &[0])?)]),
+            (1, vec![Read::SendThenStall(batch(0, &[0])?)]),
             (2, vec![Read::Batch(batch(0, &[0])?)]),
-            (3, vec![Read::Batch(batch(0, &[0])?)]),
+            (3, vec![Read::SendThenStall(batch(0, &[0])?)]),
         ]);
 
         let started_at = Instant::now();
         let (partitions, elapsed) = fetch(storage.clone(), &[0, 1, 2, 3]).await?;
 
-        assert_eq!(FETCH_DEADLINE / 2, elapsed);
+        assert_eq!(FETCH_DEADLINE, elapsed);
 
         assert_eq!(0, partitions[0].partition_index);
         assert_eq!(
@@ -2765,13 +2662,17 @@ mod tests {
             assert_eq!(1_000, partition.high_watermark);
         }
 
-        // The stall left half of the fetch deadline. Each read after it was given its partition
-        // deadline: half of what was left for the first two partitions, and all of it for the last.
-        let left = FETCH_DEADLINE / 2;
-        for (partition, time_left) in [(1, left / 2), (2, left / 2), (3, left)] {
+        // Each partition's read ran until its partition deadline: half of the time left for each
+        // partition before the last, and all of it for the last. Partition 2 returned at once, so
+        // partition 3 had all of the quarter that partition 1 left.
+        for (partition, ended_at) in [
+            (0, FETCH_DEADLINE / 2),
+            (1, FETCH_DEADLINE * 3 / 4),
+            (3, FETCH_DEADLINE),
+        ] {
             assert_eq!(
-                started_at + elapsed + time_left,
-                storage.calls(partition)[0].deadline,
+                vec![started_at + ended_at],
+                storage.read_ends(partition),
                 "partition {partition}"
             );
         }
@@ -2804,50 +2705,26 @@ mod tests {
         Ok(())
     }
 
-    /// A partition that stalls after reading some batches returns them,
-    /// with the stage read before them raised to cover them rather than
-    /// read again, and the bytes they took are not given again to the
-    /// partitions after it. Under `ReadCommitted` the engine returns only
-    /// committed records, so the last stable offset is raised to cover
-    /// them too.
+    /// A stalled read uses none of `max_bytes`: the reads after it get `max_bytes` minus only the
+    /// batch that the partition returned before the stall.
     #[tokio::test(start_paused = true)]
-    async fn a_partition_that_stalls_keeps_what_it_read() -> Result<()> {
-        for (isolation, last_stable) in [
-            (IsolationLevel::ReadUncommitted, 1_000),
-            (IsolationLevel::ReadCommitted, 1_002),
-        ] {
-            // the records reach past the high watermark the stage read
-            // before them holds
-            let first = batch(1_000, &[0, 1])?;
-            let size = u32::try_from(first.record_data.len())?;
+    async fn a_stalled_read_uses_none_of_max_bytes() -> Result<()> {
+        let first = batch(0, &[0])?;
+        let size = u32::try_from(first.record_data.len())?;
 
-            let storage = Partitions::new([
-                (0, vec![Read::Batch(first), Read::Stall]),
-                (1, vec![Read::Batch(batch(0, &[0])?)]),
-            ]);
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(first), Read::Stall]),
+            (1, vec![Read::Batch(batch(0, &[0])?)]),
+        ]);
 
-            let (mut topics, elapsed) =
-                fetch_isolated(storage.clone(), MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
-            let partitions = topics.remove(0);
+        let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
 
-            assert_eq!(FETCH_DEADLINE / 2, elapsed, "{isolation:?}");
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(1, batches(&partitions[1]));
 
-            assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
-            assert_eq!(1_002, partitions[0].high_watermark, "{isolation:?}");
-            assert_eq!(
-                Some(last_stable),
-                partitions[0].last_stable_offset,
-                "{isolation:?}"
-            );
-            assert_eq!(Some(0), partitions[0].log_start_offset, "{isolation:?}");
-            assert_eq!(1, storage.offset_stage_reads(0), "{isolation:?}");
-
-            assert_eq!(1, batches(&partitions[1]), "{isolation:?}");
-
-            let max_bytes = u32::try_from(MAX_BYTES)?;
-            assert_eq!(max_bytes - size, storage.calls(0)[1].max_bytes);
-            assert_eq!(max_bytes - size, storage.calls(1)[0].max_bytes);
-        }
+        let max_bytes = u32::try_from(MAX_BYTES)?;
+        assert_eq!(max_bytes - size, storage.calls(0)[1].max_bytes);
+        assert_eq!(max_bytes - size, storage.calls(1)[0].max_bytes);
 
         Ok(())
     }
@@ -2951,20 +2828,20 @@ mod tests {
     /// does, and each read may run until its partition deadline, whatever `max_wait` is.
     #[tokio::test(start_paused = true)]
     async fn zero_max_wait_reads_until_its_partition_deadline() -> Result<()> {
-        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]);
+        let storage = Partitions::new([(0, vec![Read::SendThenStall(batch(0, &[0])?)])]);
 
         let started_at = Instant::now();
         let (mut topics, elapsed) =
             fetch_topics(storage.clone(), Duration::ZERO, &[(TOPIC, &[0])]).await?;
         let partitions = topics.remove(0);
 
-        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(FETCH_DEADLINE_OVERHEAD, elapsed);
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1_000, partitions[0].high_watermark);
 
         assert_eq!(
-            started_at + FETCH_DEADLINE_OVERHEAD,
-            storage.calls(0)[0].deadline
+            vec![started_at + FETCH_DEADLINE_OVERHEAD],
+            storage.read_ends(0)
         );
 
         Ok(())
@@ -3015,6 +2892,138 @@ mod tests {
         Ok(())
     }
 
+    /// A Fetch whose partition read fails after it sent records answers at once with those records,
+    /// below `min_bytes`, and does not read the partition again.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_it_sent_records_answers_below_min_bytes() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::SendThenFail(batch(0, &[0])?)])]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(PARTITION_STAGE.high_watermark, partitions[0].high_watermark);
+        assert_eq!(1, storage.calls(0).len());
+
+        Ok(())
+    }
+
+    /// A Fetch whose partition read fails without records, after an earlier read of the partition
+    /// returned records, answers at once with those records, below `min_bytes`.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_after_an_earlier_read_answers_below_min_bytes() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?), Read::Fail])]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        assert_eq!(2, storage.calls(0).len());
+
+        Ok(())
+    }
+
+    /// A partition whose read fails without records answers with an error code, and the records
+    /// that an earlier partition kept from its own failed read stay in the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_fails_without_records_answers_its_partition_with_an_error_code()
+    -> Result<()> {
+        let storage = Partitions::new([
+            (0, vec![Read::SendThenFail(batch(0, &[0])?)]),
+            (1, vec![Read::Fail]),
+        ]);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0, 1])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        // The read fails with a permanent error, which Kafka also answers with
+        // `UNKNOWN_SERVER_ERROR`.
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(-1, partitions[1].high_watermark);
+
+        Ok(())
+    }
+
+    /// A partition whose offset stage read fails answers with an error code, without a read of
+    /// its records, and the other partitions of the Fetch keep their records.
+    #[tokio::test(start_paused = true)]
+    async fn an_offset_stage_read_that_fails_answers_its_partition_with_an_error_code() -> Result<()>
+    {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)]), (1, vec![])])
+            .fail_offset_stage(1);
+
+        let (mut topics, elapsed) = fetch_with_min_bytes(
+            storage.clone(),
+            MAX_WAIT,
+            i32::MAX,
+            IsolationLevel::ReadUncommitted,
+            &[(TOPIC, &[0, 1])],
+            Extensions::default(),
+        )
+        .await?;
+        let partitions = topics.remove(0);
+
+        assert_eq!(Duration::ZERO, elapsed);
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(1, batches(&partitions[0]));
+        // The read fails with a permanent error, which Kafka also answers with
+        // `UNKNOWN_SERVER_ERROR`.
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(partitions[1].error_code)?
+        );
+        assert_eq!(-1, partitions[1].high_watermark);
+        assert!(storage.calls(1).is_empty());
+
+        Ok(())
+    }
+
     /// A read that runs until its partition deadline keeps what it assembled, and the partitions
     /// after it are still read. With `max_wait` of 5s, the first of two partitions has 5s until
     /// its partition deadline.
@@ -3024,7 +3033,7 @@ mod tests {
         let time_left = (max_wait + FETCH_DEADLINE_OVERHEAD) / 2;
 
         let storage = Partitions::new([
-            (0, vec![Read::Assemble(batch(0, &[0])?, Duration::ZERO)]),
+            (0, vec![Read::SendThenStall(batch(0, &[0])?)]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
         ]);
 
@@ -3034,58 +3043,11 @@ mod tests {
         let partitions = topics.remove(0);
 
         assert_eq!(time_left, elapsed);
-        assert_eq!(started_at + time_left, storage.calls(0)[0].deadline);
+        assert_eq!(vec![started_at + time_left], storage.read_ends(0));
 
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1_000, partitions[0].high_watermark);
         assert_eq!(1, batches(&partitions[1]));
-
-        Ok(())
-    }
-
-    /// An offset stage read again after records reached past it, and that never answers, is
-    /// abandoned at a fresh partition deadline taken after the read. The partition keeps its
-    /// batches, and the stage read before them answers, raised to cover the records: the last
-    /// stable offset too, under `ReadCommitted`.
-    #[tokio::test(start_paused = true)]
-    async fn a_stalled_offset_stage_is_abandoned_at_its_own_partition_deadline() -> Result<()> {
-        for (isolation, last_stable) in [
-            (IsolationLevel::ReadUncommitted, 1_000),
-            (IsolationLevel::ReadCommitted, 1_001),
-        ] {
-            // the record is at the high watermark the stage read before the
-            // records holds, so the stage is read again
-            let storage = Partitions::new([
-                (0, vec![Read::Batch(batch(1_000, &[0])?)]),
-                (1, vec![Read::Batch(batch(0, &[0])?)]),
-            ])
-            .stall_offset_stage(0, 2);
-
-            let (mut topics, elapsed) =
-                fetch_isolated(storage, MAX_WAIT, isolation, &[(TOPIC, &[0, 1])]).await?;
-            let partitions = topics.remove(0);
-
-            // The read of the records answers at once, then the read of the offset stage gets
-            // half of the time left. Tokio's timers have millisecond resolution, so the stage's
-            // deadline can end up to a millisecond later.
-            let expected = FETCH_DEADLINE / 2;
-            assert!(
-                elapsed.abs_diff(expected) <= Duration::from_millis(1),
-                "{isolation:?}: {elapsed:?}, expected {expected:?}"
-            );
-
-            assert_eq!(1, batches(&partitions[0]), "{isolation:?}");
-            assert_eq!(1_001, partitions[0].high_watermark, "{isolation:?}");
-            assert_eq!(
-                Some(last_stable),
-                partitions[0].last_stable_offset,
-                "{isolation:?}"
-            );
-            assert_eq!(Some(0), partitions[0].log_start_offset, "{isolation:?}");
-
-            assert_eq!(1, batches(&partitions[1]), "{isolation:?}");
-            assert_eq!(1_000, partitions[1].high_watermark, "{isolation:?}");
-        }
 
         Ok(())
     }
@@ -3095,64 +3057,25 @@ mod tests {
     /// 172ms and the 128th is 43ms.
     const HALVING_MAX_WAIT: Duration = Duration::from_millis(504);
 
-    /// A partition's answer reports a high watermark past every record in it. The service reads
-    /// the partition's offset stage, which holds the high watermark, before it reads the records,
-    /// so a record written during the fetch can be past that high watermark. The service usually
-    /// reads the offset stage a second time to cover such a record. When its reads of the records
-    /// ran until the partition deadline, it skips the second read, and sets the high watermark just
-    /// past the last record that it returns.
+    /// A read that never returns is dropped at its partition deadline, so the partitions after it
+    /// are still read, each with its own deadline.
     #[tokio::test(start_paused = true)]
-    async fn a_read_that_reaches_its_partition_deadline_is_not_followed_by_a_stage_read()
-    -> Result<()> {
+    async fn a_read_that_never_returns_leaves_time_for_the_later_partitions() -> Result<()> {
         let storage = Partitions::new([
-            // The offset stage reads a high watermark of 1,000. The first read of the records
-            // returns a record at offset 1,000, as if a producer wrote it during the fetch. The
-            // second read of the records runs until the partition deadline.
-            (0, vec![Read::Batch(batch(1_000, &[0])?), Read::Stall]),
-            // Partition 1 leaves the fetch time after partition 0's deadline, so only the skip
-            // stops the service from reading partition 0's offset stage a second time.
-            (1, vec![Read::Batch(batch(0, &[0])?)]),
-        ]);
-
-        let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
-
-        // The service read partition 0's offset stage once, before the records.
-        assert_eq!(1, storage.offset_stage_reads(0));
-        assert_eq!(1, batches(&partitions[0]));
-        // 1,001 is just past the record at offset 1,000.
-        assert_eq!(1_001, partitions[0].high_watermark);
-        assert_eq!(1, batches(&partitions[1]));
-
-        Ok(())
-    }
-
-    /// If a read runs past its partition deadline, as it does on an engine that ignores its
-    /// deadline, the fetch waits for the read, and answers that partition with the batches that the
-    /// read returned. The fetch skips the partitions after it, because their deadlines have passed
-    /// by then, and answers each of them with no batches and no error.
-    #[tokio::test(start_paused = true)]
-    async fn a_read_that_overruns_its_deadline_leaves_the_later_partitions_unread() -> Result<()> {
-        // Partition 0's read returns a whole fetch deadline after its own deadline, so it ends
-        // after the fetch deadline.
-        let storage = Partitions::new([
-            (0, vec![Read::Assemble(batch(0, &[0])?, FETCH_DEADLINE)]),
+            (0, vec![Read::Stall]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
             (2, vec![Read::Batch(batch(0, &[0])?)]),
         ]);
 
         let (partitions, elapsed) = fetch(storage.clone(), &[0, 1, 2]).await?;
 
-        assert!(elapsed > FETCH_DEADLINE, "{elapsed:?}");
-        assert_eq!(1, batches(&partitions[0]));
+        assert!(elapsed < FETCH_DEADLINE, "{elapsed:?}");
+        assert_eq!(0, batches(&partitions[0]));
 
         for partition in [1, 2] {
-            assert!(storage.calls(partition).is_empty(), "partition {partition}");
-
-            let data = &partitions[usize::try_from(partition)?];
-            assert_eq!(0, batches(data), "partition {partition}");
             assert_eq!(
-                ErrorCode::None,
-                ErrorCode::try_from(data.error_code)?,
+                1,
+                batches(&partitions[usize::try_from(partition)?]),
                 "partition {partition}"
             );
         }
@@ -3173,7 +3096,7 @@ mod tests {
             (2, vec![Read::Stall]),
             (3, vec![Read::Stall]),
             (4, vec![Read::Stall]),
-            (5, vec![Read::Assemble(batch(0, &[0])?, Duration::ZERO)]),
+            (5, vec![Read::SendThenStall(batch(0, &[0])?)]),
         ]);
 
         let started_at = Instant::now();
@@ -3186,7 +3109,7 @@ mod tests {
         let partitions = topics.remove(0);
 
         assert_eq!(fetch_deadline, elapsed);
-        assert_eq!(started_at + fetch_deadline, storage.calls(5)[0].deadline);
+        assert_eq!(vec![started_at + fetch_deadline], storage.read_ends(5));
         assert_eq!(1, batches(&partitions[5]));
         assert_eq!(1_000, partitions[5].high_watermark);
 
@@ -3211,7 +3134,6 @@ mod tests {
             (7, vec![Read::Batch(batch(0, &[0])?)]),
         ]);
 
-        let started_at = Instant::now();
         let (mut topics, elapsed) = fetch_topics(
             storage.clone(),
             HALVING_MAX_WAIT,
@@ -3221,7 +3143,6 @@ mod tests {
         let partitions = topics.remove(0);
 
         assert_eq!(fetch_deadline - time_left, elapsed);
-        assert_eq!(started_at + fetch_deadline, storage.calls(7)[0].deadline);
         assert_eq!(
             ErrorCode::None,
             ErrorCode::try_from(partitions[7].error_code)?
@@ -3239,7 +3160,7 @@ mod tests {
         let stage_read = MAX_WAIT - MAX_WAIT / 4;
 
         let storage = Partitions::new([
-            (0, vec![Read::Batch(batch(0, &[0])?)]),
+            (0, vec![Read::SendThenStall(batch(0, &[0])?)]),
             (1, vec![Read::Batch(batch(0, &[0])?)]),
         ])
         .delay_offset_stage(0, 1, stage_read);
@@ -3247,28 +3168,9 @@ mod tests {
         let started_at = Instant::now();
         let (partitions, _) = fetch(storage.clone(), &[0, 1]).await?;
 
-        assert_eq!(
-            started_at + FETCH_DEADLINE / 2,
-            storage.calls(0)[0].deadline
-        );
+        assert_eq!(vec![started_at + FETCH_DEADLINE / 2], storage.read_ends(0));
         assert_eq!(1, batches(&partitions[0]));
         assert_eq!(1, batches(&partitions[1]));
-
-        Ok(())
-    }
-
-    /// The Fetch service waits for the read, so a response that reaches it after the deadline
-    /// keeps its batches.
-    #[tokio::test(start_paused = true)]
-    async fn a_response_after_the_deadline_keeps_its_batches() -> Result<()> {
-        let storage = Partitions::new([(
-            0,
-            vec![Read::Assemble(batch(0, &[0])?, Duration::from_millis(5))],
-        )]);
-
-        let (partitions, _) = fetch(storage, &[0]).await?;
-
-        assert_eq!(1, batches(&partitions[0]));
 
         Ok(())
     }
@@ -3284,7 +3186,6 @@ mod tests {
         ])
         .stall_offset_stage(0, 1);
 
-        let started_at = Instant::now();
         let (partitions, elapsed) = fetch(storage.clone(), &[0, 1]).await?;
 
         assert_eq!(FETCH_DEADLINE / 2, elapsed);
@@ -3301,9 +3202,6 @@ mod tests {
 
         assert_eq!(1, batches(&partitions[1]));
         assert_eq!(1_000, partitions[1].high_watermark);
-
-        // the last partition's time is all of the half that the stall left
-        assert_eq!(started_at + FETCH_DEADLINE, storage.calls(1)[0].deadline);
 
         Ok(())
     }
@@ -3351,8 +3249,6 @@ mod tests {
     /// does not fail.
     #[tokio::test(start_paused = true)]
     async fn storage_unknown_partition_at_each_read_answers_in_band() -> Result<()> {
-        // records up to offset 3, past a high watermark of 1, so the offset
-        // stage is read again after the records
         let stage = OffsetStage {
             last_stable: 1,
             high_watermark: 1,
@@ -3372,13 +3268,6 @@ mod tests {
                 Scripted {
                     unknown_from_fetch_call: Some(1),
                     ..Scripted::new(vec![], stage)
-                },
-            ),
-            (
-                "offset stage read after the records",
-                Scripted {
-                    unknown_from_stage_read: Some(1),
-                    ..Scripted::new(vec![vec![batch(0, &[0, 3])?], vec![]], stage)
                 },
             ),
         ];
