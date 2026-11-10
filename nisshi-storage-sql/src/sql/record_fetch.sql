@@ -19,35 +19,34 @@
 -- The header table is probed by its primary key for each record, so a record that holds only
 -- headers still spends the budget. The probe is a result column of a derived table, because the
 -- Turso engine does not accept a subquery inside the argument of a window function.
+--
+-- The window carries the size of each record, not its key or its value. SQLite copies each input
+-- row of a window into a temporary table, and the window reads every record from $4 to $6,
+-- because the filter on the running total runs after it. A key and a value in the window make one
+-- fetch copy the payload of the whole backlog, however few records the fetch returns. SQLite's
+-- length() reads only the record header, so the window reads sizes, and the final select reads
+-- the key and the value, by primary key, of only the records that it returns. The Turso engine
+-- reads each value to compute its length, so on Turso a fetch still reads the payload of every
+-- record up to $6.
 with sized as (
 select
 
+topition,
 offset_id,
-attributes,
-timestamp,
-k,
-v,
 sum(row_bytes) over (order by offset_id) as bytes,
-row_number() over (order by offset_id) as ordinal,
-producer_id,
-producer_epoch
+row_number() over (order by offset_id) as ordinal
 
 from (
 
 select
 
+r.topition,
 r.offset_id,
-r.attributes,
-r.timestamp,
-r.k,
-r.v,
 coalesce(length(r.k), 0) + coalesce(length(r.v), 0)
     + (select coalesce(sum(coalesce(length(h.k), 0) + coalesce(length(h.v), 0) + 2), 0)
        from header h
        where h.topition = r.topition
-       and h.offset_id = r.offset_id) as row_bytes,
-r.producer_id,
-r.producer_epoch
+       and h.offset_id = r.offset_id) as row_bytes
 
 from
 
@@ -74,7 +73,28 @@ and r.offset_id < $6) sized_rows)
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
-select offset_id, attributes, timestamp, k, v, bytes, producer_id, producer_epoch
-from sized
-where bytes < $5
-or ordinal = 1;
+select
+
+r.offset_id,
+r.attributes,
+r.timestamp,
+r.k,
+r.v,
+s.bytes,
+r.producer_id,
+r.producer_epoch
+
+from
+
+sized s
+join record r on r.topition = s.topition and r.offset_id = s.offset_id
+
+where
+
+s.bytes < $5
+or s.ordinal = 1
+
+-- The rows must come out in offset order, because the engine builds record batches from them
+-- in the order that it reads them, and each record's offset delta counts from the first record
+-- of its batch. A window does not guarantee the order of the rows that it returns.
+order by r.offset_id;

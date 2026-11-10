@@ -6487,6 +6487,135 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the offset of each row of a fetch query's result.
+    async fn offsets_of(mut rows: Rows) -> Result<Vec<i64>> {
+        let mut offsets = vec![];
+
+        while let Some(row) = rows.next().await? {
+            offsets.push(row.get::<i64>(0)?);
+        }
+
+        Ok(offsets)
+    }
+
+    /// A fetch from the start of a backlog of large records runs within a heap of a few MB: the
+    /// window that sums the record sizes reads the sizes, and the fetch reads the key and the value
+    /// of only the records that it returns.
+    #[tokio::test]
+    async fn fetch_over_large_records_runs_within_a_small_heap() -> Result<()> {
+        const RECORDS: i64 = 40;
+        const VALUE_BYTES: usize = 500_000;
+        const KEY: &[u8] = b"k";
+
+        let _guard = init_tracing()?;
+
+        let cluster = "nisshi";
+        let topic = "test";
+
+        let (_temp_dir, connection) = scratch_connection().await?;
+
+        _ = connection
+            .connection
+            .execute("insert into cluster (name) values (?1)", [cluster])
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topic (cluster, name, uuid, partitions, replication_factor) \
+                 select id, ?2, ?3, 1, 1 from cluster where name = ?1",
+                (cluster, topic, Uuid::new_v4().to_string()),
+            )
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topition (topic, partition) select id, 0 from topic where name = ?1",
+                [topic],
+            )
+            .await?;
+
+        let value = vec![b'x'; VALUE_BYTES];
+
+        for offset in 0..RECORDS {
+            _ = connection
+                .connection
+                .execute(
+                    "insert into record (topition, offset_id, k, v) \
+                     select id, ?1, ?2, ?3 from topition",
+                    (offset, KEY.to_vec(), value.clone()),
+                )
+                .await?;
+        }
+
+        // With the default temp store, SQLite spills the window's temporary table to a file, and
+        // the heap limit below would not see it.
+        _ = connection
+            .connection
+            .query("PRAGMA temp_store = memory", ())
+            .await?
+            .next()
+            .await?;
+
+        // The page cache of this connection counts toward the heap limit below. A small cache
+        // keeps the pages of the inserts above out of what the limit measures.
+        _ = connection
+            .connection
+            .query("PRAGMA cache_size = -256", ())
+            .await?
+            .next()
+            .await?;
+
+        // Each record is 500,001 bytes, more than the budget, so each fetch returns only its
+        // first record (KIP-74).
+        let max_bytes = 100_000_i64;
+        let high_watermark = RECORDS;
+
+        // The heap limit covers every SQLite connection in this process, and SQLite lets a later
+        // call only lower it, so nothing in this process can raise it again. The test is safe
+        // because nextest runs each test in a process of its own. Under `cargo test`, every test
+        // that runs after this one in the same binary would run within this limit.
+        //
+        // With the key and the value of each record in the window, these fetches need more than
+        // 6 MB, and without them they run within 3 MB. The edge depends on how SQLite buffers the
+        // rows of a window, so an update of libsql can move it.
+        _ = connection
+            .connection
+            .query("PRAGMA hard_heap_limit = 4000000", ())
+            .await?
+            .next()
+            .await?;
+
+        let plain = connection
+            .query(
+                "record_fetch.sql",
+                (cluster, topic, 0, 0, max_bytes, high_watermark),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(plain).await?);
+
+        let keyed = connection
+            .query(
+                "record_fetch_keyed.sql",
+                (
+                    cluster,
+                    topic,
+                    0,
+                    0,
+                    max_bytes,
+                    high_watermark,
+                    KEY.to_vec(),
+                ),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(keyed).await?);
+
+        Ok(())
+    }
+
     /// `produce_inflated` stores the batch that the caller decoded and does not decode the bytes
     /// again, also through the channel to the engine's single writer.
     ///
