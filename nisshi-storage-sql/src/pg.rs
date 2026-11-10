@@ -117,11 +117,13 @@ use crate::{
     },
 };
 
-mod connect_gate;
+mod connect_rate_limit;
 pub mod factory;
 mod metrics;
 
-use connect_gate::{ConnectGate, GatedCheckoutError, GatedPool};
+use connect_rate_limit::{
+    CheckoutError, ConnectRateLimit, RATE_LIMITED_CONNECT_INTERVAL, RateLimitedPool,
+};
 
 /// PostgreSQL Storage Engine
 #[derive(Clone, Debug)]
@@ -129,7 +131,7 @@ pub struct Postgres {
     cluster: String,
     node: i32,
     advertised_listener: Url,
-    pool: GatedPool,
+    pool: RateLimitedPool,
     cancel: Option<CancelRequests>,
     /// Permits for the ListOffsets partition reads in flight, see
     /// [`ReadLimits::list_offsets`].
@@ -254,7 +256,7 @@ pub struct PoolParts {
     host: Option<String>,
     /// The pool with the plain [`APPLICATION_NAME_PREFIX`] as its name, built where the storage
     /// URL is parsed, so that an unusable setting fails there.
-    pool: GatedPool,
+    pool: RateLimitedPool,
 }
 
 impl Debug for PoolParts {
@@ -271,14 +273,14 @@ impl Debug for PoolParts {
 
 impl PoolParts {
     /// Opens a pool of connections that use `config`, and that run `check` on them unless
-    /// `check.every` is 0. The pool has a gate of its own, which `check` starts and stops.
+    /// `check.every` is 0. The pool has a rate limit of its own, which `check` starts and stops.
     fn open(
         config: Config,
         tls: MakeRustlsConnect,
         pool_max_size: usize,
         check: &ReadOnlyCheck,
-    ) -> std::result::Result<GatedPool, deadpool_postgres::BuildError> {
-        let gate = Arc::new(ConnectGate::default());
+    ) -> std::result::Result<RateLimitedPool, deadpool_postgres::BuildError> {
+        let rate_limit = Arc::new(ConnectRateLimit::default());
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
@@ -294,17 +296,17 @@ impl PoolParts {
             builder.build()
         } else {
             builder
-                .post_create(check.post_create(gate.clone()))
+                .post_create(check.post_create(rate_limit.clone()))
                 .pre_recycle(check.pre_recycle())
                 .build()
         }
-        .map(|pool| GatedPool::new(pool, gate))
+        .map(|pool| RateLimitedPool::new(pool, rate_limit))
     }
 
     /// The pool for the broker of `cluster`: its connections are named by
     /// [`application_name`] unless the operator named them, and the check that it runs counts in
     /// `cluster`.
-    fn pool_of(&self, cluster: &str, node: i32) -> GatedPool {
+    fn pool_of(&self, cluster: &str, node: i32) -> RateLimitedPool {
         let mut config = self.config.clone();
 
         if !self.named_by_operator {
@@ -792,8 +794,8 @@ impl CheckFailure {
 /// [`PoolError::PostCreateHook`], which is a transient error to the caller, so a broker whose
 /// endpoint still reaches a read-only server fails each checkout fast instead of using the
 /// connection for one request and dropping it at the next. A new connection to a read-only
-/// server also starts gating the pool, so the pool opens about one connection a second until a
-/// new connection passes, see [`ConnectGate`].
+/// server also turns on the pool's rate limit, so the pool opens about one connection a second
+/// until a new connection passes, see [`ConnectRateLimit`].
 ///
 /// The pool logs a failed recycle only as the error's `Display`, which tokio-postgres limits to
 /// `db error`, and logs nothing for a timeout, so this check logs each failure itself, with the
@@ -878,30 +880,43 @@ impl ReadOnlyCheck {
     }
 
     /// Returns the `post_create` hook, which runs this [`ReadOnlyCheck`] on each new connection.
-    /// The hook starts or restarts gating on `gate` when the session is read-only, and stops it
-    /// when the connection passes the check.
-    fn post_create(&self, gate: Arc<ConnectGate>) -> Hook {
+    /// The hook starts or restarts `rate_limit` when the session is read-only, and stops it when
+    /// the connection passes the check. It logs when the limit turns on or off.
+    fn post_create(&self, rate_limit: Arc<ConnectRateLimit>) -> Hook {
         let check = self.clone();
 
         Hook::async_fn(move |client, _metrics| {
             let check = check.clone();
-            let gate = gate.clone();
+            let rate_limit = rate_limit.clone();
 
             Box::pin(async move {
                 match check.run(CheckStage::Create, client).await {
                     Ok(()) => {
-                        gate.stop_gating();
+                        if rate_limit.stop() {
+                            info!(
+                                cluster = check.cluster,
+                                "a new Postgres connection passed its check, so the pool no \
+                                longer limits new connections"
+                            );
+                        }
                         Ok(())
                     }
 
                     Err(failure) => {
-                        // Only a read-only session starts gating, instead of every failure. A
-                        // read-only server accepts each connection before the check runs, so
-                        // each attempt costs the server a handshake and a new backend. A
-                        // timeout slows each attempt by itself, and gating after another error
-                        // hides that error behind the gated error, which logs only at `debug`.
-                        if failure == CheckFailure::ReadOnly {
-                            gate.start_or_restart_gating();
+                        // Only a read-only session starts the rate limit, instead of every
+                        // failure. A read-only server accepts each connection before the check
+                        // runs, so each attempt costs the server a handshake and a new backend.
+                        // A timeout slows each attempt by itself, and a rate limit after another
+                        // error hides that error behind the rate-limited error, which logs only
+                        // at `debug`.
+                        if failure == CheckFailure::ReadOnly && rate_limit.start_or_restart() {
+                            warn!(
+                                cluster = check.cluster,
+                                interval = ?RATE_LIMITED_CONNECT_INTERVAL,
+                                "a new Postgres connection reached a read-only server, so the \
+                                pool opens at most one new connection per interval until a new \
+                                connection passes its check"
+                            );
                         }
 
                         Err(HookError::message(format!(
@@ -1866,19 +1881,19 @@ impl Postgres {
             .await
             .inspect_err(|err| match err {
                 // routine under load: the pool is momentarily saturated, not broken.
-                GatedCheckoutError::Pool(PoolError::Timeout(TimeoutType::Wait)) => {
+                CheckoutError::Pool(PoolError::Timeout(TimeoutType::Wait)) => {
                     debug!(?err, cluster = ?self.cluster)
                 }
 
-                // The `post_create` hook logged the read-only server at `warn` when it started
-                // gating, so each checkout that the gate fails logs only at `debug`.
-                GatedCheckoutError::Gated => {
+                // The `post_create` hook logged at `warn` when the rate limit turned on, so each
+                // checkout that the limit refuses logs only at `debug`.
+                CheckoutError::RateLimited => {
                     debug!(?err, cluster = ?self.cluster);
                     metrics::pool_failed(&self.cluster);
                 }
 
                 // likely means Postgres itself is unreachable or misbehaving.
-                GatedCheckoutError::Pool(_) => {
+                CheckoutError::Pool(_) => {
                     error!(?err, cluster = ?self.cluster);
                     metrics::pool_failed(&self.cluster);
                 }
@@ -6069,7 +6084,6 @@ pub(crate) fn from_sql_timestamp(system_time: &SystemTime) -> Result<i64> {
 mod tests {
     use super::*;
 
-    use super::connect_gate::GATED_CONNECT_INTERVAL;
     use futures_util::future;
     use nisshi_sans_io::{
         add_partitions_to_txn_request::AddPartitionsToTxnTopic,
@@ -6937,7 +6951,7 @@ mod tests {
         .build()?;
 
         Ok(Postgres {
-            pool: GatedPool::new(pool, Arc::default()),
+            pool: RateLimitedPool::new(pool, Arc::default()),
             ..Postgres::builder(&CONNECTION)?
                 .cluster(alphanumeric_string(15).as_str())
                 .node(rng().random_range(0..i32::MAX))
@@ -8389,7 +8403,7 @@ mod tests {
     }
 
     /// While new connections reach a read-only server, the pool starts one attempt to open a
-    /// connection per [`GATED_CONNECT_INTERVAL`], and each other checkout fails without one.
+    /// connection per [`RATE_LIMITED_CONNECT_INTERVAL`], and each other checkout fails without one.
     #[tokio::test]
     async fn read_only_server_gets_one_connection_attempt_per_interval() -> Result<()> {
         let cluster = alphanumeric_string(15);
@@ -8417,30 +8431,30 @@ mod tests {
         // checkout opened a connection.
         assert_matches!(
             pool.get().await,
-            Err(GatedCheckoutError::Pool(PoolError::PostCreateHook(_)))
+            Err(CheckoutError::Pool(PoolError::PostCreateHook(_)))
         );
 
         for _ in 0..3 {
-            assert_matches!(pool.get().await, Err(GatedCheckoutError::Gated));
+            assert_matches!(pool.get().await, Err(CheckoutError::RateLimited));
         }
 
-        tokio::time::sleep(GATED_CONNECT_INTERVAL).await;
+        tokio::time::sleep(RATE_LIMITED_CONNECT_INTERVAL).await;
 
         assert_matches!(
             pool.get().await,
-            Err(GatedCheckoutError::Pool(PoolError::PostCreateHook(_)))
+            Err(CheckoutError::Pool(PoolError::PostCreateHook(_)))
         );
-        assert_matches!(pool.get().await, Err(GatedCheckoutError::Gated));
+        assert_matches!(pool.get().await, Err(CheckoutError::RateLimited));
 
         Ok(())
     }
 
-    /// Returns a pool of connections to `CONNECTION`, gated by `gate`, with `post_create` as its
-    /// hook if it has one.
-    fn writable_gated_pool(
-        gate: &Arc<ConnectGate>,
+    /// Returns a pool of connections to `CONNECTION`, limited by `rate_limit`, with `post_create`
+    /// as its hook if it has one.
+    fn writable_rate_limited_pool(
+        rate_limit: &Arc<ConnectRateLimit>,
         post_create: Option<Hook>,
-    ) -> Result<GatedPool> {
+    ) -> Result<RateLimitedPool> {
         let writable = Postgres::builder(&CONNECTION)?;
         let builder = Pool::builder(Manager::from_config(
             writable.pool.config.clone(),
@@ -8457,17 +8471,17 @@ mod tests {
             None => builder.build()?,
         };
 
-        Ok(GatedPool::new(pool, gate.clone()))
+        Ok(RateLimitedPool::new(pool, rate_limit.clone()))
     }
 
-    /// A gated pool hands out an idle connection, because a read-only server still serves
+    /// A rate-limited pool hands out an idle connection, because a read-only server still serves
     /// reads, and fails a checkout only when it would open a connection.
     #[tokio::test]
-    async fn gated_pool_hands_out_an_idle_connection() -> Result<()> {
+    async fn rate_limited_pool_hands_out_an_idle_connection() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let Some(_probe) = storage_with_schema(
-            "gated_pool_hands_out_an_idle_connection",
+            "rate_limited_pool_hands_out_an_idle_connection",
             &CONNECTION,
             &cluster,
         )
@@ -8476,8 +8490,8 @@ mod tests {
             return Ok(());
         };
 
-        let gate = Arc::new(ConnectGate::default());
-        let pool = writable_gated_pool(&gate, None)?;
+        let rate_limit = Arc::new(ConnectRateLimit::default());
+        let pool = writable_rate_limited_pool(&rate_limit, None)?;
 
         // The checkout opens a connection, and dropping it returns the connection to the pool,
         // where it stays open and idle.
@@ -8485,10 +8499,10 @@ mod tests {
         assert_eq!(1, pool.status().available);
 
         // The `post_create` hook does this when a new connection finds a read-only server.
-        gate.start_or_restart_gating();
+        assert!(rate_limit.start_or_restart());
 
         let idle = pool.get().await?;
-        assert_matches!(pool.get().await, Err(GatedCheckoutError::Gated));
+        assert_matches!(pool.get().await, Err(CheckoutError::RateLimited));
         assert_eq!(1, pool.status().size);
 
         drop(idle);
@@ -8496,14 +8510,14 @@ mod tests {
         Ok(())
     }
 
-    /// A checkout of a gated pool that is full waits for a connection to come back, because the
-    /// pool would not open a connection for it.
+    /// A checkout of a rate-limited pool that is full waits for a connection to come back,
+    /// because the pool would not open a connection for it.
     #[tokio::test]
-    async fn gated_full_pool_waits_for_a_connection() -> Result<()> {
+    async fn rate_limited_full_pool_waits_for_a_connection() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let Some(_probe) = storage_with_schema(
-            "gated_full_pool_waits_for_a_connection",
+            "rate_limited_full_pool_waits_for_a_connection",
             &CONNECTION,
             &cluster,
         )
@@ -8512,23 +8526,25 @@ mod tests {
             return Ok(());
         };
 
-        let gate = Arc::new(ConnectGate::default());
-        let pool = writable_gated_pool(&gate, None)?;
+        let rate_limit = Arc::new(ConnectRateLimit::default());
+        let pool = writable_rate_limited_pool(&rate_limit, None)?;
 
         let first = pool.get().await?;
         let second = pool.get().await?;
         assert_eq!(0, pool.status().available);
 
         // The `post_create` hook does this when a new connection finds a read-only server.
-        gate.start_or_restart_gating();
+        assert!(rate_limit.start_or_restart());
 
         let waiting = tokio::spawn({
             let pool = pool.clone();
             async move { pool.get().await.map(drop) }
         });
 
-        // The checkout waits in the pool's queue, instead of failing as gated.
+        // The checkout waits in the pool's queue, instead of failing as rate limited.
+        let settled = Instant::now() + Duration::from_secs(5);
         while pool.status().waiting == 0 {
+            assert!(Instant::now() < settled, "{:?}", pool.status());
             assert!(!waiting.is_finished());
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -8543,14 +8559,14 @@ mod tests {
         Ok(())
     }
 
-    /// A new connection that passes its check stops gating, so the pool opens connections
+    /// A new connection that passes its check stops the rate limit, so the pool opens connections
     /// without a limit again.
     #[tokio::test]
-    async fn new_connection_that_passes_its_check_stops_gating() -> Result<()> {
+    async fn new_connection_that_passes_its_check_stops_the_rate_limit() -> Result<()> {
         let cluster = alphanumeric_string(15);
 
         let Some(_probe) = storage_with_schema(
-            "new_connection_that_passes_its_check_stops_gating",
+            "new_connection_that_passes_its_check_stops_the_rate_limit",
             &CONNECTION,
             &cluster,
         )
@@ -8559,21 +8575,22 @@ mod tests {
             return Ok(());
         };
 
-        let gate = Arc::new(ConnectGate::default());
+        let rate_limit = Arc::new(ConnectRateLimit::default());
         let check = ReadOnlyCheck::new(1, &cluster);
-        let pool = writable_gated_pool(&gate, Some(check.post_create(gate.clone())))?;
+        let pool =
+            writable_rate_limited_pool(&rate_limit, Some(check.post_create(rate_limit.clone())))?;
 
         // The `post_create` hook does this when a new connection finds a read-only server.
-        gate.start_or_restart_gating();
+        assert!(rate_limit.start_or_restart());
 
-        // The gate stops a checkout before the interval ends, so the checkout after it shows
-        // that the connection which passes its check stops gating.
-        assert_matches!(pool.get().await, Err(GatedCheckoutError::Gated));
+        // The limit refuses a checkout before the interval ends, so the checkout after it shows
+        // that the connection which passes its check stops the limit.
+        assert_matches!(pool.get().await, Err(CheckoutError::RateLimited));
 
-        tokio::time::sleep(GATED_CONNECT_INTERVAL).await;
+        tokio::time::sleep(RATE_LIMITED_CONNECT_INTERVAL).await;
 
         let first = pool.get().await?;
-        assert!(!gate.is_gated());
+        assert!(!rate_limit.is_limiting());
 
         let second = pool.get().await?;
         assert_eq!(2, pool.status().size);
@@ -8778,7 +8795,7 @@ mod tests {
 
         assert_matches!(
             pool.get().await,
-            Err(GatedCheckoutError::Pool(PoolError::PostCreateHook(_)))
+            Err(CheckoutError::Pool(PoolError::PostCreateHook(_)))
         );
         assert_eq!(1, counted("create", "read_only"));
         assert_eq!(0, counted("recycle", "read_only"));
