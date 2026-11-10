@@ -8,6 +8,7 @@ include.workspace = true
 keywords = ["kafka", "serde", "quote", "syn", "proc-macro2"]
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [lints.clippy]

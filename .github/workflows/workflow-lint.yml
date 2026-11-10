@@ -70,6 +70,9 @@ jobs:
       # ci.yml runs check-storage-deps.sh only in the merge queue, on real
       # dependency trees that should pass, so its failure paths are tested here.
       - run: bash .github/scripts/check-storage-deps.test.sh
+      # ci.yml runs check-rust-version.sh only on the workspace's real
+      # manifests, which should pass, so its failure paths are tested here.
+      - run: bash .github/scripts/check-rust-version.test.sh
 
   zizmor:
     runs-on: ubuntu-latest
