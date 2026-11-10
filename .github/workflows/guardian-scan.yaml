@@ -390,7 +390,7 @@ jobs:
       - name: Guardian DB sync and Jira report
         # Ahead of the other Guardian actions' pin: the merge commit of
         # SolaceDev/solace-public-workflows#144, which adds the dependency-graph input.
-        uses: SolaceDev/solace-public-workflows/guardian-db-sync@3a76b4bd77d330f34dab5c02d6f9c8d64b594ae8 # main 2026-10-19, untagged
+        uses: SolaceDev/solace-public-workflows/guardian-db-sync@6e4e551fb30a04132b09216a9af453c2a030a822 # main 2026-10-19, untagged
         with:
           guardian-url: ${{ secrets.GUARDIAN_URL }}
           guardian-key: ${{ secrets.GUARDIAN_API_TOKEN }}
