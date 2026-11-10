@@ -13,7 +13,14 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch (text, text, integer, integer, integer, integer) as
+-- prepare record_fetch (text, text, integer, integer, integer, integer, integer) as
+-- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH). The running byte total
+-- below covers every row that this query reads, so without the limit, one fetch costs as much as
+-- the whole backlog between the fetch offset and the high watermark, however few rows the client
+-- can take. The limit also bounds the header probes, which run once for each row that the limit
+-- keeps. The fetch service reads again from the last offset that it received, so a limit that
+-- ends a read early costs one more query.
+--
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
 -- The header table is probed by its primary key for each record, so a record that holds only
@@ -21,13 +28,13 @@
 -- Turso engine does not accept a subquery inside the argument of a window function.
 --
 -- The window carries the size of each record, not its key or its value. SQLite copies each input
--- row of a window into a temporary table, and the window reads every record from $4 to $6,
--- because the filter on the running total runs after it. A key and a value in the window make one
--- fetch copy the payload of the whole backlog, however few records the fetch returns. SQLite's
--- length() reads only the record header, so the window reads sizes, and the final select reads
--- the key and the value, by primary key, of only the records that it returns. The Turso engine
--- reads each value to compute its length, so on Turso a fetch still reads the payload of every
--- record up to $6.
+-- row of a window into a temporary table, and the window reads every record from $4 to $6, up to
+-- the limit of $7, because the filter on the running total runs after it. A key and a value in the
+-- window make one fetch copy the payload of the whole backlog, however few records the fetch
+-- returns. SQLite's length() reads only the record header, so the window reads sizes, and the final
+-- select reads the key and the value, by primary key, of only the records that it returns. The
+-- Turso engine reads each value to compute its length, so on Turso a fetch still reads the payload
+-- of every record that the limit keeps.
 with sized as (
 select
 
@@ -61,7 +68,10 @@ c.name = $1
 and t.name = $2
 and tp.partition = $3
 and r.offset_id >= $4
-and r.offset_id < $6) sized_rows)
+and r.offset_id < $6
+
+order by r.offset_id
+limit $7) sized_rows)
 
 -- The query returns the first row even when that row alone is larger than $5, so that a consumer
 -- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first

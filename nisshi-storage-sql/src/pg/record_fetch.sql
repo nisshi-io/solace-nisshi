@@ -62,7 +62,7 @@ r.topition = (
 and r.offset_id >= $4
 and r.offset_id < $6
 
--- The limit stops the scan after $7 rows (ROWS_PER_FETCH in pg.rs). The byte limit at the end of
+-- The limit stops the scan after $7 rows (ROWS_PER_FETCH in sql.rs). The byte limit at the end of
 -- the query does not stop it, because PostgreSQL does not know that the running total only grows,
 -- so without this limit the scan reads every row up to the high watermark.
 order by r.offset_id
