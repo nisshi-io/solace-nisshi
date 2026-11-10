@@ -92,6 +92,33 @@ where
 
         Ok(())
     }
+
+    /// Produces `deflated` to the storage after the introduced latency. Both produce methods call
+    /// this, so that each produce waits and opens its span in one place.
+    #[instrument(name = "produce", skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        self.introduce_latency().await?;
+
+        match inflated {
+            Some(inflated) => {
+                self.storage
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => {
+                self.storage
+                    .produce(transaction_id, topition, deflated)
+                    .await
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -145,21 +172,16 @@ where
         self.storage.brokers().await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -167,10 +189,7 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
     }
 

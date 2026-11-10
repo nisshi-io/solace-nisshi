@@ -142,9 +142,8 @@ impl CountingStorage {
         Self { lookup, ..self }
     }
 
-    /// Returns this storage, with `produce_inflated` waiting for a permit of `gate` before it
-    /// answers, as an engine waits for a connection. The batch it was given stays held while it
-    /// waits.
+    /// Returns this storage, with each produce waiting for a permit of `gate` before it answers,
+    /// as an engine waits for a connection. The batch it was given stays held while it waits.
     pub(crate) fn with_produce_gate(self, gate: Arc<Semaphore>) -> Self {
         Self {
             produce_gate: Some(gate),
@@ -152,9 +151,35 @@ impl CountingStorage {
         }
     }
 
-    /// The number of `produce_inflated` calls now waiting for the gate.
+    /// The number of produces now waiting for the gate.
     pub(crate) fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
+    }
+
+    /// Records a produce of `deflated` and `inflated`, after the gate lets it through. Both
+    /// produce methods call this, so that the gate holds each produce the same way.
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        if let Some(gate) = &self.produce_gate {
+            _ = self.parked.fetch_add(1, Ordering::SeqCst);
+            let permit = gate.acquire().await;
+            _ = self.parked.fetch_sub(1, Ordering::SeqCst);
+            permit?.forget();
+        }
+
+        self.produced.lock()?.push(Produced {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.clone(),
+            deflated,
+            inflated,
+        });
+
+        Ok(0)
     }
 
     /// Deletes the topic `name`.
@@ -312,14 +337,8 @@ impl Storage for CountingStorage {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        self.produced.lock()?.push(Produced {
-            transaction_id: transaction_id.map(str::to_owned),
-            topition: topition.clone(),
-            deflated,
-            inflated: None,
-        });
-
-        Ok(0)
+        self.produce_batch(transaction_id, topition, deflated, None)
+            .await
     }
 
     async fn produce_inflated(
@@ -329,21 +348,8 @@ impl Storage for CountingStorage {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        if let Some(gate) = &self.produce_gate {
-            _ = self.parked.fetch_add(1, Ordering::SeqCst);
-            let permit = gate.acquire().await;
-            _ = self.parked.fetch_sub(1, Ordering::SeqCst);
-            permit?.forget();
-        }
-
-        self.produced.lock()?.push(Produced {
-            transaction_id: transaction_id.map(str::to_owned),
-            topition: topition.clone(),
-            deflated,
-            inflated: Some(inflated),
-        });
-
-        Ok(0)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
+            .await
     }
 
     async fn offset_commit(

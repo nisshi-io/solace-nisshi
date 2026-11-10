@@ -2121,9 +2121,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// A wrapper must forward this method as well as [`Storage::produce`], or the default
     /// discards the decoded batch and the inner backend decodes it again. A wrapper that would
-    /// make the produce wait for a permit or a slot calls [`Storage::produce`] instead, so that a
-    /// waiting produce holds its compressed bytes only. The result and the errors are those of
-    /// [`Storage::produce`].
+    /// make the produce wait for a permit or a slot drops `inflated` before it waits, and then
+    /// calls [`Storage::produce`], so that a waiting produce holds its compressed bytes only. The
+    /// result and the errors are those of [`Storage::produce`].
+    ///
+    /// An implementation of both methods sends them through one private method, so that a span,
+    /// a metric or a permit that it adds applies to every produce, whichever method the caller
+    /// used.
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,

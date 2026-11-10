@@ -1443,6 +1443,42 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
     Ok((current, version))
 }
 
+impl Engine {
+    /// Writes `deflated` to `topition` in one transaction, with `inflated` as its decoded records,
+    /// or with the records that this decodes from `deflated` when the caller passed none. Both
+    /// produce methods call this, so that each produce decodes and writes in one place.
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = match inflated {
+            Some(inflated) => inflated,
+            None => inflate(deflated.clone())
+                .await
+                .inspect_err(|err| debug!(?err))?,
+        };
+
+        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
+
+        let mut connection = self.connection().await?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+
+        let high = self
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
+            .await?;
+
+        tx.commit().await.map_err(Into::into).and(Ok(high))
+    }
+}
+
 #[async_trait]
 impl Storage for Engine {
     /// A Turso connection has no busy handler, so a write that finds another
@@ -1784,14 +1820,7 @@ impl Storage for Engine {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // The batch is inflated before the transaction starts, so the wait
-        // for a decode permit and the decode do not hold a connection or the
-        // database write lock.
-        let inflated = inflate(deflated.clone())
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
-        self.produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
@@ -1802,18 +1831,8 @@ impl Storage for Engine {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        debug!(cluster = self.cluster, transaction_id, ?topition, ?deflated);
-
-        let mut connection = self.connection().await?;
-        let tx = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &tx)
-            .await?;
-
-        tx.commit().await.map_err(Into::into).and(Ok(high))
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
+            .await
     }
 
     async fn fetch(

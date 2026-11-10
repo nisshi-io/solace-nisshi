@@ -1970,6 +1970,36 @@ impl Engine {
     -> Builder<PhantomData<String>, PhantomData<i32>, PhantomData<Url>, PhantomData<Url>> {
         Builder::default()
     }
+
+    /// Sends a produce of `deflated` to the delegate, and records how long it took. Both produce
+    /// methods call this, so that each produce opens its span and records its duration in one
+    /// place.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
+
+        match inflated {
+            Some(inflated) => {
+                self.inner
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => self.inner.produce(transaction_id, topition, deflated).await,
+        }
+        .inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[StorageOperation::Produce.attribute()],
+            )
+        })
+    }
 }
 
 #[async_trait]
@@ -2059,26 +2089,16 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        self.inner
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Produce.attribute()],
-                )
-            })
     }
 
-    #[instrument(skip_all)]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -2086,16 +2106,8 @@ impl Storage for Engine {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        self.inner
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[KeyValue::new("operation", "produce")],
-                )
-            })
     }
 
     #[instrument(skip_all)]
@@ -2861,6 +2873,71 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
     Ok((current, version))
 }
 
+impl Delegate {
+    /// Writes `deflated` to `topition` in one transaction, with `inflated` as its decoded records,
+    /// or with the records that this decodes from `deflated` when the caller passed none. Both
+    /// produce methods call this, so that each produce decodes, writes and records its duration in
+    /// one place.
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        // This runs while the delegate serves the request, so the wait for a decode permit holds
+        // the engine's single permit. A caller that passes `inflated` skips this decode.
+        //
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = match inflated {
+            Some(inflated) => inflated,
+            None => inflate(deflated.clone())
+                .await
+                .inspect_err(|err| debug!(?err))?,
+        };
+
+        let start = SystemTime::now();
+
+        let pc = self.connection().await?;
+
+        let tx = pc.transaction().await.inspect(|_| {
+            debug!(after_produce_transaction = elapsed_millis(start));
+        })?;
+
+        let high = self
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
+            .await
+            .inspect(|_| {
+                debug!(after_produce_in_tx = elapsed_millis(start));
+            })
+            .inspect_err(|err| match err {
+                // A rejection the client caused: ProduceService logs it once,
+                // at warn, with the topic and partition.
+                Error::Api(_)
+                | Error::MessageTooLarge { .. }
+                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                    debug!(?err)
+                }
+                err => error!(?err),
+            })?;
+
+        pc.commit(tx)
+            .await
+            .and(Ok(high))
+            .inspect_err(|err| error!(?err))
+            .inspect(|_| {
+                debug!(after_produce_commit = elapsed_millis(start));
+
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[StorageOperation::Produce.attribute()],
+                )
+            })
+    }
+}
+
 #[async_trait]
 impl Storage for Delegate {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
@@ -3226,17 +3303,7 @@ impl Storage for Delegate {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // This runs while the delegate serves the request, so the wait for a decode permit holds
-        // the engine's single permit. `produce_inflated` skips this decode.
-        //
-        // The batch is inflated before the transaction starts, so the wait
-        // for a decode permit and the decode do not hold a connection or the
-        // database write lock.
-        let inflated = inflate(deflated.clone())
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
-        self.produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
@@ -3247,43 +3314,8 @@ impl Storage for Delegate {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-
-        let pc = self.connection().await?;
-
-        let tx = pc.transaction().await.inspect(|_| {
-            debug!(after_produce_transaction = elapsed_millis(start));
-        })?;
-
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .inspect(|_| {
-                debug!(after_produce_in_tx = elapsed_millis(start));
-            })
-            .inspect_err(|err| match err {
-                // A rejection the client caused: ProduceService logs it once,
-                // at warn, with the topic and partition.
-                Error::Api(_)
-                | Error::MessageTooLarge { .. }
-                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
-                    debug!(?err)
-                }
-                err => error!(?err),
-            })?;
-
-        pc.commit(tx)
-            .await
-            .and(Ok(high))
-            .inspect_err(|err| error!(?err))
-            .inspect(|_| {
-                debug!(after_produce_commit = elapsed_millis(start));
-
-                DELEGATE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Produce.attribute()],
-                )
-            })
     }
 
     async fn fetch(

@@ -40,7 +40,7 @@ mod produce;
 #[cfg(test)]
 mod produce_budget;
 #[cfg(test)]
-mod produce_inflated_forwarding;
+mod produce_entry_points;
 pub mod read_deadline;
 pub mod read_share;
 mod txn;
@@ -472,23 +472,93 @@ impl RequestChannelService {
         let start = Instant::now();
 
         let operation = input.operation();
-        let attributes = [operation.attribute()];
+        self.record_capacity(operation);
 
+        let permit = self.reserve(operation).await?;
+
+        Ok(Self::send_reserved(permit, input, start))
+    }
+
+    /// Records the free slots of the channel, for a request of `operation` that is about to take
+    /// one.
+    fn record_capacity(&self, operation: StorageOperation) {
         let capacity = self.tx.capacity();
-        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
+        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[operation.attribute()]);
         debug!(%operation, capacity);
+    }
 
-        let permit = self
-            .tx
+    /// Reserves a slot in the channel for a request of `operation`, and waits until the channel
+    /// has room for it.
+    async fn reserve(
+        &self,
+        operation: StorageOperation,
+    ) -> Result<mpsc::Permit<'_, ChannelRequest>, ServiceError> {
+        self.tx
             .reserve()
             .queued_for(ReadWait::ExclusiveEngineAccess)
             .await
             .inspect_err(|err| {
                 error!(%operation, ?err);
-                STORAGE_CHANNEL_ERROR.add(1, &attributes);
-            })?;
+                STORAGE_CHANNEL_ERROR.add(1, &[operation.attribute()]);
+            })
+            .map_err(Into::into)
+    }
 
-        Ok(Self::send_reserved(permit, input, start))
+    /// Sends a produce of `deflated` on the channel, and waits for its response. Both produce
+    /// methods call this, so that each produce takes its slot, records the channel's capacity and
+    /// opens its span in one place.
+    ///
+    /// A produce that has to wait for a slot drops `inflated` before it waits, so the number of
+    /// decoded batches that the channel holds is the number of slots, not the number of waiting
+    /// produces. The storage then decodes the waiting produce's batch again.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = Instant::now();
+
+        let operation = StorageOperation::Produce;
+        self.record_capacity(operation);
+
+        let (permit, inflated) = match inflated {
+            Some(inflated) => match self.tx.try_reserve() {
+                Ok(permit) => {
+                    produce_path::direct(produce_path::Stage::Channel);
+                    (permit, Some(inflated))
+                }
+
+                Err(_) => {
+                    drop(inflated);
+                    produce_path::fallback(produce_path::Stage::Channel);
+                    (self.reserve(operation).await?, None)
+                }
+            },
+
+            None => (self.reserve(operation).await?, None),
+        };
+
+        let request = Request::Produce {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.to_owned(),
+            batch: deflated,
+            inflated,
+        };
+
+        Self::send_reserved(permit, request, start)
+            .response()
+            .await
+            .and_then(|response| {
+                if let Response::Produce(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
     }
 
     /// Sends `input` through `permit`, which reserved a slot in the channel at `start`.
@@ -679,29 +749,16 @@ impl Storage for RequestChannelService {
         serve_and_extract!(self, Request::Brokers, Brokers)
     }
 
-    #[instrument(skip_all)]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         batch: deflated::Batch,
     ) -> Result<i64> {
-        let transaction_id = transaction_id.map(|s| s.to_string());
-        let topition = topition.to_owned();
-
-        serve_and_extract!(
-            self,
-            Request::Produce {
-                transaction_id,
-                topition,
-                batch,
-                inflated: None,
-            },
-            Produce
-        )
+        self.produce_batch(transaction_id, topition, batch, None)
+            .await
     }
 
-    #[instrument(skip_all)]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -709,42 +766,8 @@ impl Storage for RequestChannelService {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        // A produce that waits for a slot holds only its compressed bytes, so the number of decoded
-        // batches the channel holds is the number of slots, not the number of waiting produces.
-        // The produce then reaches the storage without the decoded batch, which decodes it again.
-        let start = Instant::now();
-
-        let capacity = self.tx.capacity();
-        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[StorageOperation::Produce.attribute()]);
-        debug!(operation = %StorageOperation::Produce, capacity);
-
-        let Ok(permit) = self.tx.try_reserve() else {
-            drop(inflated);
-            produce_path::fallback(produce_path::Stage::Channel);
-
-            return self.produce(transaction_id, topition, deflated).await;
-        };
-
-        produce_path::direct(produce_path::Stage::Channel);
-
-        let request = Request::Produce {
-            transaction_id: transaction_id.map(|s| s.to_string()),
-            topition: topition.to_owned(),
-            batch: deflated,
-            inflated: Some(inflated),
-        };
-
-        Self::send_reserved(permit, request, start)
-            .response()
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .and_then(|response| {
-                if let Response::Produce(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
