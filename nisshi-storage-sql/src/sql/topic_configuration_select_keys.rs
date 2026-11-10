@@ -37,6 +37,7 @@ sql_row! {
 }
 
 /// One config that the topic sets.
+#[cfg(feature = "postgres")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Config {
     /// The config's key.
@@ -45,6 +46,7 @@ pub(crate) struct Config {
     pub(crate) value: Option<String>,
 }
 
+#[cfg(feature = "postgres")]
 impl Row {
     /// Returns the row's config, or `None` for the row of a topic that sets none of the keys,
     /// which is not a config.

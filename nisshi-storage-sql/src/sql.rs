@@ -199,12 +199,14 @@ impl ColumnErrorCount {
 
 /// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
 /// [`QueryRow`], in order. It reads a row only when the caller reaches it.
+#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
     driver_cursor: R,
     reader: T::Reader,
     column_errors: ColumnErrorCount,
 }
 
+#[cfg(any(feature = "libsql", feature = "turso"))]
 impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
     /// Returns a cursor over the result with `columns`, which reads each row from
     /// `driver_cursor` and counts each column error in `column_errors`.

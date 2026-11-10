@@ -41,6 +41,7 @@ pub(crate) trait DriverRow {
 
 /// A cursor over one SQL driver's result, which returns each of its rows as a [`DriverRow`], in
 /// order.
+#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) trait DriverRowCursor {
     /// A row of the result.
     type Row: DriverRow;
