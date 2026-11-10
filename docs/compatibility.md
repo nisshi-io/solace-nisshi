@@ -40,7 +40,7 @@ client that reads the ApiVersions response first does not send such a request.
 | Produce | 0 | 3-11 | Yes | Yes | Yes | Yes | Versions 0-2 use the message set format, which Nisshi does not decode. Some topic configs do not apply, see [Topic configuration](#topic-configuration). The broker rejects a `CreateTime` record more than an hour ahead of its clock with INVALID_TIMESTAMP, as Kafka 4.0 does by default. Kafka 3.9.1 accepts any future timestamp, and Nisshi has no setting to change the limit. |
 | Fetch | 1 | 0-17 | Yes | Yes | Yes | Yes | Every fetch is a full fetch, because the broker does not keep incremental fetch sessions (KIP-227). |
 | ListOffsets | 2 | 0-6 | Yes | Yes | Yes | Yes | Nisshi does not support the `max-timestamp` lookup, because a client requests it with version 7. |
-| DeleteRecords | 21 | 0-2 | Yes | Yes | Yes | Yes | |
+| DeleteRecords | 21 | 0-2 | Yes | Yes | Yes | Yes | Removes records from the Kafka log only. A data lake table keeps its rows, see [Data lake](data-lake.md#removing-records-from-a-topic). |
 | OffsetForLeaderEpoch | 23 | – | No | No | No | No | |
 
 ### Topics and configuration
@@ -153,6 +153,8 @@ lists for a config marked No is Kafka's value, not what the broker does: an in-m
 `retention.ms=604800000`, and keeps every record. The broker applies
 `cleanup.policy`, `retention.ms` and `retention.bytes` in a maintenance run, every 10 minutes by
 default. The `maintenance_interval` option on the storage engine URL changes the interval.
+Retention and compaction remove records from the Kafka log only, and a data lake table keeps its
+rows, as [Data lake](data-lake.md#removing-records-from-a-topic) describes.
 
 | Config | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --- | --- | --- | --- | --- |
