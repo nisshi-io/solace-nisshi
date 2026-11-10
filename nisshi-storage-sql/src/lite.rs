@@ -6499,8 +6499,9 @@ mod tests {
     }
 
     /// A fetch from the start of a backlog of large records runs within a heap of a few MB: the
-    /// window that sums the record sizes reads the sizes, and the fetch reads the key and the value
-    /// of only the records that it returns.
+    /// window no longer copies the key and the value of every record into its temporary table. The
+    /// keyed query still reads through each value on libSQL (see `record_fetch_keyed.sql`), but
+    /// walking overflow pages uses little heap, so this test does not see it.
     #[tokio::test]
     async fn fetch_over_large_records_runs_within_a_small_heap() -> Result<()> {
         const RECORDS: i64 = 40;
