@@ -145,6 +145,23 @@ where
     Ok(())
 }
 
+pub async fn a_producer_steps_over_the_largest_sequence_one_record_at_a_time<G>(
+    storage: G,
+) -> Result<()>
+where
+    G: Storage,
+{
+    let (topition, producer) = partition_near_the_largest_sequence(&storage).await?;
+
+    // The next sequence is `i32::MAX - 1`, so a batch of one record leaves it at `i32::MAX`, the
+    // largest value that does not wrap. The batch after that is the one that wraps to 0.
+    _ = produce(&storage, &topition, producer, i32::MAX - 1, 1).await?;
+    _ = produce(&storage, &topition, producer, i32::MAX, 1).await?;
+    _ = produce(&storage, &topition, producer, 0, 1).await?;
+
+    Ok(())
+}
+
 /// Runs each listed test above against one engine.
 macro_rules! backend_tests {
     ($module:ident, $feature:literal, $storage:path, [$($test:ident),+ $(,)?]) => {
@@ -191,6 +208,7 @@ backend_tests!(
         a_batch_that_ends_at_the_largest_sequence_wraps_the_next_sequence_to_0,
         a_batch_that_crosses_the_largest_sequence_wraps_the_next_sequence,
         the_wrapped_sequence_is_the_next_sequence_exactly,
+        a_producer_steps_over_the_largest_sequence_one_record_at_a_time,
     ]
 );
 backend_tests!(
@@ -201,6 +219,7 @@ backend_tests!(
         a_batch_that_ends_at_the_largest_sequence_wraps_the_next_sequence_to_0,
         a_batch_that_crosses_the_largest_sequence_wraps_the_next_sequence,
         the_wrapped_sequence_is_the_next_sequence_exactly,
+        a_producer_steps_over_the_largest_sequence_one_record_at_a_time,
     ]
 );
 backend_tests!(
@@ -211,5 +230,6 @@ backend_tests!(
         a_batch_that_ends_at_the_largest_sequence_wraps_the_next_sequence_to_0,
         a_batch_that_crosses_the_largest_sequence_wraps_the_next_sequence,
         the_wrapped_sequence_is_the_next_sequence_exactly,
+        a_producer_steps_over_the_largest_sequence_one_record_at_a_time,
     ]
 );
