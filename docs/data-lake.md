@@ -17,9 +17,12 @@ adds rows to a table. It does not update or delete them.
 | Delta Lake | The table at `<location>/<database>.<topic>`, where `<location>` is `--location` and `<database>` is `--database` (default `nisshi`). The broker does not register the table in a catalog, so a query engine reads it by its path. |
 | Apache Parquet | One file for each batch of records, under `<location>/<topic>/<partition>/`, where `<location>` is `--location` and `<partition>` is the partition number, padded with zeros. |
 
-Each row has a `meta` column with the record's partition (`meta.partition`) and the record's
-timestamp (`meta.timestamp`). The timestamp is in microseconds, as a timestamp without a time
-zone.
+Each row has a `meta` column with the record's partition (`meta.partition`) and a timestamp
+(`meta.timestamp`). The type of `meta.timestamp` depends on the topic's schema:
+
+- Avro and Protocol Buffers: the record's timestamp, in microseconds, as a timestamp without a
+  time zone.
+- JSON Schema: the timestamp of the record's batch, as an RFC 3339 string in UTC.
 
 ## Removing records from a topic
 
@@ -36,7 +39,8 @@ the only copy of them.
 The broker does not delete rows or files from a table. It does not expire Apache Iceberg
 snapshots, and it does not vacuum a Delta Lake table. To remove data from a table, run the
 table format's own commands in your query engine, outside Nisshi. To remove the rows that
-retention removed from a topic, select them with a condition on `meta.timestamp`.
+retention removed from a topic, select them with a condition on `meta.timestamp`. For a JSON
+Schema topic, the condition casts `meta.timestamp` from a string to a timestamp.
 
 Both table formats remove data in two steps. A delete removes the rows from the table's current
 version, and the old data files stay in storage, so that a query can still read an earlier
@@ -58,16 +62,17 @@ version of the table. A second command deletes those files.
 
 1. Remove the rows with [`DELETE FROM`][delta-delete], by the table's path. For a broker started
    with `delta --location s3://lake`, run
-   ``DELETE FROM delta.`s3://lake/nisshi.<topic>` WHERE <condition>`` in Apache Spark. DuckDB 2.0
-   reads Delta Lake tables, and [does not support][duckdb-delta] `DELETE` on them.
+   ``DELETE FROM delta.`s3://lake/nisshi.<topic>` WHERE <condition>`` in Apache Spark. The
+   broker adds `/` between `--location` and the table name, so with a `--location` that ends in
+   `/` the path has `//` in it. DuckDB 2.0 reads Delta Lake tables, and
+   [does not support][duckdb-delta] `DELETE` on them.
 2. Delete the old data files with [`VACUUM`][delta-vacuum]. It deletes the files that the table
    no longer references and that are older than the table's `delta.deletedFileRetentionDuration`
    (default: 7 days). Delta Lake does not run `VACUUM` by itself.
 
 On the PostgreSQL, memory, S3 and Google Cloud Storage engines, the broker runs Delta Lake's
-`OPTIMIZE` in its maintenance run, on each table that it has written to since it started.
-`OPTIMIZE` rewrites the table's files, and the files that it replaces also stay in storage until
-`VACUUM` deletes them.
+`OPTIMIZE` in its maintenance run. The SQLite engine does not. `OPTIMIZE` rewrites a table's
+files, and the files that it replaces also stay in storage until `VACUUM` deletes them.
 
 ### Apache Parquet
 
@@ -75,8 +80,8 @@ The Parquet files belong to no table. Delete or rewrite the files under `--locat
 storage's own tools.
 
 [duckdb-delta]: https://duckdb.org/docs/2.0/core_extensions/delta.html#limitations
-[delta-delete]: https://docs.delta.io/latest/delta-update.html#delete-from-a-table
-[delta-vacuum]: https://docs.delta.io/latest/delta-utility.html#remove-files-no-longer-referenced-by-a-delta-table
+[delta-delete]: https://docs.delta.io/delta-update/#delete-from-a-table
+[delta-vacuum]: https://docs.delta.io/delta-utility/#remove-files-no-longer-referenced-by-a-delta-table
 [iceberg-delete]: https://iceberg.apache.org/docs/latest/spark-writes/#delete-from
 [iceberg-expire]: https://iceberg.apache.org/docs/latest/spark-procedures/#expire_snapshots
 [iceberg-orphan]: https://iceberg.apache.org/docs/latest/spark-procedures/#remove_orphan_files
