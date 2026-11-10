@@ -8366,7 +8366,7 @@ mod tests {
     }
 
     /// While the endpoint still reaches a read-only server, each checkout fails
-    /// fast with a transient pool error and the pool does not grow, instead of
+    /// fast with a transient error and the pool does not grow, instead of
     /// each checkout using a new connection once and dropping it at the next.
     #[tokio::test]
     async fn read_only_server_fails_each_checkout_fast_without_growing_the_pool() -> Result<()> {
@@ -8395,7 +8395,11 @@ mod tests {
                 .expect_err("a connection to a read-only server must not be handed out");
 
             assert!(started.elapsed() < Duration::from_secs(5), "{error:?}");
-            assert_matches!(&error, Error::Pool(_));
+            assert_matches!(
+                &error,
+                Error::Pool(_) | Error::PoolConnectRateLimited { .. }
+            );
+            assert!(error.is_transient(), "{error:?}");
             assert_eq!(0, storage.pool.status().size);
         }
 

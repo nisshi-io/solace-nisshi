@@ -409,6 +409,14 @@ pub enum Error {
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
 
+    /// The PostgreSQL pool refused to open a new connection, because a new connection reached a
+    /// read-only server, and the pool opens at most one new connection per `interval` until a
+    /// new connection passes its check.
+    #[cfg(feature = "postgres")]
+    PoolConnectRateLimited {
+        interval: Duration,
+    },
+
     #[cfg(feature = "slatedb")]
     Postcard(#[from] postcard::Error),
 
@@ -549,6 +557,10 @@ impl Error {
 
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             Self::Pool(_) => true,
+
+            // The limit ends when the pool's address leads to a writable server again.
+            #[cfg(feature = "postgres")]
+            Self::PoolConnectRateLimited { .. } => true,
 
             #[cfg(feature = "postgres")]
             Self::TokioPostgres(error) => match error.as_db_error() {

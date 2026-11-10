@@ -24,7 +24,7 @@ use std::{
 
 #[cfg(test)]
 use deadpool_postgres::Timeouts;
-use deadpool_postgres::{HookError, Object, Pool, PoolError, Status};
+use deadpool_postgres::{Object, Pool, PoolError, Status};
 use nisshi_storage::Error;
 use tokio::time::Instant;
 
@@ -118,17 +118,11 @@ pub(super) enum CheckoutError {
 }
 
 impl From<CheckoutError> for Error {
-    /// Converts a rate-limited checkout to the error of a failed `post_create` hook, which is
-    /// transient, so a client retries it as it retries the checkout that found the read-only
-    /// server.
     fn from(value: CheckoutError) -> Self {
         match value {
-            CheckoutError::RateLimited => {
-                Self::from(PoolError::PostCreateHook(HookError::message(
-                    "the pool opens at most one new connection per second, because the last new \
-                connection reached a read-only server",
-                )))
-            }
+            CheckoutError::RateLimited => Self::PoolConnectRateLimited {
+                interval: RATE_LIMITED_CONNECT_INTERVAL,
+            },
             CheckoutError::Pool(error) => Self::from(error),
         }
     }
@@ -263,10 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn rate_limited_checkout_is_a_transient_pool_error() {
+    fn rate_limited_checkout_is_a_transient_error() {
         let error = Error::from(CheckoutError::RateLimited);
 
-        assert_matches!(&error, Error::Pool(_));
+        assert_matches!(&error, Error::PoolConnectRateLimited { .. });
         assert!(error.is_transient(), "{error:?}");
     }
 }
