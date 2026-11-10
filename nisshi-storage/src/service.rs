@@ -468,6 +468,8 @@ impl RequestChannelService {
     }
 
     /// Sends `input` on the channel once the channel has room for it.
+    ///
+    /// A produce does not go through this or `serve`: `produce_batch` reserves its own slot.
     async fn send(&self, input: Request) -> Result<SentRequest, ServiceError> {
         let start = Instant::now();
 

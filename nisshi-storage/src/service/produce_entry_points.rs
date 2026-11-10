@@ -18,7 +18,8 @@
 //! on and applies its side effects the same way through both, so that a side effect added to one
 //! of them still reaches every produce.
 
-use nisshi_sans_io::record::{deflated, inflated};
+use bytes::Bytes;
+use nisshi_sans_io::record::{Record, deflated, inflated};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
@@ -313,12 +314,10 @@ fn record_spans() -> (OpenedSpans, DefaultGuard) {
     (spans, guard)
 }
 
-/// Each produce through the proxy opens one span, also when it waits for the permit and so drops
-/// its decoded batch.
-#[tokio::test]
-async fn a_produce_that_waits_for_the_proxy_permit_opens_one_span() -> Result<()> {
-    let (spans, _guard) = record_spans();
-
+/// Produces through `proxy` twice, the second with a decoded batch while the first holds the
+/// proxy's permit in the storage, and checks that the second waited for the permit: it reached the
+/// storage without its decoded batch.
+async fn produce_that_waits_for_the_proxy_permit() -> Result<()> {
     // The gate holds the first produce in the storage, so that it keeps the proxy's permit.
     let gate = Arc::new(Semaphore::new(0));
     let storage = storage().with_produce_gate(Arc::clone(&gate));
@@ -370,6 +369,17 @@ async fn a_produce_that_waits_for_the_proxy_permit_opens_one_span() -> Result<()
             .collect::<Vec<_>>()
     );
 
+    Ok(())
+}
+
+/// Each produce through the proxy opens one span, also when it waits for the permit and so drops
+/// its decoded batch.
+#[tokio::test]
+async fn a_produce_that_waits_for_the_proxy_permit_opens_one_span() -> Result<()> {
+    let (spans, _guard) = record_spans();
+
+    produce_that_waits_for_the_proxy_permit().await?;
+
     assert_eq!(
         vec!["produce", "produce"],
         spans.named("nisshi_storage::proxy")
@@ -378,12 +388,9 @@ async fn a_produce_that_waits_for_the_proxy_permit_opens_one_span() -> Result<()
     Ok(())
 }
 
-/// Each produce through the channel opens one span, whether it gets a slot at once or waits for
-/// one, and whichever produce method the caller used.
-#[tokio::test]
-async fn a_produce_through_the_channel_opens_one_span() -> Result<()> {
-    let (spans, _guard) = record_spans();
-
+/// Produces through a channel with one slot twice, the second with a decoded batch while the
+/// first holds the slot and nothing receives it yet, so that the second waits for a slot.
+async fn produce_that_waits_for_a_channel_slot() -> Result<()> {
     let (sender, mut receiver) = bounded_channel(1);
     let channel = RequestChannelService::new(sender);
     let topition = Topition::new("abc", 0);
@@ -424,6 +431,17 @@ async fn a_produce_through_the_channel_opens_one_span() -> Result<()> {
     let (first, second, ()) = tokio::join!(first, second, serve);
     _ = first?;
     _ = second?;
+
+    Ok(())
+}
+
+/// Each produce through the channel opens one span, whether it gets a slot at once or waits for
+/// one, and whichever produce method the caller used.
+#[tokio::test]
+async fn a_produce_through_the_channel_opens_one_span() -> Result<()> {
+    let (spans, _guard) = record_spans();
+
+    produce_that_waits_for_a_channel_slot().await?;
 
     assert_eq!(
         vec!["produce", "produce"],
@@ -609,6 +627,93 @@ async fn batcher_counts_its_produce_path_only_when_it_reserves() -> Result<()> {
         vec![(
             vec![
                 ("path".to_owned(), "direct".to_owned()),
+                ("stage".to_owned(), "batcher".to_owned())
+            ],
+            1
+        )],
+        recorded(&provider, &exporter, "nisshi_storage_produce_path")
+    );
+
+    Ok(())
+}
+
+/// A produce that carries a decoded batch and waits for the proxy's permit counts the fallback,
+/// and still records its wait.
+#[tokio::test]
+async fn a_produce_that_waits_for_the_proxy_permit_counts_a_fallback() -> Result<()> {
+    let (provider, exporter) = install_exporter();
+
+    produce_that_waits_for_the_proxy_permit().await?;
+
+    assert_eq!(
+        vec![(
+            vec![
+                ("path".to_owned(), "fallback".to_owned()),
+                ("stage".to_owned(), "semaphore".to_owned())
+            ],
+            1
+        )],
+        recorded(&provider, &exporter, "nisshi_storage_produce_path")
+    );
+
+    assert_eq!(
+        vec![(vec![("operation".to_owned(), "produce".to_owned())], 2)],
+        recorded(
+            &provider,
+            &exporter,
+            "nisshi_storage_proxy_semaphore_acquire_duration"
+        )
+    );
+
+    Ok(())
+}
+
+/// A produce that carries a decoded batch and waits for a slot in the channel counts the
+/// fallback.
+#[tokio::test]
+async fn a_produce_that_waits_for_a_channel_slot_counts_a_fallback() -> Result<()> {
+    let (provider, exporter) = install_exporter();
+
+    produce_that_waits_for_a_channel_slot().await?;
+
+    assert_eq!(
+        vec![(
+            vec![
+                ("path".to_owned(), "fallback".to_owned()),
+                ("stage".to_owned(), "channel".to_owned())
+            ],
+            1
+        )],
+        recorded(&provider, &exporter, "nisshi_storage_produce_path")
+    );
+
+    Ok(())
+}
+
+/// A produce whose decoded batch is over the batcher's decoded limit counts the fallback.
+#[tokio::test]
+async fn a_produce_over_the_decoded_limit_counts_a_batcher_fallback() -> Result<()> {
+    let (provider, exporter) = install_exporter();
+
+    // One record gives the batch a decoded size above the limit of zero.
+    let inflated = inflated::Batch::builder()
+        .last_offset_delta(0)
+        .record(Record::builder().value(Bytes::from_static(b"value").into()))
+        .build()?;
+    let deflated = deflated::Batch::try_from(inflated.clone())?;
+
+    let batcher = ProduceRequestBatcher::new(storage())
+        .with_maximum_delay(Some(Duration::from_millis(1)))
+        .with_decoded_limit(0);
+
+    _ = batcher
+        .produce_inflated(None, &Topition::new("abc", 0), deflated, inflated)
+        .await?;
+
+    assert_eq!(
+        vec![(
+            vec![
+                ("path".to_owned(), "fallback".to_owned()),
                 ("stage".to_owned(), "batcher".to_owned())
             ],
             1

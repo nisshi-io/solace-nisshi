@@ -434,7 +434,7 @@ where
     /// Sets a decoded-size limit below [`MAX_DECODED_BATCH_BYTES`], so that a test can fill a run
     /// with small batches.
     #[cfg(test)]
-    fn with_decoded_limit(self, decoded_limit: usize) -> Self {
+    pub(crate) fn with_decoded_limit(self, decoded_limit: usize) -> Self {
         Self {
             decoded_limit,
             ..self
