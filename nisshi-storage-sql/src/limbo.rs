@@ -4586,6 +4586,27 @@ mod tests {
             }
         }
 
+        // The records at the odd offsets take another key, so the keyed statement matches the
+        // 5,025 records at the even offsets. A statement that applies the row limit before the
+        // key filter returns 5,000 of them from offset 0.
+        _ = connection
+            .execute("update record set k = x'6a' where offset_id % 2 = 1", ())
+            .await?;
+
+        assert_eq!(
+            (0..RECORDS).step_by(2).collect::<Vec<_>>(),
+            fetched_offsets_from(
+                &connection,
+                "record_fetch_keyed.sql",
+                Some(b"k"),
+                0,
+                i64::MAX,
+                RECORDS
+            )
+            .await?,
+            "record_fetch_keyed.sql: the key filter must apply before the row limit",
+        );
+
         Ok(())
     }
 

@@ -6858,15 +6858,16 @@ mod tests {
     }
 
     /// Stores `count` records, 1,000 to a batch because a batch of headers can exceed the
-    /// message size limit. Each has the key `k` and the value `a`, and a 1 byte header key and a
-    /// 99 byte header value when `with_header`. A record then costs 104 bytes against a fetch's
-    /// `max_bytes`: 1 for the key, 1 for the value, 2 for the header's framing and 100 for the
-    /// header.
+    /// message size limit. Each has the key `k`, or the key `j` when `alternate_keys` and its
+    /// offset is odd. Each has the value `a`, and a 1 byte header key and a 99 byte header value
+    /// when `with_header`. A record then costs 104 bytes against a fetch's `max_bytes`: 1 for the
+    /// key, 1 for the value, 2 for the header's framing and 100 for the header.
     async fn produce_keyed_records(
         engine: &ArcDynStorage,
         topition: &Topition,
         count: i64,
         with_header: bool,
+        alternate_keys: bool,
     ) -> Result<()> {
         const RECORDS_PER_BATCH: i64 = 1_000;
 
@@ -6875,8 +6876,14 @@ mod tests {
 
             let batch = (0..in_batch)
                 .fold(inflated::Batch::builder(), |builder, delta| {
+                    let key: &'static [u8] = if alternate_keys && (first + delta) % 2 == 1 {
+                        b"j"
+                    } else {
+                        b"k"
+                    };
+
                     let record = Record::builder()
-                        .key(Some(Bytes::from_static(b"k")))
+                        .key(Some(Bytes::from_static(key)))
                         .value(Some(Bytes::from_static(b"a")))
                         .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX));
 
@@ -6947,7 +6954,7 @@ mod tests {
         for keyed in [false, true] {
             let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
 
-            produce_keyed_records(&engine, &produced, RECORDS, false).await?;
+            produce_keyed_records(&engine, &produced, RECORDS, false, false).await?;
 
             assert_eq!(
                 (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
@@ -6965,6 +6972,30 @@ mod tests {
         Ok(())
     }
 
+    /// A keyed read applies the key filter before the row limit, so a read from offset 0 returns
+    /// every record with the key, also when the limit is smaller than the number of records
+    /// that it scans. Every second record has another key, so a filter that runs after the limit
+    /// returns fewer.
+    #[tokio::test]
+    async fn keyed_fetch_filters_by_key_before_it_applies_the_row_limit() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(true).await?;
+
+        produce_keyed_records(&engine, &produced, RECORDS, false, true).await?;
+
+        // The records at the even offsets have the key `k`, which is 5,025 of them. The limit
+        // of 10,000 rows covers 5,000 of them when it applies first.
+        assert_eq!(
+            (0..RECORDS).step_by(2).collect::<Vec<_>>(),
+            fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+        );
+
+        Ok(())
+    }
+
     /// The row limit applies to records that have headers, and a record's headers still count
     /// toward `max_bytes` when the limit ends the read. A record costs 104 bytes, so a budget of
     /// 1041 bytes returns 10 of them.
@@ -6978,7 +7009,7 @@ mod tests {
         for keyed in [false, true] {
             let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
 
-            produce_keyed_records(&engine, &produced, RECORDS, true).await?;
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
 
             assert_eq!(
                 (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
@@ -7008,7 +7039,7 @@ mod tests {
         for keyed in [false, true] {
             let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
 
-            produce_keyed_records(&engine, &produced, RECORDS, true).await?;
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
 
             for offset in [0, ROWS_PER_FETCH - 1, ROWS_PER_FETCH] {
                 assert_eq!(
