@@ -28,7 +28,8 @@ so it needs:
 
 - Rust, installed with [rustup](https://rustup.rs). The build needs at least the
   Rust version in `rust-version` in [Cargo.toml](../Cargo.toml). With an older
-  version, `cargo install` stops and tells you which version it needs.
+  version, `cargo install` stops. From Rust 1.85, its message names the version
+  that it needs.
 - A C compiler. On macOS, install the Xcode Command Line Tools with
   `xcode-select --install`. On Debian or Ubuntu, run
   `sudo apt-get install build-essential`.

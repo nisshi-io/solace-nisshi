@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Fails when a workspace package's `rust-version` differs from the channel in
-# rust-toolchain.toml. rustup reads rust-toolchain.toml from the current
+# Fails when a workspace package's `rust-version` differs from the minor
+# version of the channel in rust-toolchain.toml: 1.98 for a channel of 1.98 or
+# 1.98.1. A point release in the channel does not raise the minimum, because
+# the code does not need it. rustup reads rust-toolchain.toml from the current
 # directory, so the file does not reach a user's cargo install, and
 # `rust-version` is what makes an older toolchain fail with a clear message.
 # ci.yml's rust-version job runs this check, so a toolchain bump that leaves
@@ -32,6 +34,7 @@ if ! grep -q -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' <<<"$CHANNEL"; then
   echo "::error::The channel in ${TOOLCHAIN_FILE} is '${CHANNEL}', not a version number such as 1.98."
   exit 1
 fi
+MINIMUM=$(sed -E 's/^([0-9]+\.[0-9]+).*$/\1/' <<<"$CHANNEL")
 
 # cargo metadata prints LF, but a list saved on Windows can end lines in CRLF.
 PACKAGES=$(tr -d '\r')
@@ -52,8 +55,8 @@ while IFS= read -r line || [ -n "$line" ]; do
   version=""
   case "$line" in *" "*) version="${line#* }" ;; esac
   checked=$((checked + 1))
-  if [ "$version" != "$CHANNEL" ]; then
-    echo "::error::${name} has rust-version '${version}', but the channel in ${TOOLCHAIN_FILE} is ${CHANNEL}. Set [workspace.package] rust-version in Cargo.toml and the channel together, and give the package rust-version.workspace = true."
+  if [ "$version" != "$MINIMUM" ]; then
+    echo "::error::${name} has rust-version '${version}', but the channel in ${TOOLCHAIN_FILE} is ${CHANNEL}, so rust-version must be ${MINIMUM}. Set [workspace.package] rust-version in Cargo.toml and the channel together, and give the package rust-version.workspace = true."
     found=$((found + 1))
   fi
 done <<<"$PACKAGES"
@@ -61,4 +64,4 @@ done <<<"$PACKAGES"
 if [ "$found" -gt 0 ]; then
   exit 1
 fi
-echo "${checked} packages declare rust-version ${CHANNEL}, the channel in ${TOOLCHAIN_FILE}."
+echo "${checked} packages declare rust-version ${MINIMUM}, the minor version of the channel ${CHANNEL} in ${TOOLCHAIN_FILE}."

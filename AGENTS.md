@@ -6,7 +6,8 @@ This file provides guidance to coding agents (Claude Code, Codex, Cursor and oth
 
 Nisshi is a stateless server written in Rust that implements the Apache Kafka® API, with pluggable storage backends: PostgreSQL, libSQL (SQLite), S3/object store, and memory. Schema-backed topics (Avro, JSON Schema, Protocol Buffers) can be written as Apache Iceberg or Delta Lake tables.
 
-- Rust edition 2024, toolchain pinned to 1.98 (`rust-toolchain.toml`), and the same version is the minimum (`rust-version` in the root `Cargo.toml`, inherited by every workspace crate), so `cargo install` on an older toolchain stops with cargo's message. The `rust-version` CI job checks that they match; change both in one PR
+- Rust edition 2024, toolchain pinned to 1.98 (`rust-toolchain.toml`)
+- Minimum Rust version: `rust-version` in the root `Cargo.toml`, inherited by every workspace crate, equal to the minor version of the pinned channel (1.98 for a channel of 1.98 or 1.98.1). `cargo install` on an older toolchain stops with cargo's message. The `rust-version` CI job checks that they match, so change both in one PR. A pin to a point release does not raise the minimum. A bump of the minor version does, for `cargo install` users and for every crate that depends on a published `nisshi-*` crate, so the PR description of such a bump must state the new minimum Rust version, because the changelog is generated from it
 - License: Apache-2.0
 - `unsafe_code` is forbidden workspace-wide
 
