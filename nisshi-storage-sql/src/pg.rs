@@ -114,9 +114,10 @@ use crate::{
         list_offset, pg_record_fetch, producer_epoch_current_for_producer,
         producer_epoch_for_current_txn, producer_epoch_insert, producer_epochs_select,
         producer_insert, producer_select_for_update, result_columns::ResultColumns,
-        topic_by_cluster, topic_configuration_select, topic_configuration_select_keys,
-        topic_configuration_select_name, topic_configuration_upsert, topic_insert, topic_select,
-        topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
+        row::topic_name, topic_by_cluster, topic_configuration_select,
+        topic_configuration_select_keys, topic_configuration_select_name,
+        topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
+        topic_select_uuid, topition_insert, topition_select_id,
         txn_detail_select_status_for_update, txn_detail_select_timed_out,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
         txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
@@ -2061,7 +2062,6 @@ impl Postgres {
                 match pg_record_fetch::Row::read(&reader, &row).and_then(FetchedRecord::try_from) {
                     Ok(record) => record,
                     Err(error) => {
-                        error!(?error);
                         metrics::decode_failed(sql, &self.cluster);
                         statement.failed();
                         return Ok(RecordsStatement::Abandoned(error));
@@ -4782,8 +4782,7 @@ impl Storage for Postgres {
                                     topic_select_name::QUERY,
                                     &[&self.cluster, &base_topic],
                                 )
-                                .await
-                                .inspect_err(|err| error!(?err));
+                                .await;
 
                             match selected {
                                 Ok(Some(topic_select_name::Row {
@@ -4837,7 +4836,7 @@ impl Storage for Postgres {
                                     .topic_authorized_operations(Some(-2147483648)),
 
                                 Err(reason) => {
-                                    warn!(?reason, ?topic);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
                                             sql::topic_read_error_code(
@@ -4908,7 +4907,7 @@ impl Storage for Postgres {
                                         .topic_authorized_operations(Some(-2147483648))
                                 }
                                 Err(reason) => {
-                                    warn!(?reason, ?topic);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
                                             sql::topic_read_error_code(
@@ -4943,8 +4942,14 @@ impl Storage for Postgres {
                         let reader = topic_by_cluster::Row::reader(&columns)
                             .inspect_err(|err| column_errors.record(err))?;
 
-                        // The loop skips each row with an unreadable column, which the reader
-                        // logs, so that one corrupt row does not hide the cluster's other topics.
+                        // The loop skips each row with an unreadable column, so that one corrupt
+                        // row does not hide the cluster's other topics. It leaves the topic out
+                        // instead of listing it with `UNKNOWN_SERVER_ERROR`, because the Java
+                        // consumer's `listTopics` fails for the whole cluster when one topic of
+                        // the response has an error that it can't retry
+                        // ([`TopicMetadataFetcher.getTopicMetadata`]).
+                        //
+                        // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
                         for topic_by_cluster::Row {
                             uuid,
                             name,
@@ -4953,7 +4958,14 @@ impl Storage for Postgres {
                             replication_factor,
                         } in rows.iter().filter_map(|row| {
                             topic_by_cluster::Row::read(&reader, row)
-                                .inspect_err(|err| column_errors.record(err))
+                                .inspect_err(|error| {
+                                    column_errors.record(error);
+
+                                    let name = topic_name::Row::reader(&columns)
+                                        .and_then(|reader| topic_name::Row::read(&reader, row))
+                                        .ok();
+                                    error!(?name, ?error, "skipped a topic that can't be read");
+                                })
                                 .ok()
                         }) {
                             let error_code = ErrorCode::None.into();
@@ -5082,8 +5094,7 @@ impl Storage for Postgres {
                             topic_select_name::QUERY,
                             &[&self.cluster, &name.as_str()],
                         )
-                        .await
-                        .inspect_err(|err| error!(?err));
+                        .await;
 
                     match selected {
                         Ok(Some(topic_select_name::Row {
@@ -5154,7 +5165,7 @@ impl Storage for Postgres {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            warn!(?reason, ?topic);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
                                     sql::topic_read_error_code(
@@ -5238,7 +5249,7 @@ impl Storage for Postgres {
                         }
 
                         Err(reason) => {
-                            warn!(?reason, ?topic);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
                                     sql::topic_read_error_code(

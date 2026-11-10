@@ -28,6 +28,9 @@ pub(crate) const PG_QUERY: Query<Row> = Query::new("pg/topic_select_uuid.sql");
 
 /// The query, read for the topic's name only. A delete reads it this way, so that it can delete
 /// a topic whose other columns can't be read.
+///
+/// The column check of `queries!` checks this query through [`QUERY`], because each column of
+/// [`topic_name::Row`](super::row::topic_name::Row) is a column of [`Row`].
 pub(crate) const NAME_QUERY: Query<super::row::topic_name::Row> = Query::new(QUERY.key());
 
 /// One row of the query's result.

@@ -97,3 +97,24 @@ pub(crate) mod written_id {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{topic, topic_name};
+
+    /// An engine reads the topic queries both as [`topic::Row`] and as [`topic_name::Row`], and
+    /// the column check of `queries!` reads each topic query only as [`topic::Row`]. That check
+    /// covers [`topic_name::Row`] only while each of its columns is a column of [`topic::Row`]
+    /// that reads the same kind of value.
+    #[test]
+    fn each_topic_name_column_is_a_topic_column() {
+        for name_column in topic_name::Row::COLUMNS {
+            assert!(
+                topic::Row::COLUMNS.iter().any(|topic_column| {
+                    topic_column.name == name_column.name && topic_column.kind == name_column.kind
+                }),
+                "{name_column:?} is not a column of topic::Row"
+            );
+        }
+    }
+}

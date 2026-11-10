@@ -32,7 +32,7 @@ use crate::{
         idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
-        remove_comments, result_columns::ResultColumns, topic_by_cluster,
+        remove_comments, result_columns::ResultColumns, row::topic_name, topic_by_cluster,
         topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
         topic_insert, topic_select, topic_select_name, topic_select_uuid, topition_insert,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
@@ -86,7 +86,7 @@ use opentelemetry::{
 };
 use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use turso::{
     Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
     transaction::TransactionBehavior,
@@ -387,7 +387,7 @@ impl Engine {
         let sql = sql_lookup(query)?;
         let rows = connection.query(&sql, params).await?;
         QueryRowCursor::new(
-            &ResultColumns::turso(query, &rows),
+            ResultColumns::turso(query, &rows),
             rows,
             self.column_error_count(&sql),
         )
@@ -1833,7 +1833,7 @@ impl Storage for Engine {
             value,
             producer_id,
             producer_epoch,
-        }) = records.next().await.inspect_err(|err| error!(?err))?
+        }) = records.next().await?
         {
             debug!(offset, ?timestamp);
             debug!(key_len = ?key.as_ref().map(Bytes::len));
@@ -2262,7 +2262,7 @@ impl Storage for Engine {
                                 )
                                 .await?;
 
-                            match rows.next().await.inspect_err(|err| error!(?err)) {
+                            match rows.next().await {
                                 Ok(Some(topic_select_name::Row {
                                     uuid,
                                     name,
@@ -2315,7 +2315,7 @@ impl Storage for Engine {
                                     .topic_authorized_operations(Some(-2147483648)),
 
                                 Err(reason) => {
-                                    warn!(?reason, ?topic);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
                                             sql::topic_read_error_code(
@@ -2393,7 +2393,7 @@ impl Storage for Engine {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
-                                    warn!(?reason, ?topic);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
                                             sql::topic_read_error_code(
@@ -2423,13 +2423,20 @@ impl Storage for Engine {
                     .query_rows(&c, topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
+                // The loop skips each row with an unreadable column, so that one corrupt row
+                // does not hide the cluster's other topics. It leaves the topic out instead of
+                // listing it with `UNKNOWN_SERVER_ERROR`, because the Java consumer's `listTopics`
+                // fails for the whole cluster when one topic of the response has an error that it
+                // can't retry ([`TopicMetadataFetcher.getTopicMetadata`]).
+                //
+                // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
                 while let Some(topic_by_cluster::Row {
                     uuid,
                     name,
                     is_internal,
                     partitions,
                     replication_factor,
-                }) = rows.next_readable().await?
+                }) = rows.next_readable::<topic_name::Row>().await?
                 {
                     let error_code = ErrorCode::None.into();
                     let topic_id = Some(uuid.into_bytes());
@@ -2567,7 +2574,7 @@ impl Storage for Engine {
                         )
                         .await;
 
-                    match selected.inspect_err(|err| error!(?err)) {
+                    match selected {
                         Ok(Some(topic_select_name::Row {
                             uuid,
                             name,
@@ -2636,7 +2643,7 @@ impl Storage for Engine {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            warn!(?reason, ?topic);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
                                     sql::topic_read_error_code(
@@ -2738,7 +2745,7 @@ impl Storage for Engine {
                             .topic_authorized_operations(-2147483648),
 
                         Err(reason) => {
-                            warn!(?reason, ?topic);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
                                     sql::topic_read_error_code(
@@ -5105,6 +5112,182 @@ mod tests {
             .await?;
 
         Ok(engine)
+    }
+
+    /// Returns an engine on a new database in `temp_dir`, with the topics `t` and `unreadable`.
+    /// The stored row of `unreadable` can't be read.
+    async fn engine_with_unreadable_topic(temp_dir: &TempDir) -> Result<Engine> {
+        let engine = registered_engine(temp_dir).await?;
+
+        for name in ["t", "unreadable"] {
+            _ = engine
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(name.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+        }
+
+        // Turso stores text that isn't a number as text in an `int` column, and the reader of
+        // `partitions` then can't read it as an integer.
+        _ = engine
+            .connection()
+            .await?
+            .execute(
+                "update topic set partitions = 'x' where name = ?1",
+                ["unreadable"],
+            )
+            .await?;
+
+        Ok(engine)
+    }
+
+    /// A one-row read of a result with two rows is an error, instead of the first row.
+    #[tokio::test]
+    async fn query_one_of_two_rows_is_an_error() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = registered_engine(&temp_dir).await?;
+
+        for name in ["t", "u"] {
+            _ = engine
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(name.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+        }
+
+        let connection = engine.connection().await?;
+
+        assert_matches!(
+            engine
+                .query_one(&connection, topic_by_cluster::QUERY, ["nisshi"])
+                .await,
+            Err(Error::Turso(err))
+                if matches!(&*err, turso::Error::Misuse(message) if message.contains("more than one row"))
+        );
+
+        Ok(())
+    }
+
+    /// A topic whose stored row can't be read is a server error in Metadata, not an unknown
+    /// topic, so that a client does not try to create it again. A list of every topic leaves it
+    /// out, and keeps the cluster's other topics.
+    #[tokio::test]
+    async fn metadata_answers_unknown_server_error_for_an_unreadable_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
+
+        let named = engine
+            .metadata(Some(&[TopicId::from("unreadable"), TopicId::from("t")]))
+            .await?;
+
+        assert_eq!(
+            vec![
+                (
+                    Some("unreadable".to_owned()),
+                    i16::from(ErrorCode::UnknownServerError)
+                ),
+                (Some("t".to_owned()), i16::from(ErrorCode::None)),
+            ],
+            named
+                .topics
+                .iter()
+                .map(|topic| (topic.name.clone(), topic.error_code))
+                .collect::<Vec<_>>()
+        );
+
+        let listed = engine.metadata(None).await?;
+
+        assert_eq!(
+            vec![Some("t".to_owned())],
+            listed
+                .topics
+                .iter()
+                .map(|topic| topic.name.clone())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A topic whose stored row can't be read is a server error in DescribeTopicPartitions, and
+    /// the response still describes the other topics.
+    #[tokio::test]
+    async fn describe_topic_partitions_answers_unknown_server_error_for_an_unreadable_topic()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
+
+        let described = engine
+            .describe_topic_partitions(
+                Some(&[TopicId::from("unreadable"), TopicId::from("t")]),
+                i32::MAX,
+                None,
+            )
+            .await?;
+
+        assert_eq!(
+            vec![
+                (
+                    Some("unreadable".to_owned()),
+                    i16::from(ErrorCode::UnknownServerError)
+                ),
+                (Some("t".to_owned()), i16::from(ErrorCode::None)),
+            ],
+            described
+                .iter()
+                .map(|topic| (topic.name.clone(), topic.error_code))
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// DeleteTopics deletes a topic whose stored row can't be read, because it reads only the
+    /// topic's name, so that an operator can remove a corrupt topic without editing the database.
+    #[tokio::test]
+    async fn delete_topic_deletes_a_topic_with_an_unreadable_row() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            engine.delete_topic(&TopicId::from("unreadable")).await?
+        );
+
+        // A deleted topic is unknown, where a topic that is still stored with its unreadable row
+        // is a server error.
+        assert_eq!(
+            vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
+            engine
+                .metadata(Some(&[TopicId::from("unreadable")]))
+                .await?
+                .topics
+                .iter()
+                .map(|topic| topic.error_code)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
     }
 
     /// Sets the epoch of each `producer_epoch` row of `producer` to `epoch`. A producer

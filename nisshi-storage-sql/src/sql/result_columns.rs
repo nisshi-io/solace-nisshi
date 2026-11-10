@@ -15,7 +15,6 @@
 //! The index of each column in a query's result, found by the column's name.
 
 use nisshi_storage::{Error, Result};
-use tracing::error;
 
 /// The column names of one query's result, in order, as the engine's driver reports them.
 #[derive(Clone, Debug)]
@@ -88,13 +87,6 @@ impl ResultColumns {
     /// Returns the index of the column `name`. Returns [`Error::MissingColumn`] if the result does
     /// not have that column, and [`Error::DuplicateColumn`] if it has more than one.
     pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
-        // The reader logs a column error at error level, because the error means that the query
-        // and its row do not match, and a caller can answer it with a Kafka error code that does
-        // not show it.
-        self.find_index(name).inspect_err(|err| error!(?err))
-    }
-
-    fn find_index(&self, name: &'static str) -> Result<usize> {
         let mut indexes = self
             .names
             .iter()

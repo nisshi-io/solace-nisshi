@@ -76,12 +76,7 @@ macro_rules! sql_row {
                                 query: self.query,
                                 column: stringify!($field),
                                 source: Box::new(source),
-                            })
-                            // The reader logs the error at error level, because the error means
-                            // that the row is corrupt or that the query does not match its row,
-                            // and a caller can answer it with a Kafka error code that does not
-                            // show it.
-                            .inspect_err(|err| ::tracing::error!(?err))?,
+                            })?,
                     )+
                 })
             }
@@ -238,6 +233,7 @@ impl ColumnErrorCount {
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
     driver_cursor: R,
+    columns: result_columns::ResultColumns,
     reader: T::Reader,
     column_errors: ColumnErrorCount,
 }
@@ -247,14 +243,15 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
     /// Returns a cursor over the result with `columns`, which reads each row from
     /// `driver_cursor` and counts each column error in `column_errors`.
     pub(crate) fn new(
-        columns: &result_columns::ResultColumns,
+        columns: result_columns::ResultColumns,
         driver_cursor: R,
         column_errors: ColumnErrorCount,
     ) -> Result<Self> {
-        let reader = T::reader(columns).inspect_err(|err| column_errors.record(err))?;
+        let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
 
         Ok(Self {
             driver_cursor,
+            columns,
             reader,
             column_errors,
         })
@@ -262,16 +259,33 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
 
     /// Returns the next row that the reader can read as `T`, or `None` after the last row.
     ///
-    /// It skips each row with an unreadable column, which the reader logs and counts, so that one
-    /// corrupt row does not hide the rows after it. Use it only where a result without that row
-    /// is still a correct answer, such as a list of the cluster's topics.
-    pub(crate) async fn next_readable(&mut self) -> Result<Option<T>> {
-        loop {
-            match self.next().await {
-                Err(Error::UnreadableColumn { .. }) => continue,
-                next => return next,
+    /// It skips each row with an unreadable column, so that one corrupt row does not hide the
+    /// rows after it. Use it only where a result without that row is still a correct answer, such
+    /// as a list of the cluster's topics. It counts and logs each skipped row. The log reads the
+    /// row as `Name`, a row of the columns that identify it, so that it names what the result
+    /// leaves out.
+    pub(crate) async fn next_readable<Name: QueryRow + fmt::Debug>(&mut self) -> Result<Option<T>> {
+        while let Some(row) = self.driver_cursor.next().await? {
+            match T::read(&self.reader, &row) {
+                Ok(readable) => return Ok(Some(readable)),
+
+                Err(error @ Error::UnreadableColumn { .. }) => {
+                    self.column_errors.record(&error);
+
+                    let name = Name::reader(&self.columns)
+                        .and_then(|reader| Name::read(&reader, &row))
+                        .ok();
+                    error!(?name, ?error, "skipped a row that can't be read");
+                }
+
+                Err(error) => {
+                    self.column_errors.record(&error);
+                    return Err(error);
+                }
             }
         }
+
+        Ok(None)
     }
 
     /// Returns the next row as `T`, or `None` after the last row.
@@ -345,7 +359,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher as _},
     marker::PhantomData,
 };
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
