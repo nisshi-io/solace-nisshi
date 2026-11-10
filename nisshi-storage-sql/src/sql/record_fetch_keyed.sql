@@ -28,6 +28,12 @@
 -- the key and the value, by primary key, of only the records that it returns. The Turso engine
 -- reads each value to compute its length, so on Turso a fetch still reads the payload of every
 -- record up to $6.
+--
+-- The filter on r.k reads the payload on SQLite too. The record table declares v before k, so
+-- SQLite walks the overflow pages of each value to reach the key. A keyed fetch therefore still
+-- reads the payload of every record up to $6, though it no longer copies it into the window. The
+-- fix needs a schema change: k before v, a stored hash of the key, or an index on
+-- (topition, k, offset_id).
 with sized as (
 select
 
