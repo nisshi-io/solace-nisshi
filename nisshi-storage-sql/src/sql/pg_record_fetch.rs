@@ -28,12 +28,10 @@ use nisshi_sans_io::record::Header;
 #[cfg(feature = "postgres")]
 use nisshi_storage::{Error, FetchedRecord, Result};
 #[cfg(feature = "postgres")]
-use std::time::SystemTime;
-#[cfg(feature = "postgres")]
 use tokio_postgres::types::FromSql;
 
 #[cfg(feature = "postgres")]
-use crate::pg::from_sql_timestamp;
+use crate::pg::KafkaTimestamp;
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: &str = "pg/record_fetch.sql";
@@ -127,16 +125,10 @@ impl TryFrom<&tokio_postgres::Row> for Row {
             )));
         }
 
-        let timestamp = column::<SystemTime>(row, offset_id, TIMESTAMP)?;
-
         Ok(Self {
             offset_id,
             attributes: column::<Option<i16>>(row, offset_id, ATTRIBUTES)?.unwrap_or(0),
-            timestamp: from_sql_timestamp(&timestamp).map_err(|error| {
-                Error::Message(format!(
-                    "fetched record at offset {offset_id}: column {TIMESTAMP}: {error}"
-                ))
-            })?,
+            timestamp: column::<KafkaTimestamp>(row, offset_id, TIMESTAMP)?.0,
             key: column::<Option<&[u8]>>(row, offset_id, KEY)?.map(Bytes::copy_from_slice),
             value: column::<Option<&[u8]>>(row, offset_id, VALUE)?.map(Bytes::copy_from_slice),
             producer_id: column::<Option<i64>>(row, offset_id, PRODUCER_ID)?.unwrap_or(-1),
