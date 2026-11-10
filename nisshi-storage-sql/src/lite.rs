@@ -17,8 +17,8 @@ use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
         self, Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, ROWS_PER_FETCH,
-        consumer_group_select, default_hash, driver::KafkaTimestamp, header_fetch,
-        idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        consumer_group_select, default_hash, driver::KafkaTimestamp, driver::sqlite::StoredTime,
+        header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
         remove_comments, result_columns::ResultColumns, row::topic_name, topic_by_cluster,
@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use deadpool::managed;
 use libsql::{
-    Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
+    Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior,
     ffi::SQLITE_CONSTRAINT_UNIQUE,
     params::{IntoParams, Params},
 };
@@ -93,7 +93,6 @@ use std::{
     env,
     fmt::Debug,
     marker::PhantomData,
-    ops::Deref,
     path::PathBuf,
     result,
     str::FromStr,
@@ -521,7 +520,7 @@ impl PoolConnection {
         let query = query.key();
         let rows = self.query(query, params).await?;
         QueryRowCursor::new(
-            ResultColumns::libsql(query, &rows),
+            ResultColumns::new(query, &rows),
             rows,
             self.column_error_count(query),
         )
@@ -571,7 +570,7 @@ impl PoolConnection {
             .inspect(|rows| debug!(?rows))
             .inspect_err(|err| self.record_query_error(query, start, err))?;
 
-        let reader = T::reader(&ResultColumns::libsql(query, &rows))
+        let reader = T::reader(&ResultColumns::new(query, &rows))
             .inspect_err(|err| self.column_error_count(query).record(err))?;
 
         let mut leading = Vec::with_capacity(limit);
@@ -1965,7 +1964,7 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
     let mut rows = tx
         .query(SQL.get(sql::nisshi_schema_version_select::QUERY.key())?, ())
         .await?;
-    let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::libsql(
+    let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::new(
         sql::nisshi_schema_version_select::QUERY.key(),
         &rows,
     ))?;
@@ -3607,7 +3606,7 @@ impl Storage for Delegate {
                             group,
                             offset.offset,
                             offset.leader_epoch,
-                            offset.timestamp.map(LiteTimestamp),
+                            offset.timestamp.map(StoredTime::from),
                             offset.metadata.as_deref(),
                         ),
                     )
@@ -3844,7 +3843,7 @@ impl Storage for Delegate {
                             self.cluster.as_str(),
                             topition.topic(),
                             topition.partition(),
-                            LiteTimestamp::from(timestamp),
+                            StoredTime::from(*timestamp),
                         ),
                     )
                     .await
@@ -5586,41 +5585,6 @@ impl Storage for Delegate {
         DELEGATE_REQUEST_DURATION
             .record(elapsed_millis(start), &[StorageOperation::Ping.attribute()]);
         Ok(())
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct LiteTimestamp(SystemTime);
-
-impl Deref for LiteTimestamp {
-    type Target = SystemTime;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<SystemTime> for LiteTimestamp {
-    fn from(value: SystemTime) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&SystemTime> for LiteTimestamp {
-    fn from(value: &SystemTime) -> Self {
-        Self(*value)
-    }
-}
-
-impl From<LiteTimestamp> for SystemTime {
-    fn from(value: LiteTimestamp) -> Self {
-        value.0
-    }
-}
-
-impl From<LiteTimestamp> for Value {
-    fn from(value: LiteTimestamp) -> Self {
-        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
     }
 }
 
@@ -7686,10 +7650,9 @@ mod tests {
         let mut failures = Vec::new();
         for row_query in sql::row_queries(sql::SqlEngine::Libsql) {
             let checked = match connection.prepare(SQL.get(row_query.query)?).await {
-                Ok(statement) => (row_query.check_columns)(&ResultColumns::libsql_statement(
-                    row_query.query,
-                    &statement,
-                )),
+                Ok(statement) => {
+                    (row_query.check_columns)(&ResultColumns::new(row_query.query, &statement))
+                }
                 Err(error) => Err(error.into()),
             };
 

@@ -275,6 +275,7 @@ pub enum StartupFailure {
 ///
 /// A text or blob value keeps only its length, because it can hold record data or SCRAM
 /// credentials, and the broker logs each error that holds this summary.
+#[cfg(any(feature = "libsql", feature = "turso"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SqliteValueSummary {
     Null,
@@ -501,6 +502,7 @@ pub enum Error {
 
     /// libSQL or Turso returned a value of this kind for a column whose declared type can't hold
     /// it.
+    #[cfg(any(feature = "libsql", feature = "turso"))]
     UnexpectedSqliteValue(SqliteValueSummary),
 
     UnknownCacheKey(String),
@@ -669,7 +671,6 @@ impl Error {
             | Self::UnexpectedBody(_)
             | Self::UnexpectedNull
             | Self::UnexpectedServiceResponse(_)
-            | Self::UnexpectedSqliteValue(_)
             | Self::UnreadableColumn { .. }
             | Self::UnknownCacheKey(_)
             | Self::InvalidStorageOptionValue { .. }
@@ -682,6 +683,9 @@ impl Error {
 
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             Self::DeadPoolBuild(_) => false,
+
+            #[cfg(any(feature = "libsql", feature = "turso"))]
+            Self::UnexpectedSqliteValue(_) => false,
 
             #[cfg(feature = "slatedb")]
             Self::Postcard(_) => false,

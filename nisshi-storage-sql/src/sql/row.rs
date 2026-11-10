@@ -27,18 +27,6 @@ pub(crate) mod producer_epoch {
     }
 }
 
-/// A record's offset.
-pub(crate) mod record_offset {
-    sql_row! {
-        /// One record's offset.
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub(crate) struct Row {
-            /// The record's offset.
-            offset_id: i64,
-        }
-    }
-}
-
 /// A topic of the cluster, as the queries that find topics return it.
 pub(crate) mod topic {
     sql_row! {

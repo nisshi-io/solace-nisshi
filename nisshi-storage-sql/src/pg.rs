@@ -2033,7 +2033,7 @@ impl Postgres {
         let query = query.key();
         let (sql, prepared) = self.prepare_statement(&tx, query).await?;
         let column_errors = self.column_error_count(sql);
-        let reader = pg_record_fetch::Row::reader(&ResultColumns::postgres(query, &prepared))
+        let reader = pg_record_fetch::Row::reader(&ResultColumns::new(query, &prepared))
             .inspect_err(|err| column_errors.record(err))?;
 
         // `query_raw` returns once the server has accepted the statement, and its stream yields
@@ -2336,11 +2336,10 @@ impl Postgres {
         let statement = tx
             .prepare(self.sql_lookup(sql::pg_nisshi_schema_version_exists::QUERY.key())?)
             .await?;
-        let reader =
-            sql::pg_nisshi_schema_version_exists::RowReader::new(&ResultColumns::postgres(
-                sql::pg_nisshi_schema_version_exists::QUERY.key(),
-                &statement,
-            ))?;
+        let reader = sql::pg_nisshi_schema_version_exists::RowReader::new(&ResultColumns::new(
+            sql::pg_nisshi_schema_version_exists::QUERY.key(),
+            &statement,
+        ))?;
         let sql::pg_nisshi_schema_version_exists::Row {
             version_table_exists,
         } = reader.read_row(&tx.query_one(&statement, &[]).await?)?;
@@ -2351,7 +2350,7 @@ impl Postgres {
         let statement = tx
             .prepare(self.sql_lookup(sql::nisshi_schema_version_select::QUERY.key())?)
             .await?;
-        let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::postgres(
+        let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::new(
             sql::nisshi_schema_version_select::QUERY.key(),
             &statement,
         ))?;
@@ -2730,7 +2729,7 @@ impl Postgres {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<(ResultColumns, Vec<Row>, ColumnErrorCount)> {
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let columns = ResultColumns::postgres(query, &statement);
+        let columns = ResultColumns::new(query, &statement);
         let column_errors = self.column_error_count(sql);
 
         self.record_sql_metrics(sql, client.query(&statement, params))
@@ -2774,7 +2773,7 @@ impl Postgres {
     ) -> Result<Option<T>> {
         let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))
+        let reader = T::reader(&ResultColumns::new(query, &statement))
             .inspect_err(|err| self.column_error_count(sql).record(err))?;
 
         self.record_sql_metrics(sql, client.query_opt(&statement, params))
@@ -2795,7 +2794,7 @@ impl Postgres {
     ) -> Result<T> {
         let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let reader = T::reader(&ResultColumns::postgres(query, &statement))
+        let reader = T::reader(&ResultColumns::new(query, &statement))
             .inspect_err(|err| self.column_error_count(sql).record(err))?;
 
         let row = self
@@ -6401,7 +6400,7 @@ pub(crate) mod tests {
             };
 
             if let Err(error) =
-                (row_query.check_columns)(&ResultColumns::postgres(row_query.query, &statement))
+                (row_query.check_columns)(&ResultColumns::new(row_query.query, &statement))
             {
                 failures.push(format!("{}: {error:?}", row_query.query));
             }
@@ -7692,6 +7691,58 @@ pub(crate) mod tests {
         );
 
         _ = cancel_backends(&monitor, &marker).await?;
+
+        Ok(())
+    }
+
+    /// A read of at most one row fails on a result with two rows
+    #[tokio::test]
+    async fn optional_row_of_two_rows_is_an_error() -> Result<()> {
+        let cluster = alphanumeric_string(15);
+
+        let Some(storage) = storage_with_schema(
+            "optional_row_of_two_rows_is_an_error",
+            &CONNECTION,
+            &cluster,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster.clone(),
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        for _ in 0..2 {
+            _ = storage
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(alphanumeric_string(15))
+                        .num_partitions(1)
+                        .replication_factor(0)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+        }
+
+        let connection = storage.connection().await?;
+
+        // The cluster has two topics, so this query returns two rows.
+        assert_matches!(
+            storage
+                .prepare_query_optional_row(&connection, topic_by_cluster::QUERY, &[&cluster])
+                .await,
+            Err(Error::TokioPostgres(err))
+                if err.to_string().contains("unexpected number of rows")
+        );
 
         Ok(())
     }
@@ -14738,7 +14789,7 @@ pub(crate) mod tests {
                  ARRAY[]::bytea[] AS header_values",
             )
             .await?;
-        let reader = pg_record_fetch::Row::reader(&ResultColumns::postgres(
+        let reader = pg_record_fetch::Row::reader(&ResultColumns::new(
             pg_record_fetch::QUERY.key(),
             &statement,
         ))?;

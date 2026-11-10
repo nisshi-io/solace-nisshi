@@ -23,5 +23,11 @@ use super::Query;
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: Query<Row> = Query::new("lite/policy_compact_compaction.sql");
 
-/// One record that compaction deletes.
-pub(crate) use super::row::record_offset::Row;
+sql_row! {
+    /// One record that compaction deletes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The record's offset.
+        offset_id: i64,
+    }
+}

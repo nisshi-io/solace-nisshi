@@ -28,8 +28,8 @@ use crate::{
     database_file,
     sql::{
         self, Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, ROWS_PER_FETCH,
-        consumer_group_select, default_hash, driver::KafkaTimestamp, header_fetch,
-        idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        consumer_group_select, default_hash, driver::KafkaTimestamp, driver::sqlite::StoredTime,
+        header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
         remove_comments, result_columns::ResultColumns, row::topic_name, topic_by_cluster,
@@ -63,7 +63,6 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
-    to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -88,7 +87,7 @@ use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
 use tracing::{debug, error, info};
 use turso::{
-    Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
+    Connection, Database, Row, params::IntoParams, transaction::Transaction,
     transaction::TransactionBehavior,
 };
 use url::Url;
@@ -387,7 +386,7 @@ impl Engine {
         let sql = sql_lookup(query)?;
         let rows = connection.query(&sql, params).await?;
         QueryRowCursor::new(
-            ResultColumns::turso(query, &rows),
+            ResultColumns::new(query, &rows),
             rows,
             self.column_error_count(&sql),
         )
@@ -449,7 +448,7 @@ impl Engine {
             SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
         })?;
 
-        let reader = T::reader(&ResultColumns::turso(query, &rows))
+        let reader = T::reader(&ResultColumns::new(query, &rows))
             .inspect_err(|err| self.column_error_count(&sql).record(err))?;
 
         let mut leading = Vec::with_capacity(limit);
@@ -1946,7 +1945,7 @@ impl Storage for Engine {
                             group,
                             offset.offset,
                             offset.leader_epoch,
-                            offset.timestamp.map(LiteTimestamp),
+                            offset.timestamp.map(StoredTime::from),
                             offset.metadata.as_deref(),
                         ),
                     )
@@ -2158,7 +2157,7 @@ impl Storage for Engine {
                             self.cluster.as_str(),
                             topition.topic(),
                             topition.partition(),
-                            LiteTimestamp::from(timestamp),
+                            StoredTime::from(*timestamp),
                         ),
                     )
                     .await
@@ -3650,41 +3649,6 @@ impl Storage for Engine {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct LiteTimestamp(SystemTime);
-
-impl Deref for LiteTimestamp {
-    type Target = SystemTime;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<SystemTime> for LiteTimestamp {
-    fn from(value: SystemTime) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&SystemTime> for LiteTimestamp {
-    fn from(value: &SystemTime) -> Self {
-        Self(*value)
-    }
-}
-
-impl From<LiteTimestamp> for SystemTime {
-    fn from(value: LiteTimestamp) -> Self {
-        value.0
-    }
-}
-
-impl From<LiteTimestamp> for Value {
-    fn from(value: LiteTimestamp) -> Self {
-        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
@@ -3692,6 +3656,7 @@ mod tests {
     use tempfile::{TempDir, tempdir, tempdir_in};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+    use turso::Value;
 
     use super::*;
 
@@ -3724,10 +3689,9 @@ mod tests {
 
         for row_query in sql::row_queries(sql::SqlEngine::Turso) {
             let checked = match connection.prepare(sql::SQL.get(row_query.query)?).await {
-                Ok(statement) => (row_query.check_columns)(&ResultColumns::turso_statement(
-                    row_query.query,
-                    &statement,
-                )),
+                Ok(statement) => {
+                    (row_query.check_columns)(&ResultColumns::new(row_query.query, &statement))
+                }
                 Err(error) => Err(error.into()),
             };
 
