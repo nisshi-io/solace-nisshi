@@ -334,7 +334,7 @@ mod tests {
             Error::TlsKeyDecrypt {
                 option: "--tls-key-passphrase-file",
                 path: path.clone(),
-                cause: pkcs8::Error::KeyMalformed,
+                cause: pkcs8::Error::KeyMalformed(pkcs8::KeyError::Invalid),
             }
             .to_string()
             .ends_with("Check the passphrase in --tls-key-passphrase-file.")
