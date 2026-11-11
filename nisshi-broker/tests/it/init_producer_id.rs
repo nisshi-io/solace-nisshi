@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -505,7 +506,7 @@ async fn latest(
 /// offset after its records.
 async fn end_marker(storage: &impl Storage, topition: &Topition) -> Result<Option<Bytes>> {
     let batches = storage
-        .fetch(
+        .fetch_until_deadline(
             topition,
             i64::from(RECORDS),
             1,
@@ -513,7 +514,8 @@ async fn end_marker(storage: &impl Storage, topition: &Topition) -> Result<Optio
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_millis(500),
         )
-        .await?;
+        .await
+        .map(|read| read.batches)?;
 
     assert_eq!(1, batches.len());
 

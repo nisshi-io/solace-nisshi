@@ -80,6 +80,7 @@ use nisshi_sans_io::{
         inflated,
     },
 };
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, InitProducerIdService,
     ProduceService, Storage, Topition, TxnAddPartitionsRequest,
@@ -408,7 +409,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
         let topition = Topition::new(topic.clone(), index);
         // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
         // finished, so traceforge does not schedule it.
-        let fetched = block_on_tokio(storage.fetch(
+        let fetched = block_on_tokio(storage.fetch_until_deadline(
             &topition,
             0,
             0,
@@ -418,6 +419,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
         ))
         .expect("fetch");
         let fetched_records: usize = fetched
+            .batches
             .iter()
             .map(|batch| batch.record_count as usize)
             .sum();
@@ -619,7 +621,7 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
         for topition in [&topition0, &topition1] {
             // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
             // finished, so traceforge does not schedule it.
-            let fetched = block_on_tokio(storage.fetch(
+            let fetched = block_on_tokio(storage.fetch_until_deadline(
                 topition,
                 0,
                 0,
@@ -629,7 +631,7 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
             ))
             .expect("fetch");
 
-            let has_control_marker = fetched.iter().any(|batch| {
+            let has_control_marker = fetched.batches.iter().any(|batch| {
                 BatchAttribute::try_from(batch.attributes)
                     .map(|attributes| attributes.control)
                     .unwrap_or(false)

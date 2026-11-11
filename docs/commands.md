@@ -51,6 +51,7 @@ as Apache Parquet when the broker runs with the `parquet` subcommand, for exampl
 (`--location` can also come from `DATA_LAKE`). A `file://` location must be an existing directory.
 The `iceberg` and `delta` subcommands write Apache Iceberg and Delta Lake tables;
 run `nisshi broker iceberg --help` or `nisshi broker delta --help` for their options.
+[Data lake](data-lake.md) describes where each format writes, and how to remove data from it.
 
 ## topic
 

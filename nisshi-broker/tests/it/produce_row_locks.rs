@@ -29,6 +29,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use nisshi_storage::{ArcDynStorage, Storage as _, Topition};
 use rand::{RngExt as _, rng};
 use std::{collections::BTreeMap, time::Duration};
@@ -297,7 +298,7 @@ async fn stored_records(
 
     while next_offset < high_watermark {
         let batches = storage
-            .fetch(
+            .fetch_until_deadline(
                 partition,
                 next_offset,
                 1,
@@ -305,7 +306,8 @@ async fn stored_records(
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(5),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
         assert!(
             !batches.is_empty(),
             "{partition:?} has no batch at {next_offset}"

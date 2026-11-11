@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{collections::BTreeMap, slice, time::Duration};
 use tokio::time::Instant;
 
@@ -339,7 +340,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
     // good_name was never named in a request, so its data and committed
     // offset must still be there, exactly as produced/committed above.
     let good_fetch = storage
-        .fetch(
+        .fetch_until_deadline(
             &good_topition,
             0,
             min_bytes,
@@ -347,7 +348,8 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
             isolation,
             Instant::now() + max_wait,
         )
-        .await?;
+        .await
+        .map(|read| read.batches)?;
     assert!(!good_fetch.is_empty());
 
     let offset_fetch = storage
@@ -368,7 +370,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
 
     assert_matches!(
         storage
-            .fetch(
+            .fetch_until_deadline(
                 &doomed_topition,
                 0,
                 min_bytes,
@@ -376,7 +378,8 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
                 isolation,
                 Instant::now() + max_wait
             )
-            .await,
+            .await
+            .map(|read| read.batches),
         Err(nisshi_storage::Error::Api(
             ErrorCode::UnknownTopicOrPartition
         ))
@@ -399,7 +402,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         .await?;
 
     let doomed_fetch = storage
-        .fetch(
+        .fetch_until_deadline(
             &doomed_topition,
             0,
             min_bytes,
@@ -407,7 +410,8 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
             isolation,
             Instant::now() + max_wait,
         )
-        .await?;
+        .await
+        .map(|read| read.batches)?;
     assert!(doomed_fetch.is_empty(), "{doomed_fetch:?}");
 
     Ok(())

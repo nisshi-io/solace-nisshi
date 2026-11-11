@@ -190,7 +190,8 @@ explain() {
         binds="$cluster $topic $partition $offset 1048576 $high"
         # the keyed query takes the key as $7, then the row limit as $8
         if [[ $file == record_fetch_keyed ]]; then binds="$binds key-1 10000"; else binds="$binds 10000"; fi
-        printf 'set enable_bitmapscan = off;\nset enable_seqscan = off;\nexplain (analyze, buffers) %s\n\\bind %s \\g\n' \
+        # the settings of FETCH_PLAN_SETTINGS in nisshi-storage-sql/src/pg.rs
+        printf 'set enable_bitmapscan = off;\nset enable_seqscan = off;\nset enable_sort = off;\nset enable_hashagg = off;\nset enable_nestloop = off;\nset enable_hashjoin = off;\nexplain (analyze, buffers) %s\n\\bind %s \\g\n' \
             "$query" "$binds" | psql
     done
 }

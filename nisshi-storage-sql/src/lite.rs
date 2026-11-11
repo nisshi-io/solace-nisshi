@@ -14,14 +14,12 @@
 
 use crate::{
     database_file,
-    schema::{
-        Action, Migration, RecordedSchema, Schema, announce_upgrade, check_unversioned_tables,
-        plan, report_upgrade, upgraded_compatibility,
-    },
+    schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
+        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
+        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
+        idempotent_sequence_check, producer_epochs_select, remove_comments,
+        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
         txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
     },
 };
@@ -37,7 +35,7 @@ use libsql::{
 use nisshi_sans_io::topic_config;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
+    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism,
     add_partitions_to_txn_response::{
         AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
     },
@@ -65,16 +63,16 @@ use nisshi_schema::{
 };
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
-    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService, RequestStorageService,
-    Result, ScramCredential, SemaphoreProxy, StartupFailure, Storage, StorageOperation,
-    StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel, check_claim,
+    DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
+    FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
+    RequestStorageService, RequestTimer, Result, ScramCredential, SemaphoreProxy, StartupFailure,
+    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    bounded_channel, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
-    read_deadline::ReadDeadline,
 };
 use opentelemetry::{
     KeyValue,
@@ -1795,52 +1793,14 @@ impl<C, N, L, D> Builder<C, N, L, D> {
 /// in its `nisshi_schema_version` table.
 const SCHEMA_VERSION: i32 = 1;
 
+// The build fails here when someone changes `SCHEMA_VERSION`. In a file with tables but no
+// recorded version, `ensure_schema` creates only the missing tables, and then records
+// `SCHEMA_VERSION`. A new version needs an upgrade step there, because such a file has the
+// tables of version 1.
+const _: () = assert!(SCHEMA_VERSION == 1);
+
 /// The oldest schema version whose broker can use the schema that [`DDL`] creates.
 const OLDEST_COMPATIBLE_SCHEMA_VERSION: i32 = 1;
-
-/// The steps that upgrade a file of an earlier schema version to [`SCHEMA_VERSION`], one for each
-/// version after 1.
-///
-/// A change to [`DDL`] needs a step here that makes the same change to a file of the version
-/// before it, and a new [`SCHEMA_VERSION`]. A step is a file in `migrations/`.
-///
-/// Both this list and the create SQL in `ddl/` reach the same schema, and nothing compares the
-/// two results while this list is empty. The change that adds the first step must also add that
-/// comparison: a test that builds a file from a frozen version-1 copy of the DDL plus every step,
-/// builds another from the create SQL, and compares `sqlite_schema` and `pragma table_info`.
-///
-/// A step runs in the transaction that holds the write lock. Brokers that wait for that lock fail
-/// with `SQLITE_BUSY` when a step outlasts their `busy_timeout`. A step that fails rolls the whole
-/// upgrade back and stops the broker.
-///
-/// SQLite can't change most constraints or column types with `ALTER TABLE`, so a step usually
-/// rebuilds a table: it creates the new table, copies the rows, drops the old table and renames
-/// the new one. The upgrade runs with `PRAGMA foreign_keys = OFF`, because `DROP TABLE` with
-/// foreign keys on deletes the table's rows first, which fires every `on delete cascade` rule of
-/// the tables that refer to it. For the same reason, a step's own `delete` does not fire `on
-/// delete cascade`, unlike on PostgreSQL, so a step deletes the rows of the child tables itself.
-/// After the last step, the upgrade runs `PRAGMA foreign_key_check` and fails when a row breaks a
-/// foreign key. The check reads every row of every child table, so each upgrade takes time in
-/// proportion to the stored data, and a row that broke a key before the upgrade fails it too.
-///
-/// A change to `ddl/` also changes what the Turso engine creates in a new database, because
-/// `limbo.rs` runs the same files with `create table if not exists` and ignores their errors. An
-/// existing Turso file keeps its old tables without any error, and its queries fail later. Turso
-/// has no schema upgrade yet, so the first step waits for it or lands with it.
-///
-/// The change that adds the first step must also update the version table and the line about
-/// databases that 0.7.0-pre.3 set up in `docs/storage.md`, which stops being true then.
-const MIGRATIONS: &[Migration] = &[];
-
-/// The schema that this release creates, and the way to upgrade each earlier one to it.
-const RELEASE_SCHEMA: Schema = Schema {
-    version: SCHEMA_VERSION,
-    oldest_compatible_version: OLDEST_COMPATIBLE_SCHEMA_VERSION,
-    migrations: MIGRATIONS,
-};
-
-// The build fails here when `SCHEMA_VERSION` and `MIGRATIONS` disagree.
-const _: () = assert!(RELEASE_SCHEMA.is_consistent());
 
 static DDL: LazyLock<Cache> = LazyLock::new(|| {
     let mapping = [
@@ -1909,30 +1869,13 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
 /// Makes sure that the database has the broker's schema before the broker serves a request.
 ///
 /// When the database records no schema version, this function creates the missing tables and
-/// records [`SCHEMA_VERSION`]. When the database records an older version, it runs the steps of
-/// [`MIGRATIONS`] that bring the database to [`SCHEMA_VERSION`], in one transaction. It leaves
-/// existing tables and their data as they are, except for what a step changes.
+/// records [`SCHEMA_VERSION`]. It leaves existing tables and their data as they are.
 async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
-    ensure_schema_of(db, busy_timeout, &RELEASE_SCHEMA, &DDL).await
-}
-
-/// Makes `ensure_schema` do its work for `schema`, whose new databases start from `create`.
-async fn ensure_schema_of(
-    db: &Database,
-    busy_timeout: Duration,
-    schema: &Schema,
-    create: &Cache,
-) -> Result<()> {
     let connection = db.connect()?;
 
-    // Another broker on the same file can hold the write lock while it creates or upgrades the
-    // schema. The busy timeout makes this broker wait for that lock, instead of failing at once.
+    // Another broker on the same file can hold the write lock while it creates the schema. The
+    // busy timeout makes this broker wait for that lock, instead of failing at once.
     connection.busy_timeout(busy_timeout)?;
-
-    // Foreign keys stay off for the whole upgrade. A transaction can't change this setting, and
-    // the `drop table` of a rebuild step would otherwise delete rows of the tables that refer to
-    // the dropped table.
-    _ = connection.execute("PRAGMA foreign_keys = OFF", ()).await?;
 
     // An immediate transaction takes the write lock before it reads the version. Two brokers that
     // start together then read the version one at a time, and only the first one applies the
@@ -1959,24 +1902,8 @@ async fn ensure_schema_of(
     };
     debug!(?recorded);
 
-    let action = plan(recorded, schema)?;
-    if action == Action::Keep {
+    if !should_create_schema(recorded, SCHEMA_VERSION)? {
         return tx.commit().await.map_err(Into::into);
-    }
-
-    if let (Action::Upgrade(steps), Some(recorded)) = (action, recorded) {
-        announce_upgrade(recorded, steps);
-        let started = Instant::now();
-        // The rollback is explicit because a transaction that is dropped sends none: the file's
-        // connection is closed when this function returns, and that discards the changes.
-        if let Err(err) = upgrade_schema(&tx, recorded, steps).await {
-            _ = tx.rollback().await;
-            return Err(err);
-        }
-        tx.commit().await?;
-
-        report_upgrade(recorded, steps, started.elapsed());
-        return Ok(());
     }
 
     let has_tables = tx
@@ -1989,12 +1916,7 @@ async fn ensure_schema_of(
         .await?
         .is_some();
 
-    if let Err(err) = check_unversioned_tables(has_tables, schema) {
-        _ = tx.rollback().await;
-        return Err(err);
-    }
-
-    for (name, ddl) in create.iter() {
+    for (name, ddl) in DDL.iter() {
         _ = tx
             .execute(ddl.as_str(), ())
             .await
@@ -2005,7 +1927,7 @@ async fn ensure_schema_of(
     _ = tx
         .execute(
             SQL.get("nisshi_schema_version_insert.sql")?,
-            [schema.version, schema.oldest_compatible_version],
+            [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
         )
         .await?;
 
@@ -2013,69 +1935,13 @@ async fn ensure_schema_of(
 
     if has_tables {
         warn!(
-            schema_version = schema.version,
+            schema_version = SCHEMA_VERSION,
             "recorded the schema version in a file whose tables an earlier release created"
         );
     } else {
-        info!(schema_version = schema.version, "created the schema");
+        info!(schema_version = SCHEMA_VERSION, "created the schema");
     }
 
-    Ok(())
-}
-
-/// Runs `steps` in `tx`, which holds the write lock, and records the version that the last one
-/// leaves. `recorded` is what the file recorded before the first step.
-async fn upgrade_schema(
-    tx: &Transaction,
-    recorded: RecordedSchema,
-    steps: &[Migration],
-) -> Result<()> {
-    for step in steps {
-        debug!(to_version = step.to_version);
-        _ = tx
-            .execute_batch(step.sql)
-            .await
-            .inspect_err(|err| {
-                error!(
-                    from_version = recorded.version,
-                    to_version = step.to_version,
-                    ?err,
-                    "a schema upgrade step failed, so the upgrade is rolled back and the file stays at its earlier version"
-                );
-            })?;
-    }
-
-    // The steps ran with foreign keys off, so a row that breaks a key stays unnoticed until this
-    // check. It is the last check of SQLite's procedure for rebuilding a table.
-    let mut broken_keys = tx.query("PRAGMA foreign_key_check", ()).await?;
-    if let Some(row) = broken_keys.next().await? {
-        // The columns of the first row of the check: the child table, the rowid of the child row
-        // (null for a table without rowid), and the parent table that the row refers to.
-        let table = row.get::<String>(0)?;
-        let rowid = row.get::<Option<i64>>(1)?;
-        let parent = row.get::<String>(2)?;
-        error!(
-            from_version = recorded.version,
-            table,
-            ?rowid,
-            parent,
-            "after the upgrade steps, a row breaks a foreign key, so the upgrade is rolled back and the file stays at its earlier version"
-        );
-        return Err(Error::Message(format!(
-            "after the upgrade steps, a row of `{table}` refers to a missing row of `{parent}`"
-        )));
-    }
-
-    let Some(last) = steps.last() else {
-        return Ok(());
-    };
-
-    _ = tx
-        .execute(
-            SQL.get("nisshi_schema_version_update.sql")?,
-            [last.to_version, upgraded_compatibility(recorded, steps)],
-        )
-        .await?;
     Ok(())
 }
 
@@ -2104,6 +1970,36 @@ impl Engine {
     pub fn builder()
     -> Builder<PhantomData<String>, PhantomData<i32>, PhantomData<Url>, PhantomData<Url>> {
         Builder::default()
+    }
+
+    /// Sends a produce of `deflated` to the delegate, and records how long it took. Both produce
+    /// methods call this, so that each produce opens its span and records its duration in one
+    /// place.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = SystemTime::now();
+
+        match inflated {
+            Some(inflated) => {
+                self.inner
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => self.inner.produce(transaction_id, topition, deflated).await,
+        }
+        .inspect(|_| {
+            ENGINE_REQUEST_DURATION.record(
+                elapsed_millis(start),
+                &[StorageOperation::Produce.attribute()],
+            )
+        })
     }
 }
 
@@ -2194,26 +2090,16 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        self.inner
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Produce.attribute()],
-                )
-            })
     }
 
-    #[instrument(skip_all)]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -2221,16 +2107,8 @@ impl Storage for Engine {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-        self.inner
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[KeyValue::new("operation", "produce")],
-                )
-            })
     }
 
     #[instrument(skip_all)]
@@ -2241,25 +2119,28 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
-        let start = SystemTime::now();
-        self.inner
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
+        let timer = RequestTimer::new(
+            &ENGINE_REQUEST_DURATION,
+            StorageOperation::Fetch,
+            Instant::now(),
+        );
+
+        let fetched = self
+            .inner
             .fetch(
                 topition,
                 offset,
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                deadline,
+                fetched_sender,
             )
-            .await
-            .inspect(|_| {
-                ENGINE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Fetch.attribute()],
-                )
-            })
+            .await;
+
+        timer.end(&fetched);
+        fetched
     }
 
     #[instrument(skip_all)]
@@ -2993,6 +2874,71 @@ fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
     Ok((current, version))
 }
 
+impl Delegate {
+    /// Writes `deflated` to `topition` in one transaction, with `inflated` as its decoded records,
+    /// or with the records that this decodes from `deflated` when the caller passed none. Both
+    /// produce methods call this, so that each produce decodes, writes and records its duration in
+    /// one place.
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        // This runs while the delegate serves the request, so the wait for a decode permit holds
+        // the engine's single permit. A caller that passes `inflated` skips this decode.
+        //
+        // The batch is inflated before the transaction starts, so the wait
+        // for a decode permit and the decode do not hold a connection or the
+        // database write lock.
+        let inflated = match inflated {
+            Some(inflated) => inflated,
+            None => inflate(deflated.clone())
+                .await
+                .inspect_err(|err| debug!(?err))?,
+        };
+
+        let start = SystemTime::now();
+
+        let pc = self.connection().await?;
+
+        let tx = pc.transaction().await.inspect(|_| {
+            debug!(after_produce_transaction = elapsed_millis(start));
+        })?;
+
+        let high = self
+            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
+            .await
+            .inspect(|_| {
+                debug!(after_produce_in_tx = elapsed_millis(start));
+            })
+            .inspect_err(|err| match err {
+                // A rejection the client caused: ProduceService logs it once,
+                // at warn, with the topic and partition.
+                Error::Api(_)
+                | Error::MessageTooLarge { .. }
+                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
+                    debug!(?err)
+                }
+                err => error!(?err),
+            })?;
+
+        pc.commit(tx)
+            .await
+            .and(Ok(high))
+            .inspect_err(|err| error!(?err))
+            .inspect(|_| {
+                debug!(after_produce_commit = elapsed_millis(start));
+
+                DELEGATE_REQUEST_DURATION.record(
+                    elapsed_millis(start),
+                    &[StorageOperation::Produce.attribute()],
+                )
+            })
+    }
+}
+
 #[async_trait]
 impl Storage for Delegate {
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
@@ -3358,17 +3304,7 @@ impl Storage for Delegate {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        // This runs while the delegate serves the request, so the wait for a decode permit holds
-        // the engine's single permit. `produce_inflated` skips this decode.
-        //
-        // The batch is inflated before the transaction starts, so the wait
-        // for a decode permit and the decode do not hold a connection or the
-        // database write lock.
-        let inflated = inflate(deflated.clone())
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
-        self.produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
@@ -3379,43 +3315,8 @@ impl Storage for Delegate {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        let start = SystemTime::now();
-
-        let pc = self.connection().await?;
-
-        let tx = pc.transaction().await.inspect(|_| {
-            debug!(after_produce_transaction = elapsed_millis(start));
-        })?;
-
-        let high = self
-            .produce_in_tx(transaction_id, topition, deflated, inflated, &pc)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .inspect(|_| {
-                debug!(after_produce_in_tx = elapsed_millis(start));
-            })
-            .inspect_err(|err| match err {
-                // A rejection the client caused: ProduceService logs it once,
-                // at warn, with the topic and partition.
-                Error::Api(_)
-                | Error::MessageTooLarge { .. }
-                | Error::SansIo(nisshi_sans_io::Error::MessageMaxSizeExceeded(_)) => {
-                    debug!(?err)
-                }
-                err => error!(?err),
-            })?;
-
-        pc.commit(tx)
-            .await
-            .and(Ok(high))
-            .inspect_err(|err| error!(?err))
-            .inspect(|_| {
-                debug!(after_produce_commit = elapsed_millis(start));
-
-                DELEGATE_REQUEST_DURATION.record(
-                    elapsed_millis(start),
-                    &[StorageOperation::Produce.attribute()],
-                )
-            })
     }
 
     async fn fetch(
@@ -3425,60 +3326,41 @@ impl Storage for Delegate {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
-        let started_at = SystemTime::now();
-
-        debug!(
-            ?topition,
-            offset,
-            min_bytes,
-            max_bytes,
-            ?isolation_level,
-            ?deadline
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
+        let timer = RequestTimer::new(
+            &DELEGATE_REQUEST_DURATION,
+            StorageOperation::Fetch,
+            Instant::now(),
         );
 
-        let mut read_deadline = ReadDeadline::new(StorageOperation::Fetch, deadline);
+        let fetched = async {
+            debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
-        let Ok(topic) = read_deadline
-            .timeout(self.topic_with_key(topition.topic()))
-            .await
-        else {
-            return Ok(vec![]);
-        };
+            let (base_topic, key_filter): (&str, Option<&str>) =
+                self.topic_with_key(topition.topic()).await?;
 
-        let (base_topic, key_filter): (&str, Option<&str>) = topic?;
+            let offset_stage = self.offset_stage(topition).await?;
 
-        let Ok(offset_stage) = read_deadline.timeout(self.offset_stage(topition)).await else {
-            return Ok(vec![]);
-        };
-
-        let high_watermark = offset_stage.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
+            let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
                 offset_stage.last_stable
             } else {
                 offset_stage.high_watermark
-            }
-        })?;
+            };
 
-        debug!(
-            cluster = self.cluster,
-            ?topition,
-            offset,
-            ?isolation_level,
-            high_watermark,
-            min_bytes,
-            max_bytes
-        );
+            debug!(
+                cluster = self.cluster,
+                ?topition,
+                offset,
+                ?isolation_level,
+                high_watermark,
+                min_bytes,
+                max_bytes
+            );
 
-        let Ok(c) = read_deadline.timeout(self.connection()).await else {
-            return Ok(vec![]);
-        };
+            let c = self.connection().await?;
 
-        let c = c?;
-
-        let records = async {
-            if let Some(key) = key_filter {
+            let mut records = if let Some(key) = key_filter {
                 let key_bytes = key.as_bytes().to_vec();
                 c.query(
                     "record_fetch_keyed.sql",
@@ -3490,10 +3372,10 @@ impl Storage for Delegate {
                         (max_bytes as i64),
                         high_watermark,
                         key_bytes,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
-                .inspect_err(|err| error!(?err))
             } else {
                 c.query(
                     "record_fetch.sql",
@@ -3504,60 +3386,46 @@ impl Storage for Delegate {
                         offset,
                         (max_bytes as i64),
                         high_watermark,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
-                .inspect_err(|err| error!(?err))
             }
-        };
+            .inspect_err(|err| error!(?err))?;
 
-        let Ok(records) = read_deadline.timeout(records).await else {
-            return Ok(vec![]);
-        };
+            let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
-        let mut records = records?;
+            // This loop can run past the read's deadline by the time that it takes to read one full
+            // channel of records, with the header query of each. The caller stops the read at its
+            // deadline only while the read waits. libSQL reads each row synchronously inside `next`,
+            // without waiting, so the read waits only when its channel is full.
+            //
+            // A step that waits for a lock blocks for up to the connection's busy timeout, so the
+            // read can overrun its deadline by that much. In WAL mode a read waits for a lock only
+            // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
+            // configured instead of shrinking to the time left, because it applies to each wait and
+            // is shared with every later user of the pooled connection.
+            while let Some(row) = records.next().await? {
+                let offset = row
+                    .get::<i64>(0)
+                    .inspect(|offset| debug!(offset))
+                    .inspect_err(|err| error!(?err))?;
 
-        let mut batches = vec![];
+                let mut headers = vec![];
 
-        if let Some(row) = records.next().await? {
-            let offset_delta = 0;
-            let timestamp_delta = 0;
-
-            let base_offset = row
-                .get::<i64>(0)
-                .inspect(|base_offset| debug!(base_offset))
-                .inspect_err(|err| error!(?err))?;
-
-            let record_builder = {
-                let mut record_builder = Record::builder()
-                    .offset_delta(offset_delta)
-                    .timestamp_delta(timestamp_delta)
-                    .key(
-                        row.get::<Option<Vec<u8>>>(3)
-                            .map(|o| o.map(Bytes::from))
-                            .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    )
-                    .value(
-                        row.get::<Option<Vec<u8>>>(4)
-                            .map(|o| o.map(Bytes::from))
-                            .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                            .inspect_err(|err| error!(?err))?,
-                    );
-
-                let mut headers = c
+                let mut header_rows = c
                     .query(
                         "header_fetch.sql",
                         (
                             self.cluster.as_str(),
                             topition.topic(),
                             topition.partition(),
-                            base_offset,
+                            offset,
                         ),
                     )
                     .await?;
 
-                while let Some(header) = headers.next().await? {
+                while let Some(header) = header_rows.next().await? {
                     let mut header_builder = Header::builder();
 
                     if let Some(k) = header
@@ -3574,187 +3442,51 @@ impl Storage for Delegate {
                         header_builder = header_builder.value(Bytes::from(v));
                     }
 
-                    record_builder = record_builder.header(header_builder);
+                    headers.push(header_builder);
                 }
 
-                record_builder
-            };
-
-            let mut batch_builder = inflated::Batch::builder()
-                .base_offset(base_offset)
-                .attributes(
-                    row.get::<Option<i32>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))? as i16,
-                )
-                .base_timestamp(
-                    row.get_value(2)
+                data.send_record(FetchedRecord {
+                    offset,
+                    timestamp: row
+                        .get_value(2)
                         .map_err(Error::from)
                         .and_then(LiteTimestamp::millis)
+                        .inspect(|timestamp| debug!(?timestamp))
                         .inspect_err(|err| error!(?err))?,
-                )
-                .producer_id(
-                    row.get::<Option<i64>>(6)
+                    attributes: row
+                        .get::<Option<i32>>(1)
+                        .map(|attributes| attributes.unwrap_or(0))
+                        .inspect_err(|err| error!(?err))? as i16,
+                    producer_id: row
+                        .get::<Option<i64>>(6)
                         .map(|producer_id| producer_id.unwrap_or(-1))
                         .inspect_err(|err| error!(?err))?,
-                )
-                .producer_epoch(i16::try_from(
-                    row.get::<Option<i32>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                    producer_epoch: i16::try_from(
+                        row.get::<Option<i32>>(7)
+                            .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                            .inspect_err(|err| error!(?err))?,
+                    )?,
+                    key: row
+                        .get::<Option<Vec<u8>>>(3)
+                        .map(|o| o.map(Bytes::from))
+                        .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
                         .inspect_err(|err| error!(?err))?,
-                )?)
-                .record(record_builder)
-                .last_offset_delta(offset_delta);
-
-            // libSQL steps the statement synchronously inside `next`, so the timer of
-            // `read_deadline` can't interrupt a row. The loop checks the deadline after each row.
-            //
-            // A step that waits for a lock blocks for up to the connection's busy timeout, so
-            // the read can overrun its deadline by that much. In WAL mode a read waits for a
-            // lock only rarely, such as while a checkpoint restarts the log. The busy timeout
-            // stays as configured instead of shrinking to the time left, because it applies
-            // to each wait and is shared with every later user of the pooled connection.
-            while let Some(row) = records.next().await?
-                && read_deadline.continue_reading().is_ok()
-            {
-                let attributes = row
-                    .get::<Option<i32>>(1)
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))? as i16;
-
-                let producer_id = row
-                    .get::<Option<i64>>(6)
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?;
-                let producer_epoch = i16::try_from(
-                    row.get::<Option<i32>>(7)
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
+                    value: row
+                        .get::<Option<Vec<u8>>>(4)
+                        .map(|o| o.map(Bytes::from))
+                        .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
                         .inspect_err(|err| error!(?err))?,
-                )?;
-
-                let timestamp = row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::millis)
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?;
-
-                // A `LogAppendTime` record whose timestamp differs from the batch's starts a new
-                // batch. A consumer reads one timestamp, `max_timestamp`, for every record of a
-                // `LogAppendTime` batch. Each stored record holds the broker's time of its own
-                // produce request, so one batch cannot hold two such times.
-                if batch_builder.attributes != attributes
-                    || batch_builder.producer_id != producer_id
-                    || batch_builder.producer_epoch != producer_epoch
-                    || (TimestampType::from(attributes) == TimestampType::LogAppendTime
-                        && timestamp != batch_builder.base_timestamp)
-                {
-                    batches.push(
-                        batch_builder
-                            .max_timestamp_of_records()
-                            .build()
-                            .and_then(TryInto::try_into)?,
-                    );
-
-                    batch_builder = inflated::Batch::builder()
-                        .base_offset(
-                            row.get::<i64>(0)
-                                .inspect(|base_offset| debug!(base_offset))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .base_timestamp(timestamp)
-                        .attributes(attributes)
-                        .producer_id(producer_id)
-                        .producer_epoch(producer_epoch);
-                }
-
-                let offset = row
-                    .get::<i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
-                let offset_delta = i32::try_from(offset - batch_builder.base_offset)?;
-
-                let timestamp_delta = timestamp - batch_builder.base_timestamp;
-
-                let record_builder = {
-                    let mut record_builder = Record::builder()
-                        .offset_delta(offset_delta)
-                        .timestamp_delta(timestamp_delta)
-                        .key(
-                            row.get::<Option<Vec<u8>>>(3)
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        )
-                        .value(
-                            row.get::<Option<Vec<u8>>>(4)
-                                .map(|o| o.map(Bytes::from))
-                                .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                                .inspect_err(|err| error!(?err))?,
-                        );
-
-                    let mut headers = c
-                        .query(
-                            "header_fetch.sql",
-                            (
-                                self.cluster.as_str(),
-                                topition.topic(),
-                                topition.partition(),
-                                offset,
-                            ),
-                        )
-                        .await?;
-
-                    while let Some(header) = headers.next().await? {
-                        let mut header_builder = Header::builder();
-
-                        if let Some(k) = header
-                            .get::<Option<Vec<u8>>>(0)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.key(Bytes::from(k));
-                        }
-
-                        if let Some(v) = header
-                            .get::<Option<Vec<u8>>>(1)
-                            .inspect_err(|err| error!(?err))?
-                        {
-                            header_builder = header_builder.value(Bytes::from(v));
-                        }
-
-                        record_builder = record_builder.header(header_builder);
-                    }
-
-                    record_builder
-                };
-
-                batch_builder = batch_builder
-                    .record(record_builder)
-                    .last_offset_delta(offset_delta);
+                    headers,
+                })
+                .await?;
             }
 
-            batches.push(
-                batch_builder
-                    .max_timestamp_of_records()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
-        } else {
-            batches.push(
-                inflated::Batch::builder()
-                    .build()
-                    .and_then(TryInto::try_into)?,
-            );
+            Ok::<_, Error>(())
         }
+        .await;
 
-        Ok(batches).inspect(|_| {
-            if let Ok(elapsed) = started_at.elapsed() {
-                DELEGATE_REQUEST_DURATION.record(
-                    elapsed.as_millis() as u64,
-                    &[StorageOperation::Fetch.attribute()],
-                )
-            }
-        })
+        timer.end(&fetched);
+        fetched
     }
 
     #[instrument(skip(self))]
@@ -5988,14 +5720,15 @@ mod tests {
     use std::assert_matches;
     use std::thread;
 
-    use nisshi_sans_io::Compression;
+    use nisshi_sans_io::{Compression, create_topics_request::CreatableTopicConfig};
     use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
-    use tokio::{fs::remove_file, task::yield_now};
+    use tokio::{fs::remove_file, task::yield_now, time::Instant};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+    use nisshi_storage::fetched::FetchUntilDeadline as _;
 
     #[test]
     fn timestamp_from_null_is_an_error() {
@@ -6570,7 +6303,7 @@ mod tests {
         assert_eq!(0, offset);
 
         let fetched = engine
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6579,6 +6312,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(1),
             )
             .await
+            .map(|read| read.batches)
             .inspect(|fetched| debug!(?fetched))?;
 
         assert_eq!(1, fetched.len());
@@ -6646,7 +6380,7 @@ mod tests {
         _ = engine.produce(None, &topition, batch).await?;
 
         let fetch = |deadline| {
-            engine.fetch(
+            engine.fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6656,12 +6390,15 @@ mod tests {
             )
         };
 
-        assert!(fetch(Instant::now()).await?.is_empty());
+        assert!(fetch(Instant::now()).await?.batches.is_empty());
 
         // The record is there, so the empty fetch above comes from its deadline.
         assert_eq!(
             1,
-            fetch(Instant::now() + Duration::from_secs(1)).await?.len()
+            fetch(Instant::now() + Duration::from_secs(1))
+                .await?
+                .batches
+                .len()
         );
 
         Ok(())
@@ -6675,7 +6412,7 @@ mod tests {
         deadline: Instant,
     ) -> Result<u32> {
         storage
-            .fetch(
+            .fetch_until_deadline(
                 topition,
                 0,
                 0,
@@ -6684,6 +6421,7 @@ mod tests {
                 deadline,
             )
             .await
+            .map(|read| read.batches)
             .map(|fetched| fetched.iter().map(|batch| batch.record_count).sum())
     }
 
@@ -6784,6 +6522,412 @@ mod tests {
         Ok(())
     }
 
+    /// Opens an engine on a database file in a temporary directory and creates a topic of one
+    /// partition on it, a virtual topic when `keyed`. Returns the engine, the partition that
+    /// records are produced to and the one that a fetch reads: a keyed fetch reads the records
+    /// with the key `k` of the virtual topic.
+    async fn fetch_engine_with_topic(
+        keyed: bool,
+    ) -> Result<(tempfile::TempDir, ArcDynStorage, Topition, Topition)> {
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir)?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!(
+                "file:///{}?mode=direct",
+                relative.display()
+            ))?)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        keyed
+                            .then(|| {
+                                CreatableTopicConfig::default()
+                                    .name(topic_config::VIRTUAL.to_owned())
+                                    .value(Some("true".into()))
+                            })
+                            .into_iter()
+                            .collect(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let produced = Topition::new(topic, 0);
+        let fetched = if keyed {
+            Topition::new(format!("{topic}/k"), 0)
+        } else {
+            produced.clone()
+        };
+
+        Ok((temp_dir, engine, produced, fetched))
+    }
+
+    /// Stores `count` records, 1,000 to a batch because a batch of headers can exceed the
+    /// message size limit. Each has the key `k`, or the key `j` when `alternate_keys` and its
+    /// offset is odd. Each has the value `a`, and a 1 byte header key and a 99 byte header value
+    /// when `with_header`. A record then costs 104 bytes against a fetch's `max_bytes`: 1 for the
+    /// key, 1 for the value, 2 for the header's framing and 100 for the header.
+    async fn produce_keyed_records(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        count: i64,
+        with_header: bool,
+        alternate_keys: bool,
+    ) -> Result<()> {
+        const RECORDS_PER_BATCH: i64 = 1_000;
+
+        for first in (0..count).step_by(usize::try_from(RECORDS_PER_BATCH)?) {
+            let in_batch = RECORDS_PER_BATCH.min(count - first);
+
+            let batch = (0..in_batch)
+                .fold(inflated::Batch::builder(), |builder, delta| {
+                    let key: &'static [u8] = if alternate_keys && (first + delta) % 2 == 1 {
+                        b"j"
+                    } else {
+                        b"k"
+                    };
+
+                    let record = Record::builder()
+                        .key(Some(Bytes::from_static(key)))
+                        .value(Some(Bytes::from_static(b"a")))
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX));
+
+                    builder.record(if with_header {
+                        record.header(
+                            Header::builder()
+                                .key(Bytes::from_static(b"h"))
+                                .value(Bytes::from(vec![0; 99])),
+                        )
+                    } else {
+                        record
+                    })
+                })
+                .last_offset_delta(i32::try_from(in_batch - 1)?)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, topition, batch).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offsets of the records that one engine read of `topition` from `offset`
+    /// returns within `max_bytes`.
+    async fn fetched_offsets(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+    ) -> Result<Vec<i64>> {
+        engine
+            .fetch_until_deadline(
+                topition,
+                offset,
+                1,
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?
+            .batches
+            .into_iter()
+            .try_fold(Vec::new(), |mut offsets, batch| {
+                let batch = inflated::Batch::try_from(batch)?;
+
+                offsets.extend(
+                    batch
+                        .records
+                        .iter()
+                        .map(|record| batch.base_offset + i64::from(record.offset_delta)),
+                );
+
+                Ok(offsets)
+            })
+    }
+
+    /// One engine read returns at most `ROWS_PER_FETCH` rows, and a read from the last offset that
+    /// it returned gets the rest, with no gap and no repeat. Without the limit, each read covers
+    /// every row between its offset and the high watermark, so a consumer that is far behind pays
+    /// for its whole backlog on every read. The test covers the statement of an ordinary topic and
+    /// the statement of a virtual topic.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, false, false).await?;
+
+            assert_eq!(
+                (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+                "one read must stop at the row limit, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, ROWS_PER_FETCH, u32::MAX).await?,
+                "a read from the last offset must return the rest, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A keyed read applies the key filter before the row limit, so a read from offset 0 returns
+    /// every record with the key, also when the limit is smaller than the number of records
+    /// that it scans. Every second record has another key, so a filter that runs after the limit
+    /// returns fewer.
+    #[tokio::test]
+    async fn keyed_fetch_filters_by_key_before_it_applies_the_row_limit() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(true).await?;
+
+        produce_keyed_records(&engine, &produced, RECORDS, false, true).await?;
+
+        // The records at the even offsets have the key `k`, which is 5,025 of them. The limit
+        // of 10,000 rows covers 5,000 of them when it applies first.
+        assert_eq!(
+            (0..RECORDS).step_by(2).collect::<Vec<_>>(),
+            fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+        );
+
+        Ok(())
+    }
+
+    /// The row limit applies to records that have headers, and a record's headers still count
+    /// toward `max_bytes` when the limit ends the read. A record costs 104 bytes, so a budget of
+    /// 1041 bytes returns 10 of them.
+    #[tokio::test]
+    async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
+    {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
+
+            assert_eq!(
+                (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, u32::MAX).await?,
+                "the row limit counts from the fetch offset, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (40..50).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, 1041).await?,
+                "the byte budget must count the headers, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A read over more rows than the limit still returns the first record when that record
+    /// alone is larger than `max_bytes` (KIP-74), so that a consumer gets past it.
+    #[tokio::test]
+    async fn fetch_returns_the_first_record_larger_than_max_bytes_within_a_bounded_read()
+    -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
+
+            for offset in [0, ROWS_PER_FETCH - 1, ROWS_PER_FETCH] {
+                assert_eq!(
+                    vec![offset],
+                    fetched_offsets(&engine, &fetched, offset, 50).await?,
+                    "fetch at {offset}, keyed: {keyed}",
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offset of each row of a fetch query's result.
+    async fn offsets_of(mut rows: Rows) -> Result<Vec<i64>> {
+        let mut offsets = vec![];
+
+        while let Some(row) = rows.next().await? {
+            offsets.push(row.get::<i64>(0)?);
+        }
+
+        Ok(offsets)
+    }
+
+    /// A fetch from the start of a backlog of large records runs within a heap of a few MB: the
+    /// window no longer copies the key and the value of every record into its temporary table. The
+    /// keyed query still reads through each value on libSQL (see `record_fetch_keyed.sql`), but
+    /// walking overflow pages uses little heap, so this test does not see it.
+    #[tokio::test]
+    async fn fetch_over_large_records_runs_within_a_small_heap() -> Result<()> {
+        const RECORDS: i64 = 40;
+        const VALUE_BYTES: usize = 500_000;
+        const KEY: &[u8] = b"k";
+
+        let _guard = init_tracing()?;
+
+        let cluster = "nisshi";
+        let topic = "test";
+
+        let (_temp_dir, connection) = scratch_connection().await?;
+
+        _ = connection
+            .connection
+            .execute("insert into cluster (name) values (?1)", [cluster])
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topic (cluster, name, uuid, partitions, replication_factor) \
+                 select id, ?2, ?3, 1, 1 from cluster where name = ?1",
+                (cluster, topic, Uuid::new_v4().to_string()),
+            )
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topition (topic, partition) select id, 0 from topic where name = ?1",
+                [topic],
+            )
+            .await?;
+
+        let value = vec![b'x'; VALUE_BYTES];
+
+        for offset in 0..RECORDS {
+            _ = connection
+                .connection
+                .execute(
+                    "insert into record (topition, offset_id, k, v) \
+                     select id, ?1, ?2, ?3 from topition",
+                    (offset, KEY.to_vec(), value.clone()),
+                )
+                .await?;
+        }
+
+        // With the default temp store, SQLite spills the window's temporary table to a file, and
+        // the heap limit below would not see it.
+        _ = connection
+            .connection
+            .query("PRAGMA temp_store = memory", ())
+            .await?
+            .next()
+            .await?;
+
+        // The page cache of this connection counts toward the heap limit below. A small cache
+        // keeps the pages of the inserts above out of what the limit measures.
+        _ = connection
+            .connection
+            .query("PRAGMA cache_size = -256", ())
+            .await?
+            .next()
+            .await?;
+
+        // Each record is 500,001 bytes, more than the budget, so each fetch returns only its
+        // first record (KIP-74).
+        let max_bytes = 100_000_i64;
+        let high_watermark = RECORDS;
+
+        // The heap limit covers every SQLite connection in this process, and SQLite lets a later
+        // call only lower it, so nothing in this process can raise it again. The test is safe
+        // because nextest runs each test in a process of its own. Under `cargo test`, every test
+        // that runs after this one in the same binary would run within this limit.
+        //
+        // With the key and the value of each record in the window, these fetches need more than
+        // 6 MB, and without them they run within 3 MB. The edge depends on how SQLite buffers the
+        // rows of a window, so an update of libsql can move it.
+        _ = connection
+            .connection
+            .query("PRAGMA hard_heap_limit = 4000000", ())
+            .await?
+            .next()
+            .await?;
+
+        let plain = connection
+            .query(
+                "record_fetch.sql",
+                (
+                    cluster,
+                    topic,
+                    0,
+                    0,
+                    max_bytes,
+                    high_watermark,
+                    ROWS_PER_FETCH,
+                ),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(plain).await?);
+
+        let keyed = connection
+            .query(
+                "record_fetch_keyed.sql",
+                (
+                    cluster,
+                    topic,
+                    0,
+                    0,
+                    max_bytes,
+                    high_watermark,
+                    KEY.to_vec(),
+                    ROWS_PER_FETCH,
+                ),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(keyed).await?);
+
+        Ok(())
+    }
+
     /// `produce_inflated` stores the batch that the caller decoded and does not decode the bytes
     /// again, also through the channel to the engine's single writer.
     ///
@@ -6856,7 +7000,7 @@ mod tests {
         );
 
         let fetched = engine
-            .fetch(
+            .fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -6864,7 +7008,8 @@ mod tests {
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(1),
             )
-            .await?;
+            .await
+            .map(|read| read.batches)?;
         let records: Vec<_> = fetched
             .into_iter()
             .map(inflated::Batch::try_from)
@@ -7391,6 +7536,63 @@ mod tests {
         Ok(())
     }
 
+    /// A record without a timestamp stores NO_TIMESTAMP, -1. Retention ages it from when the
+    /// broker appended it, so a sweep deletes it once `retention.ms` has passed since then, and
+    /// keeps a record appended within `retention.ms` in the same sweep.
+    #[tokio::test]
+    async fn retention_ages_a_record_without_a_timestamp_from_its_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "retention-record-without-timestamp-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        execute_on(
+            db_file,
+            "insert into topic_configuration (topic, name, value) \
+             select id, 'retention.ms', '600000' from topic where name = 't'",
+            (),
+        )
+        .await?;
+
+        for _ in 0..2 {
+            let batch = inflated::Batch::builder()
+                .base_timestamp(-1)
+                .max_timestamp(-1)
+                .record(Record::builder().value(Some(Bytes::from_static(b"a"))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        // Offset 0 was appended an hour ago, which is longer than the retention. A sweep that
+        // aged it by the sweep time, which is also its age now, would keep it.
+        execute_on(
+            db_file,
+            "update record set created_at = datetime('now', '-1 hour') where offset_id = 0",
+            (),
+        )
+        .await?;
+
+        engine.maintain(SystemTime::now()).await?;
+
+        let mut rows = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?
+            .query("select offset_id from record order by offset_id", ())
+            .await?;
+
+        let mut stored = vec![];
+        while let Some(row) = rows.next().await? {
+            stored.push(row.get::<i64>(0)?);
+        }
+
+        assert_eq!(vec![1], stored);
+
+        Ok(())
+    }
+
     async fn scratch_connection() -> Result<(tempfile::TempDir, managed::Object<ConnectionManager>)>
     {
         let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
@@ -7756,435 +7958,6 @@ mod tests {
             Ok(_) => panic!("expected the SchemaSetup failure, got a storage"),
         }
 
-        Ok(())
-    }
-
-    /// A step that upgrades a file of version 1 to version 2. It adds a table and a row, so that a
-    /// step that runs twice fails on the row, and a step that runs in part leaves the table.
-    const MARKER_SQL: &str = "create table upgrade_marker (id integer primary key); \
-                              insert into upgrade_marker (id) values (1);";
-
-    const STEP_TO_2: Migration = Migration {
-        to_version: 2,
-        oldest_compatible_version: 1,
-        breaks_previous_release: false,
-        sql: MARKER_SQL,
-    };
-
-    /// A step that upgrades a file of version 2 to version 3. It needs the table of
-    /// [`STEP_TO_2`], so that it fails when it runs before that step.
-    const STEP_TO_3: Migration = Migration {
-        to_version: 3,
-        oldest_compatible_version: 1,
-        breaks_previous_release: false,
-        sql: "create table upgrade_marker_child \
-              (id integer primary key references upgrade_marker (id)); \
-              insert into upgrade_marker_child (id) select id from upgrade_marker;",
-    };
-
-    const UPGRADE_TO_2: &[Migration] = &[STEP_TO_2];
-
-    const SCHEMA_2: Schema = Schema {
-        version: 2,
-        oldest_compatible_version: 1,
-        migrations: UPGRADE_TO_2,
-    };
-
-    const SCHEMA_3: Schema = Schema {
-        version: 3,
-        oldest_compatible_version: 1,
-        migrations: &[STEP_TO_2, STEP_TO_3],
-    };
-
-    async fn upgrade_to_2(db: &Database) -> Result<()> {
-        ensure_schema_of(db, Duration::from_secs(5), &SCHEMA_2, &DDL).await
-    }
-
-    async fn count(db: &Database, table: &str) -> Result<i64> {
-        db.connect()?
-            .query(&format!("select count(*) from {table}"), ())
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i64>(0))
-            .transpose()?
-            .ok_or_else(|| Error::Message(format!("no count of {table}")))
-    }
-
-    /// A file of version 1 holds a topic. A release of version 2 must upgrade it at startup, keep
-    /// the data, and record version 2. The release of version 1, which a rollback runs, then uses
-    /// the upgraded file, and produces and fetches.
-    #[tokio::test]
-    async fn ensure_schema_upgrades_a_version_1_file_then_produces_and_fetches() -> Result<()> {
-        let _guard = init_tracing()?;
-        let db_file = "ensure-schema-upgrade-produce-fetch-test.db";
-        let _db_file_guard = DbFileGuard::new(db_file);
-
-        let (engine, topition) = engine_with_topic(db_file).await?;
-        drop(engine);
-
-        let db = libsql::Builder::new_local(db_file).build().await?;
-        assert_eq!(recorded_version(&db).await?, Some(1));
-        upgrade_to_2(&db).await?;
-
-        assert_eq!(recorded_version(&db).await?, Some(2));
-        assert_eq!(count(&db, "upgrade_marker").await?, 1);
-        assert_eq!(count(&db, "topic").await?, 1);
-
-        // The broker of version 1 finds version 2 with `oldest_compatible_version` 1.
-        let engine = Engine::builder()
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
-            .cluster("nisshi".to_owned())
-            .storage(Url::parse(&format!("file:///{db_file}"))?)
-            .node(12321)
-            .build()
-            .await?;
-        let batch: deflated::Batch = inflated::Batch::builder()
-            .record(Record::builder().value(Bytes::from_static(b"upgraded").into()))
-            .build()
-            .and_then(TryInto::try_into)?;
-        assert_eq!(0, engine.produce(None, &topition, batch).await?);
-
-        let fetched = engine
-            .fetch(
-                &topition,
-                0,
-                0,
-                1_000_000,
-                IsolationLevel::ReadUncommitted,
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await?;
-        assert_eq!(1, fetched.len());
-        assert_eq!(recorded_version(&db).await?, Some(2));
-
-        Ok(())
-    }
-
-    /// Brokers that start together on one file of version 1 must all start, and the file must run
-    /// each step once: a second run of the step in `UPGRADE_TO_2` fails on its row.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ensure_schema_upgrades_once_for_brokers_that_start_together() -> Result<()> {
-        const BROKERS: usize = 4;
-
-        let directory = tempdir()?;
-        let path = directory.path().join("nisshi.db");
-        ensure_schema(
-            &libsql::Builder::new_local(&path).build().await?,
-            Duration::from_secs(5),
-        )
-        .await?;
-
-        let barrier = Arc::new(tokio::sync::Barrier::new(BROKERS));
-        let mut setups = Vec::with_capacity(BROKERS);
-        for _ in 0..BROKERS {
-            let db = libsql::Builder::new_local(&path).build().await?;
-            let barrier = Arc::clone(&barrier);
-            setups.push(tokio::spawn(async move {
-                _ = barrier.wait().await;
-                upgrade_to_2(&db).await
-            }));
-        }
-        for setup in setups {
-            setup.await??;
-        }
-
-        let db = libsql::Builder::new_local(&path).build().await?;
-        assert_eq!(recorded_version(&db).await?, Some(2));
-        assert_eq!(count(&db, "upgrade_marker").await?, 1);
-        Ok(())
-    }
-
-    /// A step that fails must leave the file as it was: version 1, and none of the step's earlier
-    /// statements, so the next start runs the step again.
-    #[tokio::test]
-    async fn ensure_schema_rolls_back_an_upgrade_that_fails() -> Result<()> {
-        const BROKEN: Schema = Schema {
-            version: 2,
-            oldest_compatible_version: 1,
-            migrations: &[Migration {
-                to_version: 2,
-                oldest_compatible_version: 1,
-                breaks_previous_release: false,
-                sql: "create table upgrade_marker (id integer primary key); \
-                      insert into no_such_table (id) values (1);",
-            }],
-        };
-
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-
-        assert_matches!(
-            ensure_schema_of(&db, Duration::from_secs(5), &BROKEN, &DDL).await,
-            Err(_)
-        );
-
-        assert_eq!(recorded_version(&db).await?, Some(1));
-        assert_matches!(count(&db, "upgrade_marker").await, Err(_));
-
-        upgrade_to_2(&db).await?;
-        assert_eq!(recorded_version(&db).await?, Some(2));
-        Ok(())
-    }
-
-    /// An earlier release created the tables in this file without recording a version, and they
-    /// may lack tables of version 1. A release of version 2 must refuse the file and leave it as
-    /// it was, so that a release of version 1 can still record its version.
-    #[tokio::test]
-    async fn ensure_schema_refuses_a_file_created_without_a_version_to_upgrade() -> Result<()> {
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        let connection = db.connect()?;
-        for ddl in DDL.values() {
-            _ = connection.execute(ddl.as_str(), ()).await?;
-        }
-
-        assert_matches!(
-            upgrade_to_2(&db).await,
-            Err(Error::UnversionedSchema { schema_version: 2 })
-        );
-
-        assert_matches!(recorded_version(&db).await, Err(_));
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-        assert_eq!(recorded_version(&db).await?, Some(SCHEMA_VERSION));
-        Ok(())
-    }
-
-    /// A step that rebuilds a table that other tables refer to, as SQLite's procedure for
-    /// changing a constraint does, must keep the rows of the tables that refer to it. Its
-    /// `drop table` would otherwise fire the `on delete cascade` rule of the child table.
-    #[tokio::test]
-    async fn ensure_schema_upgrade_that_rebuilds_a_table_keeps_the_rows_that_refer_to_it()
-    -> Result<()> {
-        const REBUILDS: Schema = Schema {
-            version: 3,
-            oldest_compatible_version: 1,
-            migrations: &[
-                Migration {
-                    to_version: 2,
-                    oldest_compatible_version: 1,
-                    breaks_previous_release: false,
-                    sql: "create table rebuilt_parent (id integer primary key); \
-                          create table rebuilt_child (id integer primary key, \
-                              parent_id integer not null references rebuilt_parent (id) \
-                              on delete cascade); \
-                          insert into rebuilt_parent (id) values (1); \
-                          insert into rebuilt_child (id, parent_id) values (1, 1);",
-                },
-                Migration {
-                    to_version: 3,
-                    oldest_compatible_version: 1,
-                    breaks_previous_release: false,
-                    sql: "create table rebuilt_parent_new (id integer primary key, note text); \
-                          insert into rebuilt_parent_new (id) select id from rebuilt_parent; \
-                          drop table rebuilt_parent; \
-                          alter table rebuilt_parent_new rename to rebuilt_parent;",
-                },
-            ],
-        };
-
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-
-        ensure_schema_of(&db, Duration::from_secs(5), &REBUILDS, &DDL).await?;
-
-        assert_eq!(recorded_version(&db).await?, Some(3));
-        assert_eq!(count(&db, "rebuilt_parent").await?, 1);
-        assert_eq!(count(&db, "rebuilt_child").await?, 1);
-        Ok(())
-    }
-
-    /// A step that leaves a row that breaks a foreign key must fail the upgrade, and the file must
-    /// stay at version 1 without the step's tables. The check exists because the steps run with
-    /// foreign keys off.
-    #[tokio::test]
-    async fn ensure_schema_rolls_back_an_upgrade_that_breaks_a_foreign_key() -> Result<()> {
-        const BREAKS_A_KEY: Schema = Schema {
-            version: 2,
-            oldest_compatible_version: 1,
-            migrations: &[Migration {
-                to_version: 2,
-                oldest_compatible_version: 1,
-                breaks_previous_release: false,
-                sql: "create table checked_parent (id integer primary key); \
-                      create table checked_child (parent_id integer references checked_parent (id)); \
-                      insert into checked_child (parent_id) values (7);",
-            }],
-        };
-
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-
-        assert_matches!(
-            ensure_schema_of(&db, Duration::from_secs(5), &BREAKS_A_KEY, &DDL).await,
-            Err(Error::Message(message))
-                if message.contains("`checked_child`") && message.contains("`checked_parent`")
-        );
-
-        assert_eq!(recorded_version(&db).await?, Some(1));
-        assert_matches!(count(&db, "checked_child").await, Err(_));
-        Ok(())
-    }
-
-    /// The upgrade must keep a stricter `oldest_compatible_version` that the file already records.
-    #[tokio::test]
-    async fn ensure_schema_upgrade_never_lowers_oldest_compatible_version() -> Result<()> {
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-        _ = db
-            .connect()?
-            .execute(
-                "update nisshi_schema_version set oldest_compatible_version = 2",
-                (),
-            )
-            .await?;
-
-        upgrade_to_2(&db).await?;
-
-        let oldest = db
-            .connect()?
-            .query(
-                "select oldest_compatible_version from nisshi_schema_version",
-                (),
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<i32>(0))
-            .transpose()?;
-        assert_eq!(oldest, Some(2));
-        Ok(())
-    }
-
-    /// Returns the version and the `oldest_compatible_version` that `db` records.
-    async fn recorded_versions(db: &Database) -> Result<(i32, i32)> {
-        db.connect()?
-            .query(
-                "select version, oldest_compatible_version from nisshi_schema_version",
-                (),
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| Ok::<_, Error>((row.get::<i32>(0)?, row.get::<i32>(1)?)))
-            .transpose()?
-            .ok_or_else(|| Error::Message(String::from("no recorded version")))
-    }
-
-    /// A step that leaves a schema that only version 2 can use must make the file record that.
-    /// The release of version 1 must then refuse the file and change nothing.
-    #[tokio::test]
-    async fn ensure_schema_upgrade_records_the_compatibility_of_its_step() -> Result<()> {
-        const BREAKING: Schema = Schema {
-            version: 2,
-            oldest_compatible_version: 2,
-            migrations: &[Migration {
-                to_version: 2,
-                oldest_compatible_version: 2,
-                breaks_previous_release: true,
-                sql: MARKER_SQL,
-            }],
-        };
-
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-        assert_eq!(recorded_versions(&db).await?, (1, 1));
-
-        ensure_schema_of(&db, Duration::from_secs(5), &BREAKING, &DDL).await?;
-        assert_eq!(recorded_versions(&db).await?, (2, 2));
-
-        assert_matches!(
-            ensure_schema(&db, Duration::from_secs(5)).await,
-            Err(Error::IncompatibleSchema {
-                recorded_version: 2,
-                oldest_compatible_version: 2,
-                schema_version: 1,
-            })
-        );
-        assert_eq!(recorded_versions(&db).await?, (2, 2));
-        assert_eq!(count(&db, "upgrade_marker").await?, 1);
-        Ok(())
-    }
-
-    /// An upgrade from version 1 to version 3 must run both steps in order, in one transaction,
-    /// and record version 3.
-    #[tokio::test]
-    async fn ensure_schema_upgrades_over_two_steps() -> Result<()> {
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-
-        ensure_schema_of(&db, Duration::from_secs(5), &SCHEMA_3, &DDL).await?;
-
-        assert_eq!(recorded_version(&db).await?, Some(3));
-        assert_eq!(count(&db, "upgrade_marker").await?, 1);
-        assert_eq!(count(&db, "upgrade_marker_child").await?, 1);
-        Ok(())
-    }
-
-    /// A file of version 2 has run the first step already. The upgrade to version 3 must run only
-    /// the second step: the first one fails when it runs again, because its table exists.
-    #[tokio::test]
-    async fn ensure_schema_upgrade_runs_only_the_steps_after_the_recorded_version() -> Result<()> {
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-        upgrade_to_2(&db).await?;
-
-        ensure_schema_of(&db, Duration::from_secs(5), &SCHEMA_3, &DDL).await?;
-
-        assert_eq!(recorded_version(&db).await?, Some(3));
-        assert_eq!(count(&db, "upgrade_marker_child").await?, 1);
-        Ok(())
-    }
-
-    /// When the second step of an upgrade from version 1 fails, the first step's changes must be
-    /// undone too, and the file must still record version 1.
-    #[tokio::test]
-    async fn ensure_schema_rolls_back_every_step_when_the_last_one_fails() -> Result<()> {
-        const BROKEN_STEP_TO_3: Migration = Migration {
-            sql: "insert into no_such_table (id) values (1);",
-            ..STEP_TO_3
-        };
-        const BROKEN_3: Schema = Schema {
-            migrations: &[STEP_TO_2, BROKEN_STEP_TO_3],
-            ..SCHEMA_3
-        };
-
-        let directory = tempdir()?;
-        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
-            .build()
-            .await?;
-        ensure_schema(&db, Duration::from_secs(5)).await?;
-
-        assert_matches!(
-            ensure_schema_of(&db, Duration::from_secs(5), &BROKEN_3, &DDL).await,
-            Err(_)
-        );
-
-        assert_eq!(recorded_version(&db).await?, Some(1));
-        assert_matches!(count(&db, "upgrade_marker").await, Err(_));
         Ok(())
     }
 

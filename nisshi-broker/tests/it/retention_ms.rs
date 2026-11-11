@@ -79,6 +79,9 @@ const COMPACT_POLICY: (&str, &str) = ("cleanup.policy", "compact");
 /// The `cleanup.policy` that `SUBTRACT` leaves when it removes the last policy.
 const EMPTY_POLICY: (&str, &str) = ("cleanup.policy", "");
 
+/// Kafka's `NO_TIMESTAMP`: the timestamp of a record that a producer sent without one.
+const NO_TIMESTAMP: i64 = -1;
+
 /// How many records a test produces before maintenance, at offsets 0, 1 and 2.
 const RECORDS_BEFORE_MAINTENANCE: i64 = 3;
 
@@ -164,6 +167,17 @@ async fn produce(broker: &Broker, extensions: &Extensions, name: &str) -> Result
             .as_millis(),
     )?;
 
+    produce_stamped(broker, extensions, name, timestamp).await
+}
+
+/// Produces one record to partition 0 of `name`, with `timestamp` as its timestamp, and returns
+/// its offset.
+async fn produce_stamped(
+    broker: &Broker,
+    extensions: &Extensions,
+    name: &str,
+    timestamp: i64,
+) -> Result<i64> {
     let frame = inflated::Batch::builder()
         .base_timestamp(timestamp)
         .max_timestamp(timestamp)
@@ -559,6 +573,72 @@ where
     Ok(())
 }
 
+/// A record that a producer sends without a timestamp stores NO_TIMESTAMP, -1. Kafka ages such a
+/// record by when its log segment was last written, so it survives a sweep until its topic's
+/// `retention.ms` has passed since the broker appended it. A broker that reads -1 as a timestamp in
+/// 1970 deletes the record in the first sweep, whatever the retention.
+pub async fn record_without_timestamp_survives_while_younger_than_retention<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[DELETE_POLICY, TEN_MINUTE_RETENTION],
+    )
+    .await?;
+    assert_eq!(
+        0,
+        produce_stamped(&broker, &extensions, topic, NO_TIMESTAMP).await?
+    );
+
+    sc.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        Some(0),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
+/// Retention still applies to a record without a timestamp: it expires once its topic's
+/// `retention.ms` has passed since the broker appended it. A broker that never expires such a
+/// record lets a topic that only carries them grow forever.
+pub async fn record_without_timestamp_expires_from_its_append_time<G>(sc: G) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    let broker = broker(sc.clone())?;
+    let extensions = Extensions::default();
+    let topic = &alphanumeric_string(15)[..];
+    create_topic(
+        &broker,
+        &extensions,
+        topic,
+        &[DELETE_POLICY, TEN_MINUTE_RETENTION],
+    )
+    .await?;
+    assert_eq!(
+        0,
+        produce_stamped(&broker, &extensions, topic, NO_TIMESTAMP).await?
+    );
+
+    maintain_an_hour_later(&sc).await?;
+
+    // The new record stops the partition being empty, because the broker reports an earliest
+    // offset of 0 for a partition that maintenance emptied.
+    assert_eq!(1, produce(&broker, &extensions, topic).await?);
+    assert_eq!(
+        Some(1),
+        list_offset(&broker, &extensions, topic, ListOffset::Earliest).await?
+    );
+    Ok(())
+}
+
 macro_rules! backend {
     ($name:ident, $feature:literal, $storage_type:expr) => {
         #[cfg(feature = $feature)]
@@ -653,6 +733,25 @@ macro_rules! backend {
                 super::retention_ms_with_a_plus_sign_expires_records(storage_container().await?)
                     .await
             }
+            #[tokio::test]
+            async fn record_without_timestamp_survives_while_younger_than_retention()
+            -> Result<()> {
+                let _guard = init_tracing()?;
+                super::record_without_timestamp_survives_while_younger_than_retention(
+                    storage_container().await?,
+                )
+                .await
+            }
+
+            #[tokio::test]
+            async fn record_without_timestamp_expires_from_its_append_time() -> Result<()> {
+                let _guard = init_tracing()?;
+                super::record_without_timestamp_expires_from_its_append_time(
+                    storage_container().await?,
+                )
+                .await
+            }
+
             #[tokio::test]
             async fn stored_retention_ms_with_a_plus_sign_expires_records() -> Result<()> {
                 let _guard = init_tracing()?;

@@ -40,7 +40,7 @@ mod produce;
 #[cfg(test)]
 mod produce_budget;
 #[cfg(test)]
-mod produce_inflated_forwarding;
+mod produce_entry_points;
 pub mod read_deadline;
 pub mod read_share;
 mod txn;
@@ -128,12 +128,15 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, StorageOperation, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version, produce_path,
-    service::read_deadline::{QueueWait as _, ReadDeadline, ReadWait},
+    RequestTimer, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
+    fetched::FetchedSender,
+    produce_path,
+    service::read_deadline::{QueueWait as _, ReadWait},
 };
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Debug)]
 pub enum Request {
     RegisterBroker(BrokerRegistrationRequest),
     IncrementalAlterResource(AlterConfigsResource),
@@ -157,7 +160,7 @@ pub enum Request {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
+        fetched_sender: FetchedSender,
     },
     OffsetStage(Topition),
     CurrentOffsetStage(Topition),
@@ -306,7 +309,7 @@ pub enum Response {
     DescribeConfig(Result<DescribeConfigsResult>),
     DescribeGroups(Result<Vec<NamedGroupDetail>>),
     DescribeTopicPartitions(Result<Vec<DescribeTopicPartitionsResponseTopic>>),
-    Fetch(Result<Vec<deflated::Batch>>),
+    Fetch(Result<()>),
     GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
     IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
     InitProducer(Result<ProducerIdResponse>),
@@ -465,27 +468,99 @@ impl RequestChannelService {
     }
 
     /// Sends `input` on the channel once the channel has room for it.
+    ///
+    /// A produce does not go through this or `serve`: `produce_batch` reserves its own slot.
     async fn send(&self, input: Request) -> Result<SentRequest, ServiceError> {
         let start = Instant::now();
 
         let operation = input.operation();
-        let attributes = [operation.attribute()];
+        self.record_capacity(operation);
 
+        let permit = self.reserve(operation).await?;
+
+        Ok(Self::send_reserved(permit, input, start))
+    }
+
+    /// Records the free slots of the channel, for a request of `operation` that is about to take
+    /// one.
+    fn record_capacity(&self, operation: StorageOperation) {
         let capacity = self.tx.capacity();
-        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &attributes);
+        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[operation.attribute()]);
         debug!(%operation, capacity);
+    }
 
-        let permit = self
-            .tx
+    /// Reserves a slot in the channel for a request of `operation`, and waits until the channel
+    /// has room for it.
+    async fn reserve(
+        &self,
+        operation: StorageOperation,
+    ) -> Result<mpsc::Permit<'_, ChannelRequest>, ServiceError> {
+        self.tx
             .reserve()
             .queued_for(ReadWait::ExclusiveEngineAccess)
             .await
             .inspect_err(|err| {
                 error!(%operation, ?err);
-                STORAGE_CHANNEL_ERROR.add(1, &attributes);
-            })?;
+                STORAGE_CHANNEL_ERROR.add(1, &[operation.attribute()]);
+            })
+            .map_err(Into::into)
+    }
 
-        Ok(Self::send_reserved(permit, input, start))
+    /// Sends a produce of `deflated` on the channel, and waits for its response. Both produce
+    /// methods call this, so that each produce takes its slot, records the channel's capacity and
+    /// opens its span in one place.
+    ///
+    /// A produce that has to wait for a slot drops `inflated` before it waits, so the number of
+    /// decoded batches that the channel holds is the number of slots, not the number of waiting
+    /// produces. The storage then decodes the waiting produce's batch again.
+    #[instrument(name = "produce", skip_all)]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        let start = Instant::now();
+
+        let operation = StorageOperation::Produce;
+        self.record_capacity(operation);
+
+        let (permit, inflated) = match inflated {
+            Some(inflated) => match self.tx.try_reserve() {
+                Ok(permit) => {
+                    produce_path::direct(produce_path::Stage::Channel);
+                    (permit, Some(inflated))
+                }
+
+                Err(_) => {
+                    drop(inflated);
+                    produce_path::fallback(produce_path::Stage::Channel);
+                    (self.reserve(operation).await?, None)
+                }
+            },
+
+            None => (self.reserve(operation).await?, None),
+        };
+
+        let request = Request::Produce {
+            transaction_id: transaction_id.map(str::to_owned),
+            topition: topition.to_owned(),
+            batch: deflated,
+            inflated,
+        };
+
+        Self::send_reserved(permit, request, start)
+            .response()
+            .await
+            .and_then(|response| {
+                if let Response::Produce(inner) = response {
+                    inner.map_err(Into::into)
+                } else {
+                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
+                }
+            })
+            .map_err(Into::into)
     }
 
     /// Sends `input` through `permit`, which reserved a slot in the channel at `start`.
@@ -513,7 +588,7 @@ impl RequestChannelService {
         SentRequest {
             response: resp_rx,
             started: started_rx,
-            start,
+            timer: RequestTimer::new(&STORAGE_CHANNEL_REQUEST_DURATION, operation, start),
             operation,
         }
     }
@@ -524,39 +599,29 @@ impl RequestChannelService {
 struct SentRequest {
     response: oneshot::Receiver<Result<Response>>,
     started: oneshot::Receiver<()>,
-    start: Instant,
+    timer: RequestTimer,
     operation: StorageOperation,
 }
 
 impl SentRequest {
-    /// Returns whether the service on the other end of the channel started the request by
-    /// `deadline`. If the deadline ends the wait, the wait counts as a `queued` miss of the
-    /// request's operation.
-    async fn started_by(&mut self, deadline: Instant) -> bool {
-        ReadDeadline::new(self.operation, deadline)
-            .timeout((&mut self.started).queued_for(ReadWait::ExclusiveEngineAccess))
-            .await
-            .is_ok()
-    }
-
     async fn response(self) -> Result<Response, ServiceError> {
         let operation = self.operation;
         let attributes = [operation.attribute()];
 
-        self.response
+        let response = self
+            .response
             .await
             .map_err(|_| Error::OneshotRecv)
             .and_then(|outcome| outcome)
             .map_err(ServiceError::from)
-            .inspect(|_| {
-                let elapsed_millis = self.start.elapsed().as_millis() as u64;
-                STORAGE_CHANNEL_REQUEST_DURATION.record(elapsed_millis, &attributes);
-                debug!(%operation, elapsed_millis);
-            })
+            .inspect(|_| debug!(%operation))
             .inspect_err(|err| {
                 error!(%operation, ?err);
                 STORAGE_CHANNEL_ERROR.add(1, &attributes);
-            })
+            });
+
+        self.timer.end(&response);
+        response
     }
 }
 
@@ -581,7 +646,10 @@ static STORAGE_CHANNEL_REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::ne
     METER
         .u64_histogram("nisshi_storage_channel_request_duration")
         .with_unit("ms")
-        .with_description("Storage channel request latency in milliseconds")
+        .with_description(
+            "Storage channel request latency in milliseconds. outcome=stopped counts a request \
+             that its caller dropped, such as a fetch at its deadline.",
+        )
         .build()
 });
 
@@ -683,29 +751,16 @@ impl Storage for RequestChannelService {
         serve_and_extract!(self, Request::Brokers, Brokers)
     }
 
-    #[instrument(skip_all)]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         batch: deflated::Batch,
     ) -> Result<i64> {
-        let transaction_id = transaction_id.map(|s| s.to_string());
-        let topition = topition.to_owned();
-
-        serve_and_extract!(
-            self,
-            Request::Produce {
-                transaction_id,
-                topition,
-                batch,
-                inflated: None,
-            },
-            Produce
-        )
+        self.produce_batch(transaction_id, topition, batch, None)
+            .await
     }
 
-    #[instrument(skip_all)]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -713,42 +768,8 @@ impl Storage for RequestChannelService {
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        // A produce that waits for a slot holds only its compressed bytes, so the number of decoded
-        // batches the channel holds is the number of slots, not the number of waiting produces.
-        // The produce then reaches the storage without the decoded batch, which decodes it again.
-        let start = Instant::now();
-
-        let capacity = self.tx.capacity();
-        STORAGE_CHANNEL_CAPACITY.record(capacity as u64, &[StorageOperation::Produce.attribute()]);
-        debug!(operation = %StorageOperation::Produce, capacity);
-
-        let Ok(permit) = self.tx.try_reserve() else {
-            drop(inflated);
-            produce_path::fallback();
-
-            return self.produce(transaction_id, topition, deflated).await;
-        };
-
-        produce_path::direct();
-
-        let request = Request::Produce {
-            transaction_id: transaction_id.map(|s| s.to_string()),
-            topition: topition.to_owned(),
-            batch: deflated,
-            inflated: Some(inflated),
-        };
-
-        Self::send_reserved(permit, request, start)
-            .response()
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
-            .and_then(|response| {
-                if let Response::Produce(inner) = response {
-                    inner.map_err(Into::into)
-                } else {
-                    Err(Error::UnexpectedServiceResponse(Box::new(response)).into())
-                }
-            })
-            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
@@ -759,34 +780,27 @@ impl Storage for RequestChannelService {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         let request = Request::Fetch {
             topition: topition.to_owned(),
             offset,
             min_bytes,
             max_bytes,
             isolation,
-            deadline,
+            fetched_sender,
         };
 
-        // Until the read starts, `fetch` gives up at the deadline, because nothing has been read.
-        let Ok(sent) = ReadDeadline::new(StorageOperation::Fetch, deadline)
-            .timeout(self.send(request))
-            .await
-        else {
-            return Ok(vec![]);
-        };
+        let mut sent = self.send(request).await?;
 
-        let mut sent = sent?;
+        // Wait for the service to start the read, which may be queued behind other requests.
+        // The service drops `started` if it skips the read, so ignore the result.
+        _ = (&mut sent.started)
+            .queued_for(ReadWait::ExclusiveEngineAccess)
+            .await;
 
-        if !sent.started_by(deadline).await {
-            return Ok(vec![]);
-        }
-
-        // Once the read has started, `fetch` waits for the response without a time limit,
-        // because the response holds the batches that the read finished. The engine stops the
-        // read at the deadline itself.
+        // The read on the other end of the channel sends its items to the caller directly, so the
+        // response only says how the read ended.
         match sent.response().await? {
             Response::Fetch(fetched) => fetched,
             response => Err(Error::UnexpectedServiceResponse(Box::new(response))),
@@ -1272,13 +1286,14 @@ where
                         break;
                     };
 
-                    // An expired fetch is answered with no batches instead of being served. Its
-                    // requester has already given up and counted the miss, so serving it would
-                    // only delay the requests queued behind it.
-                    if let Request::Fetch { deadline, .. } = &request
-                        && Instant::now() >= *deadline
+                    // A fetch whose requester has stopped reading is answered with no batches
+                    // instead of being served. The requester stops reading at the read's deadline,
+                    // or when its client goes away, so serving the fetch would only delay the
+                    // requests queued behind it.
+                    if let Request::Fetch { fetched_sender, .. } = &request
+                        && fetched_sender.reader_has_stopped()
                     {
-                        _ = tx.send(Ok(Response::Fetch(Ok(vec![]))));
+                        _ = tx.send(Ok(Response::Fetch(Ok(()))));
                         continue;
                     }
 
@@ -1429,12 +1444,21 @@ where
                 min_bytes,
                 max_bytes,
                 isolation,
-                deadline,
-            } => Ok(Response::Fetch(
-                self.storage
-                    .fetch(&topition, offset, min_bytes, max_bytes, isolation, deadline)
-                    .await,
-            )),
+                fetched_sender,
+            } => {
+                // A read behind the channel runs on a task of its own, so dropping the requester
+                // doesn't drop it. The read ends when its requester stops reading instead, as it
+                // would if the requester had dropped it.
+                let reader_stopped = fetched_sender.reader_stopped();
+
+                Ok(Response::Fetch(tokio::select! {
+                    biased;
+                    fetched = self.storage.fetch(
+                        &topition, offset, min_bytes, max_bytes, isolation, fetched_sender,
+                    ) => fetched,
+                    () = reader_stopped => Ok(()),
+                }))
+            }
             Request::OffsetStage(topition) => Ok(Response::OffsetStage(
                 self.storage.offset_stage(&topition).await,
             )),
@@ -1609,11 +1633,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{assert_matches, future::pending, sync::Mutex};
+
     use super::*;
+    use crate::{
+        fetched::{self, FetchUntilDeadline as _},
+        storage_double::storage_double,
+    };
     use nisshi_sans_io::record::inflated;
     use tokio::{
-        sync::oneshot,
-        time::{Duration, Instant, sleep_until},
+        sync::oneshot::{self, error::TryRecvError},
+        time::{Duration, Instant},
     };
 
     /// Pins the `operation` label each request is counted under on the
@@ -1622,6 +1652,9 @@ mod tests {
     fn operation_is_the_storage_method() {
         let topition = Topition::new("t", 0);
         let topic = TopicId::Name("t".into());
+
+        // The receiving end is unused: the test only names each request's operation.
+        let (fetched_sender, _fetched_receiver) = fetched::channel();
 
         let expected = [
             (
@@ -1663,7 +1696,7 @@ mod tests {
                     min_bytes: 0,
                     max_bytes: 0,
                     isolation: IsolationLevel::default(),
-                    deadline: Instant::now(),
+                    fetched_sender,
                 },
                 "fetch",
             ),
@@ -1830,9 +1863,10 @@ mod tests {
         }
     }
 
+    /// Reads through `storage` until `deadline`, and returns how many batches the read sent.
     async fn fetch(storage: &RequestChannelService, deadline: Instant) -> Result<usize> {
         storage
-            .fetch(
+            .fetch_until_deadline(
                 &Topition::new("abc", 0),
                 0,
                 1,
@@ -1841,7 +1875,7 @@ mod tests {
                 deadline,
             )
             .await
-            .map(|batches| batches.len())
+            .map(|read| read.batches.len())
     }
 
     #[tokio::test(start_paused = true)]
@@ -1870,10 +1904,9 @@ mod tests {
         Ok(())
     }
 
-    /// Once the service has started the read, the fetch waits for its response, and keeps its
-    /// batches even when the response arrives after the deadline.
+    /// The read on the other end of the channel sends its batches to the fetch directly.
     #[tokio::test(start_paused = true)]
-    async fn fetch_waits_for_the_response_of_a_read_that_started_by_its_deadline() -> Result<()> {
+    async fn fetch_receives_what_the_read_behind_the_channel_sends() -> Result<()> {
         let (tx, mut rx) = bounded_channel(1);
         let storage = RequestChannelService::new(tx);
 
@@ -1881,23 +1914,30 @@ mod tests {
 
         let answer = async {
             let ChannelRequest {
+                request,
                 response: reply,
                 started,
-                ..
             } = rx.recv().await.expect("a fetch request");
 
             started.send(()).expect("the reader");
 
-            sleep_until(deadline + Duration::from_millis(100)).await;
+            let Request::Fetch { fetched_sender, .. } = request else {
+                panic!("{request:?}");
+            };
 
             let batch = inflated::Batch::builder()
                 .build()
                 .and_then(deflated::Batch::try_from)
                 .expect("a batch");
 
-            reply
-                .send(Ok(Response::Fetch(Ok(vec![batch]))))
+            let mut data = fetched_sender
+                .send_offsets(OffsetStage::default())
+                .await
                 .expect("the reader");
+            data.send_batch(batch).await.expect("the reader");
+            drop(data);
+
+            reply.send(Ok(Response::Fetch(Ok(())))).expect("the reader");
         };
 
         let (fetched, ()) = tokio::join!(fetch(&storage, deadline), answer);
@@ -1925,6 +1965,147 @@ mod tests {
 
         assert_eq!(0, fetched?);
         assert_eq!(Duration::from_millis(500), started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// A storage double whose `fetch` never finishes. The read holds the `read_alive` sender, so
+    /// the receiver sees its channel close when the read is dropped.
+    #[derive(Debug)]
+    struct NeverEnds {
+        read_alive: Mutex<Option<oneshot::Sender<()>>>,
+    }
+
+    storage_double!(NeverEnds, async fn fetch(&self, _fetched_sender) {
+        let _read_alive = self.read_alive.lock()?.take();
+        pending().await
+    });
+
+    /// A read behind the storage channel ends when its reader stops reading. A task of its own
+    /// runs the read, so nothing else would drop it, and the channel would wait for it forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_ends_when_its_reader_stops() -> Result<()> {
+        // `read_ended` closes when the read drops the sender that it takes from the double. It
+        // stays open if the read never starts, because the double then keeps the sender.
+        let (read_alive, mut read_ended) = oneshot::channel::<()>();
+
+        let service = RequestStorageService::new(NeverEnds {
+            read_alive: Mutex::new(Some(read_alive)),
+        });
+
+        let (fetched_sender, receiver) = fetched::channel();
+
+        let serving = service.serve(Request::Fetch {
+            topition: Topition::new("abc", 0),
+            offset: 0,
+            min_bytes: 1,
+            max_bytes: 1024,
+            isolation: IsolationLevel::ReadUncommitted,
+            fetched_sender,
+        });
+
+        // The reader has stopped reading before the read starts.
+        drop(receiver);
+
+        let served = tokio::time::timeout(Duration::from_secs(1), serving).await;
+
+        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(())))));
+        assert_matches!(
+            read_ended.try_recv(),
+            Err(TryRecvError::Closed),
+            "the read was not dropped"
+        );
+
+        Ok(())
+    }
+
+    /// A storage double whose read sends its offsets and one batch, and then returns `outcome`.
+    #[derive(Clone, Debug)]
+    struct SendsThenReturns {
+        outcome: Result<()>,
+    }
+
+    storage_double!(SendsThenReturns, async fn fetch(&self, fetched_sender) {
+        let batch = inflated::Batch::builder()
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let mut data = fetched_sender
+            .send_offsets(OffsetStage {
+                last_stable: 1,
+                high_watermark: 1,
+                log_start: 0,
+            })
+            .await?;
+        data.send_batch(batch).await?;
+        drop(data);
+
+        self.outcome.clone()
+    });
+
+    /// Returns a client of a storage channel whose service loop serves `storage`, as mpsc mode
+    /// runs it.
+    fn channel_to(storage: SendsThenReturns) -> RequestChannelService {
+        let (sender, receiver) = bounded_channel(1);
+
+        let server = ChannelRequestLayer::new(CancellationToken::new())
+            .into_layer(RequestStorageService::new(storage));
+
+        _ = tokio::spawn(async move { server.serve(receiver).await });
+
+        RequestChannelService::new(sender)
+    }
+
+    /// A read behind the storage channel that sends and then finishes answers as soon as it
+    /// finishes, with what it sent, instead of at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_answers_when_it_finishes() -> Result<()> {
+        let storage = channel_to(SendsThenReturns { outcome: Ok(()) });
+
+        let started_at = Instant::now();
+
+        let read = storage
+            .fetch_until_deadline(
+                &Topition::new("abc", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                started_at + Duration::from_secs(1),
+            )
+            .await?;
+
+        assert_eq!(None, read.timed_out);
+        assert_eq!(1, read.batches.len());
+        assert_eq!(Duration::ZERO, started_at.elapsed());
+
+        Ok(())
+    }
+
+    /// A read behind the storage channel that fails after it sent data returns the data that it
+    /// sent, with its error.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_behind_the_channel_that_fails_returns_its_data_and_error() -> Result<()> {
+        let storage = channel_to(SendsThenReturns {
+            outcome: Err(Error::Api(ErrorCode::UnknownTopicOrPartition)),
+        });
+
+        let read = storage
+            .fetch_until_deadline_or_failure(
+                &Topition::new("abc", 0),
+                0,
+                1,
+                1024,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+
+        assert_matches!(
+            read.failed,
+            Some(Error::Api(ErrorCode::UnknownTopicOrPartition))
+        );
+        assert_eq!(1, read.batches.len());
 
         Ok(())
     }

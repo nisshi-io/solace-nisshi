@@ -108,6 +108,7 @@ Nisshi is a single statically linked binary containing the following, described 
 - [Commands](docs/commands.md) — the `broker`, `topic`, `cat` and `proxy` commands
 - [Topic configuration](docs/topic-configuration.md) — the topic settings Nisshi supports
 - [Schema registry](docs/schema-registry.md) — validating topics with Avro, JSON Schema or Protocol Buffers
+- [Data lake](docs/data-lake.md) — where the broker writes Iceberg, Delta Lake and Parquet output, and how to remove data from it
 - [Securing a broker](docs/security.md) — TLS, outbound TLS, and SASL SCRAM authentication
 - [Metrics](docs/metrics.md) — exporting metrics over OTLP
 - [Compatibility and feature status](docs/compatibility.md) — the Kafka APIs, storage engine features and Kafka clients that are supported

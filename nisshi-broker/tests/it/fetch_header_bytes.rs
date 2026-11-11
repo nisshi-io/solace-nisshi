@@ -19,6 +19,7 @@
 //!
 //! [`ReplicaManager.scala#L1733-L1739`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::time::Duration;
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
@@ -212,7 +213,7 @@ where
     let mut offsets = vec![];
 
     for batch in sc
-        .fetch(
+        .fetch_until_deadline(
             fetched,
             fetch_offset,
             1,
@@ -220,7 +221,8 @@ where
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_secs(5),
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
     {
         let batch = inflated::Batch::try_from(batch)?;
 

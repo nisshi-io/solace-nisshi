@@ -23,6 +23,7 @@
 //! `traceforge_produce_object_store_fault` in `nisshi-broker` fails the batch write. These tests
 //! fail the writes before it: the watermark, and the transaction's record of the batch.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, time::Duration};
 use tokio::time::Instant;
 
@@ -84,7 +85,7 @@ fn idempotent_batch(
 
 async fn fetched_base_offsets(storage: &DynoStore, topition: &Topition) -> Result<Vec<i64>, Error> {
     Ok(storage
-        .fetch(
+        .fetch_until_deadline(
             topition,
             0,
             1,
@@ -92,7 +93,8 @@ async fn fetched_base_offsets(storage: &DynoStore, topition: &Topition) -> Resul
             IsolationLevel::ReadUncommitted,
             Instant::now() + Duration::from_secs(5),
         )
-        .await?
+        .await
+        .map(|read| read.batches)?
         .iter()
         .map(|batch| batch.base_offset)
         .collect())

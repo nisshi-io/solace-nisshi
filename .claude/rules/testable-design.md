@@ -30,8 +30,13 @@ changes.
 - **Control monotonic time with Tokio's paused clock.** `#[tokio::test(start_paused = true)]` and
   `tokio::time::advance` move `tokio::time::Instant` and Tokio's timers, so code that measures
   elapsed time or waits for a deadline reads `tokio::time::Instant`, not `std::time::Instant`.
-  The paused clock doesn't move `SystemTime`, so code that depends on wall-clock time takes `now`
-  as a parameter, which production passes anew on every call.
+  The paused clock doesn't move `SystemTime`.
+- **Make wall-clock time a parameter only when a caller varies it.** A `now` parameter earns its
+  place when a test passes its own value through the interface that production calls, or when
+  production passes different values. When the code only compares `SystemTime::now()` with a
+  time that it reads, such as a stored write time, read `SystemTime::now()` where the code uses
+  it, and let a test control the stored time instead. A `now` that one caller reads and passes
+  down is a parameter that nothing varies.
 - **Give a test what the code needs, at the narrowest point.** When a test runs where the code's
   environment is missing, provide that environment around the calls that need it, instead of
   changing the code to run without it.

@@ -31,7 +31,7 @@ use object_store::{
 pub(crate) type PutSelector = fn(&Path, &PutPayload) -> bool;
 
 /// Wraps an [`ObjectStore`] and makes each `get()`, each `list()` or each `put()` call fail, or
-/// the next `put()` that a [`PutSelector`] picks.
+/// the next `put()` that a [`PutSelector`] picks, before or after it stores the object.
 #[derive(Clone)]
 pub(crate) struct FailingObjectStore<O> {
     object_store: O,
@@ -39,6 +39,7 @@ pub(crate) struct FailingObjectStore<O> {
     list_fails: bool,
     put_fails: bool,
     next_failing_put: Arc<Mutex<Option<PutSelector>>>,
+    next_put_failing_after_it_stores: Arc<Mutex<Option<PutSelector>>>,
 }
 
 impl<O> FailingObjectStore<O> {
@@ -49,6 +50,7 @@ impl<O> FailingObjectStore<O> {
             list_fails: false,
             put_fails: false,
             next_failing_put: Arc::default(),
+            next_put_failing_after_it_stores: Arc::default(),
         }
     }
 
@@ -59,6 +61,7 @@ impl<O> FailingObjectStore<O> {
             list_fails: true,
             put_fails: false,
             next_failing_put: Arc::default(),
+            next_put_failing_after_it_stores: Arc::default(),
         }
     }
 
@@ -69,6 +72,7 @@ impl<O> FailingObjectStore<O> {
             list_fails: false,
             put_fails: true,
             next_failing_put: Arc::default(),
+            next_put_failing_after_it_stores: Arc::default(),
         }
     }
 
@@ -80,6 +84,7 @@ impl<O> FailingObjectStore<O> {
             list_fails: false,
             put_fails: false,
             next_failing_put: Arc::default(),
+            next_put_failing_after_it_stores: Arc::default(),
         }
     }
 
@@ -91,15 +96,32 @@ impl<O> FailingObjectStore<O> {
         }
     }
 
+    /// Makes the next `put()` that `selector` picks store its object and then fail, as a put
+    /// whose response is lost does, and only that one.
+    pub(crate) fn fail_next_put_after_it_stores(&self, selector: PutSelector) {
+        if let Ok(mut next_put) = self.next_put_failing_after_it_stores.lock() {
+            _ = next_put.replace(selector);
+        }
+    }
+
     fn selected_put_fails(&self, location: &Path, payload: &PutPayload) -> bool {
-        self.next_failing_put
-            .lock()
-            .ok()
-            .is_some_and(|mut next_failing_put| {
-                next_failing_put
-                    .take_if(|selector| selector(location, payload))
-                    .is_some()
-            })
+        Self::take_selected(&self.next_failing_put, location, payload)
+    }
+
+    fn selected_put_fails_after_it_stores(&self, location: &Path, payload: &PutPayload) -> bool {
+        Self::take_selected(&self.next_put_failing_after_it_stores, location, payload)
+    }
+
+    fn take_selected(
+        next_put: &Mutex<Option<PutSelector>>,
+        location: &Path,
+        payload: &PutPayload,
+    ) -> bool {
+        next_put.lock().ok().is_some_and(|mut next_failing_put| {
+            next_failing_put
+                .take_if(|selector| selector(location, payload))
+                .is_some()
+        })
     }
 }
 
@@ -134,6 +156,11 @@ where
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
         if self.put_fails || self.selected_put_fails(location, &payload) {
+            return Err(forced_failure());
+        }
+
+        if self.selected_put_fails_after_it_stores(location, &payload) {
+            _ = self.object_store.put_opts(location, payload, opts).await?;
             return Err(forced_failure());
         }
 
