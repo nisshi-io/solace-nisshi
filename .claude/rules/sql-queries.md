@@ -64,10 +64,10 @@ changes.
 - **Declare each field as the driver reads it, and decode it in the engine.** A field's type
   implements `FromColumn` in `sql/driver.rs`. A JSON column is
   `serde_json::Result<serde_json::Value>`, so the engine decides what an undecodable document does
-  to the rest of the result. On libSQL and Turso, a `SystemTime` field reads integer milliseconds,
-  and a column with a `current_timestamp` default holds text there. A new kind of column gets one
-  `FromColumn` implementation, and a new kind of stored value gets one `DriverRow` method for each
-  driver.
+  to the rest of the result. A time column is a `KafkaTimestamp` field, which reads integer
+  milliseconds on libSQL and Turso, so it can't read a column with a `current_timestamp` default,
+  which holds text there. A new kind of column gets one `FromColumn` implementation, and a new
+  kind of stored value gets one `DriverRow` method for each driver.
 - **Add each query that an engine reads rows from to that engine's
   `every_row_query_returns_the_columns_of_its_row` test,** as `RowCheck::rows(topic_select::QUERY)`.
   The test prepares each query that it lists and builds the query's reader, so a query that

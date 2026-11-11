@@ -96,7 +96,7 @@ use tokio_postgres::{
     config::Host,
     error::SqlState,
     tls::MakeTlsConnect,
-    types::{FromSql, ToSql, Type},
+    types::{ToSql, Type},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(unix)]
@@ -6017,69 +6017,14 @@ fn to_sql_timestamp(timestamp: i64) -> Result<SystemTime> {
     }
 }
 
-/// The error of a `FromSql` conversion.
-type FromSqlError = Box<dyn std::error::Error + Sync + Send>;
-
 /// The seconds from the Unix epoch to 2000-01-01 00:00:00, the instant that PostgreSQL counts its
 /// timestamps from.
 pub(crate) const POSTGRES_EPOCH_SECONDS: u64 = 946_684_800;
 
-/// A `timestamp` or `timestamptz` column read as a [`SystemTime`], with an error for an instant
-/// that this platform's [`SystemTime`] cannot hold.
-///
-/// The `postgres-types` conversion to [`SystemTime`] panics for such an instant: it uses `-` and
-/// `+`, which panic on overflow, and a Windows [`SystemTime`] holds neither an instant before 1601
-/// nor one past the year 30828. Another platform can have stored either.
-#[derive(Debug)]
-pub(crate) struct CheckedSystemTime(pub(crate) SystemTime);
-
-impl CheckedSystemTime {
-    /// Reads the eight bytes of a `timestamp` as the instant that many microseconds after `epoch`.
-    fn from_sql_after(epoch: SystemTime, raw: &[u8]) -> std::result::Result<Self, FromSqlError> {
-        let microseconds = i64::from_be_bytes(raw.try_into()?);
-
-        system_time_after(epoch, microseconds)
-            .map(Self)
-            .ok_or_else(|| {
-                format!(
-                    "timestamp {microseconds} microseconds from 2000-01-01 is outside the range \
-                     of this platform's SystemTime"
-                )
-                .into()
-            })
-    }
-}
-
-impl<'a> FromSql<'a> for CheckedSystemTime {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> std::result::Result<Self, FromSqlError> {
-        Self::from_sql_after(postgres_epoch(), raw)
-    }
-
-    fn accepts(ty: &Type) -> bool {
-        matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
-    }
-}
-
-/// The instant that PostgreSQL counts its timestamps from: 2000-01-01 00:00:00.
-fn postgres_epoch() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(POSTGRES_EPOCH_SECONDS)
-}
-
-/// Returns the instant `microseconds` after `epoch`, before it when negative, or `None` when
-/// [`SystemTime`] cannot hold that instant.
-fn system_time_after(epoch: SystemTime, microseconds: i64) -> Option<SystemTime> {
-    let offset = Duration::from_micros(microseconds.unsigned_abs());
-
-    if microseconds < 0 {
-        epoch.checked_sub(offset)
-    } else {
-        epoch.checked_add(offset)
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use tokio_postgres::types::FromSql;
 
     use bytes::BytesMut;
     use futures_util::future;
@@ -6170,131 +6115,6 @@ pub(crate) mod tests {
             Err(Error::Message(_))
         );
         assert_matches!(to_sql_timestamp(i64::MIN), Err(Error::Message(_)));
-    }
-
-    #[test]
-    fn system_time_after_counts_from_the_given_epoch() {
-        assert_eq!(
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800)),
-            system_time_after(postgres_epoch(), 0)
-        );
-        assert_eq!(
-            Some(postgres_epoch() + Duration::from_micros(1)),
-            system_time_after(postgres_epoch(), 1)
-        );
-        assert_eq!(
-            Some(postgres_epoch() - Duration::from_micros(1)),
-            system_time_after(postgres_epoch(), -1)
-        );
-    }
-
-    /// An instant a little after the lowest one that this platform's `SystemTime` holds. Where the
-    /// `SystemTime` holds an `i64` count of seconds, that is the limit of the count, which no
-    /// `i64` count of microseconds from 2000-01-01 reaches. A Windows `SystemTime` is a count of
-    /// 100 nanosecond intervals from 1601, and its lowest instant is 1601-01-01.
-    fn near_lowest() -> SystemTime {
-        #[cfg(not(windows))]
-        let seconds = i64::MAX.unsigned_abs();
-        #[cfg(windows)]
-        let seconds = 11_644_473_600 - 1;
-
-        SystemTime::UNIX_EPOCH - Duration::from_secs(seconds)
-    }
-
-    /// `SystemTime - Duration` panics beyond what a `SystemTime` holds, as it does before 1601 on
-    /// Windows. The test takes the epoch as a parameter, so that the conversion meets that limit
-    /// on every platform.
-    #[test]
-    fn checked_system_time_is_an_error_where_subtracting_from_the_epoch_panics() -> Result<()> {
-        let beyond_lowest = Duration::from_secs(10_000_000);
-        let wire = -i64::try_from(beyond_lowest.as_micros())?;
-
-        assert!(std::panic::catch_unwind(|| near_lowest() - beyond_lowest).is_err());
-
-        assert_matches!(
-            CheckedSystemTime::from_sql_after(near_lowest(), &wire.to_be_bytes()),
-            Err(_)
-        );
-        assert_matches!(
-            CheckedSystemTime::from_sql_after(near_lowest(), &i64::MIN.to_be_bytes()),
-            Err(_)
-        );
-
-        let CheckedSystemTime(read) =
-            CheckedSystemTime::from_sql_after(near_lowest(), &(-1_000_i64).to_be_bytes())
-                .map_err(|err| Error::Message(err.to_string()))?;
-        assert_eq!(near_lowest() - Duration::from_millis(1), read);
-
-        Ok(())
-    }
-
-    /// `SystemTime + Duration` panics past what a `SystemTime` holds, which a Windows broker
-    /// reaches for a timestamp after the year 30828.
-    #[cfg(not(windows))]
-    #[test]
-    fn checked_system_time_is_an_error_where_adding_to_the_epoch_panics() -> Result<()> {
-        let near_highest = SystemTime::UNIX_EPOCH + Duration::from_secs(i64::MAX.unsigned_abs());
-        let beyond_highest = Duration::from_secs(10_000_000);
-        let wire = i64::try_from(beyond_highest.as_micros())?;
-
-        assert!(std::panic::catch_unwind(|| near_highest + beyond_highest).is_err());
-
-        assert_matches!(
-            CheckedSystemTime::from_sql_after(near_highest, &wire.to_be_bytes()),
-            Err(_)
-        );
-
-        let CheckedSystemTime(read) =
-            CheckedSystemTime::from_sql_after(near_highest, &1_000_i64.to_be_bytes())
-                .map_err(|err| Error::Message(err.to_string()))?;
-        assert_eq!(near_highest + Duration::from_millis(1), read);
-
-        Ok(())
-    }
-
-    #[test]
-    fn checked_system_time_reads_the_instant_that_the_write_side_stored() -> Result<()> {
-        for timestamp in [-1, -86_400_000, 0, 1, 1_700_000_000_000] {
-            let CheckedSystemTime(read) = CheckedSystemTime::from_sql(
-                &Type::TIMESTAMP,
-                &wire_timestamp(to_sql_timestamp(timestamp)?)?,
-            )
-            .map_err(|err| Error::Message(err.to_string()))?;
-
-            assert_eq!(to_sql_timestamp(timestamp)?, read, "{timestamp}");
-        }
-
-        Ok(())
-    }
-
-    /// A row that a Linux broker wrote with a timestamp before 1601 is an error here, where the
-    /// `postgres-types` conversion panics.
-    #[cfg(windows)]
-    #[test]
-    fn checked_system_time_refuses_a_timestamp_before_1601() {
-        // 1601-01-01 is 12_591_158_400 seconds before 2000-01-01.
-        const FLOOR_MICROSECONDS: i64 = -12_591_158_400_000_000;
-
-        assert_matches!(
-            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &FLOOR_MICROSECONDS.to_be_bytes()),
-            Ok(_)
-        );
-        assert_matches!(
-            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &(FLOOR_MICROSECONDS - 1).to_be_bytes()),
-            Err(_)
-        );
-        assert_matches!(
-            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &i64::MIN.to_be_bytes()),
-            Err(_)
-        );
-    }
-
-    #[test]
-    fn checked_system_time_refuses_a_value_that_is_not_eight_bytes() {
-        assert_matches!(
-            CheckedSystemTime::from_sql(&Type::TIMESTAMP, &[0; 4]),
-            Err(_)
-        );
     }
 
     /// The PostgreSQL server that the tests use: `NISSHI_TEST_DATABASE_URL`, or else the `db`

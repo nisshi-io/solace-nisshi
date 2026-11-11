@@ -51,9 +51,6 @@ pub(crate) trait DriverRow {
     /// Returns the UUID at `index`.
     fn uuid(&self, index: usize) -> Result<Option<Uuid>>;
 
-    /// Returns the time at `index`.
-    fn timestamp(&self, index: usize) -> Result<Option<SystemTime>>;
-
     /// Returns the time at `index` as a Kafka timestamp.
     fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>>;
 
@@ -190,12 +187,6 @@ impl FromColumn for Uuid {
     }
 }
 
-impl FromColumn for SystemTime {
-    fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
-        row.timestamp(index)
-    }
-}
-
 impl FromColumn for KafkaTimestamp {
     fn from_nullable_column<R: DriverRow>(row: &R, index: usize) -> Result<Option<Self>> {
         row.kafka_timestamp(index)
@@ -212,7 +203,7 @@ impl FromColumn for serde_json::Result<Value> {
 mod tests {
     use super::{
         super::{QueryRow, result_columns::ResultColumns},
-        KafkaTimestamp,
+        FromColumn, KafkaTimestamp,
     };
     use bytes::Bytes;
     #[cfg(any(feature = "libsql", feature = "turso"))]
@@ -223,7 +214,6 @@ mod tests {
         assert_matches,
         time::{Duration, SystemTime},
     };
-    use uuid::Uuid;
 
     /// A query that reads one column of each kind that [`DriverRow`](super::DriverRow) reads.
     mod probe {
@@ -240,53 +230,6 @@ mod tests {
             }
         }
     }
-
-    /// A query that reads one array of bytes, which only PostgreSQL stores.
-    mod array_probe {
-        sql_row! {
-            #[derive(Debug)]
-            pub(crate) struct Row {
-                headers: Option<Vec<Option<bytes::Bytes>>>,
-            }
-        }
-    }
-
-    /// A query that reads one column of each kind that SQLite stores in another form than
-    /// PostgreSQL does.
-    mod converted_probe {
-        sql_row! {
-            #[derive(Debug)]
-            pub(crate) struct Row {
-                flag: bool,
-                payload: bytes::Bytes,
-                id: uuid::Uuid,
-                time: std::time::SystemTime,
-            }
-        }
-    }
-
-    /// The UUID in the `id` column of each converted probe query.
-    const CONVERTED_PROBE_ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
-
-    /// The converted probe queries in one driver's SQL dialect.
-    struct ConvertedProbeSql {
-        /// Returns one row: true, the bytes 1 and 2, [`CONVERTED_PROBE_ID`], and 1.5 seconds after
-        /// the Unix epoch.
-        in_order: &'static str,
-    }
-
-    #[cfg(any(feature = "libsql", feature = "turso"))]
-    const SQLITE_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
-        in_order: "select 1 as flag, x'0102' as payload, \
-                   '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
-    };
-
-    #[cfg(feature = "postgres")]
-    const POSTGRES_CONVERTED: ConvertedProbeSql = ConvertedProbeSql {
-        in_order: r"select true as flag, '\x0102'::bytea as payload,
-                    '67e55044-10b1-426f-9247-bb680e5fe0c8'::uuid as id,
-                    '1970-01-01 00:00:01.5'::timestamp as time",
-    };
 
     /// The probe queries in one driver's SQL dialect.
     struct ProbeSql {
@@ -340,6 +283,9 @@ mod tests {
     trait ProbeDriver {
         /// Runs `sql`, and reads each row of its result as `T`.
         async fn probe_rows<T: QueryRow>(sql: &str) -> Result<Vec<T>>;
+
+        /// Runs `sql`, and reads the first column of its one row as `T`.
+        async fn read_value<T: FromColumn>(sql: &str) -> Result<T>;
     }
 
     #[cfg(feature = "postgres")]
@@ -379,6 +325,20 @@ mod tests {
             _ = connection.await;
             rows
         }
+
+        async fn read_value<T: FromColumn>(sql: &str) -> Result<T> {
+            let (client, connection) =
+                tokio_postgres::connect(&crate::pg::tests::CONNECTION, tokio_postgres::NoTls)
+                    .await?;
+            let connection = tokio::spawn(connection);
+
+            let row = client.query_one(sql, &[]).await?;
+            let value = T::from_column(&row, 0);
+
+            drop(client);
+            _ = connection.await;
+            value
+        }
     }
 
     #[cfg(feature = "libsql")]
@@ -400,6 +360,19 @@ mod tests {
             }
             Ok(probes)
         }
+
+        async fn read_value<T: FromColumn>(sql: &str) -> Result<T> {
+            let connection = libsql::Builder::new_local(":memory:")
+                .build()
+                .await?
+                .connect()?;
+            let mut rows = connection.query(sql, ()).await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| Error::Message(format!("{sql} returned no rows")))?;
+            T::from_column(&row, 0)
+        }
     }
 
     #[cfg(feature = "turso")]
@@ -420,6 +393,19 @@ mod tests {
                 probes.push(T::read(&reader, &row)?);
             }
             Ok(probes)
+        }
+
+        async fn read_value<T: FromColumn>(sql: &str) -> Result<T> {
+            let connection = turso::Builder::new_local(":memory:")
+                .build()
+                .await?
+                .connect()?;
+            let mut rows = connection.query(sql, ()).await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| Error::Message(format!("{sql} returned no rows")))?;
+            T::from_column(&row, 0)
         }
     }
 
@@ -510,82 +496,21 @@ mod tests {
         Ok(())
     }
 
-    /// Each driver reads a boolean, bytes, a UUID and a time from the form that its engine stores
-    /// them in, so a field has one Rust type on every engine.
-    async fn converted_columns_read_their_stored_forms<D: ProbeDriver>(
-        sql: &ConvertedProbeSql,
-    ) -> Result<()> {
-        let row = probe_row::<D, converted_probe::Row>(sql.in_order).await?;
-
-        assert!(row.flag);
-        assert_eq!(Bytes::from_static(&[1, 2]), row.payload);
-        assert_eq!(Uuid::parse_str(CONVERTED_PROBE_ID)?, row.id);
-        assert_eq!(
-            SystemTime::UNIX_EPOCH + Duration::from_millis(1500),
-            row.time
-        );
-        Ok(())
-    }
-
-    /// On libSQL and Turso, a boolean other than 0 or 1, and a time stored as text, are errors
-    /// that name the column, instead of values read as some other boolean or time. The broker
-    /// stores only 0, 1 and integer milliseconds. The error keeps a text value's length, not the
-    /// text.
+    /// On libSQL and Turso, a boolean other than 0 or 1 is an error, instead of a value read as
+    /// true. The broker stores only 0 and 1.
     #[cfg(any(feature = "libsql", feature = "turso"))]
     async fn sqlite_rejects_other_stored_forms<D: ProbeDriver>() -> Result<()> {
-        for (query, column, summary) in [
-            (
-                "select 2 as flag, x'0102' as payload, \
-                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, 1500 as time",
-                "flag",
-                SqliteValueSummary::Integer(2),
-            ),
-            (
-                "select 1 as flag, x'0102' as payload, \
-                 '67e55044-10b1-426f-9247-bb680e5fe0c8' as id, \
-                 '1970-01-01 00:00:01.500' as time",
-                "time",
-                // The length of '1970-01-01 00:00:01.500'.
-                SqliteValueSummary::Text { length: 23 },
-            ),
-        ] {
-            assert_matches!(
-                D::probe_rows::<converted_probe::Row>(query).await,
-                Err(Error::UnreadableColumn { column: found, source, .. })
-                    if found == column
-                        && matches!(*source, Error::UnexpectedSqliteValue(found) if found == summary),
-                "{query}"
-            );
-        }
+        assert_matches!(
+            D::read_value::<bool>("select 2").await,
+            Err(Error::UnexpectedSqliteValue(SqliteValueSummary::Integer(2)))
+        );
         Ok(())
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn postgres_converted_columns_read_their_stored_forms() -> Result<()> {
-        if !Postgres::is_reachable("postgres_converted_columns_read_their_stored_forms").await {
-            return Ok(());
-        }
-
-        converted_columns_read_their_stored_forms::<Postgres>(&POSTGRES_CONVERTED).await
-    }
-
-    #[cfg(feature = "libsql")]
-    #[tokio::test]
-    async fn libsql_converted_columns_read_their_stored_forms() -> Result<()> {
-        converted_columns_read_their_stored_forms::<Libsql>(&SQLITE_CONVERTED).await
     }
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn libsql_rejects_other_stored_forms() -> Result<()> {
         sqlite_rejects_other_stored_forms::<Libsql>().await
-    }
-
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_converted_columns_read_their_stored_forms() -> Result<()> {
-        converted_columns_read_their_stored_forms::<Turso>(&SQLITE_CONVERTED).await
     }
 
     #[cfg(feature = "turso")]
@@ -714,14 +639,12 @@ mod tests {
             return Ok(());
         }
 
-        let row = probe_row::<Postgres, array_probe::Row>(
-            "select array['\\x0102'::bytea, null] as headers",
-        )
-        .await?;
-
         assert_eq!(
             Some(vec![Some(Bytes::from_static(&[1, 2])), None]),
-            row.headers
+            Postgres::read_value::<Option<Vec<Option<Bytes>>>>(
+                "select array['\\x0102'::bytea, null]"
+            )
+            .await?
         );
         Ok(())
     }
@@ -730,19 +653,15 @@ mod tests {
     /// error that names the column, because SQLite stores no arrays.
     #[cfg(any(feature = "libsql", feature = "turso"))]
     async fn sqlite_bytes_array_is_only_null<D: ProbeDriver>() -> Result<()> {
-        assert!(
-            probe_row::<D, array_probe::Row>("select null as headers")
-                .await?
-                .headers
-                .is_none()
+        assert_matches!(
+            D::read_value::<Option<Vec<Option<Bytes>>>>("select null").await,
+            Ok(None)
         );
         assert_matches!(
-            D::probe_rows::<array_probe::Row>("select x'0102' as headers").await,
-            Err(Error::UnreadableColumn { column: "headers", source, .. })
-                if matches!(
-                    *source,
-                    Error::UnexpectedSqliteValue(SqliteValueSummary::Blob { length: 2 })
-                )
+            D::read_value::<Option<Vec<Option<Bytes>>>>("select x'0102'").await,
+            Err(Error::UnexpectedSqliteValue(SqliteValueSummary::Blob {
+                length: 2
+            }))
         );
         Ok(())
     }

@@ -123,12 +123,6 @@ impl<R: SqliteRow> DriverRow for R {
             .transpose()
     }
 
-    fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
-        self.kafka_timestamp(index)?
-            .map(KafkaTimestamp::system_time)
-            .transpose()
-    }
-
     fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>> {
         self.integer(index).map(|millis| millis.map(KafkaTimestamp))
     }

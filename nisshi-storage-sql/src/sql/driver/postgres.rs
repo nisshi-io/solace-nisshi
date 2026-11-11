@@ -15,14 +15,11 @@
 //! Reads the rows of tokio-postgres, the PostgreSQL driver.
 
 use super::{DriverRow, KafkaTimestamp};
-use crate::{
-    pg::{CheckedSystemTime, POSTGRES_EPOCH_SECONDS},
-    sql::result_columns::ColumnNames,
-};
+use crate::{pg::POSTGRES_EPOCH_SECONDS, sql::result_columns::ColumnNames};
 use bytes::Bytes;
 use nisshi_storage::Result;
 use serde_json::Value;
-use std::{error::Error as StdError, time::SystemTime};
+use std::error::Error as StdError;
 use tokio_postgres::{
     Row, Statement,
     types::{FromSql, Type},
@@ -103,14 +100,6 @@ impl DriverRow for Row {
 
     fn uuid(&self, index: usize) -> Result<Option<Uuid>> {
         self.try_get(index).map_err(Into::into)
-    }
-
-    /// The read checks that this platform's `SystemTime` holds the instant, because the
-    /// `postgres-types` conversion to `SystemTime` panics where it does not.
-    fn timestamp(&self, index: usize) -> Result<Option<SystemTime>> {
-        self.try_get::<_, Option<CheckedSystemTime>>(index)
-            .map(|time| time.map(|CheckedSystemTime(time)| time))
-            .map_err(Into::into)
     }
 
     fn kafka_timestamp(&self, index: usize) -> Result<Option<KafkaTimestamp>> {
