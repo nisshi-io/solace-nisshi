@@ -102,8 +102,8 @@ where
             return false;
         };
 
-        // The null engine lists every topic whatever the lookup names, so only the entry with
-        // this topic's name answers for it.
+        // The service matches the entry by name, not by position, so that a lookup that answers
+        // for other topics, or with a nameless row, is never taken for this topic.
         let Some(topic) = metadata
             .topics()
             .iter()
@@ -281,8 +281,8 @@ mod tests {
     #[tokio::test]
     async fn a_metadata_lookup_that_answers_for_another_topic_keeps_the_rejection() {
         // The topic exists. The lookup lists one topic with no name and an unknown-topic error,
-        // as the null engine's listing does, which the service takes for this topic if it does
-        // not match by name.
+        // as the PostgreSQL engine does for a failed listing query, which the service takes for
+        // this topic if it does not match by name.
         let storage =
             CountingStorage::new(Listing::NamelessTopic, &["person"]).with_lookup(Lookup::Listed);
 

@@ -97,6 +97,37 @@ pub(crate) const NAME: &str = "null (null://)";
 const FEATURE: &str = "storage";
 const MESSAGE: &str = "storage has not been defined";
 
+impl Engine {
+    fn metadata_topic(&self, topic: &CreatableTopic) -> Result<MetadataResponseTopic> {
+        nisshi_storage::assign_replicas(
+            &[self.node],
+            topic.num_partitions,
+            topic.replication_factor,
+            ErrorCode::None.into(),
+            -1,
+        )
+        .map(|partitions| {
+            MetadataResponseTopic::default()
+                .error_code(ErrorCode::None.into())
+                .is_internal(Some(false))
+                .name(Some(topic.name.clone()))
+                .partitions(Some(partitions))
+                .topic_id(Some(NULL_TOPIC_ID))
+                .topic_authorized_operations(Some(i32::MIN))
+        })
+    }
+}
+
+fn unknown_topic(name: Option<String>, topic_id: [u8; 16]) -> MetadataResponseTopic {
+    MetadataResponseTopic::default()
+        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+        .is_internal(Some(false))
+        .name(name)
+        .partitions(Some([].into()))
+        .topic_id(Some(topic_id))
+        .topic_authorized_operations(Some(i32::MIN))
+}
+
 #[async_trait]
 impl Storage for Engine {
     #[instrument(skip_all)]
@@ -273,7 +304,7 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let node_id = self.node;
         let host = self
             .advertised_listener
@@ -283,29 +314,32 @@ impl Storage for Engine {
         let port = self.advertised_listener.port().unwrap_or(9092).into();
         let rack = None;
 
-        let topics = self
-            .topics
-            .lock()?
-            .iter()
-            .map(|topic| {
-                nisshi_storage::assign_replicas(
-                    &[self.node],
-                    topic.num_partitions,
-                    topic.replication_factor,
-                    ErrorCode::None.into(),
-                    -1,
-                )
-                .map(|partitions| {
-                    MetadataResponseTopic::default()
-                        .error_code(ErrorCode::None.into())
-                        .is_internal(Some(false))
-                        .name(Some(topic.name.clone()))
-                        .partitions(Some(partitions))
-                        .topic_id(Some(NULL_TOPIC_ID))
-                        .topic_authorized_operations(Some(i32::MIN))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let topics = {
+            let existing = self.topics.lock()?;
+
+            match topics {
+                None => existing
+                    .iter()
+                    .map(|topic| self.metadata_topic(topic))
+                    .collect::<Result<Vec<_>>>()?,
+
+                Some(requested) => requested
+                    .iter()
+                    .map(|requested| match requested {
+                        TopicId::Name(name) => existing
+                            .iter()
+                            .find(|topic| topic.name == *name)
+                            .map_or_else(
+                                || Ok(unknown_topic(Some(name.clone()), NULL_TOPIC_ID)),
+                                |topic| self.metadata_topic(topic),
+                            ),
+
+                        // The engine keeps no topic IDs, so an ID names no topic.
+                        TopicId::Id(id) => Ok(unknown_topic(None, id.into_bytes())),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        };
 
         Ok(MetadataResponse {
             cluster: Some(self.cluster.clone()),
@@ -687,6 +721,106 @@ mod tests {
             unknown.error_code
         );
         assert_eq!("unknown", unknown.resource_name);
+
+        Ok(())
+    }
+
+    async fn engine_with_topics(names: &[&str]) -> Result<Engine> {
+        let engine = Engine::new(
+            "cluster".into(),
+            111,
+            Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
+        );
+
+        for name in names {
+            _ = engine
+                .create_topic(
+                    CreatableTopic::default()
+                        .name((*name).into())
+                        .num_partitions(1)
+                        .replication_factor(1),
+                    false,
+                )
+                .await?;
+        }
+
+        Ok(engine)
+    }
+
+    fn rows(metadata: &MetadataResponse) -> Vec<(Option<&str>, i16)> {
+        metadata
+            .topics
+            .iter()
+            .map(|topic| (topic.name.as_deref(), topic.error_code))
+            .collect()
+    }
+
+    /// A lookup by name answers one row for each name asked, in the order asked: the topic
+    /// when the engine tracks it, and `UNKNOWN_TOPIC_OR_PARTITION` when it doesn't, so that
+    /// `MetadataService` can auto-create it.
+    #[tokio::test]
+    async fn metadata_answers_the_topics_asked_for() -> Result<()> {
+        let engine = engine_with_topics(&["a", "b", "c"]).await?;
+        let none = i16::from(ErrorCode::None);
+        let unknown = i16::from(ErrorCode::UnknownTopicOrPartition);
+
+        let metadata = engine
+            .metadata(Some(&[
+                TopicId::Name("c".into()),
+                TopicId::Name("missing".into()),
+                TopicId::Name("a".into()),
+            ]))
+            .await?;
+
+        assert_eq!(
+            vec![
+                (Some("c"), none),
+                (Some("missing"), unknown),
+                (Some("a"), none)
+            ],
+            rows(&metadata)
+        );
+        assert_eq!(
+            Some(&Vec::new()),
+            metadata.topics[1].partitions.as_ref(),
+            "an unknown topic has no partitions"
+        );
+
+        Ok(())
+    }
+
+    /// Null asks for every topic, and an empty list for none.
+    #[tokio::test]
+    async fn metadata_lists_every_topic_for_null_and_none_for_an_empty_list() -> Result<()> {
+        let engine = engine_with_topics(&["a", "b"]).await?;
+        let none = i16::from(ErrorCode::None);
+
+        assert_eq!(
+            vec![(Some("a"), none), (Some("b"), none)],
+            rows(&engine.metadata(None).await?)
+        );
+        assert_eq!(
+            Vec::<(Option<&str>, i16)>::new(),
+            rows(&engine.metadata(Some(&[])).await?)
+        );
+
+        Ok(())
+    }
+
+    /// The engine keeps no topic IDs, so an ID names no topic, as on an engine that doesn't know
+    /// it, and the row has no name.
+    #[tokio::test]
+    async fn metadata_by_topic_id_is_unknown() -> Result<()> {
+        let engine = engine_with_topics(&["a"]).await?;
+        let id = Uuid::now_v7();
+
+        let metadata = engine.metadata(Some(&[TopicId::Id(id)])).await?;
+
+        assert_eq!(
+            vec![(None, i16::from(ErrorCode::UnknownTopicOrPartition))],
+            rows(&metadata)
+        );
+        assert_eq!(Some(id.into_bytes()), metadata.topics[0].topic_id);
 
         Ok(())
     }

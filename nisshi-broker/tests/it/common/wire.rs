@@ -73,29 +73,39 @@ pub(crate) async fn spawn_broker_with_authentication(
     tls: Option<ServerConfig>,
     authentication: bool,
 ) -> Result<RunningBroker> {
-    spawn(tls, authentication, None).await
-}
-
-/// Like [`spawn_broker`], with `schemas` as the registry that the broker validates produced
-/// records against.
-pub(crate) async fn spawn_broker_with_schemas(schemas: Option<Registry>) -> Result<RunningBroker> {
-    spawn(None, false, schemas).await
-}
-
-async fn spawn(
-    tls: Option<ServerConfig>,
-    authentication: bool,
-    schemas: Option<Registry>,
-) -> Result<RunningBroker> {
-    let port = free_port().await?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = Url::parse(&format!("tcp://{addr}"))?;
-
     let storage = if authentication {
         lite_url().await?
     } else {
         Url::parse("memory://")?
     };
+
+    spawn(tls, authentication, storage, None).await
+}
+
+/// Like [`spawn_broker`], with `schemas` as the registry that the broker validates produced
+/// records against.
+pub(crate) async fn spawn_broker_with_schemas(schemas: Option<Registry>) -> Result<RunningBroker> {
+    spawn(None, false, Url::parse("memory://")?, schemas).await
+}
+
+/// Like [`spawn_broker_with_authentication`], on the storage at `storage`.
+pub(crate) async fn spawn_broker_on(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+    storage: Url,
+) -> Result<RunningBroker> {
+    spawn(tls, authentication, storage, None).await
+}
+
+async fn spawn(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+    storage: Url,
+    schemas: Option<Registry>,
+) -> Result<RunningBroker> {
+    let port = free_port().await?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = Url::parse(&format!("tcp://{addr}"))?;
 
     let mut broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
         .node_id(NODE_ID)
