@@ -304,7 +304,6 @@ pub(crate) mod topic_configuration_select_keys;
 pub(crate) mod topic_configuration_select_name;
 pub(crate) mod topic_configuration_upsert;
 pub(crate) mod topic_insert;
-pub(crate) mod topic_select;
 pub(crate) mod topic_select_name;
 pub(crate) mod topic_select_uuid;
 pub(crate) mod topition_insert;
@@ -387,20 +386,14 @@ macro_rules! cache_key {
 ///
 /// Each line names a query by its folder and file in this crate's `src`. A line in `rows` names
 /// the constant that a query's module declares, because an engine reads the query's rows through
-/// that module's `RowReader`. A line in `without_columns` names a module's constant too, for a
-/// query whose rows an engine counts but reads no column of. A compile-time assertion checks that
-/// each such constant holds the query's key. A line in `plain` declares the constant here.
+/// that module's `RowReader`, and a compile-time assertion checks that the constant holds the
+/// query's key. A line in `plain` declares the constant here, for a query whose rows no engine
+/// reads a column of.
 macro_rules! queries {
     (
         rows {
             $(
                 $module:ident :: $module_constant:ident = $row_folder:tt / $row_file:literal,
-            )+
-        }
-        without_columns {
-            $(
-                $counted_module:ident :: $counted_constant:ident
-                    = $counted_folder:tt / $counted_file:literal,
             )+
         }
         plain {
@@ -428,34 +421,12 @@ macro_rules! queries {
             );
         )+
 
-        $(
-            const _: () = assert!(
-                const_str_eq(
-                    $counted_module::$counted_constant,
-                    cache_key!($counted_folder / $counted_file)
-                ),
-                concat!(
-                    stringify!($counted_module::$counted_constant),
-                    " must be the cache key of ",
-                    $counted_folder,
-                    "/",
-                    $counted_file
-                ),
-            );
-        )+
-
         pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             Cache::new(BTreeMap::from([
                 $(
                     (
                         $module::$module_constant.key(),
                         include_sql!(concat!($row_folder, "/", $row_file)),
-                    ),
-                )+
-                $(
-                    (
-                        $counted_module::$counted_constant,
-                        include_sql!(concat!($counted_folder, "/", $counted_file)),
                     ),
                 )+
                 $(($constant, include_sql!(concat!($folder, "/", $file))),)+
@@ -539,9 +510,6 @@ queries! {
         watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
         watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
     }
-    without_columns {
-        topic_select::QUERY = "sql" / "topic_select.sql",
-    }
     plain {
         CONSUMER_GROUP_DELETE = "sql" / "consumer_group_delete.sql",
         CONSUMER_GROUP_DETAIL_DELETE_BY_CG = "sql" / "consumer_group_detail_delete_by_cg.sql",
@@ -581,6 +549,7 @@ queries! {
         TOPIC_CONFIGURATION_DELETE = "sql" / "topic_configuration_delete.sql",
         TOPIC_CONFIGURATION_DELETE_BY_TOPIC = "sql" / "topic_configuration_delete_by_topic.sql",
         TOPIC_DELETE_BY = "sql" / "topic_delete_by.sql",
+        TOPIC_SELECT = "sql" / "topic_select.sql",
         TOPIC_SELECT_NAME_FOR_UPDATE = "sql" / "topic_select_name_for_update.sql",
         TOPITION_DELETE_BY_TOPIC = "sql" / "topition_delete_by_topic.sql",
         TOPITION_SELECT = "sql" / "topition_select.sql",

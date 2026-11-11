@@ -33,15 +33,6 @@ impl RowCheck {
         }
     }
 
-    /// Returns the check of `query`, whose rows an engine counts but reads no column of. The
-    /// check only prepares the query.
-    pub(crate) fn without_columns(query: &'static str) -> Self {
-        Self {
-            query,
-            check_columns: |_| Ok(()),
-        }
-    }
-
     /// Returns the query's name in the SQL cache.
     pub(crate) fn query(&self) -> &'static str {
         self.query

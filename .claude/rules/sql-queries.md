@@ -36,9 +36,9 @@ changes.
   }
   ```
 
-  A query whose engines read no column, because a row only means that something exists, needs
-  only a `QUERY` that holds its name, as a `&str`. Variants of one query, such as a PostgreSQL
-  version and a SQLite version, are constants in one module.
+  A query whose engines read no column, because a row only means that something exists, gets no
+  module: its constant goes in the `plain` list of `queries!`, as `TOPIC_SELECT` does. Variants of
+  one query, such as a PostgreSQL version and a SQLite version, are constants in one module.
 - **Name a field as its column, and rename a column in the SQL.** When the Rust name should differ
   from a table's column, the query renames the column with `as`, as in `p.id as producer_id`.
 - **Share one row type between the queries that return the same thing.** Declare it once, in an

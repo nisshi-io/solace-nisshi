@@ -23,7 +23,7 @@ use crate::{
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
         remove_comments, result_columns::ResultColumns, topic_by_cluster,
         topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
-        topic_insert, topic_select, topic_select_name, topic_select_uuid, topition_insert,
+        topic_insert, topic_select_name, topic_select_uuid, topition_insert,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
         txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
         txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
@@ -4183,7 +4183,7 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query(topic_select::QUERY, (self.cluster.as_str(), name))
+            .query(sql::TOPIC_SELECT, (self.cluster.as_str(), name))
             .await?;
 
         if rows.next().await?.is_some() {
@@ -7615,8 +7615,8 @@ mod tests {
             producer_epoch_insert, producer_epochs_select, producer_insert,
             producer_select_for_update, record_fetch, row_check::RowCheck, scram_credential_select,
             topic_by_cluster, topic_configuration_select, topic_configuration_select_name,
-            topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
-            topic_select_uuid, topition_insert, txn_offset_commit_tp_select_pending,
+            topic_configuration_upsert, topic_insert, topic_select_name, topic_select_uuid,
+            topition_insert, txn_offset_commit_tp_select_pending,
             txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
             txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
             virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
@@ -7662,7 +7662,6 @@ mod tests {
             RowCheck::rows(topic_configuration_select_name::QUERY),
             RowCheck::rows(topic_configuration_upsert::QUERY),
             RowCheck::rows(topic_insert::QUERY),
-            RowCheck::without_columns(topic_select::QUERY),
             RowCheck::rows(topic_select_name::NAME_QUERY),
             RowCheck::rows(topic_select_name::QUERY),
             RowCheck::rows(topic_select_uuid::NAME_QUERY),

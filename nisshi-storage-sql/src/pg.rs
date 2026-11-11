@@ -116,13 +116,13 @@ use crate::{
         producer_epochs_select, producer_insert, producer_select_for_update,
         result_columns::ResultColumns, topic_by_cluster, topic_configuration_select,
         topic_configuration_select_keys, topic_configuration_select_name,
-        topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
-        topic_select_uuid, topition_insert, topition_select_id,
-        txn_detail_select_status_for_update, txn_detail_select_timed_out,
-        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
-        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
-        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
-        virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
+        topic_configuration_upsert, topic_insert, topic_select_name, topic_select_uuid,
+        topition_insert, topition_select_id, txn_detail_select_status_for_update,
+        txn_detail_select_timed_out, txn_offset_commit_tp_select_pending,
+        txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
+        txn_produce_partition_check, txn_produce_partition_select, txn_select_name,
+        txn_select_produced_topitions, virtual_topic_upsert, watermark_insert, watermark_select,
+        watermark_select_for_write,
     },
 };
 
@@ -2620,7 +2620,7 @@ impl Postgres {
         name: &str,
     ) -> Result<Option<Vec<DescribeConfigsResourceResult>>> {
         if self
-            .prepare_query(c, topic_select::QUERY, &[&self.cluster.as_str(), &name])
+            .prepare_query(c, sql::TOPIC_SELECT, &[&self.cluster.as_str(), &name])
             .await?
             .is_empty()
         {
@@ -6185,8 +6185,8 @@ pub(crate) mod tests {
             producer_select_for_update, row_check::RowCheck, scram_credential_select,
             topic_by_cluster, topic_configuration_select, topic_configuration_select_keys,
             topic_configuration_select_name, topic_configuration_upsert, topic_insert,
-            topic_select, topic_select_name, topic_select_uuid, topition_insert,
-            topition_select_id, txn_detail_select_status_for_update, txn_detail_select_timed_out,
+            topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
+            txn_detail_select_status_for_update, txn_detail_select_timed_out,
             txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
             txn_produce_offset_select_overlapping_txn, txn_produce_partition_select,
             txn_select_name, txn_select_produced_topitions, virtual_topic_upsert, watermark_insert,
@@ -6236,7 +6236,6 @@ pub(crate) mod tests {
             RowCheck::rows(topic_configuration_select_name::QUERY),
             RowCheck::rows(topic_configuration_upsert::QUERY),
             RowCheck::rows(topic_insert::QUERY),
-            RowCheck::without_columns(topic_select::QUERY),
             RowCheck::rows(topic_select_name::NAME_QUERY),
             RowCheck::rows(topic_select_name::QUERY),
             RowCheck::rows(topic_select_uuid::NAME_QUERY),
