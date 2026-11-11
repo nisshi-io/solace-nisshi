@@ -2300,6 +2300,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// cluster and the controller, as an empty Metadata request does from v1
     /// ([`MetadataRequest.isAllTopics`]).
     ///
+    /// A backend that lists every topic whatever it is given, as `null://` and the deprecated
+    /// `slatedb://` do, still answers no topics to an empty slice: `MetadataService` enforces
+    /// it for them.
+    ///
     /// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 

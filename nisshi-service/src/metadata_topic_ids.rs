@@ -28,9 +28,6 @@ const FIRST_TOPIC_ID_METADATA_VERSION: i16 = 12;
 /// request with a null topic name or a topic ID, and that turns a v0 request for an empty list of
 /// topics into one for all topics.
 ///
-/// The second is [`all_topics_at_v0`]: the Metadata service reads an empty list as no topics, as
-/// Kafka does from v1, and only a layer that sees the API version can keep the v0 rule.
-///
 /// The Metadata request schema allows both from v10, but Kafka implemented them only at v12, and
 /// its schema says "Versions 10 and 11 should not use the topicId field or set topic name to
 /// null" ([MetadataRequest.json#L36-L37]). So its broker refuses such a request with
@@ -41,6 +38,10 @@ const FIRST_TOPIC_ID_METADATA_VERSION: i16 = 12;
 /// Without this, the storage answers a topic ID it doesn't know with a topic that has no name,
 /// and at v10 and v11, where the response name is not nullable, the encoder writes nothing for
 /// it, so the frame that goes out doesn't decode.
+///
+/// The layer also does a second thing, [`all_topics_at_v0`]: the Metadata service reads an empty
+/// list as no topics, as Kafka does from v1, and only a layer that sees the API version can keep
+/// the v0 rule.
 ///
 /// [MetadataRequest.json#L36-L37]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/resources/common/message/MetadataRequest.json#L36-L37
 /// [KafkaApis.scala#L1320-L1329]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1320-L1329
