@@ -27,7 +27,7 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    Error, METER, OffsetStage, Result, Storage, StorageOperation, Topition,
+    Error, METER, OffsetStage, Result, Storage, StorageOperation, TopicId, Topition,
     fetched::FetchUntilDeadline as _,
     service::{
         read_deadline::{ReadDeadline, ReadWait, TimedOut},
@@ -658,7 +658,11 @@ where
             .records(None)
     }
 
-    fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+    fn unknown_topic_response(
+        &self,
+        fetch: &FetchTopic,
+        error_code: ErrorCode,
+    ) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
             // From v13 the client matches a response topic by id and drops
@@ -668,7 +672,7 @@ where
             .partitions(fetch.partitions.as_ref().map(|partitions| {
                 partitions
                     .iter()
-                    .map(|partition| Self::unknown_partition(partition.partition))
+                    .map(|partition| Self::unknown_partition_with(partition.partition, error_code))
                     .collect()
             })))
     }
@@ -704,9 +708,13 @@ where
     /// The answer for a partition that the topic does not have, and for
     /// each partition of an unknown topic.
     fn unknown_partition(partition_index: i32) -> PartitionData {
+        Self::unknown_partition_with(partition_index, ErrorCode::UnknownTopicOrPartition)
+    }
+
+    fn unknown_partition_with(partition_index: i32, error_code: ErrorCode) -> PartitionData {
         PartitionData::default()
             .partition_index(partition_index)
-            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+            .error_code(error_code.into())
             .high_watermark(0)
             .last_stable_offset(Some(0))
             .log_start_offset(Some(-1))
@@ -860,7 +868,28 @@ where
             }
 
             *left = left.saturating_sub(fetch.partitions.as_ref().map_or(0, Vec::len));
-            self.unknown_topic_response(fetch)
+
+            // Kafka answers each partition of a topic ID that it cannot resolve to a name with
+            // `UNKNOWN_TOPIC_ID`, and each partition of a name that it does not know with
+            // `UNKNOWN_TOPIC_OR_PARTITION`. It picks the code in `KafkaApis` from whether the ID
+            // resolved, so the choice sits here and not in each storage engine, which answers
+            // a miss the same for an ID and a name. An error that storage reports as any other code keeps
+            // that code.
+            //
+            // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L798-L802
+            let error_code = match (
+                TopicId::from(fetch),
+                metadata.topics().first().map(|topic| topic.error_code),
+            ) {
+                (TopicId::Id(_), Some(error_code))
+                    if error_code == i16::from(ErrorCode::UnknownTopicOrPartition) =>
+                {
+                    ErrorCode::UnknownTopicId
+                }
+                _ => ErrorCode::UnknownTopicOrPartition,
+            };
+
+            self.unknown_topic_response(fetch, error_code)
         }
     }
 
@@ -1059,8 +1088,9 @@ where
 /// Kafka does: a log read error, such as `OFFSET_OUT_OF_RANGE`, in any
 /// partition ([ReplicaManager.scala]), or an error in every partition.
 ///
-/// An unknown topic alone does not end the wait while another partition has
-/// no error, because Kafka sets unknown topics aside before it reads the log,
+/// An unknown topic alone, by name or by ID, does not end the wait while
+/// another partition has no error, because Kafka sets unknown topics aside
+/// before it reads the log,
 /// and waits for the other partitions ([KafkaApis.scala]). A consumer still
 /// assigned to a deleted topic then fetches once per `max_wait`, instead of
 /// at round trip speed.
@@ -1068,7 +1098,10 @@ where
 /// [ReplicaManager.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
 /// [KafkaApis.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1031-L1032
 fn answers_without_waiting(responses: &[FetchableTopicResponse]) -> bool {
-    let unknown_topic = i16::from(ErrorCode::UnknownTopicOrPartition);
+    let unknown_topic = [
+        i16::from(ErrorCode::UnknownTopicOrPartition),
+        i16::from(ErrorCode::UnknownTopicId),
+    ];
     let none = i16::from(ErrorCode::None);
 
     let mut error_codes = responses
@@ -1086,7 +1119,7 @@ fn answers_without_waiting(responses: &[FetchableTopicResponse]) -> bool {
     for error_code in error_codes {
         if error_code == none {
             every_partition_has_error = false;
-        } else if error_code != unknown_topic {
+        } else if !unknown_topic.contains(&error_code) {
             return true;
         }
     }
@@ -3361,6 +3394,29 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// An unknown topic ID is set aside like an unknown partition: it ends
+    /// the wait only when every partition has an error.
+    #[test]
+    fn an_unknown_topic_id_is_set_aside_when_deciding_to_wait() {
+        let answer = |error_code: ErrorCode| {
+            nisshi_sans_io::fetch_response::FetchableTopicResponse::default().partitions(Some(
+                vec![PartitionData::default().error_code(error_code.into())],
+            ))
+        };
+
+        assert!(super::answers_without_waiting(&[answer(
+            ErrorCode::UnknownTopicId
+        )]));
+        assert!(!super::answers_without_waiting(&[
+            answer(ErrorCode::UnknownTopicId),
+            answer(ErrorCode::None),
+        ]));
+        assert!(super::answers_without_waiting(&[
+            answer(ErrorCode::UnknownTopicId),
+            answer(ErrorCode::OffsetOutOfRange),
+        ]));
     }
 
     /// A partition that storage reports as unknown, after the request read

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, RequestInput,
+    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, NULL_TOPIC_ID, RequestInput,
     delete_topics_response::DeletableTopicResult,
 };
 use rama::Service;
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, TopicId};
 
 /// A [`Service`] using its [`Storage`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
 /// ```no_run
@@ -87,7 +87,24 @@ where
         let mut responses = vec![];
 
         for topic in input.request.topics.unwrap_or_default() {
-            let error_code = self.storage.delete_topic(&topic.clone().into()).await?;
+            let topic_id = TopicId::from(topic.clone());
+            let mut error_code = self.storage.delete_topic(&topic_id).await?;
+
+            // Kafka answers a topic ID that it cannot resolve with `UNKNOWN_TOPIC_ID`, and a
+            // name that it does not know with `UNKNOWN_TOPIC_OR_PARTITION`. It picks the code
+            // from whether the ID resolved, before it looks at the topic, so the choice sits
+            // here and not in each storage engine. A zero ID with no name is not mapped:
+            // Kafka's KRaft controller answers that `INVALID_REQUEST`, which Nisshi does not do
+            // yet.
+            //
+            // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L2199-L2201
+            // https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L923-L929
+            if error_code == ErrorCode::UnknownTopicOrPartition
+                && matches!(topic_id, TopicId::Id(id) if id.into_bytes() != NULL_TOPIC_ID)
+            {
+                error_code = ErrorCode::UnknownTopicId;
+            }
+
             responses.push(
                 DeletableTopicResult::default()
                     .name(topic.name.clone())

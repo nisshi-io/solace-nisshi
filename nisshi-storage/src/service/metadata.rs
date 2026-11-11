@@ -15,9 +15,9 @@
 use std::collections::BTreeSet;
 
 use nisshi_sans_io::{
-    ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
-    create_topics_request::CreatableTopic, create_topics_response::CreatableTopicResult,
-    topic::is_valid_topic_name,
+    ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
+    RequestInput, create_topics_request::CreatableTopic,
+    create_topics_response::CreatableTopicResult, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
@@ -216,6 +216,16 @@ where
                     .inspect_err(|err| error!(?err))?;
             }
         }
+        // The zero ID is left out: Kafka treats it as no ID at all.
+        let requested_ids = topics
+            .iter()
+            .flatten()
+            .filter_map(|topic| match topic {
+                TopicId::Id(id) if id.into_bytes() != NULL_TOPIC_ID => Some(id.into_bytes()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
         let brokers = Some(response.brokers().to_owned());
         let cluster_id = response.cluster().map(|s| s.into());
         let controller_id = response.controller();
@@ -234,6 +244,19 @@ where
                         topic
                             .clone()
                             .error_code(ErrorCode::InvalidTopicException.into())
+                    } else if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                        && topic.name.is_none()
+                        && topic
+                            .topic_id
+                            .is_some_and(|topic_id| requested_ids.contains(&topic_id))
+                    {
+                        // Kafka picks the code in `KafkaApis` from whether the ID resolved to
+                        // a name, so the choice sits here and not in each storage engine,
+                        // which answers a miss the same for an ID and a name. The row's shape
+                        // alone does not say how the topic was asked for, so the request does.
+                        //
+                        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1336-L1340
+                        topic.clone().error_code(ErrorCode::UnknownTopicId.into())
                     } else {
                         topic.clone()
                     };
