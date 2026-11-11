@@ -8429,6 +8429,51 @@ mod tests {
         Ok(())
     }
 
+    /// A ListGroups must answer a stored group whose detail isn't text with
+    /// `UNKNOWN_SERVER_ERROR`, as it answers a detail that isn't JSON, and list the other groups
+    /// as usual.
+    #[tokio::test]
+    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let db_file = "list-groups-detail-not-text-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let cluster = "nisshi";
+        let (engine, connection, stored) = engine_with_stored_groups(db_file, cluster).await?;
+
+        // SQLite never converts a blob to text for the column's affinity, so the detail stays a
+        // value that isn't text.
+        let changed = connection
+            .execute(
+                "update consumer_group_detail set detail = x'7b7d'
+                where consumer_group = (
+                    select cg.id from consumer_group cg join cluster c on c.id = cg.cluster
+                    where c.name = ?1 and cg.name = ?2
+                )",
+                (cluster, "undecodable"),
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // readable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let mut listed = engine.list_groups().await?;
+        // The query doesn't order its rows.
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+            ],
+            listed
+        );
+
+        Ok(())
+    }
+
     /// Returns an engine on `db_file` with a readable topic, and the topic `unreadable`, whose
     /// stored row can't be read. Returns the readable topic's partition and the ID of
     /// `unreadable`.

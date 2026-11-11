@@ -5111,6 +5111,61 @@ mod tests {
         Ok(engine)
     }
 
+    /// A ListGroups must answer a stored group whose detail isn't text with
+    /// `UNKNOWN_SERVER_ERROR`, as it answers a detail that isn't JSON, and list the other groups
+    /// as usual.
+    #[tokio::test]
+    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = registered_engine(&temp_dir).await?;
+
+        // `GroupDetail::default` records the current time as the group's inception, so the test
+        // keeps the detail that it stores.
+        let stored = GroupDetail::default();
+
+        for group_id in ["healthy", "undecodable"] {
+            _ = engine
+                .update_group(group_id, stored.clone(), None)
+                .await
+                .map_err(|err| Error::Message(format!("{err:?}")))?;
+        }
+
+        // SQLite never converts a blob to text for the column's affinity, so the detail stays a
+        // value that isn't text.
+        let changed = engine
+            .connection()
+            .await?
+            .execute(
+                "update consumer_group_detail set detail = x'7b7d'
+                where consumer_group = (
+                    select cg.id from consumer_group cg join cluster c on c.id = cg.cluster
+                    where c.name = ?1 and cg.name = ?2
+                )",
+                ["nisshi", "undecodable"],
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // readable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let mut listed = engine.list_groups().await?;
+        // The query doesn't order its rows.
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+            ],
+            listed
+        );
+
+        Ok(())
+    }
+
     /// A one-row read of a result with two rows is an error, instead of the first row.
     #[tokio::test]
     async fn query_one_of_two_rows_is_an_error() -> Result<()> {

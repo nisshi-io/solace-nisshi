@@ -567,6 +567,20 @@ mod tests {
         Ok(())
     }
 
+    /// On libSQL and Turso, a document stored as a value that isn't text is kept in the row as a
+    /// parse error, as a document that isn't JSON is, instead of failing the read of the result.
+    #[cfg(any(feature = "libsql", feature = "turso"))]
+    async fn sqlite_json_that_is_not_text_is_kept_in_the_row<D: ProbeDriver>() -> Result<()> {
+        // The blob holds the bytes of `{}`, which is valid JSON, so the read fails only because
+        // the value isn't text.
+        let row = probe_row::<D, probe::Row>(
+            "select 3 as epoch, 7 as high, 'a' as name, x'7b7d' as detail",
+        )
+        .await?;
+        assert_matches!(row.detail, Some(Err(_)));
+        Ok(())
+    }
+
     /// Each driver reads a boolean, bytes, a UUID and a time from the form that its engine stores
     /// them in, so a field has one Rust type on every engine.
     async fn converted_columns_read_their_stored_forms<D: ProbeDriver>(
@@ -749,6 +763,18 @@ mod tests {
     #[tokio::test]
     async fn turso_invalid_json_is_kept_in_the_row() -> Result<()> {
         invalid_json_is_kept_in_the_row::<Turso>().await
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_json_that_is_not_text_is_kept_in_the_row() -> Result<()> {
+        sqlite_json_that_is_not_text_is_kept_in_the_row::<Libsql>().await
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_json_that_is_not_text_is_kept_in_the_row() -> Result<()> {
+        sqlite_json_that_is_not_text_is_kept_in_the_row::<Turso>().await
     }
 
     /// PostgreSQL reads each element of a `bytea[]`, a null element as `None`.

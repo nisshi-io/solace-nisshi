@@ -133,11 +133,17 @@ impl<R: SqliteRow> DriverRow for R {
         self.integer(index).map(|millis| millis.map(KafkaTimestamp))
     }
 
-    /// The parse error of a document that isn't JSON is a value, not a read error, because
-    /// SQLite stores the document as text and accepts any text.
+    /// A document that isn't JSON, and a value that isn't text, are parse errors in the value,
+    /// not read errors, because SQLite accepts any value in any column. The engine then decides
+    /// what one undecodable document does to the rest of the result.
     fn json(&self, index: usize) -> Result<Option<serde_json::Result<serde_json::Value>>> {
-        self.text(index)
-            .map(|text| text.map(|text| serde_json::from_str(&text)))
+        Ok(self.nullable_value(index)?.map(|value| match value {
+            SqliteValue::Text(text) => serde_json::from_str(&text),
+            value => Err(serde::de::Error::custom(format!(
+                "a JSON document is stored as text, not as {:?}",
+                value.unexpected()
+            ))),
+        }))
     }
 }
 
