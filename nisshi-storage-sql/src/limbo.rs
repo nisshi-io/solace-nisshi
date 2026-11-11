@@ -32,7 +32,7 @@ use crate::{
         header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
-        remove_comments, result_columns::ResultColumns, row::topic_name, topic_by_cluster,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
         topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
         topic_insert, topic_select, topic_select_name, topic_select_uuid, topition_insert,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
@@ -486,30 +486,21 @@ impl Engine {
         Ok(leading)
     }
 
-    /// Runs `query` on `connection`, and returns the one row of its result as `T`.
+    /// Runs `query` on `connection`, and returns the first row of its result as `T`.
     ///
-    /// Returns [`Error::NotOneRow`] when the result has no rows or more than one row.
+    /// Returns Turso's `QueryReturnedNoRows` error when the result has no rows.
     async fn query_one<T: QueryRow>(
         &self,
         connection: &Connection,
         query: Query<T>,
         params: impl IntoParams,
     ) -> Result<T> {
-        let mut rows = self
-            .query_leading_rows(connection, query, params, 2)
-            .await?;
-        let query = query.key();
-
-        match (rows.pop(), rows.pop()) {
-            (Some(row), None) => Ok(row),
-            (None, _) => Err(Error::NotOneRow {
-                query,
-                more_than_one: false,
-            }),
-            (Some(_), Some(_)) => Err(Error::NotOneRow {
-                query,
-                more_than_one: true,
-            }),
+        match self.query_first(connection, query, params).await? {
+            Some(row) => Ok(row),
+            None => {
+                error!(sql = query.key(), "query returned no rows");
+                Err(turso::Error::QueryReturnedNoRows.into())
+            }
         }
     }
 
@@ -552,9 +543,6 @@ impl Engine {
     }
 
     /// Adds the next epoch to `producer`, and returns it.
-    ///
-    /// Returns [`Error::NotOneRow`] when the producer does not exist, or when its newest epoch is
-    /// `i16::MAX`.
     async fn producer_epoch_insert(&self, connection: &Connection, producer: i64) -> Result<i16> {
         self.query_one(
             connection,
@@ -2306,10 +2294,13 @@ impl Storage for Engine {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
 
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -2378,10 +2369,13 @@ impl Storage for Engine {
                                     .is_internal(Some(false))
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -2403,20 +2397,13 @@ impl Storage for Engine {
                     .query_rows(&c, topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                // The loop skips each row with an unreadable column, so that one corrupt row
-                // does not hide the cluster's other topics. It leaves the topic out instead of
-                // listing it with `UNKNOWN_SERVER_ERROR`, because the Java consumer's `listTopics`
-                // fails for the whole cluster when one topic of the response has an error that it
-                // can't retry ([`TopicMetadataFetcher.getTopicMetadata`]).
-                //
-                // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
                 while let Some(topic_by_cluster::Row {
                     uuid,
                     name,
                     is_internal,
                     partitions,
                     replication_factor,
-                }) = rows.next_readable::<topic_name::Row>().await?
+                }) = rows.next().await?
                 {
                     let error_code = ErrorCode::None.into();
                     let topic_id = Some(uuid.into_bytes());
@@ -2622,10 +2609,13 @@ impl Storage for Engine {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownServerError.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -2718,10 +2708,13 @@ impl Storage for Engine {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -5189,116 +5182,30 @@ mod tests {
         Ok(())
     }
 
-    /// A one-row read of a result with two rows is an error, instead of the first row.
+    /// A topic whose stored row can't be read fails each Metadata and DescribeTopicPartitions
+    /// request that reads it by name, and a Metadata request for every topic.
     #[tokio::test]
-    async fn query_one_of_two_rows_is_an_error() -> Result<()> {
+    async fn a_request_that_reads_an_unreadable_topic_fails() -> Result<()> {
         let _guard = init_tracing()?;
 
         let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = registered_engine(&temp_dir).await?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
 
-        for name in ["t", "u"] {
-            _ = engine
-                .create_topic(
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(1)
-                        .replication_factor(1)
-                        .assignments(Some([].into()))
-                        .configs(Some([].into())),
-                    false,
-                )
-                .await?;
+        let by_name = TopicId::from("unreadable");
+
+        for topics in [Some(vec![by_name.clone()]), None] {
+            assert_matches!(
+                engine.metadata(topics.as_deref()).await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topics:?}"
+            );
         }
-
-        let connection = engine.connection().await?;
 
         assert_matches!(
             engine
-                .query_one(&connection, topic_by_cluster::QUERY, ["nisshi"])
+                .describe_topic_partitions(Some(&[by_name]), i32::MAX, None)
                 .await,
-            Err(Error::NotOneRow {
-                query: "topic_by_cluster.sql",
-                more_than_one: true
-            })
-        );
-
-        Ok(())
-    }
-
-    /// A topic whose stored row can't be read is a server error in Metadata, not an unknown
-    /// topic, so that a client does not try to create it again. A list of every topic leaves it
-    /// out, and keeps the cluster's other topics.
-    #[tokio::test]
-    async fn metadata_answers_unknown_server_error_for_an_unreadable_topic() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = engine_with_unreadable_topic(&temp_dir).await?;
-
-        let named = engine
-            .metadata(Some(&[TopicId::from("unreadable"), TopicId::from("t")]))
-            .await?;
-
-        assert_eq!(
-            vec![
-                (
-                    Some("unreadable".to_owned()),
-                    i16::from(ErrorCode::UnknownServerError)
-                ),
-                (Some("t".to_owned()), i16::from(ErrorCode::None)),
-            ],
-            named
-                .topics
-                .iter()
-                .map(|topic| (topic.name.clone(), topic.error_code))
-                .collect::<Vec<_>>()
-        );
-
-        let listed = engine.metadata(None).await?;
-
-        assert_eq!(
-            vec![Some("t".to_owned())],
-            listed
-                .topics
-                .iter()
-                .map(|topic| topic.name.clone())
-                .collect::<Vec<_>>()
-        );
-
-        Ok(())
-    }
-
-    /// A topic whose stored row can't be read is a server error in DescribeTopicPartitions, and
-    /// the response still describes the other topics.
-    #[tokio::test]
-    async fn describe_topic_partitions_answers_unknown_server_error_for_an_unreadable_topic()
-    -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = engine_with_unreadable_topic(&temp_dir).await?;
-
-        let described = engine
-            .describe_topic_partitions(
-                Some(&[TopicId::from("unreadable"), TopicId::from("t")]),
-                i32::MAX,
-                None,
-            )
-            .await?;
-
-        assert_eq!(
-            vec![
-                (
-                    Some("unreadable".to_owned()),
-                    i16::from(ErrorCode::UnknownServerError)
-                ),
-                (Some("t".to_owned()), i16::from(ErrorCode::None)),
-            ],
-            described
-                .iter()
-                .map(|topic| (topic.name.clone(), topic.error_code))
-                .collect::<Vec<_>>()
+            Err(Error::UnreadableColumn { .. })
         );
 
         Ok(())

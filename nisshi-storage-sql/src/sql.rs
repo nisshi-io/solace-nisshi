@@ -171,35 +171,10 @@ pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
     }
 }
 
-/// Returns the error code of a topic in a Metadata or DescribeTopicPartitions response when the
-/// read of the topic fails with `error`.
-///
-/// The read does not answer `UNKNOWN_TOPIC_OR_PARTITION`, because that code tells a client that
-/// the topic does not exist, and a client that may create topics then asks the broker to create
-/// it on each metadata refresh.
-///
-/// A transient error answers `LEADER_NOT_AVAILABLE`, the code that Kafka's
-/// [`AutoTopicCreationManager`] answers for a topic that it can't serve yet, so that a client
-/// retries. The Java consumer's `listTopics` retries that code, and fails at once on
-/// `UNKNOWN_SERVER_ERROR` ([`TopicMetadataFetcher.getTopicMetadata`]). Any other error answers
-/// `UNKNOWN_SERVER_ERROR`.
-///
-/// A libSQL or Turso error answers `UNKNOWN_SERVER_ERROR`, because [`Error::is_transient`]
-/// counts every libSQL and Turso error as transient. A retriable code would then make a client
-/// retry a read that never succeeds, such as a read of a missing table, until it times out.
-///
-/// [`AutoTopicCreationManager`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L129-L133
-/// [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
-pub(crate) fn topic_read_error_code(error: &Error) -> ErrorCode {
-    match error {
-        #[cfg(feature = "libsql")]
-        Error::LibSql(_) => ErrorCode::UnknownServerError,
-
-        #[cfg(feature = "turso")]
-        Error::Turso(_) => ErrorCode::UnknownServerError,
-
-        error => error.error_code(ErrorCode::LeaderNotAvailable),
-    }
+/// Returns whether `error` is a column error that a row reader returns: a column that the
+/// result lacks, has twice, or holds a value that its field can't read.
+pub(crate) fn is_column_error(error: &Error) -> bool {
+    column_error_kind(error).is_some()
 }
 
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
@@ -231,7 +206,6 @@ impl ColumnErrorCount {
 /// Reads each row of one query's result as `T`, and counts each column error in the query's
 /// [`ColumnErrorCount`].
 pub(crate) struct ResultRowReader<T: QueryRow> {
-    columns: result_columns::ResultColumns,
     reader: T::Reader,
     column_errors: ColumnErrorCount,
 }
@@ -246,7 +220,6 @@ impl<T: QueryRow> ResultRowReader<T> {
         let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
 
         Ok(Self {
-            columns,
             reader,
             column_errors,
         })
@@ -254,38 +227,6 @@ impl<T: QueryRow> ResultRowReader<T> {
 
     pub(crate) fn read<R: driver::DriverRow>(&self, row: &R) -> Result<T> {
         T::read(&self.reader, row).inspect_err(|err| self.column_errors.record(err))
-    }
-
-    /// Reads `row` as `T`, or returns `None` when a column of `row` can't be read.
-    ///
-    /// Use it only where a result without that row is still a correct answer, such as a list of
-    /// the cluster's topics, so that one corrupt row does not hide the others. It counts and logs
-    /// each skipped row. The log reads the row as `Name`, a row of the columns that identify it,
-    /// so that it names what the result leaves out.
-    pub(crate) fn read_readable<Name, R>(&self, row: &R) -> Result<Option<T>>
-    where
-        Name: QueryRow + fmt::Debug,
-        R: driver::DriverRow,
-    {
-        match T::read(&self.reader, row) {
-            Ok(readable) => Ok(Some(readable)),
-
-            Err(error @ Error::UnreadableColumn { .. }) => {
-                self.column_errors.record(&error);
-
-                let name = Name::reader(&self.columns)
-                    .and_then(|reader| Name::read(&reader, row))
-                    .ok();
-                error!(?name, ?error, "skipped a row that can't be read");
-
-                Ok(None)
-            }
-
-            Err(error) => {
-                self.column_errors.record(&error);
-                Err(error)
-            }
-        }
     }
 }
 
@@ -310,18 +251,6 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
             driver_cursor,
             rows: ResultRowReader::new(columns, column_errors)?,
         })
-    }
-
-    /// Returns the next row that can be read as `T`, or `None` after the last row. It skips each
-    /// row that [`ResultRowReader::read_readable`] skips.
-    pub(crate) async fn next_readable<Name: QueryRow + fmt::Debug>(&mut self) -> Result<Option<T>> {
-        while let Some(row) = self.driver_cursor.next().await? {
-            if let Some(readable) = self.rows.read_readable::<Name, _>(&row)? {
-                return Ok(Some(readable));
-            }
-        }
-
-        Ok(None)
     }
 
     /// Returns the next row as `T`, or `None` after the last row.
@@ -396,7 +325,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher as _},
     marker::PhantomData,
 };
-use tracing::{debug, error};
+use tracing::debug;
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
@@ -822,43 +751,6 @@ mod tests {
     }
 
     /// A failed topic read answers a code that a client retries only when a retry can succeed.
-    #[test]
-    fn topic_read_error_code_is_retriable_only_for_a_transient_error() {
-        use super::topic_read_error_code;
-        use nisshi_sans_io::ErrorCode;
-        use std::io;
-
-        assert_eq!(
-            topic_read_error_code(&Error::from(io::Error::from(
-                io::ErrorKind::ConnectionReset
-            ))),
-            ErrorCode::LeaderNotAvailable
-        );
-
-        assert_eq!(
-            topic_read_error_code(&Error::UnreadableColumn {
-                query: "topic_select_name.sql",
-                column: "partitions",
-                source: Box::new(Error::UnexpectedNull),
-            }),
-            ErrorCode::UnknownServerError
-        );
-
-        // `Error::is_transient` counts this libSQL error as transient, and a retry of it can't
-        // succeed.
-        #[cfg(feature = "libsql")]
-        assert_eq!(
-            topic_read_error_code(&Error::from(libsql::Error::Misuse("no such table".into()))),
-            ErrorCode::UnknownServerError
-        );
-
-        #[cfg(feature = "turso")]
-        assert_eq!(
-            topic_read_error_code(&Error::from(turso::Error::Misuse("no such table".into()))),
-            ErrorCode::UnknownServerError
-        );
-    }
-
     #[test]
     fn txn_produce_partition_check() {
         use super::txn_produce_partition_select::{

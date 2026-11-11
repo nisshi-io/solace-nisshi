@@ -114,10 +114,10 @@ use crate::{
         idempotent_sequence_check, list_offset, pg_record_fetch,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update,
-        result_columns::ResultColumns, row::topic_name, topic_by_cluster,
-        topic_configuration_select, topic_configuration_select_keys,
-        topic_configuration_select_name, topic_configuration_upsert, topic_insert, topic_select,
-        topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
+        result_columns::ResultColumns, topic_by_cluster, topic_configuration_select,
+        topic_configuration_select_keys, topic_configuration_select_name,
+        topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
+        topic_select_uuid, topition_insert, topition_select_id,
         txn_detail_select_status_for_update, txn_detail_select_timed_out,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
         txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
@@ -4825,10 +4825,13 @@ impl Storage for Postgres {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
 
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4897,10 +4900,13 @@ impl Storage for Postgres {
                                     .is_internal(Some(false))
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4918,65 +4924,74 @@ impl Storage for Postgres {
             _ => {
                 let mut responses = vec![];
 
-                let (reader, rows) = self
+                match self
                     .prepare_query_result(&c, topic_by_cluster::QUERY, &[&self.cluster])
-                    .await?;
+                    .await
+                {
+                    Ok((reader, rows)) => {
+                        for row in &rows {
+                            let topic_by_cluster::Row {
+                                uuid,
+                                name,
+                                is_internal,
+                                partitions,
+                                replication_factor,
+                            } = reader.read(row)?;
 
-                // The loop skips each row with an unreadable column, so that one corrupt row
-                // does not hide the cluster's other topics. It leaves the topic out instead of
-                // listing it with `UNKNOWN_SERVER_ERROR`, because the Java consumer's `listTopics`
-                // fails for the whole cluster when one topic of the response has an error that it
-                // can't retry ([`TopicMetadataFetcher.getTopicMetadata`]).
-                //
-                // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
-                for row in &rows {
-                    let Some(topic_by_cluster::Row {
-                        uuid,
-                        name,
-                        is_internal,
-                        partitions,
-                        replication_factor,
-                    }) = reader.read_readable::<topic_name::Row, _>(row)?
-                    else {
-                        continue;
-                    };
+                            let error_code = ErrorCode::None.into();
+                            let topic_id = Some(uuid.into_bytes());
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
-                    let error_code = ErrorCode::None.into();
-                    let topic_id = Some(uuid.into_bytes());
-                    let name = Some(name);
-                    let is_internal = Some(is_internal);
+                            debug!(
+                                ?error_code,
+                                ?topic_id,
+                                ?name,
+                                ?is_internal,
+                                ?partitions,
+                                ?replication_factor
+                            );
 
-                    debug!(
-                        ?error_code,
-                        ?topic_id,
-                        ?name,
-                        ?is_internal,
-                        ?partitions,
-                        ?replication_factor
-                    );
+                            let mut rng = rng();
+                            let mut broker_ids: Vec<_> =
+                                brokers.iter().map(|broker| broker.node_id).collect();
+                            broker_ids.shuffle(&mut rng);
 
-                    let mut rng = rng();
-                    let mut broker_ids: Vec<_> =
-                        brokers.iter().map(|broker| broker.node_id).collect();
-                    broker_ids.shuffle(&mut rng);
+                            let partitions = Some(nisshi_storage::assign_replicas(
+                                &broker_ids,
+                                partitions,
+                                replication_factor,
+                                error_code,
+                                0,
+                            )?);
 
-                    let partitions = Some(nisshi_storage::assign_replicas(
-                        &broker_ids,
-                        partitions,
-                        replication_factor,
-                        error_code,
-                        0,
-                    )?);
+                            responses.push(
+                                MetadataResponseTopic::default()
+                                    .error_code(error_code)
+                                    .name(name)
+                                    .topic_id(topic_id)
+                                    .is_internal(is_internal)
+                                    .partitions(partitions)
+                                    .topic_authorized_operations(Some(-2147483648)),
+                            );
+                        }
+                    }
 
-                    responses.push(
-                        MetadataResponseTopic::default()
-                            .error_code(error_code)
-                            .name(name)
-                            .topic_id(topic_id)
-                            .is_internal(is_internal)
-                            .partitions(partitions)
-                            .topic_authorized_operations(Some(-2147483648)),
-                    );
+                    // A row that can't be read fails the whole request, not only this topic.
+                    Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
+                    Err(reason) => {
+                        error!(?reason);
+                        responses.push(
+                            MetadataResponseTopic::default()
+                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .name(None)
+                                .topic_id(Some(NULL_TOPIC_ID))
+                                .is_internal(Some(false))
+                                .partitions(Some([].into()))
+                                .topic_authorized_operations(Some(-2147483648)),
+                        );
+                    }
                 }
 
                 responses
@@ -5123,10 +5138,13 @@ impl Storage for Postgres {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownServerError.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -5213,10 +5231,13 @@ impl Storage for Postgres {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

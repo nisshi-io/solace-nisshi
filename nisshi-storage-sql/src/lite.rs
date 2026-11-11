@@ -21,7 +21,7 @@ use crate::{
         header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
-        remove_comments, result_columns::ResultColumns, row::topic_name, topic_by_cluster,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
         topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
         topic_insert, topic_select, topic_select_name, topic_select_uuid, topition_insert,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
@@ -687,24 +687,13 @@ impl PoolConnection {
         Ok(row)
     }
 
-    /// Runs `query`, and returns the one row of its result as `T`.
+    /// Runs `query`, and returns the first row of its result as `T`.
     ///
-    /// Returns [`Error::NotOneRow`] when the result has no rows or more than one row.
+    /// Returns a libSQL `Misuse` error when the result has no rows.
     async fn query_one<T: QueryRow>(&self, query: Query<T>, params: impl IntoParams) -> Result<T> {
-        let mut rows = self.query_leading_rows(query, params, 2).await?;
-        let query = query.key();
-
-        match (rows.pop(), rows.pop()) {
-            (Some(row), None) => Ok(row),
-            (None, _) => Err(Error::NotOneRow {
-                query,
-                more_than_one: false,
-            }),
-            (Some(_), Some(_)) => Err(Error::NotOneRow {
-                query,
-                more_than_one: true,
-            }),
-        }
+        self.query_first(query, params)
+            .await?
+            .ok_or_else(|| libsql::Error::Misuse(format!("sql={key}", key = query.key())).into())
     }
 
     /// Returns the newest epoch of `producer` in `cluster`, or `None` when the producer does not
@@ -740,9 +729,6 @@ impl PoolConnection {
     }
 
     /// Adds the next epoch to `producer` in `cluster`, and returns it.
-    ///
-    /// Returns [`Error::NotOneRow`] when the producer does not exist, or when its newest epoch is
-    /// `i16::MAX`.
     async fn producer_epoch_insert(&self, cluster: &str, producer: i64) -> Result<i16> {
         self.query_one(producer_epoch_insert::QUERY, (cluster, producer))
             .await
@@ -4017,10 +4003,13 @@ impl Storage for Delegate {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
 
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4089,10 +4078,13 @@ impl Storage for Delegate {
                                     .is_internal(Some(false))
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::topic_read_error_code(&reason).into())
+                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4114,20 +4106,13 @@ impl Storage for Delegate {
                     .query_rows(topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                // The loop skips each row with an unreadable column, so that one corrupt row
-                // does not hide the cluster's other topics. It leaves the topic out instead of
-                // listing it with `UNKNOWN_SERVER_ERROR`, because the Java consumer's `listTopics`
-                // fails for the whole cluster when one topic of the response has an error that it
-                // can't retry ([`TopicMetadataFetcher.getTopicMetadata`]).
-                //
-                // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
                 while let Some(topic_by_cluster::Row {
                     uuid,
                     name,
                     is_internal,
                     partitions,
                     replication_factor,
-                }) = rows.next_readable::<topic_name::Row>().await?
+                }) = rows.next().await?
                 {
                     let error_code = ErrorCode::None.into();
                     let topic_id = Some(uuid.into_bytes());
@@ -4351,10 +4336,13 @@ impl Storage for Delegate {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownServerError.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -4446,10 +4434,13 @@ impl Storage for Delegate {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::topic_read_error_code(&reason).into())
+                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -8125,27 +8116,6 @@ mod tests {
         PoolConnection::new(connection).await
     }
 
-    /// A one-row read of a result with two rows is an error, instead of the first row.
-    #[tokio::test]
-    async fn query_one_of_two_rows_is_an_error() -> Result<()> {
-        let _guard = init_tracing()?;
-        let db_file = "query-one-of-two-rows-test.db";
-        let _db_file_guard = DbFileGuard::new(db_file);
-        let connection = connection_with_two_topics(db_file).await?;
-
-        assert_matches!(
-            connection
-                .query_one(topic_by_cluster::QUERY, ["nisshi"])
-                .await,
-            Err(Error::NotOneRow {
-                query: "topic_by_cluster.sql",
-                more_than_one: true
-            })
-        );
-
-        Ok(())
-    }
-
     /// Each row that a read returns holds its own values. A libSQL `Row` reads from the
     /// statement's current row, so a row read after the next step would hold the next row's
     /// values.
@@ -8549,94 +8519,39 @@ mod tests {
         Ok((engine, healthy, unreadable))
     }
 
-    /// A topic whose stored row can't be read is a server error in Metadata, by name and by ID,
-    /// not an unknown topic, so that a client does not try to create it again. A list of every
-    /// topic leaves it out, and keeps the cluster's other topics.
+    /// A topic whose stored row can't be read fails each Metadata and DescribeTopicPartitions
+    /// request that reads it: by name, by ID, and in a list of every topic.
     #[tokio::test]
-    async fn metadata_answers_unknown_server_error_for_an_unreadable_topic() -> Result<()> {
+    async fn a_request_that_reads_an_unreadable_topic_fails() -> Result<()> {
+        use std::assert_matches;
+
         let _guard = init_tracing()?;
 
-        let db_file = "metadata-unreadable-topic-test.db";
+        let db_file = "unreadable-topic-request-test.db";
         let _db_file_guard = DbFileGuard::new(db_file);
 
-        let (engine, healthy, unreadable) = engine_with_unreadable_topic(db_file).await?;
+        let (engine, _healthy, unreadable) = engine_with_unreadable_topic(db_file).await?;
 
-        let named = engine
-            .metadata(Some(&[
-                TopicId::from("unreadable"),
-                TopicId::from(unreadable),
-                TopicId::from(healthy.topic()),
-            ]))
-            .await?;
+        let by_name = TopicId::from("unreadable");
+        let by_id = TopicId::from(unreadable);
 
-        assert_eq!(
-            vec![
-                (
-                    Some("unreadable".to_owned()),
-                    i16::from(ErrorCode::UnknownServerError)
-                ),
-                (None, i16::from(ErrorCode::UnknownServerError)),
-                (Some(healthy.topic().to_owned()), i16::from(ErrorCode::None)),
-            ],
-            named
-                .topics
-                .iter()
-                .map(|topic| (topic.name.clone(), topic.error_code))
-                .collect::<Vec<_>>()
-        );
+        for topics in [Some(vec![by_name.clone()]), Some(vec![by_id.clone()]), None] {
+            assert_matches!(
+                engine.metadata(topics.as_deref()).await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topics:?}"
+            );
+        }
 
-        let listed = engine.metadata(None).await?;
-
-        assert_eq!(
-            vec![Some(healthy.topic().to_owned())],
-            listed
-                .topics
-                .iter()
-                .map(|topic| topic.name.clone())
-                .collect::<Vec<_>>()
-        );
-
-        Ok(())
-    }
-
-    /// A topic whose stored row can't be read is a server error in DescribeTopicPartitions, by
-    /// name and by ID, and the response still describes the other topics.
-    #[tokio::test]
-    async fn describe_topic_partitions_answers_unknown_server_error_for_an_unreadable_topic()
-    -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let db_file = "describe-topic-partitions-unreadable-topic-test.db";
-        let _db_file_guard = DbFileGuard::new(db_file);
-
-        let (engine, healthy, unreadable) = engine_with_unreadable_topic(db_file).await?;
-
-        let described = engine
-            .describe_topic_partitions(
-                Some(&[
-                    TopicId::from("unreadable"),
-                    TopicId::from(unreadable),
-                    TopicId::from(healthy.topic()),
-                ]),
-                i32::MAX,
-                None,
-            )
-            .await?;
-
-        assert_eq!(
-            vec![
-                (
-                    Some("unreadable".to_owned()),
-                    i16::from(ErrorCode::UnknownServerError)
-                ),
-                (None, i16::from(ErrorCode::UnknownServerError)),
-                (Some(healthy.topic().to_owned()), i16::from(ErrorCode::None)),
-            ],
-            described
-                .iter()
-                .map(|topic| (topic.name.clone(), topic.error_code))
-                .collect::<Vec<_>>()
-        );
+        for topic in [by_name, by_id] {
+            assert_matches!(
+                engine
+                    .describe_topic_partitions(Some(std::slice::from_ref(&topic)), i32::MAX, None)
+                    .await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topic:?}"
+            );
+        }
 
         Ok(())
     }

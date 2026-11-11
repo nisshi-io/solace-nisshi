@@ -409,13 +409,6 @@ pub enum Error {
         nth: u32,
     },
     NoSuchOffset(i64),
-
-    /// `query` must return exactly one row, and its result has none, or more than one when
-    /// `more_than_one` is true. `query` is the query's name in the SQL cache.
-    NotOneRow {
-        query: &'static str,
-        more_than_one: bool,
-    },
     OsString(OsString),
 
     /// The error when the storage at `storage` fails at startup. `failure` names what failed.
@@ -656,7 +649,6 @@ impl Error {
             | Self::MissingColumn { .. }
             | Self::NoSuchEntry { .. }
             | Self::NoSuchOffset(_)
-            | Self::NotOneRow { .. }
             | Self::OsString(_)
             | Self::StartupFailed { .. }
             | Self::ParseFilter(_)
