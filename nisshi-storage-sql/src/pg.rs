@@ -4838,11 +4838,9 @@ impl Storage for Postgres {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
@@ -4855,7 +4853,7 @@ impl Storage for Postgres {
                         TopicId::Id(id) => {
                             debug!(?id);
                             let selected = self
-                                .prepare_query_one_row(
+                                .prepare_query_optional_row(
                                     &c,
                                     topic_select_uuid::PG_QUERY,
                                     &[&self.cluster, &id],
@@ -4863,13 +4861,13 @@ impl Storage for Postgres {
                                 .await;
 
                             match selected {
-                                Ok(topic_select_uuid::Row {
+                                Ok(Some(topic_select_uuid::Row {
                                     uuid,
                                     name,
                                     is_internal,
                                     partitions,
                                     replication_factor,
-                                }) => {
+                                })) => {
                                     let error_code = ErrorCode::None.into();
                                     let topic_id = Some(uuid.into_bytes());
                                     let name = Some(name);
@@ -4905,15 +4903,20 @@ impl Storage for Postgres {
                                         .partitions(partitions)
                                         .topic_authorized_operations(Some(-2147483648))
                                 }
+                                Ok(None) => MetadataResponseTopic::default()
+                                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                    .name(None)
+                                    .topic_id(Some(id.into_bytes()))
+                                    .is_internal(Some(false))
+                                    .partitions(Some([].into()))
+                                    .topic_authorized_operations(Some(-2147483648)),
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
@@ -5167,11 +5170,9 @@ impl Storage for Postgres {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownServerError,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
@@ -5190,17 +5191,21 @@ impl Storage for Postgres {
                 TopicId::Id(id) => {
                     debug!(?id);
                     let selected = self
-                        .prepare_query_one_row(&c, topic_select_uuid::QUERY, &[&self.cluster, &id])
+                        .prepare_query_optional_row(
+                            &c,
+                            topic_select_uuid::QUERY,
+                            &[&self.cluster, &id],
+                        )
                         .await;
 
                     match selected {
-                        Ok(topic_select_uuid::Row {
+                        Ok(Some(topic_select_uuid::Row {
                             uuid,
                             name,
                             is_internal,
                             partitions,
                             replication_factor,
-                        }) => {
+                        })) => {
                             let topic_id = uuid.into_bytes();
                             let name = Some(name);
                             let is_internal = Some(is_internal);
@@ -5247,15 +5252,21 @@ impl Storage for Postgres {
                                 .topic_authorized_operations(-2147483648)
                         }
 
+                        Ok(None) => DescribeTopicPartitionsResponseTopic::default()
+                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .name(None)
+                            .topic_id(id.into_bytes())
+                            .is_internal(false)
+                            .partitions(Some([].into()))
+                            .topic_authorized_operations(-2147483648),
+
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownTopicOrPartition,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),

@@ -4023,11 +4023,9 @@ impl Storage for Delegate {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
@@ -4101,11 +4099,9 @@ impl Storage for Delegate {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
@@ -4369,11 +4365,9 @@ impl Storage for Delegate {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownServerError,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
@@ -4470,11 +4464,9 @@ impl Storage for Delegate {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownTopicOrPartition,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),

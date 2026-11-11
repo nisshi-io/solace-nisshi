@@ -2317,11 +2317,9 @@ impl Storage for Engine {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
@@ -2395,11 +2393,9 @@ impl Storage for Engine {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(
-                                            sql::topic_read_error_code(
-                                                &reason,
-                                                ErrorCode::UnknownTopicOrPartition,
-                                            )
-                                            .into(),
+                                            reason
+                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                                .into(),
                                         )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
@@ -2645,11 +2641,9 @@ impl Storage for Engine {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownServerError,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
@@ -2747,11 +2741,9 @@ impl Storage for Engine {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(
-                                    sql::topic_read_error_code(
-                                        &reason,
-                                        ErrorCode::UnknownTopicOrPartition,
-                                    )
-                                    .into(),
+                                    reason
+                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
+                                        .into(),
                                 )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
@@ -5111,9 +5103,8 @@ mod tests {
         Ok(engine)
     }
 
-    /// A ListGroups must answer a stored group whose detail isn't text with
-    /// `UNKNOWN_SERVER_ERROR`, as it answers a detail that isn't JSON, and list the other groups
-    /// as usual.
+    /// A ListGroups must answer a stored group whose detail isn't text with `UNKNOWN_SERVER_ERROR`
+    /// as it answers a detail that isn't JSON, and list the other groups as usual.
     #[tokio::test]
     async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
     {

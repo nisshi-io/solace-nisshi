@@ -185,22 +185,18 @@ pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
     }
 }
 
-/// Returns the error code that a Metadata or DescribeTopicPartitions response gives a topic whose
-/// read failed with `error`. `query_error_code` is the code for any error other than a column
-/// error, such as a failed query.
+/// The error code of a topic in a Metadata or DescribeTopicPartitions response when the read of
+/// the topic fails with a transient error. A permanent error, such as a corrupt stored row,
+/// answers `UNKNOWN_SERVER_ERROR` through [`Error::error_code`].
 ///
-/// A column error means that the topic's stored row is corrupt, or that the query doesn't match
-/// its row, and a retry fixes neither. The topic then gets `UNKNOWN_SERVER_ERROR`, which a client
-/// does not retry, instead of `UNKNOWN_TOPIC_OR_PARTITION`. That code tells a client that the
-/// topic does not exist, and a client that may create topics then asks the broker to create it,
-/// which fails because the topic exists, on each metadata refresh.
-pub(crate) fn topic_read_error_code(error: &Error, query_error_code: ErrorCode) -> ErrorCode {
-    if column_error_kind(error).is_some() {
-        ErrorCode::UnknownServerError
-    } else {
-        query_error_code
-    }
-}
+/// Kafka's [`AutoTopicCreationManager`] answers `LEADER_NOT_AVAILABLE` for a topic that it can't
+/// serve yet, and Kafka clients refresh their metadata and retry that code. The read does not
+/// answer `UNKNOWN_TOPIC_OR_PARTITION`, because that code tells a client that the topic does not
+/// exist, and a client that may create topics then asks the broker to create it on each metadata
+/// refresh.
+///
+/// [`AutoTopicCreationManager`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L129-L133
+pub(crate) const TOPIC_READ_RETRIABLE_ERROR_CODE: ErrorCode = ErrorCode::LeaderNotAvailable;
 
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
 /// the engine gives the query and the error's [`column_error_kind`] as `kind`.
