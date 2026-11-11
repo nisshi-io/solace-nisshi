@@ -30,4 +30,4 @@ select exists (
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     where c.relname = 'nisshi_schema_version'
     and n.nspname = any (current_schemas(false))
-)
+) as version_table_exists

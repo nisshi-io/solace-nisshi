@@ -15,7 +15,7 @@
 
 select
 
-coalesce(pd.sequence, 0)
+coalesce(pd.sequence, 0) as sequence
 
 from
 

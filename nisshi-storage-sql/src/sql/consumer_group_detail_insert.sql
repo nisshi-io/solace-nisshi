@@ -35,4 +35,4 @@ e_tag = $4
 
 where consumer_group_detail.e_tag = $3
 
-returning $2, $1, e_tag, detail;
+returning $2 as consumer_group_name, $1 as cluster_name, e_tag, detail;

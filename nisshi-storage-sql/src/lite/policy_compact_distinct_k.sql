@@ -14,6 +14,6 @@
 -- limitations under the License.
 
 select
-distinct r.k
+distinct r.k as key
 from record r
 where r.topition = $1

@@ -12,164 +12,104 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The PostgreSQL queries that read the records of a fetch with their headers, in offset order, and
-//! the names of the columns that PostgreSQL reads from their result. The two versions return the
-//! same columns. A change to either version's `select` list must keep these names.
+//! The PostgreSQL queries that read the records of a fetch with their headers, in offset order.
+//! The two versions return the same columns.
 //!
 //! Each version takes seven parameters: `$1` is the cluster's name, `$2` the topic's name, `$3` the
 //! partition's index, `$4` the fetch offset, `$5` the fetch's byte limit, and `$6` the offset that
 //! ends the read, which the read does not include. The last parameter is the most rows that the
 //! read returns: `$7`, or `$8` in the keyed version, which takes the key as `$7`.
 
-#[cfg(feature = "postgres")]
-use bytes::Bytes;
+use super::{Query, driver::KafkaTimestamp};
+
 #[cfg(feature = "postgres")]
 use nisshi_sans_io::record::Header;
 #[cfg(feature = "postgres")]
 use nisshi_storage::{Error, FetchedRecord, Result};
-#[cfg(feature = "postgres")]
-use tokio_postgres::types::FromSql;
-
-#[cfg(feature = "postgres")]
-use crate::pg::KafkaTimestamp;
 
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "pg/record_fetch.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("pg/record_fetch.sql");
 
 /// The keyed version's name in the SQL cache. This version reads only the records with the key.
-pub(crate) const KEYED_QUERY: &str = "pg/record_fetch_keyed.sql";
+pub(crate) const KEYED_QUERY: Query<Row> = Query::new("pg/record_fetch_keyed.sql");
 
-/// The record's offset.
-#[cfg(feature = "postgres")]
-const OFFSET_ID: &str = "offset_id";
+sql_row! {
+    /// One record of the partition, with its headers.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The record's offset.
+        offset_id: i64,
+        /// The attributes of the record's batch.
+        attributes: Option<i16>,
+        /// The record's timestamp. A record without a timestamp reads as -1.
+        timestamp: KafkaTimestamp,
+        /// The record's key.
+        key: Option<bytes::Bytes>,
+        /// The record's value.
+        value: Option<bytes::Bytes>,
+        /// The ID of the producer that wrote the record.
+        producer_id: Option<i64>,
+        /// The epoch of the producer that wrote the record.
+        producer_epoch: Option<i16>,
+        /// The keys of the record's headers, in produce order. It is null for a record without
+        /// headers.
+        header_keys: Option<Vec<Option<bytes::Bytes>>>,
+        /// The values of the record's headers, in the order of `header_keys`. It is null for a
+        /// record without headers.
+        header_values: Option<Vec<Option<bytes::Bytes>>>,
+    }
+}
 
-/// The attributes of the record's batch.
+/// A record's offset, read from a result that returns a whole [`Row`].
+///
+/// A fetch reads it from a row that it can't read as a [`Row`], so that the fetch's log names the
+/// record, which the column error does not.
 #[cfg(feature = "postgres")]
-const ATTRIBUTES: &str = "attributes";
-
-/// The record's timestamp.
-#[cfg(feature = "postgres")]
-const TIMESTAMP: &str = "timestamp";
-
-/// The record's key.
-#[cfg(feature = "postgres")]
-const KEY: &str = "k";
-
-/// The record's value.
-#[cfg(feature = "postgres")]
-const VALUE: &str = "v";
-
-/// The ID of the producer that wrote the record.
-#[cfg(feature = "postgres")]
-const PRODUCER_ID: &str = "producer_id";
-
-/// The epoch of the producer that wrote the record.
-#[cfg(feature = "postgres")]
-const PRODUCER_EPOCH: &str = "producer_epoch";
-
-/// The keys of the record's headers, in produce order. It is null for a record without headers.
-#[cfg(feature = "postgres")]
-const HEADER_KEYS: &str = "header_keys";
-
-/// The values of the record's headers, in the order of [`HEADER_KEYS`]. It is null for a record
-/// without headers.
-#[cfg(feature = "postgres")]
-const HEADER_VALUES: &str = "header_values";
-
-/// One record of the partition, with its headers.
-#[cfg(feature = "postgres")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Row {
-    /// The record's offset.
-    offset_id: i64,
-    /// The attributes of the record's batch, or 0 when the record stores none.
-    attributes: i16,
-    /// The record's timestamp, in milliseconds since the epoch.
-    timestamp: i64,
-    /// The record's key.
-    key: Option<Bytes>,
-    /// The record's value.
-    value: Option<Bytes>,
-    /// The ID of the producer that wrote the record, or -1 when the record stores none.
-    producer_id: i64,
-    /// The epoch of the producer that wrote the record, or -1 when the record stores none.
-    producer_epoch: i16,
-    /// The record's headers, in produce order.
-    headers: Vec<Header>,
+pub(crate) mod offset {
+    sql_row! {
+        /// One record's offset.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(crate) struct Row {
+            /// The record's offset.
+            offset_id: i64,
+        }
+    }
 }
 
 #[cfg(feature = "postgres")]
-impl TryFrom<&tokio_postgres::Row> for Row {
+impl TryFrom<Row> for FetchedRecord {
     type Error = Error;
 
-    /// Reads one row of the query's result. An error names the record's offset, once that column
-    /// has been read, and the column that failed.
-    fn try_from(row: &tokio_postgres::Row) -> Result<Self> {
-        let offset_id = row.try_get::<_, i64>(OFFSET_ID).map_err(|error| {
-            Error::Message(format!("fetched record: column {OFFSET_ID}: {error}"))
-        })?;
-
-        let header_keys =
-            column::<Option<Vec<Option<&[u8]>>>>(row, offset_id, HEADER_KEYS)?.unwrap_or_default();
-        let header_values = column::<Option<Vec<Option<&[u8]>>>>(row, offset_id, HEADER_VALUES)?
-            .unwrap_or_default();
+    /// Returns the record that `row` stores. An error names the record's offset.
+    fn try_from(row: Row) -> Result<Self> {
+        let offset = row.offset_id;
+        let header_keys = row.header_keys.unwrap_or_default();
+        let header_values = row.header_values.unwrap_or_default();
 
         // Both arrays aggregate the same header rows, so a difference in length means that the
         // query no longer pairs each key with its value.
         if header_keys.len() != header_values.len() {
             return Err(Error::Message(format!(
-                "fetched record at offset {offset_id}: {HEADER_KEYS} has {} entries, \
-                 {HEADER_VALUES} has {}",
+                "fetched record at offset {offset}: header_keys has {} entries, \
+                 header_values has {}",
                 header_keys.len(),
                 header_values.len()
             )));
         }
 
         Ok(Self {
-            offset_id,
-            attributes: column::<Option<i16>>(row, offset_id, ATTRIBUTES)?.unwrap_or(0),
-            timestamp: column::<KafkaTimestamp>(row, offset_id, TIMESTAMP)?.0,
-            key: column::<Option<&[u8]>>(row, offset_id, KEY)?.map(Bytes::copy_from_slice),
-            value: column::<Option<&[u8]>>(row, offset_id, VALUE)?.map(Bytes::copy_from_slice),
-            producer_id: column::<Option<i64>>(row, offset_id, PRODUCER_ID)?.unwrap_or(-1),
-            producer_epoch: column::<Option<i16>>(row, offset_id, PRODUCER_EPOCH)?.unwrap_or(-1),
+            offset,
+            timestamp: row.timestamp.0,
+            attributes: row.attributes.unwrap_or(0),
+            producer_id: row.producer_id.unwrap_or(-1),
+            producer_epoch: row.producer_epoch.unwrap_or(-1),
+            key: row.key,
+            value: row.value,
             headers: header_keys
                 .into_iter()
                 .zip(header_values)
-                .map(|(key, value)| Header {
-                    key: key.map(Bytes::copy_from_slice),
-                    value: value.map(Bytes::copy_from_slice),
-                })
+                .map(|(key, value)| Header { key, value }.into())
                 .collect(),
         })
     }
-}
-
-#[cfg(feature = "postgres")]
-impl From<Row> for FetchedRecord {
-    fn from(row: Row) -> Self {
-        Self {
-            offset: row.offset_id,
-            timestamp: row.timestamp,
-            attributes: row.attributes,
-            producer_id: row.producer_id,
-            producer_epoch: row.producer_epoch,
-            key: row.key,
-            value: row.value,
-            headers: row.headers.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-/// Returns the column `name` of `row`, the record at `offset_id`, with an error that names both.
-#[cfg(feature = "postgres")]
-fn column<'a, T>(row: &'a tokio_postgres::Row, offset_id: i64, name: &str) -> Result<T>
-where
-    T: FromSql<'a>,
-{
-    row.try_get(name).map_err(|error| {
-        Error::Message(format!(
-            "fetched record at offset {offset_id}: column {name}: {error}"
-        ))
-    })
 }

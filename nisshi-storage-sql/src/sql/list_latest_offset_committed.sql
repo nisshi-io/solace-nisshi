@@ -72,7 +72,7 @@ last_stable as (
 
 select
 
-coalesce(last_stable.offset_id, requested_topition.high, 0),
+coalesce(last_stable.offset_id, requested_topition.high, 0) as offset_id,
 r.timestamp
 
 from

@@ -36,9 +36,9 @@ changes.
   }
   ```
 
-  A query whose engines read no column, because a row only means that something exists, needs
-  only a `QUERY` that holds its name, as a `&str`. Variants of one query, such as a PostgreSQL version and a SQLite version, are
-  constants in one module.
+  A query whose engines read no column, because a row only means that something exists, gets no
+  module: its constant goes in the `plain` list of `queries!`, as `TOPIC_SELECT` does. Variants of
+  one query, such as a PostgreSQL version and a SQLite version, are constants in one module.
 - **Name a field as its column, and rename a column in the SQL.** When the Rust name should differ
   from a table's column, the query renames the column with `as`, as in `p.id as producer_id`.
 - **Share one row type between the queries that return the same thing.** Declare it once, in an
@@ -57,14 +57,22 @@ changes.
   }
   ```
 
-  Use a one-row helper for a result of at most one row.
+  Use a one-row helper for a result of at most one row. Build a reader yourself only to read one
+  result as two row types, as PostgreSQL's fetch does through `prepare_query_result`.
 - **Write the row type qualified, as `topic_select::Row`.** Each engine file also imports its
   driver's own `Row`, and the qualified name shows which of the two a line means.
 - **Declare each field as the driver reads it, and decode it in the engine.** A field's type
   implements `FromColumn` in `sql/driver.rs`. A JSON column is
   `serde_json::Result<serde_json::Value>`, so the engine decides what an undecodable document does
-  to the rest of the result. A new kind of column gets one `FromColumn` implementation, and a new
+  to the rest of the result. A time column is a `KafkaTimestamp` field, which reads integer
+  milliseconds on libSQL and Turso, so it can't read a column with a `current_timestamp` default,
+  which holds text there. A new kind of column gets one `FromColumn` implementation, and a new
   kind of stored value gets one `DriverRow` method for each driver.
+- **Let each engine's `every_row_query_returns_the_columns_of_its_row` test check every new
+  query.** The test prepares each query in the `rows` list of `queries!` from the folders that the
+  engine runs, and builds the query's reader, so a query whose column names don't match its row
+  fails CI, not a rare path at runtime. The check compares names only, not types. A query that an
+  engine doesn't run and can't prepare goes in that engine's `skipped` list, with the reason.
 - **Put what a row means in the query's module.** When a result has a row that is not data, such
   as a marker row for a topic that sets none of the requested keys, the module gives `Row` a method
   that returns `None` for it, and each engine calls that method instead of testing the field.
@@ -79,5 +87,5 @@ changes.
 ## The Test
 
 Change the order of a query's `select` list. Every engine still reads the same values. Rename a
-column in the query. Every engine returns `Error::MissingColumn`, which names the column, even when
-the result has no rows.
+column in the query. Every engine returns `Error::MissingColumn`, and the
+`every_row_query_returns_the_columns_of_its_row` tests fail.

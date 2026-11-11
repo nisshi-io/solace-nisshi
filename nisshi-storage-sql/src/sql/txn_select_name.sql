@@ -15,7 +15,7 @@
 
 select
 
-p.id
+p.id as producer_id
 
 from
 

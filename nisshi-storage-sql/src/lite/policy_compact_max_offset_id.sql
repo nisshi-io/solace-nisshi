@@ -14,7 +14,7 @@
 -- limitations under the License.
 
 select
-    max(r.offset_id)
+    max(r.offset_id) as max_offset_id
 from record r
 where r.topition = $1
 and r.k = $2

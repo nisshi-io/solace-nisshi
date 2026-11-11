@@ -99,8 +99,8 @@ select
 r.offset_id,
 r.attributes,
 r.timestamp,
-r.k,
-r.v,
+r.k as key,
+r.v as value,
 s.bytes,
 r.producer_id,
 r.producer_epoch

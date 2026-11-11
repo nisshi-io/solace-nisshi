@@ -21,4 +21,4 @@ and t.name = $2
 and tp.partition = $3
 and t.cluster = c.id
 and tp.topic = t.id
-returning watermark.id;
+returning watermark.id as id;
