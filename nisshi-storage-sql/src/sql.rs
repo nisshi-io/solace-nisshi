@@ -193,9 +193,15 @@ impl ColumnErrorCount {
         }
     }
 
-    /// Counts `error` when a row reader returned it, and ignores any other error.
+    /// Counts and logs `error` when a row reader returned it, and ignores any other error.
+    ///
+    /// The log names the query and the column, which the error holds. The engines log a driver's
+    /// error where their query helpers receive it, and this log does the same for a column error,
+    /// so that each failed read has a log whichever caller receives the error.
     pub(crate) fn record(&self, error: &Error) {
         if let Some(kind) = column_error_kind(error) {
+            error!(?error, "a column of the result can't be read");
+
             let mut attributes = self.attributes.clone();
             attributes.push(KeyValue::new("kind", kind));
             self.counter.add(1, &attributes);
@@ -325,7 +331,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher as _},
     marker::PhantomData,
 };
-use tracing::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
