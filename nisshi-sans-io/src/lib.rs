@@ -366,10 +366,16 @@ pub enum Error {
     /// The encoder has no bytes to write for it, and skipping it would shift every later field.
     /// `field` is the field's path, e.g. `Frame.FetchRequest.FetchTopic.FetchPartition.current_leader_epoch`,
     /// and `api_version` is the version that the message was encoded at.
-    ///
-    /// The decoder returns it too, for a list that is not nullable at the decoded version and
-    /// came off the wire as null, as Kafka's reader refuses it.
     MandatoryFieldUnset {
+        field: String,
+        api_version: i16,
+    },
+    /// An array or string came off the wire as null at a version where its field is not nullable.
+    ///
+    /// Kafka's reader refuses it too, and the broker closes the connection. `field` is the field's
+    /// path in the decoder, e.g. `body.topics`, and `api_version` is the version that the message
+    /// was decoded at.
+    NullNotAllowed {
         field: String,
         api_version: i16,
     },
@@ -419,6 +425,12 @@ impl Display for Error {
                 write!(
                     f,
                     "field {field} is mandatory at version {api_version} but unset"
+                )
+            }
+            Error::NullNotAllowed { field, api_version } => {
+                write!(
+                    f,
+                    "field {field} was null on the wire at version {api_version}, which does not allow null"
                 )
             }
             Error::OffsetDeltaOverflow(sum) => {
@@ -2502,6 +2514,8 @@ pub trait Decode: Sized {
 mod tests {
     use std::{assert_matches, io::Write, thread::sleep};
 
+    use crate::metadata_request::MetadataRequestTopic;
+
     use super::*;
 
     #[test]
@@ -2986,7 +3000,7 @@ mod tests {
             } else {
                 assert_matches!(
                     decoded,
-                    Err(Error::MandatoryFieldUnset { api_version, .. }) if api_version == version,
+                    Err(Error::NullNotAllowed { api_version, .. }) if api_version == version,
                     "{api_key} v{version}"
                 );
             }
@@ -3003,6 +3017,97 @@ mod tests {
         assert_matches!(
             frame.body,
             Body::MetadataRequest(MetadataRequest { topics: Some(topics), .. }) if topics.is_empty()
+        );
+    }
+
+    /// A null string, flexible or not, fails to decode where its field is not nullable, as
+    /// Kafka's reader refuses it. Metadata's topic `name` is nullable only from v10, and the
+    /// message is flexible from v9, so v8 is a non-flexible string and v9 a flexible one.
+    #[test]
+    fn a_null_string_fails_to_decode_where_it_is_not_nullable() {
+        for (version, body) in [
+            // One topic, whose name is -1.
+            (8, &[0, 0, 0, 1, 0xff, 0xff][..]),
+            // The header's tag buffer, then one topic (the length is one more than the count),
+            // whose name is 0.
+            (9, &[0, 2, 0][..]),
+        ] {
+            assert_matches!(
+                Frame::request_from_bytes(request_bytes(MetadataRequest::KEY, version, body)),
+                Err(Error::NullNotAllowed { api_version, .. }) if api_version == version,
+                "Metadata v{version}"
+            );
+        }
+    }
+
+    /// A null flexible array fails to decode where its field is not nullable. CreateTopics'
+    /// `topics` is flexible from v5 and never nullable.
+    #[test]
+    fn a_null_flexible_array_fails_to_decode_where_it_is_not_nullable() {
+        assert_matches!(
+            Frame::request_from_bytes(request_bytes(CreateTopicsRequest::KEY, 5, &[0, 0])),
+            Err(Error::NullNotAllowed { api_version: 5, .. })
+        );
+    }
+
+    /// The error names the field and the version.
+    #[test]
+    fn null_not_allowed_names_the_field_and_the_version() {
+        let Err(error) =
+            Frame::request_from_bytes(request_bytes(MetadataRequest::KEY, 0, &[0xff; 4]))
+        else {
+            panic!("a null list of topics at v0 decoded");
+        };
+
+        assert_eq!(
+            "field body.topics was null on the wire at version 0, which does not allow null",
+            error.to_string()
+        );
+    }
+
+    /// A flexible string and a flexible array that are nullable at the version still decode null:
+    /// Metadata's topic `name` is nullable from v10 and its `topics` from v1, and the message is
+    /// flexible from v9.
+    #[test]
+    fn a_null_flexible_string_and_array_decode_where_they_are_nullable() {
+        let decode = |version, topics| {
+            let header = Header::Request {
+                api_key: MetadataRequest::KEY,
+                api_version: version,
+                correlation_id: 1,
+                client_id: None,
+            };
+            let request = MetadataRequest {
+                topics,
+                allow_auto_topic_creation: Some(false),
+                include_cluster_authorized_operations: Some(false),
+                include_topic_authorized_operations: Some(false),
+                ..Default::default()
+            };
+
+            Frame::request_from_bytes(Frame::request(header, request.into()).expect("encodes"))
+                .unwrap_or_else(|err| panic!("v{version}: {err}"))
+        };
+
+        let frame = decode(
+            10,
+            Some(vec![MetadataRequestTopic {
+                topic_id: Some([1; 16]),
+                name: None,
+            }]),
+        );
+
+        assert_matches!(
+            frame.body,
+            Body::MetadataRequest(MetadataRequest { topics: Some(topics), .. })
+                if matches!(topics.as_slice(), [MetadataRequestTopic { name: None, .. }])
+        );
+
+        let frame = decode(9, None);
+
+        assert_matches!(
+            frame.body,
+            Body::MetadataRequest(MetadataRequest { topics: None, .. })
         );
     }
 

@@ -274,6 +274,31 @@ impl<'de> Decoder<'de> {
             || self.meta.field.is_some_and(|field| field.kind.is_string())
     }
 
+    /// Refuse a length that says null (-1 for a non-flexible array or string, 0 for a flexible
+    /// one) at a version where the field is not nullable.
+    ///
+    /// Kafka's generated reader throws for a negative length outside the field's
+    /// `nullableVersions`, for every length-prefixed type, so the request fails to decode and the
+    /// broker closes the connection with no response: a Metadata v0 request with a null list of
+    /// topics, as one example ([MessageDataGenerator.java#L620-L626],
+    /// [RequestContext.java#L111-L131]). The request header's client ID is the exception: it is
+    /// nullable at every version and has no field metadata.
+    ///
+    /// This covers arrays and strings. Bytes and records are not checked here.
+    ///
+    /// [MessageDataGenerator.java#L620-L626]: https://github.com/apache/kafka/blob/3.9.1/generator/src/main/java/org/apache/kafka/message/MessageDataGenerator.java#L620-L626
+    /// [RequestContext.java#L111-L131]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L131
+    fn refuse_null_unless_nullable(&self) -> Result<()> {
+        if self.in_header() || self.is_nullable() {
+            return Ok(());
+        }
+
+        Err(Error::NullNotAllowed {
+            field: self.field_name(),
+            api_version: self.api_version.unwrap_or_default(),
+        })
+    }
+
     fn read_mandatory_non_nullable_length(&mut self) -> Result<()> {
         debug!(
             "header mezzanine: {}, nullable: {}, valid: {}",
@@ -754,6 +779,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 if self.is_flexible() {
                     self.unsigned_varint().and_then(|length| {
                         if length == 0 {
+                            self.refuse_null_unless_nullable()?;
                             self.length = None;
                             visitor.visit_none()
                         } else {
@@ -769,22 +795,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                     debug!(length);
 
                     if length == -1 {
-                        // Kafka's generated reader throws for a null array outside the field's
-                        // `nullableVersions`, so the request fails to decode and the broker
-                        // closes the connection with no response: a Metadata v0 request with a
-                        // null list of topics, as one example
-                        // ([MessageDataGenerator.java#L620-L626],
-                        // [RequestContext.java#L111-L131]).
-                        //
-                        // [MessageDataGenerator.java#L620-L626]: https://github.com/apache/kafka/blob/3.9.1/generator/src/main/java/org/apache/kafka/message/MessageDataGenerator.java#L620-L626
-                        // [RequestContext.java#L111-L131]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L131
-                        if !self.is_nullable() {
-                            return Err(Error::MandatoryFieldUnset {
-                                field: self.field_name(),
-                                api_version: self.api_version.unwrap_or_default(),
-                            });
-                        }
-
+                        self.refuse_null_unless_nullable()?;
                         self.length = None;
                         visitor.visit_none()
                     } else {
@@ -796,6 +807,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 if self.is_flexible() {
                     self.unsigned_varint().and_then(|length| {
                         if length == 0 {
+                            self.refuse_null_unless_nullable()?;
                             self.length = None;
                             visitor.visit_none()
                         } else {
@@ -811,6 +823,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                     debug!(length);
 
                     if length == -1 {
+                        self.refuse_null_unless_nullable()?;
                         self.length = None;
                         visitor.visit_none()
                     } else {
