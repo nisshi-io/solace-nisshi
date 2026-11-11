@@ -423,6 +423,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
             ))
             .expect("fetch");
             let fetched_records: usize = fetched
+                .batches
                 .iter()
                 .map(|batch| batch.record_count as usize)
                 .sum();
