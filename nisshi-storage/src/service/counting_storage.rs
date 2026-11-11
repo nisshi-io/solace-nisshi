@@ -104,6 +104,7 @@ pub(crate) struct CountingStorage {
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
     produced: Arc<Mutex<Vec<Produced>>>,
+    produce_failure: Option<(Topition, Error)>,
     produce_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
 }
@@ -151,6 +152,15 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with each produce to `topition` failing with `error`, and recording
+    /// nothing. A produce to any other partition succeeds.
+    pub(crate) fn with_failing_produce(self, topition: Topition, error: Error) -> Self {
+        Self {
+            produce_failure: Some((topition, error)),
+            ..self
+        }
+    }
+
     /// The number of produces now waiting for the gate.
     pub(crate) fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
@@ -170,6 +180,12 @@ impl CountingStorage {
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
             permit?.forget();
+        }
+
+        if let Some((failing, error)) = &self.produce_failure
+            && failing == topition
+        {
+            return Err(error.clone());
         }
 
         self.produced.lock()?.push(Produced {

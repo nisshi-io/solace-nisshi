@@ -219,6 +219,7 @@ pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
 mod operation;
+mod produce_entry;
 mod produce_path;
 mod producer;
 mod proxy;
@@ -238,6 +239,7 @@ pub use fetched::{FetchedDataSender, FetchedRecord, FetchedSender};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
+pub use produce_entry::ProduceEntry;
 pub use producer::{
     FirstSequence, OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted,
     producer_claim,
@@ -2210,6 +2212,50 @@ pub trait Storage: Debug + Send + Sync + 'static {
         self.produce(transaction_id, topition, deflated).await
     }
 
+    /// Produces every entry to this storage, and returns one result per entry, in the order of
+    /// `entries`.
+    ///
+    /// A failed entry does not stop the entries after it, and does not undo the entries before it.
+    /// Each result is the result that [`Storage::produce_inflated`] gives for an entry with a
+    /// decoded batch, and the result that [`Storage::produce`] gives for one without.
+    ///
+    /// Like those methods, this one trusts its entries. [`ProduceService`] validates a client's
+    /// batches before it produces them.
+    ///
+    /// This default writes the entries one after another, and each commits on its own. A storage
+    /// that overrides it can write the entries in one transaction, but a caller cannot rely on
+    /// that for a storage that has not overridden it.
+    ///
+    /// A wrapper that adds a span, a metric or a permit to a produce forwards this method as well
+    /// as the other two, or the default sends each entry through the wrapper's own methods.
+    async fn produce_all(&self, entries: Vec<ProduceEntry>) -> Vec<Result<i64>> {
+        let mut results = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let ProduceEntry {
+                topition,
+                transaction_id,
+                deflated,
+                inflated,
+            } = entry;
+
+            let result = match inflated {
+                Some(inflated) => {
+                    self.produce_inflated(transaction_id.as_deref(), &topition, deflated, inflated)
+                        .await
+                }
+                None => {
+                    self.produce(transaction_id.as_deref(), &topition, deflated)
+                        .await
+                }
+            };
+
+            results.push(result);
+        }
+
+        results
+    }
+
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
     /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
@@ -3513,6 +3559,7 @@ impl Debug for ScramCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::counting_storage::{CountingStorage, Listing};
     use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
@@ -4206,5 +4253,110 @@ mod tests {
                 "{storage}"
             );
         }
+    }
+
+    fn produce_entry(partition: i32, inflated: Option<inflated::Batch>) -> ProduceEntry {
+        ProduceEntry {
+            topition: Topition::new("abc", partition),
+            transaction_id: Some("transaction".to_owned()),
+            deflated: deflated::Batch::default(),
+            inflated,
+        }
+    }
+
+    fn failed_indexes(results: &[Result<i64>]) -> Vec<usize> {
+        results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| result.is_err().then_some(index))
+            .collect()
+    }
+
+    fn produced_topitions(storage: &CountingStorage) -> Vec<Topition> {
+        storage
+            .produced()
+            .into_iter()
+            .map(|produced| produced.topition)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn produce_all_sends_an_entry_to_the_method_that_its_decoded_batch_selects() {
+        let storage = CountingStorage::new(Listing::default(), &["abc"]);
+
+        let results = storage
+            .produce_all(vec![
+                produce_entry(0, Some(inflated::Batch::default())),
+                produce_entry(1, None),
+            ])
+            .await;
+
+        assert!(failed_indexes(&results).is_empty());
+
+        let produced = storage.produced();
+        assert_eq!(2, produced.len());
+        assert_eq!(Topition::new("abc", 0), produced[0].topition);
+        assert_eq!(Some("transaction"), produced[0].transaction_id.as_deref());
+        assert_matches!(produced[0].inflated, Some(_));
+        assert_eq!(Topition::new("abc", 1), produced[1].topition);
+        assert_matches!(produced[1].inflated, None);
+    }
+
+    #[tokio::test]
+    async fn produce_all_writes_the_entries_in_order() {
+        let storage = CountingStorage::new(Listing::default(), &["abc"]);
+
+        let results = storage
+            .produce_all(vec![
+                produce_entry(2, None),
+                produce_entry(0, None),
+                produce_entry(1, None),
+            ])
+            .await;
+
+        assert_eq!(3, results.len());
+        assert_eq!(
+            vec![
+                Topition::new("abc", 2),
+                Topition::new("abc", 0),
+                Topition::new("abc", 1),
+            ],
+            produced_topitions(&storage)
+        );
+    }
+
+    #[tokio::test]
+    async fn produce_all_leaves_the_entries_around_a_failed_entry_written() {
+        // The middle partition fails, so that an entry before it and an entry after it show that
+        // the failure neither undoes nor stops the others.
+        let storage = CountingStorage::new(Listing::default(), &["abc"]).with_failing_produce(
+            Topition::new("abc", 1),
+            Error::Api(ErrorCode::KafkaStorageError),
+        );
+
+        let results = storage
+            .produce_all(vec![
+                produce_entry(0, None),
+                produce_entry(1, None),
+                produce_entry(2, None),
+            ])
+            .await;
+
+        assert_eq!(vec![1], failed_indexes(&results));
+        assert_matches!(results[1], Err(Error::Api(ErrorCode::KafkaStorageError)));
+        assert_eq!(
+            vec![Topition::new("abc", 0), Topition::new("abc", 2)],
+            produced_topitions(&storage)
+        );
+    }
+
+    #[tokio::test]
+    async fn produce_all_with_no_entries_produces_nothing() {
+        let storage = CountingStorage::new(Listing::default(), &["abc"]);
+
+        let results = storage.produce_all(Vec::new()).await;
+
+        assert!(results.is_empty());
+        assert!(storage.produced().is_empty());
     }
 }

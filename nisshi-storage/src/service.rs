@@ -19,7 +19,7 @@
 mod alter_user_scram_credentials;
 mod consumer_group_describe;
 #[cfg(test)]
-mod counting_storage;
+pub(crate) mod counting_storage;
 mod create_acls;
 mod create_topics;
 mod delete_acls;
