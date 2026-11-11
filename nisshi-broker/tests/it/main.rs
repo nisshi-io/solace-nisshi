@@ -61,6 +61,7 @@ pub mod log_append_time;
 pub mod log_redaction;
 pub mod metadata;
 pub mod metadata_authorized_operations;
+pub mod metadata_empty_topics;
 pub mod metadata_topic_ids;
 pub mod new_cg;
 pub mod offset_commit_fence;

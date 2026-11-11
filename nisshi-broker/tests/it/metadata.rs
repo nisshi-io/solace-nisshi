@@ -132,7 +132,50 @@ where
     Ok(())
 }
 
+/// An empty list asks for no topics, so the response has the brokers and no topic, however many
+/// topics there are ([`MetadataRequest.isAllTopics`]).
+///
+/// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
 pub async fn topics_some_empty<G>(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    advertised_listener: Url,
+    sc: G,
+) -> Result<()>
+where
+    G: Storage + Clone,
+{
+    debug!(broker_id, %advertised_listener);
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(alphanumeric_string(15))
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let metadata = sc
+        .metadata(Some([].as_slice()))
+        .await
+        .inspect(|metadata| debug!(?metadata))?;
+
+    assert_eq!(1, metadata.brokers().len());
+    assert_eq!(broker_id, metadata.brokers()[0].node_id);
+    assert_eq!(0, metadata.topics().len());
+
+    Ok(())
+}
+
+/// Checks that the storage lists every topic for an empty slice, which the deprecated slatedb
+/// backend still does, since AGENTS.md accepts no bug fix for it. `MetadataService` answers no
+/// topics for an empty list whatever a backend lists.
+pub async fn topics_some_empty_lists_every_topic<G>(
     cluster_id: impl Into<String>,
     broker_id: i32,
     advertised_listener: Url,
@@ -922,6 +965,41 @@ mod lite {
     }
 }
 
+#[cfg(feature = "turso")]
+mod turso {
+    use crate::common::{StorageType, init_tracing};
+    use nisshi_storage::ArcDynStorage;
+    use rand::{prelude::*, rng};
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String> + Clone,
+        node: i32,
+        advertised_listener: Url,
+    ) -> Result<ArcDynStorage> {
+        common::storage_container(StorageType::Turso, cluster, node, advertised_listener, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn topics_some_empty() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster = Uuid::now_v7();
+        let node = rng().random_range(0..i32::MAX);
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+
+        super::topics_some_empty(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+        )
+        .await
+    }
+}
+
 #[cfg(feature = "slatedb")]
 mod slatedb {
     use crate::common::{StorageType, init_tracing};
@@ -970,7 +1048,7 @@ mod slatedb {
         let node = rng().random_range(0..i32::MAX);
         let advertised_listener = Url::parse("tcp://example.com:9092/")?;
 
-        super::topics_some_empty(
+        topics_some_empty_lists_every_topic(
             cluster,
             node,
             advertised_listener.clone(),

@@ -4763,7 +4763,7 @@ impl Storage for DynoStore {
         ];
 
         let responses = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 let mut responses = vec![];
 
                 for topic in topics {
@@ -4846,7 +4846,7 @@ impl Storage for DynoStore {
                 responses
             }
 
-            _ => {
+            None => {
                 self.meta
                     .with(&self.object_store, |meta| {
                         let mut responses = vec![];
