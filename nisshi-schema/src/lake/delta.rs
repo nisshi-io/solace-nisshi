@@ -2393,7 +2393,7 @@ mod tests {
             let partition = 32123;
 
             let (schema_registry, record_batch) = {
-                let schema = Schema::from(definition.clone());
+                let schema = Schema::try_from(definition.clone())?;
                 let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
 
                 let values = [r(

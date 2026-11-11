@@ -234,6 +234,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "apache-avro"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "312c1ea69e5fe9966e0029fb95aca8790100b85aff4f0d3b00a9337c74069a9c"
+dependencies = [
+ "bigdecimal",
+ "bon",
+ "crc32fast",
+ "digest 0.11.3",
+ "log",
+ "miniz_oxide 0.9.1",
+ "num-bigint 0.4.8",
+ "ouroboros",
+ "quad-rand",
+ "rand 0.10.3",
+ "regex-lite",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "snap",
+ "strum 0.28.0",
+ "thiserror 2.0.21",
+ "uuid",
+ "zstd 0.13.3",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4596,7 +4623,7 @@ checksum = "6e50fb53c7480f414911ab76b6e14c0042d54ad5c30f6ac2bf2f52a487a25716"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "apache-avro",
+ "apache-avro 0.21.0",
  "array-init",
  "arrow-arith",
  "arrow-array",
@@ -6187,7 +6214,7 @@ name = "nisshi-schema"
 version = "0.8.2"
 dependencies = [
  "anyhow",
- "apache-avro",
+ "apache-avro 0.22.0",
  "arrow",
  "async-trait",
  "buoyant_kernel_derive",
