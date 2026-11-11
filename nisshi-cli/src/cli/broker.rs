@@ -242,12 +242,13 @@ fn encrypted_pkcs8_section(pem: &str) -> Option<&str> {
 }
 
 fn decrypt_pkcs8(section: &str, passphrase: &[u8]) -> pkcs8::Result<PrivateKeyDer<'static>> {
-    use pkcs8::{EncryptedPrivateKeyInfo, SecretDocument, der::pem::PemLabel as _};
+    use pkcs8::{EncryptedPrivateKeyInfoRef, SecretDocument, der::pem::PemLabel as _};
 
     let (label, encrypted) = SecretDocument::from_pem(section)?;
-    EncryptedPrivateKeyInfo::validate_pem_label(label)?;
+    EncryptedPrivateKeyInfoRef::validate_pem_label(label)?;
 
-    let decrypted = EncryptedPrivateKeyInfo::try_from(encrypted.as_bytes())?.decrypt(passphrase)?;
+    let decrypted =
+        EncryptedPrivateKeyInfoRef::try_from(encrypted.as_bytes())?.decrypt(passphrase)?;
 
     // `decrypted` is zeroized on drop; the copy handed to rustls is not,
     // because `PrivatePkcs8KeyDer` has no zeroize-on-drop. The unencrypted
@@ -1050,7 +1051,7 @@ mod tests {
     /// The freshly generated key, re-encoded as an encrypted PKCS#8 PEM
     /// (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC) under `passphrase`.
     fn encrypt_key(pem: &Pem, passphrase: &[u8]) -> PathBuf {
-        use pkcs8::{LineEnding, PrivateKeyInfo, SecretDocument, pkcs5::pbes2::Parameters};
+        use pkcs8::{LineEnding, PrivateKeyInfoRef, SecretDocument, pkcs5::pbes2::Parameters};
 
         let plain = fs::read_to_string(&pem.key).expect("read key");
         let (label, der) = SecretDocument::from_pem(&plain).expect("pkcs8 pem");
@@ -1058,9 +1059,10 @@ mod tests {
 
         let salt = [7u8; 16];
         let iv = [9u8; 16];
-        let params = Parameters::pbkdf2_sha256_aes256cbc(10_000, &salt, &iv).expect("pbes2");
+        let params =
+            Parameters::generate_pbkdf2_sha256_aes256cbc(10_000, &salt, iv).expect("pbes2");
 
-        let encrypted = PrivateKeyInfo::try_from(der.as_bytes())
+        let encrypted = PrivateKeyInfoRef::try_from(der.as_bytes())
             .expect("private key info")
             .encrypt_with_params(params, passphrase)
             .expect("encrypt");
