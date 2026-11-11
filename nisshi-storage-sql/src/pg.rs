@@ -2058,15 +2058,23 @@ impl Postgres {
                 }
             };
 
-            let record =
-                match pg_record_fetch::Row::read(&reader, &row).and_then(FetchedRecord::try_from) {
-                    Ok(record) => record,
-                    Err(error) => {
+            // The fetch counts a column error under its own kind, as the other engines do, and
+            // counts a row as `decode` only when it reads but holds no valid record. Each error
+            // is then counted once.
+            let record = match pg_record_fetch::Row::read(&reader, &row)
+                .inspect_err(|error| column_errors.record(error))
+                .and_then(|row| {
+                    FetchedRecord::try_from(row).inspect_err(|error| {
+                        error!(?error);
                         metrics::decode_failed(sql, &self.cluster);
-                        statement.failed();
-                        return Ok(RecordsStatement::Abandoned(error));
-                    }
-                };
+                    })
+                }) {
+                Ok(record) => record,
+                Err(error) => {
+                    statement.failed();
+                    return Ok(RecordsStatement::Abandoned(error));
+                }
+            };
 
             // A send fails when the caller has stopped taking records, which is a stop like the
             // drop of the read at its deadline, so the guard counts the statement as stopped.
