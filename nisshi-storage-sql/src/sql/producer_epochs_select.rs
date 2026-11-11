@@ -20,6 +20,7 @@
 //! topic's name, and `$4` the partition's index.
 
 use super::Query;
+use nisshi_storage::StoredEpochs;
 
 /// The query's name in the SQL cache.
 pub(crate) const QUERY: Query<Row> = Query::new("producer_epochs_select.sql");
@@ -35,5 +36,15 @@ sql_row! {
         partition_epoch: Option<i16>,
         /// 1 when a transactional ID owns the producer, and 0 otherwise.
         transactional: i32,
+    }
+}
+
+impl From<Row> for StoredEpochs {
+    fn from(row: Row) -> Self {
+        Self {
+            transactional: row.transactional != 0,
+            newest: row.newest_epoch,
+            partition: row.partition_epoch,
+        }
     }
 }

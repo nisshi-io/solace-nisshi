@@ -890,11 +890,7 @@ impl Delegate {
             .inspect_err(|err| error!(?err))?;
 
         if let Some(epochs) = epochs {
-            let stored = StoredEpochs {
-                transactional: epochs.transactional != 0,
-                newest: epochs.newest_epoch,
-                partition: epochs.partition_epoch,
-            };
+            let stored = StoredEpochs::from(epochs);
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
                 _ = connection
@@ -1016,8 +1012,7 @@ impl Delegate {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err))?
-            .map(|txn_produce_partition_select::Row { producer, added }| (producer, added));
+            .inspect_err(|err| error!(?err))?;
 
         txn_produce_partition_check(row, deflated.producer_id)
             .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))

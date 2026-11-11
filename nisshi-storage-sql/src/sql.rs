@@ -759,9 +759,8 @@ pub(crate) fn idempotent_epoch_check(
 }
 
 /// Checks that a client's transactional batch goes to a partition in its producer's ongoing
-/// transaction, from the row that [`txn_produce_partition_select`] read: `None` when the
-/// transactional ID does not exist, otherwise the producer ID that owns it and whether the
-/// partition was added at the batch's producer ID and epoch (the query's `added` column).
+/// transaction, from the row that [`txn_produce_partition_select`] read, or `None` when the
+/// transactional ID does not exist.
 ///
 /// Kafka's transaction coordinator answers an unknown transactional ID, or one that another
 /// producer ID owns, `INVALID_PRODUCER_ID_MAPPING`, a transaction that is preparing to commit
@@ -774,23 +773,24 @@ pub(crate) fn idempotent_epoch_check(
 ///
 /// [TransactionCoordinator.scala#L357-L402]: https://github.com/apache/kafka/blob/4.1.0/core/src/main/scala/kafka/coordinator/transaction/TransactionCoordinator.scala#L357-L402
 pub(crate) fn txn_produce_partition_check(
-    row: Option<(Option<i64>, i32)>,
+    row: Option<txn_produce_partition_select::Row>,
     producer_id: i64,
 ) -> Result<()> {
+    use txn_produce_partition_select::{ADDED_IN_PREPARING_TRANSACTION, ADDED_IN_TRANSACTION, Row};
+
     match row {
-        Some((Some(producer), txn_produce_partition_select::ADDED_IN_TRANSACTION))
-            if producer == producer_id =>
-        {
-            Ok(())
-        }
-        Some((Some(producer), txn_produce_partition_select::ADDED_IN_PREPARING_TRANSACTION))
-            if producer == producer_id =>
-        {
-            Err(Error::Api(ErrorCode::ConcurrentTransactions))
-        }
-        Some((Some(producer), _not_added)) if producer == producer_id => {
-            Err(Error::Api(ErrorCode::TransactionAbortable))
-        }
+        Some(Row {
+            producer: Some(producer),
+            added: ADDED_IN_TRANSACTION,
+        }) if producer == producer_id => Ok(()),
+        Some(Row {
+            producer: Some(producer),
+            added: ADDED_IN_PREPARING_TRANSACTION,
+        }) if producer == producer_id => Err(Error::Api(ErrorCode::ConcurrentTransactions)),
+        Some(Row {
+            producer: Some(producer),
+            added: _not_added,
+        }) if producer == producer_id => Err(Error::Api(ErrorCode::TransactionAbortable)),
         None | Some(_) => Err(Error::Api(ErrorCode::InvalidProducerIdMapping)),
     }
 }
@@ -857,33 +857,42 @@ mod tests {
 
     #[test]
     fn txn_produce_partition_check() {
+        use super::txn_produce_partition_select::{
+            ADDED_IN_PREPARING_TRANSACTION, ADDED_IN_TRANSACTION, Row,
+        };
         use nisshi_sans_io::ErrorCode;
         use std::assert_matches;
 
+        const NOT_ADDED: i32 = 0;
+
+        fn row(producer: Option<i64>, added: i32) -> Option<Row> {
+            Some(Row { producer, added })
+        }
+
         assert_matches!(
-            super::txn_produce_partition_check(Some((Some(7), 1)), 7),
+            super::txn_produce_partition_check(row(Some(7), ADDED_IN_TRANSACTION), 7),
             Ok(())
         );
 
         assert_matches!(
-            super::txn_produce_partition_check(Some((Some(7), 0)), 7),
+            super::txn_produce_partition_check(row(Some(7), NOT_ADDED), 7),
             Err(Error::Api(ErrorCode::TransactionAbortable))
         );
 
         assert_matches!(
-            super::txn_produce_partition_check(Some((Some(7), 2)), 7),
+            super::txn_produce_partition_check(row(Some(7), ADDED_IN_PREPARING_TRANSACTION), 7),
             Err(Error::Api(ErrorCode::ConcurrentTransactions))
         );
 
         for row in [
             None,
-            Some((None, 1)),
-            Some((Some(8), 1)),
-            Some((Some(8), 0)),
-            Some((Some(8), 2)),
+            row(None, ADDED_IN_TRANSACTION),
+            row(Some(8), ADDED_IN_TRANSACTION),
+            row(Some(8), NOT_ADDED),
+            row(Some(8), ADDED_IN_PREPARING_TRANSACTION),
         ] {
             assert_matches!(
-                super::txn_produce_partition_check(row, 7),
+                super::txn_produce_partition_check(row.clone(), 7),
                 Err(Error::Api(ErrorCode::InvalidProducerIdMapping)),
                 "{row:?}"
             );
