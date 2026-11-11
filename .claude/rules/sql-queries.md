@@ -68,10 +68,11 @@ changes.
   milliseconds on libSQL and Turso, so it can't read a column with a `current_timestamp` default,
   which holds text there. A new kind of column gets one `FromColumn` implementation, and a new
   kind of stored value gets one `DriverRow` method for each driver.
-- **Add each query that an engine reads rows from to that engine's
-  `every_row_query_returns_the_columns_of_its_row` test,** as `RowCheck::rows(topic_select::QUERY)`.
-  The test prepares each query that it lists and builds the query's reader, so a query that
-  doesn't match its row fails CI, not a rare path at runtime.
+- **Let each engine's `every_row_query_returns_the_columns_of_its_row` test check every new
+  query.** The test prepares each query in the `rows` list of `queries!` from the folders that the
+  engine runs, and builds the query's reader, so a query whose column names don't match its row
+  fails CI, not a rare path at runtime. The check compares names only, not types. A query that an
+  engine doesn't run and can't prepare goes in that engine's `skipped` list, with the reason.
 - **Put what a row means in the query's module.** When a result has a row that is not data, such
   as a marker row for a topic that sets none of the requested keys, the module gives `Row` a method
   that returns `None` for it, and each engine calls that method instead of testing the field.

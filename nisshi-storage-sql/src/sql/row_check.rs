@@ -33,6 +33,38 @@ impl RowCheck {
         }
     }
 
+    /// Returns the check of each row query in `folders`, the folders of this crate's `src` whose
+    /// queries an engine runs, except the queries in `skipped`.
+    ///
+    /// Panics if a query in `skipped` is not a row query in `folders`, so that the list of an
+    /// engine's skipped queries can't name a query that no longer exists.
+    pub(crate) fn in_folders(folders: &[&str], skipped: &[&str]) -> Vec<Self> {
+        let checks: Vec<Self> = super::row_checks()
+            .into_iter()
+            .filter(|check| folders.contains(&check.folder()))
+            .collect();
+
+        for query in skipped {
+            assert!(
+                checks.iter().any(|check| check.query == *query),
+                "{query} is not a row query in {folders:?}"
+            );
+        }
+
+        checks
+            .into_iter()
+            .filter(|check| !skipped.contains(&check.query))
+            .collect()
+    }
+
+    /// Returns the folder of the query's file in this crate's `src`. A cache key starts with the
+    /// folder and a `/` for each folder except `sql`.
+    fn folder(&self) -> &'static str {
+        self.query
+            .split_once('/')
+            .map_or("sql", |(folder, _)| folder)
+    }
+
     /// Returns the query's name in the SQL cache.
     pub(crate) fn query(&self) -> &'static str {
         self.query

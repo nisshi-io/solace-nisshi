@@ -421,6 +421,12 @@ macro_rules! queries {
             );
         )+
 
+        /// Returns the check of each query in `rows`.
+        #[cfg(test)]
+        pub(crate) fn row_checks() -> Vec<row_check::RowCheck> {
+            vec![$(row_check::RowCheck::rows($module::$module_constant),)+]
+        }
+
         pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             Cache::new(BTreeMap::from([
                 $(
