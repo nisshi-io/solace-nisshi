@@ -359,7 +359,9 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher as _},
     marker::PhantomData,
 };
-use tracing::{debug, error};
+use tracing::debug;
+#[cfg(any(feature = "libsql", feature = "turso"))]
+use tracing::error;
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};

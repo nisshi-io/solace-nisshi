@@ -100,6 +100,7 @@ impl KafkaTimestamp {
 
 /// A cursor over one SQL driver's result, which returns each of its rows as a [`DriverRow`], in
 /// order.
+#[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) trait DriverRowCursor {
     /// A row of the result.
     type Row: DriverRow;
@@ -376,6 +377,7 @@ mod tests {
         name_twice: &'static str,
     }
 
+    #[cfg(any(feature = "libsql", feature = "turso"))]
     const SQLITE: ProbeSql = ProbeSql {
         in_order: r#"select 3 as epoch, 7 as high, 'a' as name, '{"k":1}' as detail"#,
         reordered: r#"select '{"k":1}' as detail, 'a' as name, 7 as high, 3 as epoch"#,
@@ -387,6 +389,7 @@ mod tests {
         name_twice: "select 3 as epoch, 7 as high, 'a' as name, 'b' as name, null as detail",
     };
 
+    #[cfg(feature = "postgres")]
     const POSTGRES: ProbeSql = ProbeSql {
         in_order: r#"select 3::int2 as epoch, 7::int4 as high, 'a'::text as name,
                      '{"k":1}'::json as detail"#,
@@ -555,6 +558,7 @@ mod tests {
 
     /// A document that isn't JSON is kept in the row as a parse error, so that the engine decides
     /// what it does to the rest of the result.
+    #[cfg(any(feature = "libsql", feature = "turso"))]
     async fn invalid_json_is_kept_in_the_row<D: ProbeDriver>() -> Result<()> {
         let row =
             probe_row::<D, probe::Row>("select 3 as epoch, 7 as high, 'a' as name, '{' as detail")
