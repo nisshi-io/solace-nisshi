@@ -873,8 +873,8 @@ where
             // `UNKNOWN_TOPIC_ID`, and each partition of a name that it does not know with
             // `UNKNOWN_TOPIC_OR_PARTITION`. It picks the code in `KafkaApis` from whether the ID
             // resolved, so the choice sits here and not in each storage engine, which answers
-            // a miss the same for an ID and a name. An error that storage reports as any other code keeps
-            // that code.
+            // a miss the same for an ID and a name. Any other code that storage reports is
+            // answered `UNKNOWN_TOPIC_OR_PARTITION` and logged above.
             //
             // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L798-L802
             let error_code = match (
