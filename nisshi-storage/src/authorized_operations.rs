@@ -17,12 +17,10 @@
 //!
 //! The broker has no authorizer, so it reports every operation that the resource supports, as
 //! Kafka does without an authorizer ([`AuthHelper.authorizedOperations`]). Kafka reports the
-//! operations only when the request sets `include_authorized_operations`, and only on a row whose
-//! error is NONE ([`KafkaApis` DescribeGroups], [`KafkaApis` ConsumerGroupDescribe]).
+//! operations only when the request asks for them. Which rows carry them differs by resource, and
+//! each function says which.
 //!
 //! [`AuthHelper.authorizedOperations`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AuthHelper.scala#L62-L76
-//! [`KafkaApis` DescribeGroups]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1772-L1781
-//! [`KafkaApis` ConsumerGroupDescribe]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L3907-L3916
 
 use nisshi_sans_io::{ErrorCode, acl::Operation};
 
@@ -37,8 +35,68 @@ pub(crate) const OMITTED: i32 = i32::MIN;
 pub(crate) const GROUP: i32 =
     1 << Operation::Read as i32 | 1 << Operation::Delete as i32 | 1 << Operation::Describe as i32;
 
+/// The operations that the cluster supports, as Kafka's [`AclEntry.supportedOperations`] lists
+/// them.
+///
+/// [`AclEntry.supportedOperations`]: https://github.com/apache/kafka/blob/3.9.1/server/src/main/java/org/apache/kafka/security/authorizer/AclEntry.java#L150-L167
+pub(crate) const CLUSTER: i32 = 1 << Operation::Create as i32
+    | 1 << Operation::Alter as i32
+    | 1 << Operation::Describe as i32
+    | 1 << Operation::ClusterAction as i32
+    | 1 << Operation::DescribeConfigs as i32
+    | 1 << Operation::AlterConfigs as i32
+    | 1 << Operation::IdempotentWrite as i32;
+
+/// The operations that a topic supports, as Kafka's [`AclEntry.supportedOperations`] lists them.
+///
+/// [`AclEntry.supportedOperations`]: https://github.com/apache/kafka/blob/3.9.1/server/src/main/java/org/apache/kafka/security/authorizer/AclEntry.java#L150-L167
+pub(crate) const TOPIC: i32 = 1 << Operation::Read as i32
+    | 1 << Operation::Write as i32
+    | 1 << Operation::Create as i32
+    | 1 << Operation::Delete as i32
+    | 1 << Operation::Alter as i32
+    | 1 << Operation::Describe as i32
+    | 1 << Operation::DescribeConfigs as i32
+    | 1 << Operation::AlterConfigs as i32;
+
+/// Returns the cluster operations of a Metadata response: [`CLUSTER`] when the request asked for
+/// them, and [`OMITTED`] otherwise ([`KafkaApis` Metadata]).
+///
+/// `include_cluster_authorized_operations` is `Some` only for the versions that carry it, 8 to 10,
+/// and a response of any other version has no field to put it in.
+///
+/// [`KafkaApis` Metadata]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1396-L1406
+pub(crate) fn cluster(include_cluster_authorized_operations: Option<bool>) -> i32 {
+    if include_cluster_authorized_operations == Some(true) {
+        CLUSTER
+    } else {
+        OMITTED
+    }
+}
+
+/// Returns the authorized operations of a Metadata topic row: [`TOPIC`] when the request asked
+/// for them and the row has a name, and [`OMITTED`] otherwise.
+///
+/// Unlike a group row, a topic row carries them whatever its error, so an unknown or invalid name
+/// gets them too. Kafka sets them on every row that it looked up by name, and it leaves the rows
+/// that answer an unknown topic ID, which have no name, at the default
+/// ([`KafkaApis` Metadata]).
+///
+/// [`KafkaApis` Metadata]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1409-L1419
+pub(crate) fn topic(include_topic_authorized_operations: Option<bool>, name: Option<&str>) -> i32 {
+    if include_topic_authorized_operations == Some(true) && name.is_some() {
+        TOPIC
+    } else {
+        OMITTED
+    }
+}
+
 /// Returns the authorized operations of a described group row: [`GROUP`] when the request asked
-/// for them and the row's `error_code` is NONE, and [`OMITTED`] otherwise.
+/// for them and the row's `error_code` is NONE, and [`OMITTED`] otherwise ([`KafkaApis`
+/// DescribeGroups], [`KafkaApis` ConsumerGroupDescribe]).
+///
+/// [`KafkaApis` DescribeGroups]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1772-L1781
+/// [`KafkaApis` ConsumerGroupDescribe]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L3907-L3916
 pub(crate) fn group(include_authorized_operations: bool, error_code: i16) -> i32 {
     if include_authorized_operations && error_code == i16::from(ErrorCode::None) {
         GROUP
@@ -54,6 +112,33 @@ mod tests {
     #[test]
     fn group_bitfield_matches_kafka_without_an_authorizer() {
         assert_eq!(328, GROUP);
+    }
+
+    #[test]
+    fn cluster_bitfield_matches_kafka_without_an_authorizer() {
+        assert_eq!(8096, CLUSTER);
+    }
+
+    #[test]
+    fn topic_bitfield_matches_kafka_without_an_authorizer() {
+        assert_eq!(3576, TOPIC);
+    }
+
+    #[test]
+    fn cluster_operations_reported_only_when_requested() {
+        assert_eq!(OMITTED, cluster(None));
+        assert_eq!(OMITTED, cluster(Some(false)));
+        assert_eq!(CLUSTER, cluster(Some(true)));
+    }
+
+    #[test]
+    fn topic_operations_reported_only_when_requested_for_a_named_row() {
+        for include in [None, Some(false)] {
+            assert_eq!(OMITTED, topic(include, Some("orders")));
+        }
+
+        assert_eq!(TOPIC, topic(Some(true), Some("orders")));
+        assert_eq!(OMITTED, topic(Some(true), None));
     }
 
     #[test]

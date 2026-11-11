@@ -27,7 +27,7 @@ pub use auto_create_refusals::AutoCreateRefusals;
 use super::create_topics::validation::ValidatedCreateTopicsRequest;
 use crate::{
     CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, TopicCreationConfig,
-    TopicId,
+    TopicId, authorized_operations,
 };
 
 mod auto_create_refusals;
@@ -215,7 +215,7 @@ where
                 .topics()
                 .iter()
                 .map(|topic| {
-                    if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    let topic = if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
                         && topic
                             .name
                             .as_deref()
@@ -226,11 +226,20 @@ where
                             .error_code(ErrorCode::InvalidTopicException.into())
                     } else {
                         topic.clone()
-                    }
+                    };
+
+                    let operations = authorized_operations::topic(
+                        input.request.include_topic_authorized_operations,
+                        topic.name.as_deref(),
+                    );
+
+                    topic.topic_authorized_operations(Some(operations))
                 })
                 .collect::<Vec<_>>(),
         );
-        let cluster_authorized_operations = Some(-1);
+        let cluster_authorized_operations = Some(authorized_operations::cluster(
+            input.request.include_cluster_authorized_operations,
+        ));
 
         let throttle_time_ms = Some(0);
 
