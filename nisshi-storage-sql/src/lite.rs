@@ -6595,8 +6595,8 @@ mod tests {
     /// Stores `count` records, 1,000 to a batch because a batch of headers can exceed the
     /// message size limit. Each has the key `k`, or the key `j` when `alternate_keys` and its
     /// offset is odd. Each has the value `a`, and a 1 byte header key and a 99 byte header value
-    /// when `with_header`. A record then costs 104 bytes against a fetch's `max_bytes`: 1 for the
-    /// key, 1 for the value, 2 for the header's framing and 100 for the header.
+    /// when `with_header`. A record then costs 111 bytes against a fetch's `max_bytes`: 7 for every
+    /// record, 1 for the key, 1 for the value, 2 for the header's framing and 100 for the header.
     async fn produce_keyed_records(
         engine: &ArcDynStorage,
         topition: &Topition,
@@ -6733,8 +6733,8 @@ mod tests {
     }
 
     /// The row limit applies to records that have headers, and a record's headers still count
-    /// toward `max_bytes` when the limit ends the read. A record costs 104 bytes, so a budget of
-    /// 1041 bytes returns 10 of them.
+    /// toward `max_bytes` when the limit ends the read. A record costs 111 bytes with the 7 of
+    /// every record, so a budget of 1111 bytes returns 10 of them.
     #[tokio::test]
     async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
     {
@@ -6755,7 +6755,7 @@ mod tests {
 
             assert_eq!(
                 (40..50).collect::<Vec<_>>(),
-                fetched_offsets(&engine, &fetched, 40, 1041).await?,
+                fetched_offsets(&engine, &fetched, 40, 1111).await?,
                 "the byte budget must count the headers, keyed: {keyed}",
             );
         }

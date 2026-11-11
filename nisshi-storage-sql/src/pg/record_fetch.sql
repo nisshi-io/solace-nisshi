@@ -25,6 +25,16 @@
 --
 -- A record's size is its key, its value and its headers, as Kafka counts the whole record batch
 -- toward max_bytes, and each header costs 2 bytes more, the smallest that it takes on the wire.
+-- Every record also costs 7 bytes, the smallest record that Kafka writes: a length, attributes, two
+-- deltas, a null key, a null value and no headers, 1 byte each. That is less than Kafka counts,
+-- which adds 61 bytes for the header of each record batch
+-- ([DefaultRecordBatch.java#L129]), because this query does not know where the batches that
+-- a read builds begin. Counting less than Kafka means a read spends the budget no sooner than Kafka
+-- would for the same records, and a record with no key, no value and no headers still costs 7.
+-- The bytes of a response can therefore exceed max_bytes by the framing that this count leaves out.
+--
+-- [DefaultRecordBatch.java#L129]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
+--
 -- The header table is probed by its primary key for each candidate, so a record that holds only
 -- headers still spends the budget. The rows that the read returns stop at $5 bytes, but the
 -- read still covers up to $7 rows, and probes the header table once for each.
@@ -77,7 +87,8 @@ timestamp,
 k,
 v,
 (sum(
-    coalesce(length(k), 0)
+    7
+    + coalesce(length(k), 0)
     + coalesce(length(v), 0)
     + (select coalesce(sum(coalesce(length(h.k), 0) + coalesce(length(h.v), 0) + 2), 0)
        from header h
@@ -126,8 +137,8 @@ group by h.offset_id)
 -- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
 -- does not know about batches or about the other partitions of the fetch.
 --
--- The query finds the first row by its ordinal, not by a running total equal to its own size,
--- because a row with a null key and a null value has a size of 0. It does not compare offset_id
+-- The query finds the first row by its ordinal, so that finding it does not depend on every
+-- record having a non-zero size. It does not compare offset_id
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
 --
