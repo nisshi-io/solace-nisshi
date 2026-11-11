@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use apache_avro::{
     Reader,
-    schema::{Schema as AvroSchema, SchemaKind},
+    schema::{ResolvedSchema, Schema as AvroSchema, SchemaKind},
     types::Value,
 };
 use bytes::Bytes;
@@ -137,11 +137,16 @@ impl TryFrom<JsonValue> for Schema {
         let schema = field_shorthand::expand(schema);
         debug!(%schema);
 
-        let key = field_schema(&schema, MessageKind::Key)?;
-        let value = field_schema(&schema, MessageKind::Value)?;
-        let meta = field_schema(&schema, MessageKind::Meta)?;
-
         let complete = AvroSchema::parse(&schema)?;
+        let named_types = ResolvedSchema::try_from(&complete)?
+            .get_names()
+            .values()
+            .map(|named_type| (*named_type).clone())
+            .collect::<Vec<_>>();
+
+        let key = field_schema(&schema, &complete, &named_types, MessageKind::Key)?;
+        let value = field_schema(&schema, &complete, &named_types, MessageKind::Value)?;
+        let meta = field_schema(&schema, &complete, &named_types, MessageKind::Meta)?;
 
         #[cfg(not(any(feature = "parquet", feature = "iceberg", feature = "delta")))]
         let _ = complete;
@@ -166,16 +171,44 @@ impl TryFrom<JsonValue> for Schema {
 
 /// Parses the type of the field of `schema`, a topic's record schema, that holds a message of
 /// `message_kind`. Returns `None` if the record does not have that field.
-fn field_schema(schema: &JsonValue, message_kind: MessageKind) -> Result<Option<AvroSchema>> {
-    schema["fields"]
-        .as_array()
-        .and_then(|fields| {
-            fields
+///
+/// The type parses on its own when it can, so that its named types do not take the record's
+/// namespace. A type that refers to a named type of another field does not parse on its own, so
+/// its schema comes from `complete`, the parse of the whole record. Each reference in it is
+/// replaced by its definition from `named_types`, because a reader of a message has only this
+/// schema.
+fn field_schema(
+    schema: &JsonValue,
+    complete: &AvroSchema,
+    named_types: &[AvroSchema],
+    message_kind: MessageKind,
+) -> Result<Option<AvroSchema>> {
+    let Some(field) = schema["fields"].as_array().and_then(|fields| {
+        fields
+            .iter()
+            .find(|field| field["name"] == message_kind.as_ref())
+    }) else {
+        return Ok(None);
+    };
+
+    AvroSchema::parse(&field["type"])
+        .or_else(|error| {
+            let AvroSchema::Record(record) = complete else {
+                return Err(error);
+            };
+
+            let mut field_schema = record
+                .fields
                 .iter()
-                .find(|field| field["name"] == message_kind.as_ref())
+                .find(|field| field.name == message_kind.as_ref())
+                .map(|field| field.schema.clone())
+                .ok_or(error)?;
+
+            field_schema.denormalize(named_types)?;
+            Ok(field_schema)
         })
-        .map(|field| AvroSchema::parse(&field["type"]).map_err(Into::into))
-        .transpose()
+        .map(Some)
+        .map_err(Into::into)
 }
 
 impl Schema {
@@ -794,6 +827,46 @@ mod tests {
         assert_eq!(
             Some(&AvroSchema::Date),
             schema.value().and_then(|value| record_field(value, "day"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn value_that_refers_to_a_type_defined_in_key_parses() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {
+                    "name": "key",
+                    "type": {"type": "record", "name": "Id", "fields": [{"name": "n", "type": "int"}]}
+                },
+                {"name": "value", "type": "Id"}
+            ]
+        }))?;
+
+        assert!(schema.key().is_some());
+        assert_eq!(schema.key(), schema.value());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_reference_to_a_type_defined_in_key_is_replaced_by_its_definition() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {
+                    "name": "key",
+                    "type": {"type": "record", "name": "Id", "fields": [{"name": "n", "type": "int"}]}
+                },
+                {"name": "value", "type": {"type": "array", "items": "Id"}}
+            ]
+        }))?;
+
+        assert_matches!(
+            schema.value(),
+            Some(AvroSchema::Array(array)) if Some(array.items.as_ref()) == schema.key()
         );
         Ok(())
     }
