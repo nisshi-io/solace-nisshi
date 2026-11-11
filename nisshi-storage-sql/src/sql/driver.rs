@@ -18,7 +18,7 @@
 use bytes::Bytes;
 use nisshi_storage::{Error, Result};
 use serde_json::Value;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
@@ -80,21 +80,21 @@ impl KafkaTimestamp {
     /// A record that its producer sent without a timestamp stores Kafka's `NO_TIMESTAMP`, -1. A
     /// negative count is the instant before the epoch that it names, so each engine reads the same
     /// record as the same instant. Returns an error for an instant that a `SystemTime` can't hold
-    /// on this platform, such as one before 1601 on Windows.
+    /// on this platform, such as one before 1601 or after 30828 on Windows.
     pub(crate) fn system_time(self) -> Result<SystemTime> {
         let Self(millis) = self;
+        let offset = Duration::from_millis(millis.unsigned_abs());
 
         if millis >= 0 {
-            nisshi_sans_io::to_system_time(millis).map_err(Into::into)
+            SystemTime::UNIX_EPOCH.checked_add(offset)
         } else {
-            SystemTime::UNIX_EPOCH
-                .checked_sub(std::time::Duration::from_millis(millis.unsigned_abs()))
-                .ok_or_else(|| {
-                    Error::Message(format!(
-                        "timestamp {millis} is before the earliest that this platform holds"
-                    ))
-                })
+            SystemTime::UNIX_EPOCH.checked_sub(offset)
         }
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "timestamp {millis} is outside the range that this platform holds"
+            ))
+        })
     }
 }
 
@@ -844,5 +844,18 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// A timestamp after the end of the platform's `SystemTime`, as on Windows after the year
+    /// 30828, reads as an error and not a panic.
+    #[test]
+    fn kafka_timestamp_after_the_platform_range_is_an_error() {
+        let read = KafkaTimestamp(i64::MAX).system_time();
+
+        if cfg!(windows) {
+            assert_matches!(read, Err(Error::Message(_)));
+        } else {
+            assert_matches!(read, Ok(_));
+        }
     }
 }

@@ -608,7 +608,7 @@ impl PoolConnection {
         if is_unique_constraint(err) {
             debug!(?err);
         } else {
-            error!(?err, elapsed_millis = elapsed_millis(start));
+            error!(?err, query, elapsed_millis = elapsed_millis(start));
             SQL_ERROR.add(1, &self.attributes_for_error(Some(query), err)[..]);
         }
     }
@@ -4017,11 +4017,7 @@ impl Storage for Delegate {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(
-                                            reason
-                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                                .into(),
-                                        )
+                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4093,11 +4089,7 @@ impl Storage for Delegate {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(
-                                            reason
-                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                                .into(),
-                                        )
+                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4359,11 +4351,7 @@ impl Storage for Delegate {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(
-                                    reason
-                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                        .into(),
-                                )
+                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -4458,11 +4446,7 @@ impl Storage for Delegate {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(
-                                    reason
-                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                        .into(),
-                                )
+                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

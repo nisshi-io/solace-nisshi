@@ -186,17 +186,20 @@ pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
 }
 
 /// The error code of a topic in a Metadata or DescribeTopicPartitions response when the read of
-/// the topic fails with a transient error. A permanent error, such as a corrupt stored row,
-/// answers `UNKNOWN_SERVER_ERROR` through [`Error::error_code`].
+/// the topic fails.
 ///
-/// Kafka's [`AutoTopicCreationManager`] answers `LEADER_NOT_AVAILABLE` for a topic that it can't
-/// serve yet, and Kafka clients refresh their metadata and retry that code. The read does not
-/// answer `UNKNOWN_TOPIC_OR_PARTITION`, because that code tells a client that the topic does not
-/// exist, and a client that may create topics then asks the broker to create it on each metadata
-/// refresh.
+/// The read does not answer `UNKNOWN_TOPIC_OR_PARTITION`, because that code tells a client that
+/// the topic does not exist, and a client that may create topics then asks the broker to create
+/// it on each metadata refresh.
+///
+/// The read answers this code for a transient error too, instead of a retriable code such as the
+/// `LEADER_NOT_AVAILABLE` that Kafka's [`AutoTopicCreationManager`] answers for a topic that it
+/// can't serve yet. [`Error::is_transient`] counts every libSQL and Turso error as transient, so a
+/// retriable code would make a client retry a read that never succeeds, such as a read of a
+/// missing table, until the client times out.
 ///
 /// [`AutoTopicCreationManager`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L129-L133
-pub(crate) const TOPIC_READ_RETRIABLE_ERROR_CODE: ErrorCode = ErrorCode::LeaderNotAvailable;
+pub(crate) const TOPIC_READ_ERROR_CODE: ErrorCode = ErrorCode::UnknownServerError;
 
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
 /// the engine gives the query and the error's [`column_error_kind`] as `kind`.
@@ -224,14 +227,73 @@ impl ColumnErrorCount {
     }
 }
 
+/// Reads each row of one query's result as `T`, and counts each column error in the query's
+/// [`ColumnErrorCount`].
+pub(crate) struct ResultRowReader<T: QueryRow> {
+    columns: result_columns::ResultColumns,
+    reader: T::Reader,
+    column_errors: ColumnErrorCount,
+}
+
+impl<T: QueryRow> ResultRowReader<T> {
+    /// Returns the reader of `T` for the result with `columns`, which counts each column error in
+    /// `column_errors`.
+    pub(crate) fn new(
+        columns: result_columns::ResultColumns,
+        column_errors: ColumnErrorCount,
+    ) -> Result<Self> {
+        let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
+
+        Ok(Self {
+            columns,
+            reader,
+            column_errors,
+        })
+    }
+
+    pub(crate) fn read<R: driver::DriverRow>(&self, row: &R) -> Result<T> {
+        T::read(&self.reader, row).inspect_err(|err| self.column_errors.record(err))
+    }
+
+    /// Reads `row` as `T`, or returns `None` when a column of `row` can't be read.
+    ///
+    /// Use it only where a result without that row is still a correct answer, such as a list of
+    /// the cluster's topics, so that one corrupt row does not hide the others. It counts and logs
+    /// each skipped row. The log reads the row as `Name`, a row of the columns that identify it,
+    /// so that it names what the result leaves out.
+    pub(crate) fn read_readable<Name, R>(&self, row: &R) -> Result<Option<T>>
+    where
+        Name: QueryRow + fmt::Debug,
+        R: driver::DriverRow,
+    {
+        match T::read(&self.reader, row) {
+            Ok(readable) => Ok(Some(readable)),
+
+            Err(error @ Error::UnreadableColumn { .. }) => {
+                self.column_errors.record(&error);
+
+                let name = Name::reader(&self.columns)
+                    .and_then(|reader| Name::read(&reader, row))
+                    .ok();
+                error!(?name, ?error, "skipped a row that can't be read");
+
+                Ok(None)
+            }
+
+            Err(error) => {
+                self.column_errors.record(&error);
+                Err(error)
+            }
+        }
+    }
+}
+
 /// A cursor over one query's result on libSQL or Turso, which returns each of its rows as a
 /// [`QueryRow`], in order. It reads a row only when the caller reaches it.
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) struct QueryRowCursor<R: driver::DriverRowCursor, T: QueryRow> {
     driver_cursor: R,
-    columns: result_columns::ResultColumns,
-    reader: T::Reader,
-    column_errors: ColumnErrorCount,
+    rows: ResultRowReader<T>,
 }
 
 #[cfg(any(feature = "libsql", feature = "turso"))]
@@ -243,41 +305,18 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
         driver_cursor: R,
         column_errors: ColumnErrorCount,
     ) -> Result<Self> {
-        let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
-
         Ok(Self {
             driver_cursor,
-            columns,
-            reader,
-            column_errors,
+            rows: ResultRowReader::new(columns, column_errors)?,
         })
     }
 
-    /// Returns the next row that the reader can read as `T`, or `None` after the last row.
-    ///
-    /// It skips each row with an unreadable column, so that one corrupt row does not hide the
-    /// rows after it. Use it only where a result without that row is still a correct answer, such
-    /// as a list of the cluster's topics. It counts and logs each skipped row. The log reads the
-    /// row as `Name`, a row of the columns that identify it, so that it names what the result
-    /// leaves out.
+    /// Returns the next row that can be read as `T`, or `None` after the last row. It skips each
+    /// row that [`ResultRowReader::read_readable`] skips.
     pub(crate) async fn next_readable<Name: QueryRow + fmt::Debug>(&mut self) -> Result<Option<T>> {
         while let Some(row) = self.driver_cursor.next().await? {
-            match T::read(&self.reader, &row) {
-                Ok(readable) => return Ok(Some(readable)),
-
-                Err(error @ Error::UnreadableColumn { .. }) => {
-                    self.column_errors.record(&error);
-
-                    let name = Name::reader(&self.columns)
-                        .and_then(|reader| Name::read(&reader, &row))
-                        .ok();
-                    error!(?name, ?error, "skipped a row that can't be read");
-                }
-
-                Err(error) => {
-                    self.column_errors.record(&error);
-                    return Err(error);
-                }
+            if let Some(readable) = self.rows.read_readable::<Name, _>(&row)? {
+                return Ok(Some(readable));
             }
         }
 
@@ -289,9 +328,8 @@ impl<R: driver::DriverRowCursor, T: QueryRow> QueryRowCursor<R, T> {
         self.driver_cursor
             .next()
             .await?
-            .map(|row| T::read(&self.reader, &row))
+            .map(|row| self.rows.read(&row))
             .transpose()
-            .inspect_err(|err| self.column_errors.record(err))
     }
 }
 
@@ -355,9 +393,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher as _},
     marker::PhantomData,
 };
-use tracing::debug;
-#[cfg(any(feature = "libsql", feature = "turso"))]
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
@@ -497,6 +533,7 @@ macro_rules! queries {
         pub(crate) static ROW_QUERIES: &[RowQuery] = &[
             $(
                 RowQuery {
+                    constant: concat!(stringify!($module), "::", stringify!($module_constant)),
                     query: $module::$module_constant.key(),
                     engines: &[$(SqlEngine::$row_engine),+],
                     check_columns: |columns| {
@@ -507,6 +544,7 @@ macro_rules! queries {
             )+
             $(
                 RowQuery {
+                    constant: concat!(stringify!($counted_module), "::", stringify!($counted_constant)),
                     query: $counted_module::$counted_constant,
                     engines: &[$(SqlEngine::$counted_engine),+],
                     check_columns: |_| Ok(()),
@@ -548,6 +586,8 @@ pub(crate) enum SqlEngine {
 /// A query in [`ROW_QUERIES`]: one whose rows an engine reads.
 #[cfg(test)]
 pub(crate) struct RowQuery {
+    /// The path of the query's constant, such as `topic_select::QUERY`.
+    pub(crate) constant: &'static str,
     /// The query's name in [`SQL`].
     pub(crate) query: &'static str,
     /// The engines that run the query.
@@ -853,6 +893,93 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    /// Each line of `queries!` names exactly the engines whose source names its constant, so
+    /// that each engine's `every_row_query_returns_the_columns_of_its_row` checks every query
+    /// that the engine reads rows from.
+    #[test]
+    fn each_row_query_names_the_engines_that_run_it() -> Result<()> {
+        use super::{ROW_QUERIES, SqlEngine, row_queries, topic_select_name, topic_select_uuid};
+        use regex::Regex;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Each of these constants names the query of another line, so it has no line of its own.
+        let aliases = [
+            (
+                "topic_select_name::NAME_QUERY",
+                topic_select_name::NAME_QUERY.key(),
+            ),
+            (
+                "topic_select_uuid::NAME_QUERY",
+                topic_select_uuid::NAME_QUERY.key(),
+            ),
+        ];
+
+        let queries = ROW_QUERIES
+            .iter()
+            .map(|row_query| (row_query.constant, row_query.query))
+            .chain(aliases)
+            .collect::<BTreeMap<_, _>>();
+
+        let constant = Regex::new(r"\b[a-z_][a-z0-9_]*::(?:[A-Z][A-Z0-9_]*_)?QUERY\b")?;
+
+        let mut failures = Vec::new();
+
+        for (engine, source) in [
+            (SqlEngine::Postgres, "pg"),
+            (SqlEngine::Libsql, "lite"),
+            (SqlEngine::Turso, "limbo"),
+        ] {
+            let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+            let mut files = vec![format!("{directory}/{source}.rs").into()];
+            files.extend(
+                glob::glob(&format!("{directory}/{source}/**/*.rs"))
+                    .map_err(|error| Error::Message(error.to_string()))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| Error::Message(error.to_string()))?,
+            );
+
+            let mut run = BTreeSet::new();
+            for file in files {
+                let text = std::fs::read_to_string(&file)?;
+
+                // A comment can name a constant that the engine doesn't run.
+                for line in text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                {
+                    for found in constant.find_iter(line) {
+                        match queries.get(found.as_str()) {
+                            Some(query) => _ = run.insert(*query),
+                            None => failures.push(format!(
+                                "{engine:?}: {} has no line in queries!",
+                                found.as_str()
+                            )),
+                        }
+                    }
+                }
+            }
+
+            let listed = row_queries(engine)
+                .map(|row_query| row_query.query)
+                .collect::<BTreeSet<_>>();
+
+            for query in run.difference(&listed) {
+                failures.push(format!(
+                    "{engine:?} runs {query}, but its line doesn't name it"
+                ));
+            }
+
+            for query in listed.difference(&run) {
+                failures.push(format!(
+                    "{engine:?} doesn't run {query}, but its line names it"
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
     }
 
     #[test]

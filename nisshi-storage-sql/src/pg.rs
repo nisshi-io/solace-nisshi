@@ -109,15 +109,15 @@ use self::metrics::{FetchStatementMetrics, POOL_REPLACED};
 use crate::{
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        self, ColumnErrorCount, Query, QueryRow, ROWS_PER_FETCH, consumer_group_select,
-        default_hash, driver::KafkaTimestamp, idempotent_epoch_check, idempotent_sequence_check,
-        list_offset, pg_record_fetch, producer_epoch_current_for_producer,
-        producer_epoch_for_current_txn, producer_epoch_insert, producer_epochs_select,
-        producer_insert, producer_select_for_update, result_columns::ResultColumns,
-        row::topic_name, topic_by_cluster, topic_configuration_select,
-        topic_configuration_select_keys, topic_configuration_select_name,
-        topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
-        topic_select_uuid, topition_insert, topition_select_id,
+        self, ColumnErrorCount, Query, QueryRow, ROWS_PER_FETCH, ResultRowReader,
+        consumer_group_select, default_hash, driver::KafkaTimestamp, idempotent_epoch_check,
+        idempotent_sequence_check, list_offset, pg_record_fetch,
+        producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
+        producer_epochs_select, producer_insert, producer_select_for_update,
+        result_columns::ResultColumns, row::topic_name, topic_by_cluster,
+        topic_configuration_select, topic_configuration_select_keys,
+        topic_configuration_select_name, topic_configuration_upsert, topic_insert, topic_select,
+        topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
         txn_detail_select_status_for_update, txn_detail_select_timed_out,
         txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
         txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
@@ -2711,26 +2711,29 @@ impl Postgres {
             .await
     }
 
-    /// Runs the query that the SQL cache holds for `query`, and returns its rows with the names
-    /// of its result's columns, and the count of the query's column errors.
+    /// Runs the query that the SQL cache holds for `query`, and returns its rows with the reader
+    /// that reads each of them as `T`.
     ///
     /// A caller uses this when it reads each row on its own, such as to skip a row that it can't
     /// read. Every other read takes its row type through [`Self::prepare_query_rows`] or a one-row
     /// helper.
     #[instrument(skip(self, client, params))]
-    async fn prepare_query_result(
+    async fn prepare_query_result<T: QueryRow>(
         &self,
         client: &impl GenericClient,
-        query: &'static str,
+        query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
-    ) -> Result<(ResultColumns, Vec<Row>, ColumnErrorCount)> {
+    ) -> Result<(ResultRowReader<T>, Vec<Row>)> {
+        let query = query.key();
         let (sql, statement) = self.prepare_statement(client, query).await?;
-        let columns = ResultColumns::new(query, &statement);
-        let column_errors = self.column_error_count(sql);
+        let reader = ResultRowReader::new(
+            ResultColumns::new(query, &statement),
+            self.column_error_count(sql),
+        )?;
 
         self.record_sql_metrics(sql, client.query(&statement, params))
             .await
-            .map(|rows| (columns, rows, column_errors))
+            .map(|rows| (reader, rows))
     }
 
     /// Returns the count of `sql`'s column errors on this engine's cluster.
@@ -2747,15 +2750,8 @@ impl Postgres {
         query: Query<T>,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<T>> {
-        let (columns, rows, column_errors) = self
-            .prepare_query_result(client, query.key(), params)
-            .await?;
-        let reader = T::reader(&columns).inspect_err(|err| column_errors.record(err))?;
-
-        rows.iter()
-            .map(|row| T::read(&reader, row))
-            .collect::<Result<_>>()
-            .inspect_err(|err| column_errors.record(err))
+        let (reader, rows) = self.prepare_query_result(client, query, params).await?;
+        rows.iter().map(|row| reader.read(row)).collect()
     }
 
     /// Runs the query that the SQL cache holds for `query`, and returns its row as `T`, or `None`
@@ -4832,11 +4828,7 @@ impl Storage for Postgres {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(
-                                            reason
-                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                                .into(),
-                                        )
+                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -4908,11 +4900,7 @@ impl Storage for Postgres {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(
-                                            reason
-                                                .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                                .into(),
-                                        )
+                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4931,14 +4919,11 @@ impl Storage for Postgres {
                 let mut responses = vec![];
 
                 match self
-                    .prepare_query_result(&c, topic_by_cluster::QUERY.key(), &[&self.cluster])
+                    .prepare_query_result(&c, topic_by_cluster::QUERY, &[&self.cluster])
                     .await
                     .inspect_err(|err| error!(?err))
                 {
-                    Ok((columns, rows, column_errors)) => {
-                        let reader = topic_by_cluster::Row::reader(&columns)
-                            .inspect_err(|err| column_errors.record(err))?;
-
+                    Ok((reader, rows)) => {
                         // The loop skips each row with an unreadable column, so that one corrupt
                         // row does not hide the cluster's other topics. It leaves the topic out
                         // instead of listing it with `UNKNOWN_SERVER_ERROR`, because the Java
@@ -4947,24 +4932,18 @@ impl Storage for Postgres {
                         // ([`TopicMetadataFetcher.getTopicMetadata`]).
                         //
                         // [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
-                        for topic_by_cluster::Row {
-                            uuid,
-                            name,
-                            is_internal,
-                            partitions,
-                            replication_factor,
-                        } in rows.iter().filter_map(|row| {
-                            topic_by_cluster::Row::read(&reader, row)
-                                .inspect_err(|error| {
-                                    column_errors.record(error);
+                        for row in &rows {
+                            let Some(topic_by_cluster::Row {
+                                uuid,
+                                name,
+                                is_internal,
+                                partitions,
+                                replication_factor,
+                            }) = reader.read_readable::<topic_name::Row, _>(row)?
+                            else {
+                                continue;
+                            };
 
-                                    let name = topic_name::Row::reader(&columns)
-                                        .and_then(|reader| topic_name::Row::read(&reader, row))
-                                        .ok();
-                                    error!(?name, ?error, "skipped a topic that can't be read");
-                                })
-                                .ok()
-                        }) {
                             let error_code = ErrorCode::None.into();
                             let topic_id = Some(uuid.into_bytes());
                             let name = Some(name);
@@ -5164,11 +5143,7 @@ impl Storage for Postgres {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(
-                                    reason
-                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                        .into(),
-                                )
+                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -5258,11 +5233,7 @@ impl Storage for Postgres {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(
-                                    reason
-                                        .error_code(sql::TOPIC_READ_RETRIABLE_ERROR_CODE)
-                                        .into(),
-                                )
+                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
