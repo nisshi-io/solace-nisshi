@@ -97,12 +97,13 @@ where
 /// key and the length of its value, whatever the header holds. Two shapes of record pin each part
 /// of that sum, and a Fetch that left one out would return two records where it returns one:
 ///
-/// - 50 headers with an empty key and a null value cost 100 bytes, and a `max_bytes` of 150
-///   returns one record. Dropping the framing costs 0, and taking the largest header, not the sum,
-///   costs 2.
+/// - 50 headers with an empty key and a null value cost 107 bytes with the 7 of every record (108
+///   with the key of a keyed record), and a `max_bytes` of 150 returns one record. Dropping the
+///   framing costs 7 (8 keyed), and taking the largest header, not the sum, costs 9 (10 keyed).
 /// - a header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
-///   cost 84 bytes, and a `max_bytes` of 100 returns one record. Dropping the key, or the value,
-///   or taking the larger header, costs 42 or 44.
+///   cost 91 bytes (92 keyed), and a `max_bytes` of 110 returns one record. Dropping the key, or
+///   the value, costs 51 (52 keyed), and taking the larger header costs 49 (50 keyed), so each
+///   returns two.
 ///
 /// The test reads from the engine, not through `FetchService`, which reads again until the
 /// response's `max_bytes` is spent.
@@ -126,7 +127,7 @@ where
         Header::builder().value(Bytes::from(vec![b'x'; 40])),
     ];
 
-    for (headers, max_bytes) in [(empty_headers, 150), (key_and_value_headers, 100)] {
+    for (headers, max_bytes) in [(empty_headers, 150), (key_and_value_headers, 110)] {
         // a keyed fetch of a virtual topic reads through its own statement, and each of its
         // records carries a 1 byte key
         for keyed in [false, true] {
@@ -162,7 +163,7 @@ where
 /// Creates a topic of one partition, a virtual topic when `keyed`, and returns the partition that
 /// records are produced to and the one that a fetch reads: a keyed fetch reads the records with
 /// the key `k` of the virtual topic.
-async fn create_topic<G>(sc: &G, keyed: bool) -> Result<(Topition, Topition)>
+pub(crate) async fn create_topic<G>(sc: &G, keyed: bool) -> Result<(Topition, Topition)>
 where
     G: Storage,
 {
@@ -201,7 +202,7 @@ where
 
 /// Returns the offsets of the records that one engine read from `fetch_offset` returns within
 /// `max_bytes`.
-async fn fetched_offsets<G>(
+pub(crate) async fn fetched_offsets<G>(
     sc: &G,
     fetched: &Topition,
     fetch_offset: i64,

@@ -4393,9 +4393,9 @@ mod tests {
     /// A fetch statement returns at most `ROWS_PER_FETCH` rows, and a read from the last offset
     /// that it returned gets the rest, with no gap and no repeat. Each record has a header of 99
     /// bytes, so the statement runs its header probe for the rows that it keeps, and costs a
-    /// record 103 bytes with its key. The statements run here, on the Turso engine, because it
-    /// rejects some SQL that SQLite takes, and a row limit inside a derived table is one such
-    /// construct.
+    /// record 110 bytes with its key and the 7 of every record. The statements run here, on the
+    /// Turso engine, because it rejects some SQL that SQLite takes, and a row limit inside a
+    /// derived table is one such construct.
     #[tokio::test]
     async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
         const RECORDS: i64 = ROWS_PER_FETCH + 50;
@@ -4431,10 +4431,10 @@ mod tests {
                 "{statement}: the row limit counts from the fetch offset",
             );
 
-            // A record costs 103 bytes, so a budget of 1031 bytes holds 10 of them.
+            // A record costs 110 bytes, so a budget of 1101 bytes holds 10 of them.
             assert_eq!(
                 (40..50).collect::<Vec<_>>(),
-                fetch_from(40, 1031).await?,
+                fetch_from(40, 1101).await?,
                 "{statement}: the byte budget must count the headers",
             );
 
@@ -4474,9 +4474,9 @@ mod tests {
     }
 
     /// The fetch statements count a record's headers toward `max_bytes`: three records with a
-    /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
-    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
-    /// because it rejects some SQL that SQLite takes.
+    /// one byte key, no value and a 100 byte header each cost 110 bytes (the 7 bytes of every
+    /// record, the header's 2 bytes of framing, 100 of its own, and the key). The statements run
+    /// here, on the Turso engine, because it rejects some SQL that SQLite takes.
     #[tokio::test]
     async fn fetch_counts_header_bytes() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4506,9 +4506,9 @@ mod tests {
     }
 
     /// Each header costs 2 bytes of framing, even when its key is empty and its value is null: 50
-    /// such headers and a one byte key cost a record 101 bytes, so a budget of 150 bytes returns
+    /// such headers and a one byte key cost a record 108 bytes, so a budget of 150 bytes returns
     /// one record. A fetch that dropped the framing, or that took the largest header of a record
-    /// instead of the sum of its headers, would count 1 to 3 bytes for a record and return all
+    /// instead of the sum of its headers, would count 8 to 10 bytes for a record and return all
     /// three.
     #[tokio::test]
     async fn fetch_counts_the_framing_of_every_header() -> Result<()> {
@@ -4534,9 +4534,9 @@ mod tests {
 
     /// A header costs the length of its key and the length of its value. Each record has one
     /// header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
-    /// and so costs 85 bytes with its own key, and a budget of 100 bytes returns one record. A
+    /// and so costs 92 bytes with its own key, and a budget of 110 bytes returns one record. A
     /// fetch that left out the key, or the value, or took the larger header of the two, would
-    /// count 43 to 45 bytes and return two.
+    /// count 50 to 52 bytes and return two.
     #[tokio::test]
     async fn fetch_counts_the_key_and_the_value_of_every_header() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4557,7 +4557,45 @@ mod tests {
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
                 vec![0],
-                fetched_offsets(&connection, statement, key, 100).await?,
+                fetched_offsets(&connection, statement, key, 110).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A record with no value and no headers still costs the 7 bytes of the smallest record, and
+    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 4 records whose running
+    /// total stays under it, where a statement that counts 1 byte for each returns all 10.
+    #[tokio::test]
+    async fn fetch_counts_a_fixed_cost_for_every_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        for offset in 0..10 {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+        }
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0, 1, 2, 3],
+                fetched_offsets_from(&connection, statement, key, 0, 40, 10).await?,
+                "{statement}"
+            );
+
+            // the first record is returned whatever its size (KIP-74)
+            assert_eq!(
+                vec![0],
+                fetched_offsets_from(&connection, statement, key, 0, 1, 10).await?,
                 "{statement}"
             );
         }
