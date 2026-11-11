@@ -54,10 +54,12 @@ changes.
   the type's file, or give the type a method that does the work.
 - **Name a module with children after its folder.** Write `topics.rs` beside `topics/`, never
   `topics/mod.rs`, so that each editor tab shows a different name. A folder never holds a file
-  with the folder's own name, because clippy's `module_inception` rejects `topics/topics.rs`. A
-  crate's top-level `tests/` folder is the exception: Cargo builds each `.rs` file in it as a test
-  binary of its own, so the helpers that several test binaries share go in `tests/common/mod.rs`,
-  which Cargo does not build alone.
+  with the folder's own name, because clippy's `module_inception` rejects `topics/topics.rs`. The
+  `common` module of a crate's integration tests is the exception, and stays `common/mod.rs`. In
+  a crate that builds one integration-test binary, `it`, as `AGENTS.md` describes, it is
+  `tests/it/common/mod.rs`. In a crate that builds a binary from each file in `tests/`, it is
+  `tests/common/mod.rs`, because Cargo builds each `.rs` file directly in `tests/` as a binary of
+  its own, and does not build a file in a subfolder alone.
 
 [C-METHOD]: https://rust-lang.github.io/api-guidelines/predictability.html#c-method
 
