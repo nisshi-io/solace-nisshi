@@ -488,8 +488,7 @@ impl Engine {
 
     /// Runs `query` on `connection`, and returns the one row of its result as `T`.
     ///
-    /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the result has no
-    /// rows, and [`Error::Turso`] with [`turso::Error::Misuse`] when it has more than one.
+    /// Returns [`Error::NotOneRow`] when the result has no rows or more than one row.
     async fn query_one<T: QueryRow>(
         &self,
         connection: &Connection,
@@ -503,14 +502,14 @@ impl Engine {
 
         match (rows.pop(), rows.pop()) {
             (Some(row), None) => Ok(row),
-            (None, _) => {
-                error!(query, "query returned no rows");
-                Err(turso::Error::QueryReturnedNoRows.into())
-            }
-            (Some(_), Some(_)) => {
-                error!(query, "query returned more than one row");
-                Err(turso::Error::Misuse(format!("{query} returned more than one row")).into())
-            }
+            (None, _) => Err(Error::NotOneRow {
+                query,
+                more_than_one: false,
+            }),
+            (Some(_), Some(_)) => Err(Error::NotOneRow {
+                query,
+                more_than_one: true,
+            }),
         }
     }
 
@@ -554,8 +553,8 @@ impl Engine {
 
     /// Adds the next epoch to `producer`, and returns it.
     ///
-    /// Returns [`Error::Turso`] with [`turso::Error::QueryReturnedNoRows`] when the producer does
-    /// not exist, or when its newest epoch is `i16::MAX`.
+    /// Returns [`Error::NotOneRow`] when the producer does not exist, or when its newest epoch is
+    /// `i16::MAX`.
     async fn producer_epoch_insert(&self, connection: &Connection, producer: i64) -> Result<i16> {
         self.query_one(
             connection,
@@ -2310,7 +2309,7 @@ impl Storage for Engine {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
+                                        .error_code(sql::topic_read_error_code(&reason).into())
                                         .name(Some(name.into()))
                                         .topic_id(Some(NULL_TOPIC_ID))
                                         .is_internal(Some(false))
@@ -2382,7 +2381,7 @@ impl Storage for Engine {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::TOPIC_READ_ERROR_CODE.into())
+                                        .error_code(sql::topic_read_error_code(&reason).into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -2626,7 +2625,7 @@ impl Storage for Engine {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
+                                .error_code(sql::topic_read_error_code(&reason).into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -2722,7 +2721,7 @@ impl Storage for Engine {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::TOPIC_READ_ERROR_CODE.into())
+                                .error_code(sql::topic_read_error_code(&reason).into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -5163,8 +5162,10 @@ mod tests {
             engine
                 .query_one(&connection, topic_by_cluster::QUERY, ["nisshi"])
                 .await,
-            Err(Error::Turso(err))
-                if matches!(&*err, turso::Error::Misuse(message) if message.contains("more than one row"))
+            Err(Error::NotOneRow {
+                query: "topic_by_cluster.sql",
+                more_than_one: true
+            })
         );
 
         Ok(())

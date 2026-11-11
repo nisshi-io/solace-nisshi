@@ -185,21 +185,36 @@ pub(crate) fn column_error_kind(error: &Error) -> Option<&'static str> {
     }
 }
 
-/// The error code of a topic in a Metadata or DescribeTopicPartitions response when the read of
-/// the topic fails.
+/// Returns the error code of a topic in a Metadata or DescribeTopicPartitions response when the
+/// read of the topic fails with `error`.
 ///
 /// The read does not answer `UNKNOWN_TOPIC_OR_PARTITION`, because that code tells a client that
 /// the topic does not exist, and a client that may create topics then asks the broker to create
 /// it on each metadata refresh.
 ///
-/// The read answers this code for a transient error too, instead of a retriable code such as the
-/// `LEADER_NOT_AVAILABLE` that Kafka's [`AutoTopicCreationManager`] answers for a topic that it
-/// can't serve yet. [`Error::is_transient`] counts every libSQL and Turso error as transient, so a
-/// retriable code would make a client retry a read that never succeeds, such as a read of a
-/// missing table, until the client times out.
+/// A transient error answers `LEADER_NOT_AVAILABLE`, the code that Kafka's
+/// [`AutoTopicCreationManager`] answers for a topic that it can't serve yet, so that a client
+/// retries. The Java consumer's `listTopics` retries that code, and fails at once on
+/// `UNKNOWN_SERVER_ERROR` ([`TopicMetadataFetcher.getTopicMetadata`]). Any other error answers
+/// `UNKNOWN_SERVER_ERROR`.
+///
+/// A libSQL or Turso error answers `UNKNOWN_SERVER_ERROR`, because [`Error::is_transient`]
+/// counts every libSQL and Turso error as transient. A retriable code would then make a client
+/// retry a read that never succeeds, such as a read of a missing table, until it times out.
 ///
 /// [`AutoTopicCreationManager`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L129-L133
-pub(crate) const TOPIC_READ_ERROR_CODE: ErrorCode = ErrorCode::UnknownServerError;
+/// [`TopicMetadataFetcher.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/TopicMetadataFetcher.java#L117-L138
+pub(crate) fn topic_read_error_code(error: &Error) -> ErrorCode {
+    match error {
+        #[cfg(feature = "libsql")]
+        Error::LibSql(_) => ErrorCode::UnknownServerError,
+
+        #[cfg(feature = "turso")]
+        Error::Turso(_) => ErrorCode::UnknownServerError,
+
+        error => error.error_code(ErrorCode::LeaderNotAvailable),
+    }
+}
 
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
 /// the engine gives the query and the error's [`column_error_kind`] as `kind`.
@@ -893,6 +908,44 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    /// A failed topic read answers a code that a client retries only when a retry can succeed.
+    #[test]
+    fn topic_read_error_code_is_retriable_only_for_a_transient_error() {
+        use super::topic_read_error_code;
+        use nisshi_sans_io::ErrorCode;
+        use std::io;
+
+        assert_eq!(
+            topic_read_error_code(&Error::from(io::Error::from(
+                io::ErrorKind::ConnectionReset
+            ))),
+            ErrorCode::LeaderNotAvailable
+        );
+
+        assert_eq!(
+            topic_read_error_code(&Error::UnreadableColumn {
+                query: "topic_select_name.sql",
+                column: "partitions",
+                source: Box::new(Error::UnexpectedNull),
+            }),
+            ErrorCode::UnknownServerError
+        );
+
+        // `Error::is_transient` counts this libSQL error as transient, and a retry of it can't
+        // succeed.
+        #[cfg(feature = "libsql")]
+        assert_eq!(
+            topic_read_error_code(&Error::from(libsql::Error::Misuse("no such table".into()))),
+            ErrorCode::UnknownServerError
+        );
+
+        #[cfg(feature = "turso")]
+        assert_eq!(
+            topic_read_error_code(&Error::from(turso::Error::Misuse("no such table".into()))),
+            ErrorCode::UnknownServerError
+        );
     }
 
     /// Each line of `queries!` names exactly the engines whose source names its constant, so
