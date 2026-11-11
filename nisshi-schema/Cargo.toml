@@ -65,6 +65,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+apache-avro = { workspace = true, features = ["snappy", "zstandard"] }
 pretty_assertions.workspace = true
 rand.workspace = true
 
