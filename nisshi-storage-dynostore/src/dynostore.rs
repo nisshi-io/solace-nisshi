@@ -3387,6 +3387,24 @@ impl DynoStore {
         self.lake.is_some().then_some(inflated)
     }
 
+    /// Returns whether `config` turns schema validation on. A topic that does not set
+    /// `nisshi.schema.validation`, or sets a value that is not a boolean, validates.
+    ///
+    /// This must give the answer of `TopicConfiguration::schema_validation` in `nisshi-storage`,
+    /// because the produce service validates exactly the topics for which this returns `true`.
+    fn schema_validation(config: &DescribeConfigsResult) -> bool {
+        topic_config::lookup(
+            config
+                .configs
+                .iter()
+                .flatten()
+                .filter_map(|config| Some((config.name.as_str(), config.value.as_deref()?))),
+            topic_config::SCHEMA_VALIDATION,
+        )
+        .and_then(|value| bool::from_str(value).ok())
+        .unwrap_or(true)
+    }
+
     /// Returns `inflated`, or decodes `deflated` on the blocking pool when the caller passed none.
     async fn decoded(
         inflated: Option<inflated::Batch>,
@@ -3623,18 +3641,23 @@ impl DynoStore {
             // next batch. If the stored sequence had moved, that batch would
             // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
             // although nothing was stored.
-            let inflated = if !attributes.control && self.lake.is_some() {
-                let inflated = Self::decoded(inflated, &deflated)
-                    .await
-                    .inspect_err(|err| debug!(?err))?;
+            //
+            // A topic whose schema validation is off does not reach the lake. The lake converts
+            // each record through the schema, and a record that breaks the schema fails that
+            // conversion after the offsets below are reserved.
+            let inflated =
+                if !attributes.control && self.lake.is_some() && Self::schema_validation(&config) {
+                    let inflated = Self::decoded(inflated, &deflated)
+                        .await
+                        .inspect_err(|err| debug!(?err))?;
 
-                Some(inflated)
-            } else {
-                // Not decoded here, so a batch that the caller decoded is not held across the
-                // writes below.
-                drop(inflated);
-                None
-            };
+                    Some(inflated)
+                } else {
+                    // Not decoded here, so a batch that the caller decoded is not held across the
+                    // writes below.
+                    drop(inflated);
+                    None
+                };
 
             let transactional = transaction_id.is_some() || deflated.is_transactional();
             let idempotent = IdempotentBatch::of(&deflated);
