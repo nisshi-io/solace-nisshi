@@ -2295,6 +2295,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
+    ///
+    /// `None` asks for every topic, and an empty slice for no topic, only the brokers, the
+    /// cluster and the controller, as an empty Metadata request does from v1
+    /// ([`MetadataRequest.isAllTopics`]).
+    ///
+    /// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
     async fn upsert_user_scram_credential(

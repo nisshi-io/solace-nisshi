@@ -270,7 +270,9 @@ pub use version_gate::{
 
 pub use input::TcpListenerInput;
 
-pub use metadata_topic_ids::{MetadataTopicIdLayer, MetadataTopicIdService, refuse_topic_ids};
+pub use metadata_topic_ids::{
+    MetadataTopicIdLayer, MetadataTopicIdService, all_topics_at_v0, refuse_topic_ids,
+};
 
 pub use transaction_abortable::{
     TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,

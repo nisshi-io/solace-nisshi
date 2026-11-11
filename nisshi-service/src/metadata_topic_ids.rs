@@ -25,7 +25,11 @@ use tracing::{instrument, warn};
 const FIRST_TOPIC_ID_METADATA_VERSION: i16 = 12;
 
 /// A [`Layer`] for the Metadata route that answers `INVALID_REQUEST` to a Metadata v10 or v11
-/// request with a null topic name or a topic ID.
+/// request with a null topic name or a topic ID, and that turns a v0 request for an empty list of
+/// topics into one for all topics.
+///
+/// The second is [`all_topics_at_v0`]: the Metadata service reads an empty list as no topics, as
+/// Kafka does from v1, and only a layer that sees the API version can keep the v0 rule.
 ///
 /// The Metadata request schema allows both from v10, but Kafka implemented them only at v12, and
 /// its schema says "Versions 10 and 11 should not use the topicId field or set topic name to
@@ -73,7 +77,15 @@ where
     type Error = S::Error;
 
     #[instrument(skip_all)]
-    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, mut req: FrameInput) -> Result<Self::Output, Self::Error> {
+        if matches!(req.frame.body, Body::MetadataRequest(_)) {
+            let api_version = req.frame.api_version()?;
+
+            if let Body::MetadataRequest(ref mut request) = req.frame.body {
+                all_topics_at_v0(api_version, request);
+            }
+        }
+
         if let Body::MetadataRequest(ref request) = req.frame.body {
             let api_version = req.frame.api_version()?;
 
@@ -108,6 +120,21 @@ where
 /// that it sends only what the layer lets through.
 pub fn refuse_topic_ids(api_version: i16, request: &MetadataRequest) -> Option<MetadataResponse> {
     refusal(api_version, request).map(|_| invalid_request(request))
+}
+
+/// Turns a v0 request for an empty list of topics into one for all topics, as Kafka reads it:
+/// "all topics" is a null list, or an empty one at v0 only ([`MetadataRequest.isAllTopics`]).
+///
+/// [`MetadataTopicIdLayer`] applies it before the request reaches the Metadata service or the
+/// proxy's origin, which both read an empty list as no topics. A test that serves a Metadata
+/// request to `MetadataService` without the layer, as a fuzz target does, can call this on the
+/// request first, as it can [`refuse_topic_ids`].
+///
+/// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
+pub fn all_topics_at_v0(api_version: i16, request: &mut MetadataRequest) {
+    if api_version == 0 && request.topics.as_ref().is_some_and(Vec::is_empty) {
+        request.topics = None;
+    }
 }
 
 /// What the first refused topic of a Metadata request asks for.
@@ -162,6 +189,8 @@ fn invalid_request(request: &MetadataRequest) -> MetadataResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use nisshi_sans_io::{ApiKey as _, metadata_request::MetadataRequestTopic};
     use rama::extensions::Extensions;
 
@@ -377,6 +406,96 @@ mod tests {
         );
 
         encodes(11, frame)
+    }
+
+    /// A handler that keeps the topics of the request that reaches it.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Option<Option<Vec<MetadataRequestTopic>>>>>);
+
+    impl Service<FrameInput> for Capture {
+        type Output = Frame;
+        type Error = Error;
+
+        async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+            let Body::MetadataRequest(request) = req.frame.body else {
+                panic!("a metadata request: {:?}", req.frame);
+            };
+
+            *self.0.lock().expect("lock") = Some(request.topics);
+
+            Pass.serve(FrameInput {
+                frame: Frame {
+                    size: 0,
+                    header: Header::Response { correlation_id: 0 },
+                    body: MetadataResponse::default().into(),
+                },
+                extensions: Extensions::default(),
+            })
+            .await
+        }
+    }
+
+    /// What `MetadataTopicIdLayer` passes on for a request of `topics` at `api_version`.
+    async fn passed_on(
+        api_version: i16,
+        topics: Option<Vec<MetadataRequestTopic>>,
+    ) -> Result<Option<Vec<MetadataRequestTopic>>, Error> {
+        let capture = Capture::default();
+
+        _ = MetadataTopicIdLayer
+            .layer(capture.clone())
+            .serve(FrameInput {
+                frame: Frame {
+                    size: 0,
+                    header: Header::Request {
+                        api_key: MetadataRequest::KEY,
+                        api_version,
+                        correlation_id: CORRELATION_ID,
+                        client_id: None,
+                    },
+                    body: MetadataRequest::default().topics(topics).into(),
+                },
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        Ok(capture.0.lock().expect("lock").take().expect("reached"))
+    }
+
+    /// An empty list means all topics at v0 only, so the layer passes it on as a null list there
+    /// and leaves it empty from v1, where it means no topics.
+    #[tokio::test]
+    async fn an_empty_list_is_all_topics_at_v0_only() -> Result<(), Error> {
+        assert_eq!(None, passed_on(0, Some(Vec::new())).await?);
+
+        for api_version in 1..=12 {
+            assert_eq!(
+                Some(Vec::new()),
+                passed_on(api_version, Some(Vec::new())).await?,
+                "v{api_version}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_null_list_and_a_named_topic_are_unchanged_at_every_version() -> Result<(), Error> {
+        let named = vec![MetadataRequestTopic::default().name(Some("orders".into()))];
+
+        for api_version in 0..=11 {
+            assert_eq!(
+                Some(named.clone()),
+                passed_on(api_version, Some(named.clone())).await?,
+                "v{api_version}"
+            );
+        }
+
+        for api_version in 1..=12 {
+            assert_eq!(None, passed_on(api_version, None).await?, "v{api_version}");
+        }
+
+        Ok(())
     }
 
     #[tokio::test]

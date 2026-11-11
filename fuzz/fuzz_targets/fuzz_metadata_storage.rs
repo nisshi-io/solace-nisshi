@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock};
 use libfuzzer_sys::fuzz_target;
 use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::MetadataRequest;
-use nisshi_service::refuse_topic_ids;
+use nisshi_service::{all_topics_at_v0, refuse_topic_ids};
 use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -46,9 +46,13 @@ fuzz_target!(|input: (u16, MetadataRequest)| {
 
     RUNTIME.block_on(async {
         // Serve what a client could actually have sent: the request as decoded off the wire.
-        let Some(request) = check_request(request, version).expect("encode/decode request") else {
+        let Some(mut request) = check_request(request, version).expect("encode/decode request")
+        else {
             return;
         };
+
+        // The same layer turns a v0 request for an empty list of topics into one for all topics.
+        all_topics_at_v0(version, &mut request);
 
         // The broker routes Metadata through a layer that refuses a v10 or v11 request with a
         // null topic name or a topic ID, so the service never sees one. Serving it here would

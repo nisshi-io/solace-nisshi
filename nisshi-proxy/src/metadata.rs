@@ -88,8 +88,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use nisshi_sans_io::{ApiKey as _, Body, ErrorCode, Header};
     use rama::extensions::Extensions;
@@ -100,14 +100,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct Origin {
         requests: Arc<AtomicUsize>,
+        topics: Arc<Mutex<Option<Option<Vec<MetadataRequestTopic>>>>>,
     }
 
     impl Service<MetadataRequest> for Origin {
         type Output = MetadataResponse;
         type Error = Error;
 
-        async fn serve(&self, _req: MetadataRequest) -> Result<Self::Output, Self::Error> {
+        async fn serve(&self, req: MetadataRequest) -> Result<Self::Output, Self::Error> {
             _ = self.requests.fetch_add(1, Ordering::SeqCst);
+            *self.topics.lock().expect("lock") = Some(req.topics);
 
             Ok(MetadataResponse::default().brokers(Some(vec![
                 MetadataResponseBroker::default()
@@ -123,6 +125,14 @@ mod tests {
         api_version: i16,
         topic: MetadataRequestTopic,
     ) -> Result<Frame, Error> {
+        serve_topics(origin, api_version, Some(vec![topic])).await
+    }
+
+    async fn serve_topics(
+        origin: &Origin,
+        api_version: i16,
+        topics: Option<Vec<MetadataRequestTopic>>,
+    ) -> Result<Frame, Error> {
         service(origin.clone(), "proxy".into(), 19092)
             .serve(FrameInput {
                 frame: Frame {
@@ -133,7 +143,7 @@ mod tests {
                         correlation_id: 12,
                         client_id: None,
                     },
-                    body: MetadataRequest::default().topics(Some(vec![topic])).into(),
+                    body: MetadataRequest::default().topics(topics).into(),
                 },
                 extensions: Extensions::default(),
             })
@@ -172,6 +182,29 @@ mod tests {
         }
 
         assert_eq!(0, origin.requests.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    /// The request to the origin goes at the version that the proxy negotiated with it, not the
+    /// client's, so the origin would read a v0 client's empty list, which means all topics, as
+    /// no topics. From v1 the empty list means no topics at both, and must reach the origin as
+    /// it is, or every producer's bootstrap through the proxy would list all topics there.
+    #[tokio::test]
+    async fn an_empty_list_reaches_the_origin_as_all_topics_at_v0_only() -> Result<(), Error> {
+        let origin = Origin::default();
+
+        _ = serve_topics(&origin, 0, Some(Vec::new())).await?;
+        assert_eq!(Some(None), origin.topics.lock().expect("lock").take());
+
+        for api_version in [1, 12] {
+            _ = serve_topics(&origin, api_version, Some(Vec::new())).await?;
+            assert_eq!(
+                Some(Some(Vec::new())),
+                origin.topics.lock().expect("lock").take(),
+                "v{api_version}"
+            );
+        }
 
         Ok(())
     }

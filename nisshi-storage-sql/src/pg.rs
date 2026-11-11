@@ -4727,7 +4727,7 @@ impl Storage for Postgres {
         debug!(?brokers);
 
         let responses = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 let mut responses = vec![];
 
                 for topic in topics {
@@ -4888,7 +4888,7 @@ impl Storage for Postgres {
                 responses
             }
 
-            _ => {
+            None => {
                 let mut responses = vec![];
 
                 match self
