@@ -388,9 +388,9 @@ mod tests {
         Ok(())
     }
 
-    /// The null engine lists every topic whatever the lookup names, and the deprecated slatedb
-    /// engine does the same for an empty slice, so the service itself keeps an empty list from
-    /// answering topics.
+    /// The deprecated slatedb engine lists every topic for an empty slice, so the service itself
+    /// keeps an empty list from answering topics. [`Lookup::Listed`] stands in for it, since it
+    /// lists the topics whatever the lookup names.
     #[tokio::test(start_paused = true)]
     async fn an_empty_list_answers_no_topics_from_a_storage_that_lists_every_topic() -> Result<()> {
         let storage =

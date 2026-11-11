@@ -726,18 +726,23 @@ mod tests {
     }
 
     async fn engine_with_topics(names: &[&str]) -> Result<Engine> {
+        let topics = names.iter().map(|name| (*name, 1)).collect::<Vec<_>>();
+        engine_with_partitions(&topics).await
+    }
+
+    async fn engine_with_partitions(topics: &[(&str, i32)]) -> Result<Engine> {
         let engine = Engine::new(
             "cluster".into(),
             111,
             Url::parse("tcp://127.0.0.1:9092/").expect("valid url"),
         );
 
-        for name in names {
+        for (name, num_partitions) in topics {
             _ = engine
                 .create_topic(
                     CreatableTopic::default()
                         .name((*name).into())
-                        .num_partitions(1)
+                        .num_partitions(*num_partitions)
                         .replication_factor(1),
                     false,
                 )
@@ -760,7 +765,7 @@ mod tests {
     /// `MetadataService` can auto-create it.
     #[tokio::test]
     async fn metadata_answers_the_topics_asked_for() -> Result<()> {
-        let engine = engine_with_topics(&["a", "b", "c"]).await?;
+        let engine = engine_with_partitions(&[("a", 1), ("b", 2), ("c", 3)]).await?;
         let none = i16::from(ErrorCode::None);
         let unknown = i16::from(ErrorCode::UnknownTopicOrPartition);
 
@@ -780,10 +785,17 @@ mod tests {
             ],
             rows(&metadata)
         );
+        // Fetch bounds the valid partition indexes by the length of the first row's partitions,
+        // so each tracked row must carry its own topic's count.
+        let partition_counts = metadata
+            .topics
+            .iter()
+            .map(|topic| topic.partitions.as_ref().map(Vec::len))
+            .collect::<Vec<_>>();
         assert_eq!(
-            Some(&Vec::new()),
-            metadata.topics[1].partitions.as_ref(),
-            "an unknown topic has no partitions"
+            vec![Some(3), Some(0), Some(1)],
+            partition_counts,
+            "a tracked topic has its own partitions, and an unknown one has none"
         );
 
         Ok(())
