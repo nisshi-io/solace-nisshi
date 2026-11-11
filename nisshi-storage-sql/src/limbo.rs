@@ -2839,16 +2839,14 @@ impl Storage for Engine {
                     // committed offsets, never a JoinGroup) joins to a NULL
                     // `detail` column here: that group exists and is empty, not
                     // an error.
-                    let current = match row.detail {
-                        None => GroupDetail::default(),
-                        Some(value) => value
+                    let stored = row.detail.map(|detail| {
+                        detail
                             .and_then(serde_json::from_value::<GroupDetail>)
                             .map_err(Error::from)
                             .inspect(|current| debug!(?current))
-                            .inspect_err(|err| error!(?err, group_id))?,
-                    };
+                    });
 
-                    results.push(NamedGroupDetail::found(group_id.into(), current));
+                    results.push(NamedGroupDetail::decoded(group_id.into(), stored));
                 } else {
                     results.push(NamedGroupDetail::error_code(
                         group_id.into(),
@@ -5127,18 +5125,16 @@ mod tests {
         Ok(engine)
     }
 
-    /// A ListGroups must answer a stored group whose detail isn't text with `UNKNOWN_SERVER_ERROR`
-    /// as it answers a detail that isn't JSON, and list the other groups as usual.
-    #[tokio::test]
-    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
-    {
-        let _guard = init_tracing()?;
+    /// Returns an engine on a new database in `temp_dir`, with the groups `healthy` and
+    /// `undecodable`, and the detail that it stored for `healthy`. The stored detail of
+    /// `undecodable` isn't text.
+    async fn engine_with_group_detail_not_text(
+        temp_dir: &TempDir,
+    ) -> Result<(Engine, GroupDetail)> {
+        let engine = registered_engine(temp_dir).await?;
 
-        let temp_dir = tempdir_in(env::current_dir()?)?;
-        let engine = registered_engine(&temp_dir).await?;
-
-        // `GroupDetail::default` records the current time as the group's inception, so the test
-        // keeps the detail that it stores.
+        // `GroupDetail::default` records the current time as the group's inception, so the helper
+        // returns the detail that it stores.
         let stored = GroupDetail::default();
 
         for group_id in ["healthy", "undecodable"] {
@@ -5163,8 +5159,21 @@ mod tests {
             )
             .await?;
         // The update must change the group's row. An update that changes no row leaves the group
-        // readable, and the test then fails for that reason instead of testing the engine.
+        // readable, and a test then fails for that reason instead of testing the engine.
         assert_eq!(1, changed);
+
+        Ok((engine, stored))
+    }
+
+    /// A ListGroups must answer a stored group whose detail isn't text with `UNKNOWN_SERVER_ERROR`
+    /// as it answers a detail that isn't JSON, and list the other groups as usual.
+    #[tokio::test]
+    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let (engine, stored) = engine_with_group_detail_not_text(&temp_dir).await?;
 
         let mut listed = engine.list_groups().await?;
         // The query doesn't order its rows.
@@ -5176,6 +5185,31 @@ mod tests {
                 NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
             ],
             listed
+        );
+
+        Ok(())
+    }
+
+    /// A DescribeGroups must answer a stored group whose detail isn't text with
+    /// `UNKNOWN_SERVER_ERROR`, which clients report at once, and answer the other groups in the
+    /// request as usual.
+    #[tokio::test]
+    async fn describe_groups_answers_unknown_server_error_for_a_detail_that_is_not_text()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let (engine, stored) = engine_with_group_detail_not_text(&temp_dir).await?;
+
+        let group_ids = ["healthy", "undecodable", "missing"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+                NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
+            ],
+            engine.describe_groups(Some(&group_ids), false).await?
         );
 
         Ok(())
