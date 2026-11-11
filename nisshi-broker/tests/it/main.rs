@@ -99,6 +99,7 @@ pub mod retention_ms;
 #[cfg(feature = "libsql")]
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
+pub mod shutdown;
 pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;
 pub mod storage_capabilities;

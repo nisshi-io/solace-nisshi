@@ -256,6 +256,7 @@ mod frame;
 mod input;
 mod metadata_topic_ids;
 mod peer_address;
+mod shutdown;
 mod stream;
 mod transaction_abortable;
 mod version_gate;
@@ -283,6 +284,8 @@ pub use channel::{
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
 
 pub use peer_address::PeerAddressExtension;
+
+pub use shutdown::ShutdownExtension;
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
