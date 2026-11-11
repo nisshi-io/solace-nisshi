@@ -82,20 +82,6 @@ macro_rules! sql_row {
             }
         }
 
-        #[cfg(test)]
-        impl Row {
-            /// Each column of the row, with the kind of value that its field reads.
-            #[allow(dead_code, reason = "a test probe's row is in no query's line of `queries!`")]
-            pub(crate) const COLUMNS: &[$crate::sql::driver::DeclaredColumn] = &[
-                $(
-                    $crate::sql::driver::DeclaredColumn {
-                        name: stringify!($field),
-                        kind: <$type as $crate::sql::driver::FromColumn>::KIND,
-                    },
-                )+
-            ];
-        }
-
         impl $crate::sql::QueryRow for Row {
             type Reader = RowReader;
 
@@ -554,7 +540,6 @@ macro_rules! queries {
                     check_columns: |columns| {
                         query_reader($module::$module_constant, columns).map(|_| ())
                     },
-                    columns: $module::Row::COLUMNS,
                 },
             )+
             $(
@@ -563,7 +548,6 @@ macro_rules! queries {
                     query: $counted_module::$counted_constant,
                     engines: &[$(SqlEngine::$counted_engine),+],
                     check_columns: |_| Ok(()),
-                    columns: &[],
                 },
             )+
         ];
@@ -609,15 +593,6 @@ pub(crate) struct RowQuery {
     pub(crate) engines: &'static [SqlEngine],
     /// Returns the error of the query's `RowReader` for the columns of the query's result.
     pub(crate) check_columns: fn(&result_columns::ResultColumns) -> Result<()>,
-    /// Each column of the query's row, with the kind of value that its field reads.
-    #[cfg_attr(
-        not(feature = "postgres"),
-        allow(
-            dead_code,
-            reason = "only the PostgreSQL test reads a column's declared kind"
-        )
-    )]
-    pub(crate) columns: &'static [driver::DeclaredColumn],
 }
 
 /// Returns the reader of `T`, the row of `query`, for the result with `columns`.

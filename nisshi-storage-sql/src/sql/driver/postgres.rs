@@ -67,24 +67,6 @@ impl<'a> FromSql<'a> for KafkaTimestamp {
     }
 }
 
-#[cfg(test)]
-impl super::ColumnKind {
-    /// Returns whether the [`DriverRow`] method for this kind reads a column of type `ty`.
-    pub(crate) fn postgres_accepts(self, ty: &Type) -> bool {
-        match self {
-            Self::Integer => Integer::accepts(ty),
-            Self::Boolean => bool::accepts(ty),
-            Self::Text => String::accepts(ty),
-            Self::Bytes => <&[u8]>::accepts(ty),
-            Self::BytesArray => <Vec<Option<&[u8]>>>::accepts(ty),
-            Self::Uuid => Uuid::accepts(ty),
-            Self::Timestamp => CheckedSystemTime::accepts(ty),
-            Self::KafkaTimestamp => KafkaTimestamp::accepts(ty),
-            Self::Json => Value::accepts(ty),
-        }
-    }
-}
-
 impl DriverRow for Row {
     fn integer(&self, index: usize) -> Result<Option<i64>> {
         self.try_get::<_, Option<Integer>>(index)

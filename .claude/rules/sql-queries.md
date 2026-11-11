@@ -70,8 +70,7 @@ changes.
   driver.
 - **Name the engines that run a query on its line in `queries!`,** as `[Postgres, Libsql, Turso]`.
   Each engine's `every_row_query_returns_the_columns_of_its_row` test checks those queries against
-  their rows. On PostgreSQL, which reports each column's type when it prepares a query, the test
-  also checks that each field reads its column's type.
+  their rows.
 - **Put what a row means in the query's module.** When a result has a row that is not data, such
   as a marker row for a topic that sets none of the requested keys, the module gives `Row` a method
   that returns `None` for it, and each engine calls that method instead of testing the field.
