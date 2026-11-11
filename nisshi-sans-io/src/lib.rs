@@ -366,6 +366,9 @@ pub enum Error {
     /// The encoder has no bytes to write for it, and skipping it would shift every later field.
     /// `field` is the field's path, e.g. `Frame.FetchRequest.FetchTopic.FetchPartition.current_leader_epoch`,
     /// and `api_version` is the version that the message was encoded at.
+    ///
+    /// The decoder returns it too, for a list that is not nullable at the decoded version and
+    /// came off the wire as null, as Kafka's reader refuses it.
     MandatoryFieldUnset {
         field: String,
         api_version: i16,
@@ -2497,7 +2500,7 @@ pub trait Decode: Sized {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, thread::sleep};
+    use std::{assert_matches, io::Write, thread::sleep};
 
     use super::*;
 
@@ -2939,6 +2942,67 @@ mod tests {
         assert!(
             matches!(err, Error::MessageMaxSizeExceeded(length) if length == CLAIMED_AUTH_BYTES_LENGTH as usize),
             "{err:?}"
+        );
+    }
+
+    /// The bytes of a request frame at `api_version` with a null client ID, which is legal, and
+    /// `body`.
+    fn request_bytes(api_key: i16, api_version: i16, body: &[u8]) -> Bytes {
+        let mut encoded = BytesMut::new();
+        encoded.put_i32(0); // size: unused by Frame::request_from_bytes
+        encoded.put_i16(api_key);
+        encoded.put_i16(api_version);
+        encoded.put_i32(1); // correlation_id
+        encoded.put_i16(-1); // client_id: null
+        encoded.put_slice(body);
+        encoded.freeze()
+    }
+
+    /// A list that is nullable only from some version, with `length` -1, fails to decode below
+    /// that version, as Kafka's does. Metadata's `topics` is nullable from v1, and OffsetFetch's
+    /// from v2.
+    #[test]
+    fn a_null_list_fails_to_decode_below_the_version_that_allows_it() {
+        let null_list = (-1_i32).to_be_bytes();
+        let group_and_null_list = [&[0, 1, b'g'][..], &null_list].concat();
+
+        for (api_key, version, body, nullable) in [
+            (MetadataRequest::KEY, 0, &null_list[..], false),
+            (MetadataRequest::KEY, 1, &null_list[..], true),
+            (OffsetFetchRequest::KEY, 0, &group_and_null_list[..], false),
+            (OffsetFetchRequest::KEY, 1, &group_and_null_list[..], false),
+            (OffsetFetchRequest::KEY, 2, &group_and_null_list[..], true),
+        ] {
+            let decoded = Frame::request_from_bytes(request_bytes(api_key, version, body));
+
+            if nullable {
+                let frame = decoded.unwrap_or_else(|err| panic!("{api_key} v{version}: {err}"));
+
+                assert_matches!(
+                    frame.body,
+                    Body::MetadataRequest(MetadataRequest { topics: None, .. })
+                        | Body::OffsetFetchRequest(OffsetFetchRequest { topics: None, .. })
+                );
+            } else {
+                assert_matches!(
+                    decoded,
+                    Err(Error::MandatoryFieldUnset { api_version, .. }) if api_version == version,
+                    "{api_key} v{version}"
+                );
+            }
+        }
+    }
+
+    /// An empty list, which is how a v0 request asks for all topics, still decodes.
+    #[test]
+    fn an_empty_list_decodes_at_v0() {
+        let frame =
+            Frame::request_from_bytes(request_bytes(MetadataRequest::KEY, 0, &[0, 0, 0, 0]))
+                .expect("an empty list decodes");
+
+        assert_matches!(
+            frame.body,
+            Body::MetadataRequest(MetadataRequest { topics: Some(topics), .. }) if topics.is_empty()
         );
     }
 

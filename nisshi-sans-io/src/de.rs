@@ -769,6 +769,22 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                     debug!(length);
 
                     if length == -1 {
+                        // Kafka's generated reader throws for a null array outside the field's
+                        // `nullableVersions`, so the request fails to decode and the broker
+                        // closes the connection with no response: a Metadata v0 request with a
+                        // null list of topics, as one example
+                        // ([MessageDataGenerator.java#L620-L626],
+                        // [RequestContext.java#L111-L131]).
+                        //
+                        // [MessageDataGenerator.java#L620-L626]: https://github.com/apache/kafka/blob/3.9.1/generator/src/main/java/org/apache/kafka/message/MessageDataGenerator.java#L620-L626
+                        // [RequestContext.java#L111-L131]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L131
+                        if !self.is_nullable() {
+                            return Err(Error::MandatoryFieldUnset {
+                                field: self.field_name(),
+                                api_version: self.api_version.unwrap_or_default(),
+                            });
+                        }
+
                         self.length = None;
                         visitor.visit_none()
                     } else {
