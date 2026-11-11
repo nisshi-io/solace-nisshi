@@ -28,6 +28,21 @@ impl ResultColumns {
         Self { query, names }
     }
 
+    /// Returns the column names of `statement`, PostgreSQL's prepared statement of `query`.
+    ///
+    /// The names come from the statement, not from a row, so a result without rows has them too.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn postgres(query: &'static str, statement: &tokio_postgres::Statement) -> Self {
+        Self::new(
+            query,
+            statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect(),
+        )
+    }
+
     /// Returns the column names of `rows`, libSQL's result of `query`.
     #[cfg(feature = "libsql")]
     pub(crate) fn libsql(query: &'static str, rows: &libsql::Rows) -> Self {
@@ -45,16 +60,34 @@ impl ResultColumns {
         Self::new(query, rows.column_names())
     }
 
-    /// Returns the index of the column `name`, or an error if the result has no such column.
-    pub(crate) fn index(&self, name: &str) -> Result<usize> {
-        self.names
+    /// Returns the query's name in the SQL cache.
+    pub(crate) fn query(&self) -> &'static str {
+        self.query
+    }
+
+    /// Returns the index of the column `name`. Returns [`Error::MissingColumn`] if the result does
+    /// not have that column, and [`Error::DuplicateColumn`] if it has more than one.
+    pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
+        let mut indexes = self
+            .names
             .iter()
-            .position(|found| found == name)
-            .ok_or_else(|| {
-                Error::Message(format!(
-                    "{}: no column {name:?} in {:?}",
-                    self.query, self.names
-                ))
-            })
+            .enumerate()
+            .filter(|(_, found)| *found == name)
+            .map(|(index, _)| index);
+
+        let index = indexes.next().ok_or_else(|| Error::MissingColumn {
+            query: self.query,
+            column: name,
+            found: self.names.clone(),
+        })?;
+
+        if indexes.next().is_some() {
+            return Err(Error::DuplicateColumn {
+                query: self.query,
+                column: name,
+            });
+        }
+
+        Ok(index)
     }
 }

@@ -27,11 +27,12 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
-        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
-        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+        Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, ROWS_PER_FETCH,
+        consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
+        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
+        remove_comments, result_columns::ResultColumns, topic_configuration_select, topic_select,
+        txn_offset_commit_tp_select_pending, txn_produce_partition_check,
+        txn_produce_partition_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -420,6 +421,97 @@ impl Engine {
         Ok(row)
     }
 
+    /// Runs `query` on `connection`, and returns its rows, each read as `T` when the caller
+    /// reaches it.
+    async fn query_rows<T: QueryRow>(
+        &self,
+        connection: &Connection,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<QueryRowCursor<turso::Rows, T>> {
+        let query = query.key();
+        let sql = sql_lookup(query)?;
+        let rows = connection.query(&sql, params).await?;
+        QueryRowCursor::new(
+            &ResultColumns::turso(query, &rows),
+            rows,
+            self.column_error_count(&sql),
+        )
+    }
+
+    /// Returns the count of `sql`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, sql: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(
+            &SQL_ERROR,
+            vec![
+                KeyValue::new("sql", sql.to_owned()),
+                KeyValue::new("cluster_id", self.cluster.clone()),
+            ],
+        )
+    }
+
+    /// Runs `query` on `connection`, and returns the first row of its result as `T`, or `None`
+    /// when the result has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    async fn query_first<T: QueryRow>(
+        &self,
+        connection: &Connection,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<Option<T>> {
+        let query = query.key();
+        let sql = sql_lookup(query)?;
+
+        // The params hold record data, so we log only the SQL.
+        debug!(?connection, sql);
+
+        let mut statement = connection
+            .prepare(&sql)
+            .await
+            .inspect_err(|err| error!(?err, sql))?;
+
+        let execute_start = SystemTime::now();
+
+        let mut rows = statement.query(params).await.inspect_err(|err| {
+            error!(?err, sql);
+            SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+        })?;
+
+        let reader = T::reader(&ResultColumns::turso(query, &rows))
+            .inspect_err(|err| self.column_error_count(&sql).record(err))?;
+
+        let row = rows
+            .next()
+            .await
+            .inspect(|row| debug!(?row))
+            .inspect_err(|err| {
+                error!(?err, sql);
+                SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+            })?
+            .map(|row| T::read(&reader, &row))
+            .transpose()
+            .inspect_err(|err| self.column_error_count(&sql).record(err))?;
+
+        let attributes = [
+            KeyValue::new("sql", sql),
+            KeyValue::new("cluster_id", self.cluster.clone()),
+        ];
+
+        SQL_DURATION.record(
+            execute_start
+                .elapsed()
+                .map_or(0, |duration| duration.as_millis() as u64),
+            &attributes,
+        );
+
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok(row)
+    }
+
     async fn prepare_query_one<P>(
         &self,
         connection: &Connection,
@@ -483,9 +575,10 @@ impl Engine {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let mut rows = connection
-            .query(
-                &sql_lookup(producer_epochs_select::QUERY)?,
+        let epochs = self
+            .query_first(
+                connection,
+                producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
                     deflated.producer_id,
@@ -493,23 +586,14 @@ impl Engine {
                     topition.partition(),
                 ),
             )
-            .await?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-        let columns = ResultColumns::turso(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)?;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)?;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)?;
-
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
+        if let Some(epochs) = epochs {
             let stored = StoredEpochs {
-                transactional: integer_value(&row, transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: epoch_value(&row, newest_epoch).inspect_err(|err| error!(?err))?,
-                partition: match row.get_value(partition_epoch)? {
-                    Value::Null => None,
-                    _ => Some(epoch_value(&row, partition_epoch).inspect_err(|err| error!(?err))?),
-                },
+                transactional: epochs.transactional != 0,
+                newest: epochs.newest_epoch,
+                partition: epochs.partition_epoch,
             };
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
@@ -608,44 +692,18 @@ impl Engine {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition, ?tx);
 
-        let mut rows = tx
-            .query(
-                &sql_lookup(watermark_select_for_write::LITE_QUERY)?,
-                (
-                    self.cluster.as_str(),
-                    topition.topic(),
-                    topition.partition(),
-                ),
-            )
-            .await?;
-
-        let columns = ResultColumns::turso(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)?;
-        let high = columns.index(watermark_select_for_write::HIGH)?;
-        let max_message_bytes = columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)?;
-
-        let Some(row) = rows
-            .next()
-            .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        Ok(watermark_select_for_write::Row {
-            low: row
-                .get_value(low)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            high: row
-                .get_value(high)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            max_message_bytes: row
-                .get_value(max_message_bytes)
-                .map(|value| value.as_text().cloned())
-                .inspect_err(|err| error!(?err))?,
-        })
+        self.query_first(
+            tx,
+            watermark_select_for_write::LITE_QUERY,
+            (
+                self.cluster.as_str(),
+                topition.topic(),
+                topition.partition(),
+            ),
+        )
+        .await
+        .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
+        .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     /// Refuses a client's transactional batch for a partition that is not in its producer's
@@ -2735,38 +2793,25 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("topic_select.sql")?,
+                &sql_lookup(topic_select::QUERY)?,
                 (self.cluster.as_str(), name),
             )
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = c
-                .query(
-                    &sql_lookup("topic_configuration_select.sql")?,
+            let mut rows = self
+                .query_rows(
+                    &c,
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
             let mut configs = vec![];
 
-            while let Some(row) = rows.next().await? {
-                let name = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_text()
-                            .cloned()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect_err(|err| error!(?err))?;
-
-                let value = row
-                    .get_value(1)
-                    .map(|value| value.as_text().cloned())
-                    .inspect_err(|err| error!(?err))?;
-
+            while let Some(topic_configuration_select::Row { name, value }) =
+                rows.next().await.inspect_err(|err| error!(?err))?
+            {
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
@@ -3066,39 +3111,15 @@ impl Storage for Engine {
 
         let mut listed_groups = vec![];
 
-        let mut rows = c
-            .query(
-                &sql_lookup(consumer_group_select::QUERY)?,
-                &[self.cluster.as_str()],
-            )
+        let mut rows = self
+            .query_rows(&c, consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::turso(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)?;
-        let detail = columns.index(consumer_group_select::DETAIL)?;
+        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_value(name).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value.clone()))
-            })?;
-
-            let detail = row.get_value(detail).map_err(Error::from)?;
-
-            let stored = if detail.is_null() {
-                None
-            } else {
-                Some(
-                    detail
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(detail.clone()))
-                        .and_then(|text| serde_json::from_str(text).map_err(Error::from)),
-                )
-            };
-
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups)
