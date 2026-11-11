@@ -187,7 +187,8 @@ updates:
     ignore:
       # The devcontainer's rust tag must stay equal to the channel in
       # rust-toolchain.toml, so Dependabot updates only its digest. A
-      # toolchain bump changes both files in one PR.
+      # toolchain bump changes both files, and `rust-version` in the root
+      # Cargo.toml, in one PR.
       - dependency-name: "rust"
         update-types:
           - "version-update:semver-major"

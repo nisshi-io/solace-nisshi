@@ -163,7 +163,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
   - In a temporary worktree of `MERGE_SHA` (or with `git show "MERGE_SHA:Cargo.toml"` and `git show "MERGE_SHA:CHANGELOG.md"` written to a scratch directory), `check-release-tag.sh TAG` passes.
   - Stable: `git log --first-parent DRAFT_BASE..MERGE_SHA^` lists the commits that the merge queue landed ahead of the PR. Each one ships in this release. If any is visible to users, stop and ask the operator whether to tag anyway or to add it in a follow-up PR first. A follow-up PR is a new `docs(changelog): ...` PR from `origin/main`. Its squash commit becomes `MERGE_SHA`, its base becomes `DRAFT_BASE`, and this phase starts again.
   - The push run of `ci.yml` on `MERGE_SHA` is green: `gh run list --workflow ci.yml --commit MERGE_SHA --event push --json databaseId,status,conclusion`. If it is still running, wait with `gh run watch <id> --exit-status` in the background.
-  - The push run of `guardian-scan.yaml` on `MERGE_SHA` is green, checked and waited for the same way. The tag's `release-readiness` job repeats this scan, so a block found now keeps the version free, and a block found after tagging costs it unless an admin approves the override. If the run failed in its `FOSSA` job on a licensing conflict that is waived in FOSSA, the operator can set the `FOSSA_LICENSING_BLOCK` repository variable to `false` before the tag is pushed; a release run reads it only when it starts.
+  - The push run of `guardian-scan.yaml` on `MERGE_SHA` is green, checked and waited for the same way. The tag's `release-readiness` job repeats this scan, so a block found now keeps the version free, and a block found after tagging costs it unless an admin approves the override.
 - **Ask the operator** to confirm the tag, naming `TAG` and `MERGE_SHA`. Only after a yes:
 
   ```bash
@@ -183,7 +183,6 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
   - An outage: every failed step is in this list: `Install FOSSA CLI`, `FOSSA analyze and upload`, `Download scan image`, `Load image`, `Prisma Cloud scan`, `Install Trivy`, `Guardian DB sync and Jira report`, or a step of the `Build image` job whose log shows a network or registry error. Say so and give the operator a third way forward besides approving and rejecting: reject the override, wait for the outage to end, then `gh run rerun <id> --failed`. That re-runs `release-readiness`, `override` is skipped once it passes, and the publish jobs run as usual with no new version. The override publishes with no verdict at all, so don't present it as the default for an outage.
   - Anything else, such as `Verify trunk mode` or the self-test in `Resolve context`: report the step and its log to the operator and don't offer the rerun. These fail the same way on every attempt, and `--failed` doesn't re-run `setup`.
 - Tell the operator to approve or rerun within 3 days. The publish jobs of this run, and of a rerun of it, download the `image-*` and tarball artifacts of this run, which `ci.yml` keeps for 3 days on a tag push, while the waiting deployment can sit for 30. An approval or a rerun after the artifacts expire fails `publish-image`, and the only way back is a full re-run with a rebuild, a rescan and another approval. The operator should pass the 3 days on to whoever approves.
-- If the operator set `FOSSA_LICENSING_BLOCK=false` for this release, delete it with `gh variable delete FOSSA_LICENSING_BLOCK` once the `Resolve context` job of `release-readiness` has run. It turns off the licensing block for every trunk run until it is removed.
 - Pre-release: the body is two paragraphs. The first is fixed, with `X.Y.Z` being `VERSION` without its `-pre.N`:
 
   ```markdown
@@ -205,7 +204,7 @@ Fix or remove each claim it returns. Don't publish a claim that nobody checked.
 
 ## 9. Report
 
-Report the run URL and its conclusion, and whether the `FOSSA_LICENSING_BLOCK` variable is still set (`gh variable list`).
+Report the run URL and its conclusion.
 
 - **On failure:** say which job failed and what it had already published. The jobs run in order:
   - `ci`, `on-main` or `release-tag` failed, or `release-readiness` failed and the `override` deployment was rejected: nothing was published. The tag stays, because a tag is never moved or deleted. Fix `main`, then cut the next version. Phase 1 skips this tag's version, because it has no GitHub release. The exception is an override that the operator rejected to wait out a scanner outage: the version is not lost while the artifacts last, so go back to phase 8's rerun instead.

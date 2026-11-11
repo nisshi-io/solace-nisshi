@@ -35,7 +35,7 @@ pub struct TopicConfiguration {
 impl TopicConfiguration {
     /// Reads the configuration of the topic `name` from `storage`.
     ///
-    /// The read and `storage.produce()` run in separate transactions. If the topic's
+    /// The read and `storage.produce_inflated()` run in separate transactions. If the topic's
     /// `message.timestamp.type` changes between them, the batch keeps the type that this function
     /// read. The batch stores its type in its attributes, so a consumer still reads its timestamps
     /// correctly. Kafka also applies a config change asynchronously, and an append that is in

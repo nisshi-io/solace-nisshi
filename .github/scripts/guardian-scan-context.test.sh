@@ -131,24 +131,16 @@ check "pr-fork" pr refs/pull/7/merge PR $PR_SHA v1 true true false false false f
 run EVENT_NAME=merge_group FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/gh-readonly-queue/main/pr-9 IS_FORK=false
 check "queue-scan" queue refs/heads/gh-readonly-queue/main/pr-9 merge-queue v1 v1 false false false true false false false REPORT
 
-# --- Case 5a: FOSSA_LICENSING_BLOCK turns off only the licensing block ---------
-# Exactly "false" makes licensing REPORT on trunk while enforce (the Guardian
-# gate) stays on; any other value fails closed.
+# --- Case 5a: no repository setting turns the licensing block off on trunk --
+# The licensing guard's mode follows enforce alone, so a leftover
+# FOSSA_LICENSING_BLOCK=false still blocks.
 run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
     GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK=false
-check "licensing-off" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true REPORT
+check "licensing-var-ignored" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true BLOCK
 case "$STDOUT" in
-  *"::warning::FOSSA licensing guard is REPORT-only"*) pass "licensing-off: warns" ;;
-  *) fail "licensing-off: warns" "stdout=[$STDOUT]" ;;
+  *"REPORT-only"*) fail "licensing-var-ignored: no warning" "stdout=[$STDOUT]" ;;
+  *) pass "licensing-var-ignored: no warning" ;;
 esac
-for value in true no FALSE; do
-  run EVENT_NAME=push FULL_VERSION_INPUT=v1.2.3 \
-      GITHUB_REF=refs/heads/main IS_FORK=false FOSSA_LICENSING_BLOCK="$value"
-  check "licensing-$value" trunk refs/heads/main main v1.2.3 v1.2.3 false false true false false true true BLOCK
-done
-run EVENT_NAME=pull_request HEAD_SHA=$PR_SHA FULL_VERSION_INPUT=v1 \
-    GITHUB_REF=refs/pull/7/merge IS_FORK=false FOSSA_LICENSING_BLOCK=false
-check "licensing-off-pr" pr refs/pull/7/merge PR $PR_SHA v1 false true false false false true false REPORT
 
 # --- Case 6: ref precedence - explicit input wins, else github.ref -------------
 run EVENT_NAME=push FULL_VERSION_INPUT=v1 GITHUB_REF=refs/heads/main \

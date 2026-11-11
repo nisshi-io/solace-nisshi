@@ -23,6 +23,7 @@
 //! there without the lock, so the second batch can pass its check, or be stored, before the first
 //! one is. The tests read every wait from `pg_blocking_pids`, not from a timer.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, collections::BTreeMap, time::Duration};
 
 use crate::common::{alphanumeric_string, postgres_storage, postgres_url};
@@ -128,7 +129,7 @@ impl Producer {
         while next_offset < high_watermark {
             let batches = self
                 .storage
-                .fetch(
+                .fetch_until_deadline(
                     &self.topition,
                     next_offset,
                     1,
@@ -136,7 +137,8 @@ impl Producer {
                     IsolationLevel::ReadUncommitted,
                     Instant::now() + Duration::from_secs(5),
                 )
-                .await?;
+                .await
+                .map(|read| read.batches)?;
             assert!(!batches.is_empty(), "no batch at {next_offset}");
 
             for batch in &batches {

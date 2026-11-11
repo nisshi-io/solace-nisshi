@@ -80,7 +80,7 @@ impl From<(ErrorCode, &'static str)> for Rejection {
     }
 }
 
-/// The error code for a failed `storage.produce()`.
+/// The error code for a failed `storage.produce_inflated()`.
 ///
 /// A batch over the decoded-size limit is reported as `MESSAGE_TOO_LARGE`:
 /// Kafka's code for "this batch is too large for the broker", which a

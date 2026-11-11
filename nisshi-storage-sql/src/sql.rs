@@ -15,6 +15,7 @@
 pub(crate) mod consumer_group_select;
 pub(crate) mod consumer_offset_select;
 pub(crate) mod consumer_offset_select_by_group;
+pub(crate) mod pg_record_fetch;
 pub(crate) mod producer_epochs_select;
 #[cfg(any(feature = "libsql", feature = "turso"))]
 pub(crate) mod result_columns;
@@ -35,6 +36,12 @@ use tracing::debug;
 use uuid::Uuid;
 
 use std::{collections::BTreeMap, ops::Deref, sync::LazyLock};
+
+/// The most rows that one fetch reads from `record`, bound as the limit of the fetch queries. The
+/// fetch service reads again from the last offset it received, so a limit that ends a read early
+/// costs one more query. Without it, one fetch costs as much as the whole backlog between the fetch
+/// offset and the high watermark.
+pub(crate) const ROWS_PER_FETCH: i64 = 10_000;
 
 pub(crate) struct Cache(pub BTreeMap<&'static str, String>);
 
@@ -129,10 +136,6 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             include_sql!("sql/header_delete_by_topic.sql"),
         ),
         ("header_fetch.sql", include_sql!("sql/header_fetch.sql")),
-        (
-            "header_fetch_range.sql",
-            include_sql!("sql/header_fetch_range.sql"),
-        ),
         ("header_insert.sql", include_sql!("sql/header_insert.sql")),
         (
             "list_earliest_offset.sql",
@@ -186,10 +189,6 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
         (
             "nisshi_schema_version_insert.sql",
             include_sql!("sql/nisshi_schema_version_insert.sql"),
-        ),
-        (
-            "nisshi_schema_version_update.sql",
-            include_sql!("sql/nisshi_schema_version_update.sql"),
         ),
         (
             "nisshi_schema_version_select.sql",
@@ -272,9 +271,9 @@ pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
             "record_fetch_keyed.sql",
             include_sql!("sql/record_fetch_keyed.sql"),
         ),
-        ("record_fetch_pg.sql", include_sql!("pg/record_fetch.sql")),
+        (pg_record_fetch::QUERY, include_sql!("pg/record_fetch.sql")),
         (
-            "record_fetch_pg_keyed.sql",
+            pg_record_fetch::KEYED_QUERY,
             include_sql!("pg/record_fetch_keyed.sql"),
         ),
         ("record_insert.sql", include_sql!("sql/record_insert.sql")),

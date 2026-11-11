@@ -36,7 +36,7 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use rand::{prelude::*, rngs::SmallRng};
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 use tracing::{debug, instrument};
 use url::Url;
 use uuid::Uuid;
@@ -44,9 +44,9 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version, service::read_deadline::ReadDeadline,
+    Version, fetched::FetchedSender,
 };
 
 #[derive(Clone, Debug)]
@@ -91,6 +91,33 @@ where
         sleep(latency).await;
 
         Ok(())
+    }
+
+    /// Produces `deflated` to the storage after the introduced latency. Both produce methods call
+    /// this, so that each produce waits and opens its span in one place.
+    #[instrument(name = "produce", skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    async fn produce_batch(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+        inflated: Option<inflated::Batch>,
+    ) -> Result<i64> {
+        self.introduce_latency().await?;
+
+        match inflated {
+            Some(inflated) => {
+                self.storage
+                    .produce_inflated(transaction_id, topition, deflated, inflated)
+                    .await
+            }
+
+            None => {
+                self.storage
+                    .produce(transaction_id, topition, deflated)
+                    .await
+            }
+        }
     }
 }
 
@@ -145,21 +172,16 @@ where
         self.storage.brokers().await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .produce(transaction_id, topition, deflated)
+        self.produce_batch(transaction_id, topition, deflated, None)
             .await
     }
 
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -167,10 +189,7 @@ where
         deflated: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Result<i64> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .produce_inflated(transaction_id, topition, deflated, inflated)
+        self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
     }
 
@@ -181,19 +200,19 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
-        let Ok(latency) = ReadDeadline::new(StorageOperation::Fetch, deadline)
-            .timeout(self.introduce_latency())
-            .await
-        else {
-            return Ok(vec![]);
-        };
-
-        latency?;
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
+        self.introduce_latency().await?;
 
         self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 

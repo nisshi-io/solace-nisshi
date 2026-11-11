@@ -192,7 +192,7 @@ use std::{
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTime, SystemTimeError},
 };
-use tokio::{sync::AcquireError, task::JoinError, time::Instant};
+use tokio::{sync::AcquireError, task::JoinError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use tracing_subscriber::filter::ParseError;
@@ -206,6 +206,7 @@ pub mod config;
 #[cfg(test)]
 mod decoded_batch_probe;
 mod decoded_budget;
+pub mod fetched;
 mod inflate;
 mod latency;
 pub mod max_message_bytes;
@@ -215,7 +216,10 @@ mod operation;
 mod produce_path;
 mod producer;
 mod proxy;
+mod request_timer;
 mod service;
+#[cfg(test)]
+mod storage_double;
 mod topic_creation;
 mod topic_defaults;
 
@@ -224,6 +228,7 @@ pub use batch::ProduceRequestBatcher;
 pub use decoded_budget::{
     configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
 };
+pub use fetched::{FetchedDataSender, FetchedRecord, FetchedSender};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
@@ -232,6 +237,7 @@ pub use producer::{
     producer_claim,
 };
 pub use proxy::SemaphoreProxy;
+pub use request_timer::RequestTimer;
 pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
@@ -335,44 +341,11 @@ pub enum Error {
         schema_version: i32,
     },
 
-    /// The database records schema `recorded_version`, which is older than `schema_version`, and
-    /// a broker of `schema_version` has no step that upgrades it. Every version from 1 has one, so
-    /// the recorded version is below 1: a row that holds a version that no release records.
+    /// The database records schema `recorded_version`, which is older than `schema_version`. A
+    /// broker of `schema_version` can't upgrade the recorded schema.
     OutdatedSchema {
         recorded_version: i32,
         schema_version: i32,
-    },
-
-    /// The database has tables but records no schema version, and a broker of `schema_version`,
-    /// which is newer than version 1, can't tell which tables it lacks.
-    UnversionedSchema {
-        schema_version: i32,
-    },
-
-    /// The database records schema `schema_version` but has no `cluster` table on the
-    /// `search_path` that the connection uses. Nisshi creates `cluster` before it records a
-    /// version, so the search path changed or someone dropped or moved the tables.
-    MissingClusterTable {
-        schema_version: i32,
-        search_path: String,
-    },
-
-    /// The step that upgrades the schema from `from_version` to `to_version` failed with the
-    /// SQLSTATE `code`, and the upgrade rolled back.
-    ///
-    /// This holds the server's `message`, `table` and `constraint` and leaves out its `DETAIL`,
-    /// because the `DETAIL` of a failed constraint repeats the failing row, and a row of `record`
-    /// or `header` holds message payloads. The `message` of a SQLSTATE in class `22`, data
-    /// exception, is a fixed phrase instead of the server's, because that message quotes the value
-    /// that failed. The fields are boxed strings, so that this variant does not make [`Error`]
-    /// larger.
-    SchemaStepFailed {
-        from_version: i32,
-        to_version: i32,
-        code: Box<str>,
-        message: Box<str>,
-        table: Option<Box<str>>,
-        constraint: Option<Box<str>>,
     },
 
     InsufficientCapacity(#[from] InsufficientCapacity),
@@ -441,6 +414,14 @@ pub enum Error {
 
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
+
+    /// The PostgreSQL pool refused to open a new connection, because a new connection reached a
+    /// read-only server, and the pool opens at most one new connection per `interval` until a
+    /// new connection passes its check.
+    #[cfg(feature = "postgres")]
+    PoolConnectRateLimited {
+        interval: Duration,
+    },
 
     #[cfg(feature = "slatedb")]
     Postcard(#[from] postcard::Error),
@@ -551,9 +532,6 @@ impl Error {
     /// [`Error::Schema`] is permanent, as are its lake I/O failures. A lake write runs after a
     /// batch took its offset, so a retry can store the batch twice.
     ///
-    /// A failure of the schema setup, such as [`Error::SchemaStepFailed`], is permanent for the
-    /// caller, because a restart of the broker retries the setup, not the caller.
-    ///
     /// [`Error::Api`] is not classified here: it carries the code that the engine chose, which
     /// [`Error::error_code`] keeps.
     ///
@@ -585,6 +563,10 @@ impl Error {
 
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             Self::Pool(_) => true,
+
+            // The limit ends when the pool's address leads to a writable server again.
+            #[cfg(feature = "postgres")]
+            Self::PoolConnectRateLimited { .. } => true,
 
             #[cfg(feature = "postgres")]
             Self::TokioPostgres(error) => match error.as_db_error() {
@@ -621,9 +603,6 @@ impl Error {
             | Self::NoEngineForScheme { .. }
             | Self::IncompatibleSchema { .. }
             | Self::OutdatedSchema { .. }
-            | Self::UnversionedSchema { .. }
-            | Self::MissingClusterTable { .. }
-            | Self::SchemaStepFailed { .. }
             | Self::InsufficientCapacity(_)
             | Self::LessThanBaseOffset { .. }
             | Self::LessThanLastOffset { .. }
@@ -1294,6 +1273,22 @@ impl OffsetStage {
 
     pub fn log_start(&self) -> i64 {
         self.log_start
+    }
+
+    /// Returns whether this stage covers the records before `next`: its high watermark is at
+    /// least `next`, and for a `ReadCommitted` read, which returns only committed records, its
+    /// last stable offset is too.
+    pub(crate) fn covers(&self, next: i64, isolation: IsolationLevel) -> bool {
+        self.high_watermark >= next
+            && (isolation == IsolationLevel::ReadUncommitted || self.last_stable >= next)
+    }
+
+    /// Returns this stage with its high watermark raised to at least `next`.
+    pub(crate) fn with_high_watermark_at_least(self, next: i64) -> Self {
+        Self {
+            high_watermark: self.high_watermark.max(next),
+            ..self
+        }
     }
 }
 
@@ -2148,9 +2143,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// A wrapper must forward this method as well as [`Storage::produce`], or the default
     /// discards the decoded batch and the inner backend decodes it again. A wrapper that would
-    /// make the produce wait for a permit or a slot calls [`Storage::produce`] instead, so that a
-    /// waiting produce holds its compressed bytes only. The result and the errors are those of
-    /// [`Storage::produce`].
+    /// make the produce wait for a permit or a slot drops `inflated` before it waits, and then
+    /// calls [`Storage::produce`], so that a waiting produce holds its compressed bytes only. The
+    /// result and the errors are those of [`Storage::produce`].
+    ///
+    /// An implementation of both methods sends them through one private method, so that a span,
+    /// a metric or a permit that it adds applies to every produce, whichever method the caller
+    /// used.
     async fn produce_inflated(
         &self,
         transaction_id: Option<&str>,
@@ -2163,22 +2162,22 @@ pub trait Storage: Debug + Send + Sync + 'static {
         self.produce(transaction_id, topition, deflated).await
     }
 
-    /// Fetch deflated batches from storage.
+    /// Reads the records of `topition` from `offset`, and sends them as it reads them through
+    /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
-    /// The batches hold at most `max_bytes`, except that a read can exceed it by one batch. A read
+    /// The read first sends the offset stage that bounds it, and then its records, or its whole
+    /// stored batches, in offset order from the batch that holds `offset`, with no gap. A read
+    /// that finds nothing to read may send nothing at all.
+    ///
+    /// The records hold at most `max_bytes`, except that a read can exceed it by one batch. A read
     /// returns the first batch at or after `offset` even when that batch alone is larger than
     /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
     /// so that a consumer whose fetch limit is smaller than a record can read past that record.
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
-    /// The read must return by `deadline`, with the batches that it finished by then. Callers wait
-    /// for the read without a time limit of their own, so a read that overruns its deadline holds
-    /// up the whole response. SOL-157529 tracks a limit above the engine that keeps the batches
-    /// that a read finished.
-    ///
-    /// The batches run in offset order from the batch that holds `offset`, with no gap between
-    /// them, also when the deadline stops the read. An answer with no batches is always valid.
+    /// The caller drops the read at its deadline, and keeps what the read sent before it, so an
+    /// engine doesn't stop the read itself.
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2186,8 +2185,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>>;
+        fetched_sender: FetchedSender,
+    ) -> Result<()>;
 
     /// Query the offset stage for a topic partition.
     ///
@@ -2502,10 +2501,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -2803,10 +2809,17 @@ where
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> Result<Vec<deflated::Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -3442,6 +3455,42 @@ mod tests {
     use std::{assert_matches, fs::File, sync::Arc, thread};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+
+    /// A stage covers the records before `next` when its high watermark reaches `next`, and, for
+    /// a `ReadCommitted` read, its last stable offset does too.
+    #[test]
+    fn offset_stage_covers_records_by_isolation() {
+        let stage = OffsetStage {
+            last_stable: 5,
+            high_watermark: 10,
+            log_start: 0,
+        };
+
+        assert!(stage.covers(10, IsolationLevel::ReadUncommitted));
+        assert!(!stage.covers(11, IsolationLevel::ReadUncommitted));
+        assert!(stage.covers(5, IsolationLevel::ReadCommitted));
+        assert!(!stage.covers(6, IsolationLevel::ReadCommitted));
+    }
+
+    /// Raising the high watermark leaves the last stable offset and the log start as they are.
+    #[test]
+    fn offset_stage_raises_only_its_high_watermark() {
+        let stage = OffsetStage {
+            last_stable: 5,
+            high_watermark: 10,
+            log_start: 2,
+        };
+
+        assert_eq!(
+            OffsetStage {
+                last_stable: 5,
+                high_watermark: 12,
+                log_start: 2,
+            },
+            stage.with_high_watermark_at_least(12)
+        );
+        assert_eq!(stage, stage.with_high_watermark_at_least(8));
+    }
 
     #[test]
     fn authentication_unsupported_message_names_the_engines_that_can() {

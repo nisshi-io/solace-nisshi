@@ -49,10 +49,10 @@ use nisshi_sans_io::{
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
+    FetchedSender, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
     max_message_bytes, producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -1071,8 +1071,8 @@ impl Storage for Engine {
         min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
-        deadline: tokio::time::Instant,
-    ) -> Result<Vec<Batch>> {
+        fetched_sender: FetchedSender,
+    ) -> Result<()> {
         // Get the high watermark based on isolation level
         let offset_stage = self.offset_stage(topition).await?;
         let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
@@ -1105,8 +1105,10 @@ impl Storage for Engine {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
 
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+
         if offset >= high_watermark {
-            return Ok(vec![]);
+            return Ok(());
         }
 
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, topition.partition))?;
@@ -1128,11 +1130,6 @@ impl Storage for Engine {
                 .unwrap_or(offset),
         };
 
-        // The read checks the deadline between steps, and can overrun it by one step.
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(vec![]);
-        }
-
         let mut i = {
             let from =
                 postcard::to_stdvec(&BatchKey::scan_from(metadata.id, topition.partition, start))?;
@@ -1140,14 +1137,11 @@ impl Storage for Engine {
             self.db.scan(from..).await?
         };
 
-        let mut batches = vec![];
         let mut total_bytes: usize = 0;
         let min_bytes = min_bytes as usize;
         let max_bytes = max_bytes as usize;
 
-        while let Some(kv) = i.next().await?
-            && tokio::time::Instant::now() < deadline
-        {
+        while let Some(kv) = i.next().await? {
             // Check if the key still belongs to the same topic/partition
             if !kv.key.starts_with(&prefix) {
                 break;
@@ -1173,7 +1167,7 @@ impl Storage for Engine {
                 continue;
             }
 
-            batches.push(batch);
+            data.send_batch(batch).await?;
             total_bytes += size;
 
             // Stop if we've exceeded max_bytes (unless we haven't reached min_bytes yet)
@@ -1184,7 +1178,7 @@ impl Storage for Engine {
             }
         }
 
-        Ok(batches)
+        Ok(())
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

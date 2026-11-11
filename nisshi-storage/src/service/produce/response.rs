@@ -57,7 +57,7 @@ pub(super) fn produce_response(responses: Vec<TopicProduceResponse>) -> ProduceR
         .node_endpoints(None)
 }
 
-/// Returns the response for a batch that `storage.produce()` or the schema validation failed with
+/// Returns the response for a batch that `storage.produce_inflated()` or the schema validation failed with
 /// `error`, and logs the failure once, with the partition: a rejection that the client caused is
 /// a warning, and an internal failure is an error.
 pub(super) fn produce_failure(

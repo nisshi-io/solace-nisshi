@@ -6412,6 +6412,7 @@ dependencies = [
  "nisshi-storage",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "rama",
  "rand 0.10.3",
  "regex",

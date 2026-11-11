@@ -9,6 +9,7 @@ keywords.workspace = true
 license.workspace = true
 publish = false
 repository.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [lints]

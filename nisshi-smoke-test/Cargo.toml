@@ -10,6 +10,7 @@ repository.workspace = true
 keywords.workspace = true
 authors.workspace = true
 include.workspace = true
+rust-version.workspace = true
 
 # Each storage engine has one feature, and `just smoke <engine>` turns it on. A
 # test that applies only to some engines is compiled only with their features,

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{collections::BTreeMap, slice, time::Duration};
 use tokio::time::Instant;
 
@@ -1460,7 +1461,7 @@ where
     let max_wait = Duration::from_millis(500);
 
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             (num_records * num_transactions) as i64,
             min_bytes,
@@ -1469,6 +1470,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| {
             batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
                 inflated::Batch::try_from(batch)
@@ -1540,7 +1542,7 @@ where
     }
 
     let batches = sc
-        .fetch(
+        .fetch_until_deadline(
             &topition,
             (num_records * num_transactions + 1) as i64,
             min_bytes,
@@ -1549,6 +1551,7 @@ where
             Instant::now() + max_wait,
         )
         .await
+        .map(|read| read.batches)
         .and_then(|batches| {
             batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
                 inflated::Batch::try_from(batch)

@@ -85,6 +85,7 @@ pub mod produce_idempotent_epoch_bump;
 pub mod produce_idempotent_first_sequence;
 #[cfg(feature = "postgres")]
 pub mod produce_idempotent_race;
+pub mod produce_idempotent_sequence_wrap;
 pub mod produce_inflated;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;

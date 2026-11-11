@@ -67,7 +67,7 @@ pub(super) const CRC_MISMATCH: &str = "batch crc does not match its contents";
 ///   value above `i32::MAX` is rejected too. `INVALID_RECORD`.
 /// - `record_count` alone must not imply more decoded memory than the
 ///   decoded-size limit allows. `nisshi-sans-io` enforces the limit during
-///   decode as well; checking here rejects the batch before `storage.produce()`
+///   decode as well; checking here rejects the batch before `storage.produce_inflated()`
 ///   and before any decompression is paid for. `MESSAGE_TOO_LARGE`, the same
 ///   code the decode-time rejection maps to (see [`storage_error_code`](super::rejection::storage_error_code)).
 ///

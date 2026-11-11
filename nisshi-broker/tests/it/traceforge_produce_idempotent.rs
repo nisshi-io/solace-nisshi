@@ -92,6 +92,7 @@ use nisshi_sans_io::{
     },
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
+use nisshi_storage::fetched::FetchUntilDeadline as _;
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, CreateTopicsService,
     CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,
@@ -295,7 +296,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             let topition = Topition::new(topic.clone(), index);
             // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
             // finished, so traceforge does not schedule it.
-            let fetched = block_on_tokio(storage.fetch(
+            let fetched = block_on_tokio(storage.fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -306,6 +307,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
             .expect("fetch");
 
             let fetched_records: usize = fetched
+                .batches
                 .iter()
                 .map(|batch| batch.record_count as usize)
                 .sum();
@@ -451,10 +453,17 @@ impl Storage for FaultInjectingProduceStorage {
         min_bytes: u32,
         max_bytes: u32,
         isolation: IsolationLevel,
-        deadline: Instant,
-    ) -> StorageResult<Vec<deflated::Batch>> {
+        fetched_sender: nisshi_storage::FetchedSender,
+    ) -> StorageResult<()> {
         self.inner
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, deadline)
+            .fetch(
+                topition,
+                offset,
+                min_bytes,
+                max_bytes,
+                isolation,
+                fetched_sender,
+            )
             .await
     }
 
@@ -827,7 +836,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
             let topition = Topition::new(topic.clone(), index);
             // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
             // finished, so traceforge does not schedule it.
-            let fetched = block_on_tokio(real_storage.fetch(
+            let fetched = block_on_tokio(real_storage.fetch_until_deadline(
                 &topition,
                 0,
                 0,
@@ -838,6 +847,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
             .expect("fetch");
 
             let fetched_records: usize = fetched
+                .batches
                 .iter()
                 .map(|batch| batch.record_count as usize)
                 .sum();
