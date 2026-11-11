@@ -7614,6 +7614,23 @@ mod tests {
     /// that doesn't match its row before a rare path does.
     #[tokio::test]
     async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        use crate::sql::{
+            consumer_group_detail, consumer_group_detail_insert, consumer_group_select,
+            consumer_group_select_by_name, consumer_offset_select, consumer_offset_select_by_group,
+            header_fetch, list_offset, lite_policy_compact_compaction,
+            lite_policy_compact_distinct_k, lite_policy_compact_max_offset_id,
+            lite_policy_compact_topitions, maintain_vacuum, nisshi_schema_version_select,
+            producer_epoch_current_for_producer, producer_epoch_for_current_txn,
+            producer_epoch_insert, producer_epochs_select, producer_insert,
+            producer_select_for_update, record_fetch, row_check::RowCheck, scram_credential_select,
+            topic_by_cluster, topic_configuration_select, topic_configuration_select_name,
+            topic_configuration_upsert, topic_insert, topic_select, topic_select_name,
+            topic_select_uuid, topition_insert, txn_offset_commit_tp_select_pending,
+            txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
+            txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
+            virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
+        };
+
         let directory = tempdir()?;
         let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
             .build()
@@ -7622,16 +7639,66 @@ mod tests {
         let connection = db.connect()?;
 
         let mut failures = Vec::new();
-        for row_query in sql::row_queries(sql::SqlEngine::Libsql) {
-            let checked = match connection.prepare(SQL.get(row_query.query)?).await {
+        let checks = [
+            RowCheck::rows(consumer_group_detail::QUERY),
+            RowCheck::rows(consumer_group_detail_insert::QUERY),
+            RowCheck::rows(consumer_group_select::QUERY),
+            RowCheck::rows(consumer_group_select_by_name::QUERY),
+            RowCheck::rows(consumer_offset_select::QUERY),
+            RowCheck::rows(consumer_offset_select_by_group::QUERY),
+            RowCheck::rows(header_fetch::QUERY),
+            RowCheck::rows(list_offset::EARLIEST_QUERY),
+            RowCheck::rows(list_offset::LATEST_COMMITTED_QUERY),
+            RowCheck::rows(list_offset::LATEST_TIMESTAMP_QUERY),
+            RowCheck::rows(list_offset::LATEST_UNCOMMITTED_QUERY),
+            RowCheck::rows(lite_policy_compact_compaction::QUERY),
+            RowCheck::rows(lite_policy_compact_distinct_k::QUERY),
+            RowCheck::rows(lite_policy_compact_max_offset_id::QUERY),
+            RowCheck::rows(lite_policy_compact_topitions::QUERY),
+            RowCheck::rows(maintain_vacuum::QUERY),
+            RowCheck::rows(nisshi_schema_version_select::QUERY),
+            RowCheck::rows(producer_epoch_current_for_producer::QUERY),
+            RowCheck::rows(producer_epoch_for_current_txn::QUERY),
+            RowCheck::rows(producer_epoch_insert::QUERY),
+            RowCheck::rows(producer_epochs_select::QUERY),
+            RowCheck::rows(producer_insert::QUERY),
+            RowCheck::rows(producer_select_for_update::QUERY),
+            RowCheck::rows(record_fetch::KEYED_QUERY),
+            RowCheck::rows(record_fetch::QUERY),
+            RowCheck::rows(scram_credential_select::QUERY),
+            RowCheck::rows(topic_by_cluster::QUERY),
+            RowCheck::rows(topic_configuration_select::QUERY),
+            RowCheck::rows(topic_configuration_select_name::QUERY),
+            RowCheck::rows(topic_configuration_upsert::QUERY),
+            RowCheck::rows(topic_insert::QUERY),
+            RowCheck::without_columns(topic_select::QUERY),
+            RowCheck::rows(topic_select_name::NAME_QUERY),
+            RowCheck::rows(topic_select_name::QUERY),
+            RowCheck::rows(topic_select_uuid::NAME_QUERY),
+            RowCheck::rows(topic_select_uuid::QUERY),
+            RowCheck::rows(topition_insert::QUERY),
+            RowCheck::rows(txn_offset_commit_tp_select_pending::QUERY),
+            RowCheck::rows(txn_produce_offset_select_offset_range::QUERY),
+            RowCheck::rows(txn_produce_offset_select_overlapping_txn::QUERY),
+            RowCheck::rows(txn_produce_partition_select::QUERY),
+            RowCheck::rows(txn_select_name::QUERY),
+            RowCheck::rows(txn_select_produced_topitions::QUERY),
+            RowCheck::rows(virtual_topic_upsert::QUERY),
+            RowCheck::rows(watermark_insert::QUERY),
+            RowCheck::rows(watermark_select::QUERY),
+            RowCheck::rows(watermark_select_for_write::LITE_QUERY),
+        ];
+
+        for check in &checks {
+            let checked = match connection.prepare(SQL.get(check.query())?).await {
                 Ok(statement) => {
-                    (row_query.check_columns)(&ResultColumns::new(row_query.query, &statement))
+                    check.check_columns(&ResultColumns::new(check.query(), &statement))
                 }
                 Err(error) => Err(error.into()),
             };
 
             if let Err(error) = checked {
-                failures.push(format!("{}: {error:?}", row_query.query));
+                failures.push(format!("{}: {error:?}", check.query()));
             }
         }
 

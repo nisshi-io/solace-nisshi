@@ -360,6 +360,8 @@ pub(crate) mod producer_select_for_update;
 pub(crate) mod record_fetch;
 pub(crate) mod result_columns;
 pub(crate) mod row;
+#[cfg(test)]
+pub(crate) mod row_check;
 pub(crate) mod scram_credential_select;
 pub(crate) mod topic_by_cluster;
 pub(crate) mod topic_configuration_select;
@@ -453,20 +455,15 @@ macro_rules! cache_key {
 /// that module's `RowReader`. A line in `without_columns` names a module's constant too, for a
 /// query whose rows an engine counts but reads no column of. A compile-time assertion checks that
 /// each such constant holds the query's key. A line in `plain` declares the constant here.
-///
-/// A line in `rows` or `without_columns` starts with the engines that run the query, and
-/// `ROW_QUERIES` lists those queries for a test that prepares each one on each of its engines.
 macro_rules! queries {
     (
         rows {
             $(
-                [$($row_engine:ident),+]
                 $module:ident :: $module_constant:ident = $row_folder:tt / $row_file:literal,
             )+
         }
         without_columns {
             $(
-                [$($counted_engine:ident),+]
                 $counted_module:ident :: $counted_constant:ident
                     = $counted_folder:tt / $counted_file:literal,
             )+
@@ -529,28 +526,6 @@ macro_rules! queries {
                 $(($constant, include_sql!(concat!($folder, "/", $file))),)+
             ]))
         });
-
-        #[cfg(test)]
-        pub(crate) static ROW_QUERIES: &[RowQuery] = &[
-            $(
-                RowQuery {
-                    constant: concat!(stringify!($module), "::", stringify!($module_constant)),
-                    query: $module::$module_constant.key(),
-                    engines: &[$(SqlEngine::$row_engine),+],
-                    check_columns: |columns| {
-                        query_reader($module::$module_constant, columns).map(|_| ())
-                    },
-                },
-            )+
-            $(
-                RowQuery {
-                    constant: concat!(stringify!($counted_module), "::", stringify!($counted_constant)),
-                    query: $counted_module::$counted_constant,
-                    engines: &[$(SqlEngine::$counted_engine),+],
-                    check_columns: |_| Ok(()),
-                },
-            )+
-        ];
     };
 }
 
@@ -573,103 +548,64 @@ const fn const_str_eq(left: &str, right: &str) -> bool {
     true
 }
 
-/// An engine that runs the queries of [`SQL`].
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SqlEngine {
-    Postgres,
-    Libsql,
-    Turso,
-}
-
-/// A query in [`ROW_QUERIES`]: one whose rows an engine reads.
-#[cfg(test)]
-pub(crate) struct RowQuery {
-    /// The path of the query's constant, such as `topic_select::QUERY`.
-    pub(crate) constant: &'static str,
-    /// The query's name in [`SQL`].
-    pub(crate) query: &'static str,
-    /// The engines that run the query.
-    pub(crate) engines: &'static [SqlEngine],
-    /// Returns the error of the query's `RowReader` for the columns of the query's result.
-    pub(crate) check_columns: fn(&result_columns::ResultColumns) -> Result<()>,
-}
-
-/// Returns the reader of `T`, the row of `query`, for the result with `columns`.
-#[cfg(test)]
-fn query_reader<T: QueryRow>(
-    _query: Query<T>,
-    columns: &result_columns::ResultColumns,
-) -> Result<T::Reader> {
-    T::reader(columns)
-}
-
-/// Returns each query of [`ROW_QUERIES`] that `engine` runs.
-#[cfg(test)]
-pub(crate) fn row_queries(engine: SqlEngine) -> impl Iterator<Item = &'static RowQuery> {
-    ROW_QUERIES
-        .iter()
-        .filter(move |row_query| row_query.engines.contains(&engine))
-}
-
 queries! {
     rows {
-        [Postgres, Libsql, Turso] consumer_group_detail::QUERY = "sql" / "consumer_group_detail.sql",
-        [Postgres, Libsql, Turso] consumer_group_detail_insert::QUERY = "sql" / "consumer_group_detail_insert.sql",
-        [Postgres, Libsql, Turso] consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
-        [Postgres, Libsql, Turso] consumer_group_select_by_name::QUERY = "sql" / "consumer_group_select_by_name.sql",
-        [Postgres, Libsql, Turso] consumer_offset_select::QUERY = "sql" / "consumer_offset_select.sql",
-        [Postgres, Libsql, Turso] consumer_offset_select_by_group::QUERY = "sql" / "consumer_offset_select_by_group.sql",
-        [Libsql, Turso] header_fetch::QUERY = "sql" / "header_fetch.sql",
-        [Postgres, Libsql, Turso] list_offset::EARLIEST_QUERY = "sql" / "list_earliest_offset.sql",
-        [Postgres, Libsql, Turso] list_offset::LATEST_COMMITTED_QUERY = "sql" / "list_latest_offset_committed.sql",
-        [Postgres, Libsql, Turso] list_offset::LATEST_TIMESTAMP_QUERY = "sql" / "list_latest_offset_timestamp.sql",
-        [Postgres, Libsql, Turso] list_offset::LATEST_UNCOMMITTED_QUERY = "sql" / "list_latest_offset_uncommitted.sql",
-        [Libsql] lite_policy_compact_compaction::QUERY = "lite" / "policy_compact_compaction.sql",
-        [Libsql] lite_policy_compact_distinct_k::QUERY = "lite" / "policy_compact_distinct_k.sql",
-        [Libsql] lite_policy_compact_max_offset_id::QUERY = "lite" / "policy_compact_max_offset_id.sql",
-        [Libsql] lite_policy_compact_topitions::QUERY = "lite" / "policy_compact_topitions.sql",
-        [Libsql] maintain_vacuum::QUERY = "sql" / "maintain-vacuum.sql",
-        [Postgres, Libsql] nisshi_schema_version_select::QUERY = "sql" / "nisshi_schema_version_select.sql",
-        [Postgres] pg_nisshi_schema_version_exists::QUERY = "pg" / "nisshi_schema_version_exists.sql",
-        [Postgres] pg_record_fetch::KEYED_QUERY = "pg" / "record_fetch_keyed.sql",
-        [Postgres] pg_record_fetch::QUERY = "pg" / "record_fetch.sql",
-        [Postgres, Libsql, Turso] producer_epoch_current_for_producer::QUERY = "sql" / "producer_epoch_current_for_producer.sql",
-        [Postgres, Libsql, Turso] producer_epoch_for_current_txn::QUERY = "sql" / "producer_epoch_for_current_txn.sql",
-        [Postgres, Libsql, Turso] producer_epoch_insert::QUERY = "sql" / "producer_epoch_insert.sql",
-        [Postgres, Libsql, Turso] producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
-        [Postgres, Libsql, Turso] producer_insert::QUERY = "sql" / "producer_insert.sql",
-        [Postgres, Libsql, Turso] producer_select_for_update::QUERY = "sql" / "producer_select_for_update.sql",
-        [Libsql] record_fetch::KEYED_QUERY = "sql" / "record_fetch_keyed.sql",
-        [Libsql, Turso] record_fetch::QUERY = "sql" / "record_fetch.sql",
-        [Postgres, Libsql] scram_credential_select::QUERY = "sql" / "scram_credential_select.sql",
-        [Postgres, Libsql, Turso] topic_by_cluster::QUERY = "sql" / "topic_by_cluster.sql",
-        [Postgres, Libsql, Turso] topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
-        [Postgres] topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
-        [Postgres, Libsql, Turso] topic_configuration_select_name::QUERY = "sql" / "topic_configuration_select_name.sql",
-        [Postgres, Libsql, Turso] topic_configuration_upsert::QUERY = "sql" / "topic_configuration_upsert.sql",
-        [Postgres, Libsql, Turso] topic_insert::QUERY = "sql" / "topic_insert.sql",
-        [Postgres, Libsql, Turso] topic_select_name::QUERY = "sql" / "topic_select_name.sql",
-        [Postgres] topic_select_uuid::PG_QUERY = "pg" / "topic_select_uuid.sql",
-        [Postgres, Libsql, Turso] topic_select_uuid::QUERY = "sql" / "topic_select_uuid.sql",
-        [Postgres, Libsql, Turso] topition_insert::QUERY = "sql" / "topition_insert.sql",
-        [Postgres] topition_select_id::QUERY = "sql" / "topition_select_id.sql",
-        [Postgres] txn_detail_select_status_for_update::QUERY = "sql" / "txn_detail_select_status_for_update.sql",
-        [Postgres] txn_detail_select_timed_out::QUERY = "sql" / "txn_detail_select_timed_out.sql",
-        [Postgres, Libsql, Turso] txn_offset_commit_tp_select_pending::QUERY = "sql" / "txn_offset_commit_tp_select_pending.sql",
-        [Postgres, Libsql, Turso] txn_produce_offset_select_offset_range::QUERY = "sql" / "txn_produce_offset_select_offset_range.sql",
-        [Postgres, Libsql, Turso] txn_produce_offset_select_overlapping_txn::QUERY = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
-        [Postgres, Libsql, Turso] txn_produce_partition_select::QUERY = "sql" / "txn_produce_partition_select.sql",
-        [Postgres, Libsql, Turso] txn_select_name::QUERY = "sql" / "txn_select_name.sql",
-        [Postgres, Libsql, Turso] txn_select_produced_topitions::QUERY = "sql" / "txn_select_produced_topitions.sql",
-        [Postgres, Libsql] virtual_topic_upsert::QUERY = "sql" / "virtual_topic_upsert.sql",
-        [Postgres, Libsql, Turso] watermark_insert::QUERY = "sql" / "watermark_insert.sql",
-        [Postgres, Libsql, Turso] watermark_select::QUERY = "sql" / "watermark_select.sql",
-        [Libsql, Turso] watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
-        [Postgres] watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
+        consumer_group_detail::QUERY = "sql" / "consumer_group_detail.sql",
+        consumer_group_detail_insert::QUERY = "sql" / "consumer_group_detail_insert.sql",
+        consumer_group_select::QUERY = "sql" / "consumer_group_select.sql",
+        consumer_group_select_by_name::QUERY = "sql" / "consumer_group_select_by_name.sql",
+        consumer_offset_select::QUERY = "sql" / "consumer_offset_select.sql",
+        consumer_offset_select_by_group::QUERY = "sql" / "consumer_offset_select_by_group.sql",
+        header_fetch::QUERY = "sql" / "header_fetch.sql",
+        list_offset::EARLIEST_QUERY = "sql" / "list_earliest_offset.sql",
+        list_offset::LATEST_COMMITTED_QUERY = "sql" / "list_latest_offset_committed.sql",
+        list_offset::LATEST_TIMESTAMP_QUERY = "sql" / "list_latest_offset_timestamp.sql",
+        list_offset::LATEST_UNCOMMITTED_QUERY = "sql" / "list_latest_offset_uncommitted.sql",
+        lite_policy_compact_compaction::QUERY = "lite" / "policy_compact_compaction.sql",
+        lite_policy_compact_distinct_k::QUERY = "lite" / "policy_compact_distinct_k.sql",
+        lite_policy_compact_max_offset_id::QUERY = "lite" / "policy_compact_max_offset_id.sql",
+        lite_policy_compact_topitions::QUERY = "lite" / "policy_compact_topitions.sql",
+        maintain_vacuum::QUERY = "sql" / "maintain-vacuum.sql",
+        nisshi_schema_version_select::QUERY = "sql" / "nisshi_schema_version_select.sql",
+        pg_nisshi_schema_version_exists::QUERY = "pg" / "nisshi_schema_version_exists.sql",
+        pg_record_fetch::KEYED_QUERY = "pg" / "record_fetch_keyed.sql",
+        pg_record_fetch::QUERY = "pg" / "record_fetch.sql",
+        producer_epoch_current_for_producer::QUERY = "sql" / "producer_epoch_current_for_producer.sql",
+        producer_epoch_for_current_txn::QUERY = "sql" / "producer_epoch_for_current_txn.sql",
+        producer_epoch_insert::QUERY = "sql" / "producer_epoch_insert.sql",
+        producer_epochs_select::QUERY = "sql" / "producer_epochs_select.sql",
+        producer_insert::QUERY = "sql" / "producer_insert.sql",
+        producer_select_for_update::QUERY = "sql" / "producer_select_for_update.sql",
+        record_fetch::KEYED_QUERY = "sql" / "record_fetch_keyed.sql",
+        record_fetch::QUERY = "sql" / "record_fetch.sql",
+        scram_credential_select::QUERY = "sql" / "scram_credential_select.sql",
+        topic_by_cluster::QUERY = "sql" / "topic_by_cluster.sql",
+        topic_configuration_select::QUERY = "sql" / "topic_configuration_select.sql",
+        topic_configuration_select_keys::QUERY = "pg" / "topic_configuration_select_keys.sql",
+        topic_configuration_select_name::QUERY = "sql" / "topic_configuration_select_name.sql",
+        topic_configuration_upsert::QUERY = "sql" / "topic_configuration_upsert.sql",
+        topic_insert::QUERY = "sql" / "topic_insert.sql",
+        topic_select_name::QUERY = "sql" / "topic_select_name.sql",
+        topic_select_uuid::PG_QUERY = "pg" / "topic_select_uuid.sql",
+        topic_select_uuid::QUERY = "sql" / "topic_select_uuid.sql",
+        topition_insert::QUERY = "sql" / "topition_insert.sql",
+        topition_select_id::QUERY = "sql" / "topition_select_id.sql",
+        txn_detail_select_status_for_update::QUERY = "sql" / "txn_detail_select_status_for_update.sql",
+        txn_detail_select_timed_out::QUERY = "sql" / "txn_detail_select_timed_out.sql",
+        txn_offset_commit_tp_select_pending::QUERY = "sql" / "txn_offset_commit_tp_select_pending.sql",
+        txn_produce_offset_select_offset_range::QUERY = "sql" / "txn_produce_offset_select_offset_range.sql",
+        txn_produce_offset_select_overlapping_txn::QUERY = "sql" / "txn_produce_offset_select_overlapping_txn.sql",
+        txn_produce_partition_select::QUERY = "sql" / "txn_produce_partition_select.sql",
+        txn_select_name::QUERY = "sql" / "txn_select_name.sql",
+        txn_select_produced_topitions::QUERY = "sql" / "txn_select_produced_topitions.sql",
+        virtual_topic_upsert::QUERY = "sql" / "virtual_topic_upsert.sql",
+        watermark_insert::QUERY = "sql" / "watermark_insert.sql",
+        watermark_select::QUERY = "sql" / "watermark_select.sql",
+        watermark_select_for_write::LITE_QUERY = "lite" / "watermark_select_for_write.sql",
+        watermark_select_for_write::QUERY = "sql" / "watermark_select_for_write.sql",
     }
     without_columns {
-        [Postgres, Libsql, Turso] topic_select::QUERY = "sql" / "topic_select.sql",
+        topic_select::QUERY = "sql" / "topic_select.sql",
     }
     plain {
         CONSUMER_GROUP_DELETE = "sql" / "consumer_group_delete.sql",
@@ -921,93 +857,6 @@ mod tests {
             topic_read_error_code(&Error::from(turso::Error::Misuse("no such table".into()))),
             ErrorCode::UnknownServerError
         );
-    }
-
-    /// Each line of `queries!` names exactly the engines whose source names its constant, so
-    /// that each engine's `every_row_query_returns_the_columns_of_its_row` checks every query
-    /// that the engine reads rows from.
-    #[test]
-    fn each_row_query_names_the_engines_that_run_it() -> Result<()> {
-        use super::{ROW_QUERIES, SqlEngine, row_queries, topic_select_name, topic_select_uuid};
-        use regex::Regex;
-        use std::collections::{BTreeMap, BTreeSet};
-
-        // Each of these constants names the query of another line, so it has no line of its own.
-        let aliases = [
-            (
-                "topic_select_name::NAME_QUERY",
-                topic_select_name::NAME_QUERY.key(),
-            ),
-            (
-                "topic_select_uuid::NAME_QUERY",
-                topic_select_uuid::NAME_QUERY.key(),
-            ),
-        ];
-
-        let queries = ROW_QUERIES
-            .iter()
-            .map(|row_query| (row_query.constant, row_query.query))
-            .chain(aliases)
-            .collect::<BTreeMap<_, _>>();
-
-        let constant = Regex::new(r"\b[a-z_][a-z0-9_]*::(?:[A-Z][A-Z0-9_]*_)?QUERY\b")?;
-
-        let mut failures = Vec::new();
-
-        for (engine, source) in [
-            (SqlEngine::Postgres, "pg"),
-            (SqlEngine::Libsql, "lite"),
-            (SqlEngine::Turso, "limbo"),
-        ] {
-            let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-            let mut files = vec![format!("{directory}/{source}.rs").into()];
-            files.extend(
-                glob::glob(&format!("{directory}/{source}/**/*.rs"))
-                    .map_err(|error| Error::Message(error.to_string()))?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|error| Error::Message(error.to_string()))?,
-            );
-
-            let mut run = BTreeSet::new();
-            for file in files {
-                let text = std::fs::read_to_string(&file)?;
-
-                // A comment can name a constant that the engine doesn't run.
-                for line in text
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                {
-                    for found in constant.find_iter(line) {
-                        match queries.get(found.as_str()) {
-                            Some(query) => _ = run.insert(*query),
-                            None => failures.push(format!(
-                                "{engine:?}: {} has no line in queries!",
-                                found.as_str()
-                            )),
-                        }
-                    }
-                }
-            }
-
-            let listed = row_queries(engine)
-                .map(|row_query| row_query.query)
-                .collect::<BTreeSet<_>>();
-
-            for query in run.difference(&listed) {
-                failures.push(format!(
-                    "{engine:?} runs {query}, but its line doesn't name it"
-                ));
-            }
-
-            for query in listed.difference(&run) {
-                failures.push(format!(
-                    "{engine:?} doesn't run {query}, but its line names it"
-                ));
-            }
-        }
-
-        assert!(failures.is_empty(), "{failures:#?}");
-        Ok(())
     }
 
     #[test]
