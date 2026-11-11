@@ -18,6 +18,7 @@ mod common;
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod ch;
 pub mod close_after_response;
+pub mod drain;
 pub mod route;
 pub mod tcp;
 pub mod version_gate;
