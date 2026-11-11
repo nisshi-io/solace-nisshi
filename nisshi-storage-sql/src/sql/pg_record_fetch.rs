@@ -60,6 +60,22 @@ sql_row! {
     }
 }
 
+/// A record's offset, read from a result that returns a whole [`Row`].
+///
+/// A fetch reads it from a row that it can't read as a [`Row`], so that the fetch's log names the
+/// record, which the column error does not.
+#[cfg(feature = "postgres")]
+pub(crate) mod offset {
+    sql_row! {
+        /// One record's offset.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(crate) struct Row {
+            /// The record's offset.
+            offset_id: i64,
+        }
+    }
+}
+
 #[cfg(feature = "postgres")]
 impl TryFrom<Row> for FetchedRecord {
     type Error = Error;

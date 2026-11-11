@@ -2033,7 +2033,10 @@ impl Postgres {
         let query = query.key();
         let (sql, prepared) = self.prepare_statement(&tx, query).await?;
         let column_errors = self.column_error_count(sql);
-        let reader = pg_record_fetch::Row::reader(&ResultColumns::new(query, &prepared))
+        let columns = ResultColumns::new(query, &prepared);
+        let reader =
+            pg_record_fetch::Row::reader(&columns).inspect_err(|err| column_errors.record(err))?;
+        let offset_reader = pg_record_fetch::offset::Row::reader(&columns)
             .inspect_err(|err| column_errors.record(err))?;
 
         // `query_raw` returns once the server has accepted the statement, and its stream yields
@@ -2062,7 +2065,17 @@ impl Postgres {
             // counts a row as `decode` only when it reads but holds no valid record. Each error
             // is then counted once.
             let record = match pg_record_fetch::Row::read(&reader, &row)
-                .inspect_err(|error| column_errors.record(error))
+                .inspect_err(|error| {
+                    column_errors.record(error);
+
+                    // An operator fixes or deletes a row that can't be read, so the log names
+                    // the record's offset. The offset is unknown when its own column is the one
+                    // that can't be read.
+                    let offset = pg_record_fetch::offset::Row::read(&offset_reader, &row)
+                        .map(|row| row.offset_id)
+                        .ok();
+                    error!(?offset, "a fetched record can't be read");
+                })
                 .and_then(|row| {
                     FetchedRecord::try_from(row).inspect_err(|error| {
                         error!(?error);
