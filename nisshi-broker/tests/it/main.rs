@@ -135,6 +135,7 @@ pub mod txn_offset_commit_fence;
 pub mod txn_produce_unadded_partition;
 #[cfg(feature = "libsql")]
 pub mod unauthenticated;
+pub mod unknown_topic_id;
 pub mod update_group_conditional;
 pub mod version_gate;
 

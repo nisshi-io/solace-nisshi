@@ -1108,7 +1108,7 @@ where
 }
 
 /// A fetch by topic id (v13 and later) for an id that does not exist is
-/// answered with `UNKNOWN_TOPIC_OR_PARTITION` at once, and the response
+/// answered with `UNKNOWN_TOPIC_ID` at once, and the response
 /// carries the requested id. The Java client matches a v13 response topic by
 /// id and drops one it cannot match, so the null id would hide the error
 /// from it, and a consumer on a deleted topic would fetch again at round
@@ -1172,7 +1172,7 @@ where
 
     assert_eq!(1, partitions.len());
     assert_eq!(
-        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::UnknownTopicId,
         ErrorCode::try_from(partitions[0].error_code)?
     );
     assert_eq!(None, partitions[0].current_leader);
@@ -1543,9 +1543,10 @@ where
     Ok(())
 }
 
-/// A fetch for an unknown topic beside a live topic idle at its high
+/// A fetch for an unknown topic ID beside a live topic idle at its high
 /// watermark waits out `max_wait`, as in Kafka, which sets unknown topics
-/// aside and waits for the rest. A consumer still assigned to a deleted
+/// aside, whether it answers them `UNKNOWN_TOPIC_ID` or
+/// `UNKNOWN_TOPIC_OR_PARTITION`, and waits for the rest. A consumer still assigned to a deleted
 /// topic then fetches once per `max_wait`, not at round trip speed.
 pub async fn unknown_topic_beside_idle_topic<C, G>(
     cluster_id: C,
@@ -1622,7 +1623,7 @@ where
     let partitions = partition_data(response);
     assert_eq!(2, partitions.len());
     assert_eq!(
-        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::UnknownTopicId,
         ErrorCode::try_from(partitions[0].error_code)?
     );
     assert_eq!(

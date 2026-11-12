@@ -262,10 +262,7 @@ async fn an_unknown_topic_id_omits_the_topic_operations_at_v12() -> Result<()> {
         let topics = response.topics.unwrap_or_default();
         assert_eq!(1, topics.len(), "{topics:?}");
         assert_eq!(None, topics[0].name);
-        assert_eq!(
-            i16::from(ErrorCode::UnknownTopicOrPartition),
-            topics[0].error_code
-        );
+        assert_eq!(i16::from(ErrorCode::UnknownTopicId), topics[0].error_code);
         assert_eq!(Some(OMITTED), topics[0].topic_authorized_operations);
 
         Ok::<_, anyhow::Error>(())

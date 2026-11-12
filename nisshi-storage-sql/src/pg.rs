@@ -4904,7 +4904,7 @@ impl Storage for Postgres {
                                 Err(reason) if sql::is_column_error(&reason) => return Err(reason),
 
                                 Err(reason) => {
-                                    error!(?reason, ?topic);
+                                    error!(?reason, ?topic, topic_id = %id, "topic ID query failed, answering UNKNOWN_TOPIC_OR_PARTITION");
                                     MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
