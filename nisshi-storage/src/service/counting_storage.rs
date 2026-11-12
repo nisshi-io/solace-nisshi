@@ -76,8 +76,8 @@ pub(crate) enum Lookup {
     Named,
     /// Fails with an error.
     Error,
-    /// Answers as the `Listing` does, whatever topics the lookup names: the null engine lists every
-    /// topic.
+    /// Answers as the `Listing` does, whatever topics the lookup names, so that a test can
+    /// check the service against a lookup that answers for other topics.
     Listed,
 }
 
