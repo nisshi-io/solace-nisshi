@@ -132,4 +132,42 @@ impl TopicConfiguration {
 
         schema_validation
     }
+
+    /// Returns whether the topic's records are validated against its schema. A topic with a lake
+    /// sink validates whatever its `schema.validation` is.
+    pub fn validates_schema(&self) -> bool {
+        self.schema_validation() || self.lake_sink()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::produce::tests::support::configuration;
+
+    #[test]
+    fn a_topic_validates_unless_it_turns_schema_validation_off() {
+        assert!(configuration(&[]).validates_schema());
+        assert!(configuration(&[(topic_config::SCHEMA_VALIDATION, "true")]).validates_schema());
+        assert!(!configuration(&[(topic_config::SCHEMA_VALIDATION, "false")]).validates_schema());
+
+        // A value that is not a boolean leaves validation on.
+        assert!(configuration(&[(topic_config::SCHEMA_VALIDATION, "off")]).validates_schema());
+    }
+
+    #[test]
+    fn a_topic_with_a_lake_sink_validates_whatever_its_schema_validation_is() {
+        assert!(
+            configuration(&[
+                (topic_config::SCHEMA_VALIDATION, "false"),
+                (topic_config::LAKE_SINK, "true"),
+            ])
+            .validates_schema()
+        );
+    }
+
+    #[test]
+    fn the_tansu_alias_turns_schema_validation_off() {
+        assert!(!configuration(&[("tansu.schema.validation", "false")]).validates_schema());
+    }
 }

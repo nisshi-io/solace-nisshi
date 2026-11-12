@@ -74,9 +74,9 @@ use nisshi_storage::{
     DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -861,16 +861,18 @@ impl Engine {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
-                config,
-            )
-            .await
-            .inspect(|store| debug!(?store))
-            .inspect_err(|err| debug!(?err))?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    &inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
+            }
         }
 
         Ok(high.unwrap_or_default())

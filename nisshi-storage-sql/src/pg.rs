@@ -70,8 +70,8 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
@@ -3885,14 +3885,16 @@ impl Postgres {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                inflated,
-                config,
-            )
-            .await?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    inflated,
+                    config,
+                )
+                .await?;
+            }
         }
 
         Ok(())

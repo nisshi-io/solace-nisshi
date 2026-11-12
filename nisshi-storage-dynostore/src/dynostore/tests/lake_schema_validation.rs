@@ -18,7 +18,6 @@
 use bytes::Bytes;
 use nisshi_sans_io::{
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     record::{Record, deflated, inflated},
     topic_config,
 };
@@ -118,43 +117,4 @@ async fn a_topic_with_validation_off_is_not_written_to_the_lake() -> Result<(), 
     );
 
     Ok(())
-}
-
-fn described(name: &str, value: &str) -> DescribeConfigsResult {
-    DescribeConfigsResult::default().configs(Some(vec![
-        DescribeConfigsResourceResult::default()
-            .name(name.into())
-            .value(Some(value.into())),
-    ]))
-}
-
-#[test]
-fn schema_validation_is_on_unless_the_topic_turns_it_off() {
-    assert!(DynoStore::schema_validation(
-        &DescribeConfigsResult::default()
-    ));
-
-    assert!(DynoStore::schema_validation(&described(
-        topic_config::SCHEMA_VALIDATION,
-        "true"
-    )));
-
-    assert!(!DynoStore::schema_validation(&described(
-        topic_config::SCHEMA_VALIDATION,
-        "false"
-    )));
-
-    // A value that is not a boolean leaves validation on.
-    assert!(DynoStore::schema_validation(&described(
-        topic_config::SCHEMA_VALIDATION,
-        "off"
-    )));
-}
-
-#[test]
-fn the_tansu_alias_turns_schema_validation_off() {
-    assert!(!DynoStore::schema_validation(&described(
-        "tansu.schema.validation",
-        "false"
-    )));
 }

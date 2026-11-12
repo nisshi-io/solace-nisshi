@@ -73,9 +73,9 @@ use nisshi_storage::{
     FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
     RequestStorageService, RequestTimer, Result, ScramCredential, SemaphoreProxy, StartupFailure,
-    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel, check_claim,
+    Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
     producer_claim,
@@ -1212,15 +1212,17 @@ impl Delegate {
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
-                config,
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    &inflated,
+                    config,
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
+            }
         }
 
         debug!(after_all_done = elapsed_millis(start));
@@ -5536,7 +5538,11 @@ mod tests {
     use std::assert_matches;
     use std::thread;
 
-    use nisshi_sans_io::{Compression, create_topics_request::CreatableTopicConfig};
+    use nisshi_sans_io::{
+        Compression,
+        create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    };
+    use nisshi_schema::{Registry, lake::House};
     use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
     use tokio::{fs::remove_file, task::yield_now, time::Instant};
@@ -8515,6 +8521,117 @@ mod tests {
                 .iter()
                 .map(|topic| topic.error_code)
                 .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A record that the person schema cannot convert, because its value is not JSON.
+    fn unconvertible_person() -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::from_static(b"\"345-67-6543\"")))
+                    .value(Some(Bytes::from_static(b"not json"))),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// Returns a store with a Parquet lake that knows the person schema, and the topic `person`
+    /// with one partition and the given configs.
+    async fn person_storage_with_lake(
+        directory: &std::path::Path,
+        configs: Vec<CreatableTopicConfig>,
+    ) -> Result<ArcDynStorage> {
+        let registry = Registry::builder_try_from_url(&Url::parse("file://../etc/schema")?)
+            .map(|builder| builder.build())?;
+
+        // The lake writes nothing in these tests, because the record in them fails to convert. Its
+        // location is the build directory, so that a write that a test did not expect stays out of
+        // the source tree.
+        let lake = House::parquet()
+            .location(Url::parse("file://../target")?)
+            .schema_registry(registry.clone())
+            .build()?;
+
+        let storage = factory::LiteFactory
+            .build(nisshi_storage::StorageFactoryConfiguration {
+                node_id: 111,
+                cluster: String::from("nisshi"),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: Url::parse(&format!(
+                    "sqlite:///{}",
+                    directory.join("nisshi.db").display()
+                ))?,
+                schema_registry: Some(registry),
+                lake_house: Some(lake),
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+
+        // The cluster row, which the topic's insert reads, exists once a broker has registered.
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: String::from("nisshi"),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("person".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some(configs)),
+                false,
+            )
+            .await?;
+
+        Ok(storage)
+    }
+
+    /// Shows that the lake fails on the record, so that the test below passes because the engine
+    /// does not write the record to the lake and not because the lake accepts it.
+    #[tokio::test]
+    async fn a_record_that_breaks_the_schema_fails_in_the_lake_when_validation_is_on() -> Result<()>
+    {
+        let directory = tempdir()?;
+        let storage = person_storage_with_lake(directory.path(), vec![]).await?;
+
+        assert!(
+            storage
+                .produce(None, &Topition::new("person", 0), unconvertible_person()?)
+                .await
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_validation_off_is_not_written_to_the_lake() -> Result<()> {
+        let directory = tempdir()?;
+        let storage = person_storage_with_lake(
+            directory.path(),
+            vec![
+                CreatableTopicConfig::default()
+                    .name(topic_config::SCHEMA_VALIDATION.into())
+                    .value(Some("false".into())),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            0,
+            storage
+                .produce(None, &Topition::new("person", 0), unconvertible_person()?)
+                .await?
         );
 
         Ok(())

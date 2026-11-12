@@ -100,7 +100,7 @@ where
         // offsets, and a record that breaks the schema fails that conversion and leaves the
         // reserved offsets empty.
         if let Some(schemas) = &self.schemas
-            && (request.configuration.schema_validation() || request.configuration.lake_sink())
+            && request.configuration.validates_schema()
             && let Err(error) = schemas
                 .validate(&request.topic, &inflated)
                 .await
