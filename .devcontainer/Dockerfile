@@ -1,4 +1,4 @@
-# Copyright ⓒ 2024 Peter Morgan <peter.james.morgan@gmail.com>
+# Copyright ⓒ Solace Corporation
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as

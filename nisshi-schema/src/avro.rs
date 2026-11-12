@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
