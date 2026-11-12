@@ -21,11 +21,17 @@ use url::Url;
 #[derive(Args, Clone, Debug)]
 pub(super) struct Arg {
     /// The proxy will listen on this address
-    #[arg(long, env = "LISTENER_URL", default_value = "tcp://0.0.0.0:9092")]
+    #[arg(
+        hide_env_values = true,
+        long,
+        env = "LISTENER_URL",
+        default_value = "tcp://0.0.0.0:9092"
+    )]
     pub(super) listener_url: EnvVarExp<Url>,
 
     /// This location is advertised to clients in metadata
     #[arg(
+        hide_env_values = true,
         long,
         env = "ADVERTISED_LISTENER_URL",
         default_value = DEFAULT_BROKER,
@@ -33,11 +39,11 @@ pub(super) struct Arg {
     pub(super) advertised_listener_url: EnvVarExp<Url>,
 
     /// The proxy will forward traffic to this origin broker, which must not require authentication
-    #[arg(long, env = "ORIGIN_URL", default_value = DEFAULT_BROKER)]
+    #[arg(hide_env_values = true, long, env = "ORIGIN_URL", default_value = DEFAULT_BROKER)]
     pub(super) origin_url: EnvVarExp<Url>,
 
     /// OTEL Exporter OTLP endpoint
-    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    #[arg(hide_env_values = true, long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     pub(super) otlp_endpoint_url: Option<EnvVarExp<Url>>,
 }
 

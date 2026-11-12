@@ -83,6 +83,7 @@ pub(super) struct Arg {
     // `[::]`, not `0.0.0.0`. This default requires the broker to bind an IPv6 address
     // with `IPV6_V6ONLY` cleared, so that it also accepts IPv4 connections.
     #[arg(
+        hide_env_values = true,
         long,
         env = "LISTENER_URL",
         default_value = "tcp://[::]:9092",
@@ -92,6 +93,7 @@ pub(super) struct Arg {
 
     /// This location is advertised to clients in metadata
     #[arg(
+        hide_env_values = true,
         long,
         env = "ADVERTISED_LISTENER_URL",
         default_value = DEFAULT_BROKER,
@@ -100,7 +102,12 @@ pub(super) struct Arg {
     advertised_listener_url: EnvVarExp<Url>,
 
     /// Storage engine examples are: postgres://postgres:postgres@localhost, memory://nisshi/ or s3://nisshi/
-    #[arg(long, env = "STORAGE_ENGINE", default_value = "memory://nisshi/")]
+    #[arg(
+        hide_env_values = true,
+        long,
+        env = "STORAGE_ENGINE",
+        default_value = "memory://nisshi/"
+    )]
     storage_engine: EnvVarExp<Url>,
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
@@ -110,7 +117,7 @@ pub(super) struct Arg {
     /// subcommand that declares its own `schema_registry` into this one, so it must declare it as
     /// `EnvVarExp<Url>`, or reading it here panics. The test
     /// `an_argument_with_a_global_arguments_name_has_its_type` checks this.
-    #[arg(long, env = "SCHEMA_REGISTRY", global = true)]
+    #[arg(hide_env_values = true, long, env = "SCHEMA_REGISTRY", global = true)]
     schema_registry: Option<EnvVarExp<Url>>,
 
     /// Schema registry cache expiry duration
@@ -141,7 +148,7 @@ pub(super) struct Arg {
     produce_decoded_bytes: Option<u64>,
 
     /// OTEL Exporter OTLP endpoint
-    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    #[arg(hide_env_values = true, long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
 
     /// When present, client authentication is required
@@ -377,11 +384,11 @@ pub(super) enum Lake {
     #[cfg(feature = "iceberg")]
     Iceberg {
         /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
+        #[arg(hide_env_values = true, long, env = "DATA_LAKE")]
         location: EnvVarExp<Url>,
 
         /// Apache Iceberg Catalog, examples are: http://localhost:8181/
-        #[arg(long, env = "ICEBERG_CATALOG")]
+        #[arg(hide_env_values = true, long, env = "ICEBERG_CATALOG")]
         catalog: EnvVarExp<Url>,
 
         /// Iceberg namespace
@@ -397,7 +404,7 @@ pub(super) enum Lake {
     #[cfg(feature = "delta")]
     Delta {
         /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
+        #[arg(hide_env_values = true, long, env = "DATA_LAKE")]
         location: EnvVarExp<Url>,
 
         /// Delta database
@@ -413,7 +420,7 @@ pub(super) enum Lake {
     #[cfg(feature = "parquet")]
     Parquet {
         /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
+        #[arg(hide_env_values = true, long, env = "DATA_LAKE")]
         location: EnvVarExp<Url>,
     },
 }

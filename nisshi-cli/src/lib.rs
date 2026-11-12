@@ -16,6 +16,7 @@
 use std::{collections::HashMap, env::vars, path::PathBuf, result, str::FromStr};
 
 mod cli;
+mod env_var_exp_parser;
 mod exit_status;
 mod insecure_tls;
 
