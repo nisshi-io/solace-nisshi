@@ -2361,7 +2361,7 @@ impl Storage for Engine {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -2700,7 +2700,7 @@ impl Storage for Engine {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
