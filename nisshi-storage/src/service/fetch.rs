@@ -32,6 +32,7 @@ use crate::{
     service::{
         read_deadline::{ReadDeadline, ReadWait, TimedOut},
         read_share::{FetchReadShare, warn_timeout_at_client_share},
+        storage_error_code,
     },
 };
 use validation::ValidatedFetchRequest;
@@ -46,6 +47,21 @@ static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description(
             "Partition reads whose fetch offset is below the log start or above the high \
              watermark, answered with OFFSET_OUT_OF_RANGE (once per Fetch)",
+        )
+        .build()
+});
+
+/// Partitions that a Fetch answers with an error code because a storage read failed, by `topic`,
+/// by `operation`, the [`StorageOperation`] that failed, and by `error_code`: `KAFKA_STORAGE_ERROR` for an error that
+/// a retry may clear, `UNKNOWN_SERVER_ERROR` for any other. Each is answered once per Fetch,
+/// without waiting for `max_wait`, and the connection stays open. A read that fails after the
+/// partition has records answers with them and is not counted.
+static FETCH_STORAGE_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_fetch_storage_error")
+        .with_description(
+            "Fetch partitions answered with an error code because a storage read failed, by \
+             operation and error_code (once per Fetch)",
         )
         .build()
 });
@@ -315,10 +331,11 @@ where
                 }
                 Ok(Ok(offset_stage)) => offset_stage,
                 Ok(Err(error)) => {
-                    error!(?tp, ?error, "offset stage read failed");
-                    return Ok(Self::unknown_offsets(
-                        partition_index,
-                        error.error_code(ErrorCode::KafkaStorageError),
+                    return Ok(Self::storage_failure(
+                        &tp,
+                        StorageOperation::OffsetStage,
+                        fetch_offset,
+                        &error,
                     ));
                 }
                 Err(reason) => {
@@ -377,7 +394,15 @@ where
                         StorageOperation::CurrentOffsetStage,
                     ));
                 }
-                Ok(current) => current.inspect_err(|error| error!(?error, ?tp))?,
+                Ok(Ok(current)) => current,
+                Ok(Err(error)) => {
+                    return Ok(Self::storage_failure(
+                        &tp,
+                        StorageOperation::CurrentOffsetStage,
+                        fetch_offset,
+                        &error,
+                    ));
+                }
                 Err(reason) => {
                     log_timed_out(
                         &tp,
@@ -459,10 +484,11 @@ where
                 //
                 // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
                 Err(error) => {
-                    error!(?tp, offset, ?error, "fetch read failed");
-                    return Ok(Self::unknown_offsets(
-                        partition_index,
-                        error.error_code(ErrorCode::KafkaStorageError),
+                    return Ok(Self::storage_failure(
+                        &tp,
+                        StorageOperation::Fetch,
+                        offset,
+                        &error,
                     ));
                 }
                 Ok(read) => read,
@@ -635,6 +661,108 @@ where
         Self::unknown_offsets(partition_index, ErrorCode::OffsetOutOfRange)
     }
 
+    /// Counts `partitions` partitions of `topic` that answer `error`, which a read of `operation`
+    /// returned, and returns the code that they answer.
+    fn count_storage_failure(
+        topic: &str,
+        operation: StorageOperation,
+        partitions: u64,
+        error: &Error,
+    ) -> ErrorCode {
+        let error_code = storage_error_code(error);
+
+        FETCH_STORAGE_ERROR.add(
+            partitions,
+            &[
+                KeyValue::new("topic", topic.to_owned()),
+                KeyValue::new("operation", operation.as_str()),
+                KeyValue::new("error_code", format!("{error_code:?}")),
+            ],
+        );
+
+        error_code
+    }
+
+    /// The answer for a partition whose storage read of `operation` at `offset` failed with
+    /// `error`, so the Fetch answers the partition and keeps the connection, and still answers
+    /// the others, as Kafka does for a failed log read ([ReplicaManager.scala#L1698-L1727]). It
+    /// has no records and unknown (-1) offsets.
+    ///
+    /// `KAFKA_STORAGE_ERROR` answers a failure that a retry may clear, which a client retries
+    /// after a metadata refresh, as many times per second as it likes. That answer logs at debug
+    /// and counts in `nisshi_fetch_storage_error`, because a log line per Fetch would flood the
+    /// log while the store is down, and the engine has already logged the cause. Any other
+    /// answer is a failure that a retry does not fix, so it logs at error.
+    ///
+    /// [ReplicaManager.scala#L1698-L1727]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+    fn storage_failure(
+        tp: &Topition,
+        operation: StorageOperation,
+        offset: i64,
+        error: &Error,
+    ) -> PartitionData {
+        let error_code = Self::count_storage_failure(tp.topic(), operation, 1, error);
+
+        if error_code == ErrorCode::KafkaStorageError {
+            debug!(?tp, %operation, offset, ?error, "fetch storage read failed");
+        } else {
+            error!(?tp, %operation, offset, ?error, ?error_code, "fetch storage read failed");
+        }
+
+        Self::unknown_offsets(tp.partition(), error_code)
+    }
+
+    /// The answer for each partition of `fetch`, when the read of the topic's metadata failed
+    /// with `error`: each answers as [`Self::storage_failure`] does, and the other topics of the
+    /// Fetch keep their answers. It counts and logs once for the topic, not once for each of its
+    /// partitions, because a request can list millions of them.
+    fn metadata_failure(fetch: &FetchTopic, error: &Error) -> FetchableTopicResponse {
+        let partitions = fetch.partitions.as_ref().map_or(0, Vec::len);
+
+        let error_code = Self::count_storage_failure(
+            &match TopicId::from(fetch) {
+                TopicId::Name(name) => name,
+                TopicId::Id(id) => id.to_string(),
+            },
+            StorageOperation::Metadata,
+            u64::try_from(partitions).unwrap_or(u64::MAX),
+            error,
+        );
+
+        if error_code == ErrorCode::KafkaStorageError {
+            debug!(
+                topic = ?fetch.topic,
+                topic_id = ?fetch.topic_id,
+                operation = %StorageOperation::Metadata,
+                partitions,
+                ?error,
+                "fetch storage read failed"
+            );
+        } else {
+            error!(
+                topic = ?fetch.topic,
+                topic_id = ?fetch.topic_id,
+                operation = %StorageOperation::Metadata,
+                partitions,
+                ?error,
+                ?error_code,
+                "fetch storage read failed"
+            );
+        }
+
+        FetchableTopicResponse::default()
+            .topic(fetch.topic.clone())
+            // From v13 the client matches a response topic by id and drops one it cannot match, so
+            // the requested id is echoed.
+            .topic_id(fetch.topic_id)
+            .partitions(fetch.partitions.as_ref().map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|partition| Self::unknown_offsets(partition.partition, error_code))
+                    .collect()
+            }))
+    }
+
     /// The answer for a partition with `error_code`, no records, and
     /// unknown (-1) offsets.
     ///
@@ -742,7 +870,14 @@ where
         is_first_non_empty: &mut bool,
         read_failed: &mut bool,
     ) -> Result<FetchableTopicResponse> {
-        let metadata = self.storage.metadata(Some(&[fetch.into()])).await?;
+        let metadata = match self.storage.metadata(Some(&[fetch.into()])).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                *left = left.saturating_sub(fetch.partitions.as_ref().map_or(0, Vec::len));
+
+                return Ok(Self::metadata_failure(fetch, &error));
+            }
+        };
 
         if let Some(MetadataResponseTopic {
             topic_id,
@@ -1266,7 +1401,7 @@ mod tests {
         /// How long `current_offset_stage` takes, on the (paused) clock.
         current_delay: Option<Duration>,
         /// The error that `current_offset_stage` answers.
-        current_error: Option<ErrorCode>,
+        current_error: Option<Error>,
         current_offset_stage_reads: Arc<AtomicUsize>,
     }
 
@@ -1363,8 +1498,8 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
 
-            if let Some(error_code) = self.current_error {
-                return Err(Error::Api(error_code));
+            if let Some(error) = &self.current_error {
+                return Err(error.clone());
             }
 
             let high_watermark = self
@@ -1772,7 +1907,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_second_offset_stage_read_of_an_unknown_partition_answers_it_unknown() -> Result<()> {
         let mut storage = bounded();
-        storage.current_error = Some(ErrorCode::UnknownTopicOrPartition);
+        storage.current_error = Some(Error::Api(ErrorCode::UnknownTopicOrPartition));
 
         let partition = fetch_partition_at(
             storage.clone(),
@@ -2101,6 +2236,8 @@ mod tests {
         SendThenFail(deflated::Batch),
         /// Fails before it sends anything.
         Fail,
+        /// Fails before it sends anything, with an error that a retry may clear.
+        FailTransient,
     }
 
     /// One storage read of a partition, as [`Partitions`] saw it.
@@ -2161,6 +2298,11 @@ mod tests {
         /// Partitions of [`TOPIC`] whose offset stage read fails with an error that has no Kafka
         /// error code.
         failing_offset_stages: Arc<Mutex<BTreeSet<i32>>>,
+        /// Partitions of [`TOPIC`] whose offset stage read fails with an error that a retry may
+        /// clear.
+        transient_offset_stages: Arc<Mutex<BTreeSet<i32>>>,
+        /// Topics whose metadata read fails with an error that a retry may clear.
+        failing_metadata: Arc<Mutex<BTreeSet<String>>>,
         calls: Arc<Mutex<Vec<Call>>>,
         read_ends: Arc<Mutex<Vec<ReadEnd>>>,
         /// Whether each offset stage read takes a permit from its read
@@ -2223,6 +2365,27 @@ mod tests {
                 .lock()
                 .expect("failing offset stages")
                 .insert(partition);
+            self
+        }
+
+        /// Makes each offset stage read of `partition` of [`TOPIC`] fail with an error that a
+        /// retry may clear.
+        fn fail_offset_stage_transiently(self, partition: i32) -> Self {
+            _ = self
+                .transient_offset_stages
+                .lock()
+                .expect("transient offset stages")
+                .insert(partition);
+            self
+        }
+
+        /// Makes each metadata read of `topic` fail with an error that a retry may clear.
+        fn fail_metadata(self, topic: &str) -> Self {
+            _ = self
+                .failing_metadata
+                .lock()
+                .expect("failing metadata")
+                .insert(topic.into());
             self
         }
 
@@ -2340,6 +2503,7 @@ mod tests {
                     Err(Error::Message("the read failed".into()))
                 }
                 Read::Fail => Err(Error::Message("the read failed".into())),
+                Read::FailTransient => Err(Error::from(std::io::Error::other("the read failed"))),
             }
         }
 
@@ -2383,12 +2547,40 @@ mod tests {
                 return Err(Error::Message("the offset stage read failed".into()));
             }
 
+            if topition.topic() == TOPIC
+                && self
+                    .transient_offset_stages
+                    .lock()?
+                    .contains(&topition.partition())
+            {
+                return Err(Error::from(std::io::Error::other(
+                    "the offset stage read failed",
+                )));
+            }
+
             Ok(PARTITION_STAGE)
         }
 
         /// Lists each scripted topic with partitions up to its highest
         /// scripted index.
         async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+            if topics
+                .unwrap_or_default()
+                .iter()
+                .any(|topic| {
+                    let topic = match topic {
+                        TopicId::Name(name) => name.clone(),
+                        TopicId::Id(id) => id.to_string(),
+                    };
+
+                    self.failing_metadata
+                        .lock()
+                        .is_ok_and(|failing| failing.contains(&topic))
+                })
+            {
+                return Err(Error::from(std::io::Error::other("the metadata read failed")));
+            }
+
             let known = {
                 let scripts = self.scripts.lock()?;
 
@@ -2435,6 +2627,8 @@ mod tests {
             })
         }
     });
+
+    mod storage_error;
 
     const TOPIC: &str = "abc";
     const MAX_WAIT: Duration = Duration::from_millis(500);
