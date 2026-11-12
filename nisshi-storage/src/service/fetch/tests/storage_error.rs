@@ -16,6 +16,8 @@
 //! the other partitions keep their answers. The Fetch returns `Ok`, so the connection stays
 //! open.
 
+use std::collections::BTreeMap;
+
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
@@ -23,16 +25,19 @@ use nisshi_sans_io::{
 };
 use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, SdkMeterProvider,
-    data::{AggregatedMetrics, MetricData},
+    data::{AggregatedMetrics, MetricData, SumDataPoint},
 };
 use tokio::time::Duration;
 use uuid::Uuid;
 
 use super::{
     FETCH_DEADLINE, MAX_WAIT, Partitions, Read, Scripted, TOPIC, batch, batches, bounded,
-    capture_metrics, counted, fetch_partition_at, fetch_topics,
+    capture_metrics, fetch_partition_at, fetch_topics,
 };
-use crate::{Error, FetchService, Result};
+use crate::{
+    Error, FetchService, Result, StorageOperation,
+    service::fetch::{STORAGE_FAILURE_WARN_INTERVAL, storage_failure_warns_now},
+};
 
 /// Fetches an offset above the cached high watermark, which makes the service read the current
 /// offset stage.
@@ -98,7 +103,8 @@ async fn a_current_offset_stage_read_that_fails_permanently_answers_unknown_serv
 /// without waiting for `max_wait`, and the other topics of the Fetch keep their records.
 #[tokio::test(start_paused = true)]
 async fn a_metadata_read_that_fails_answers_the_partitions_of_its_topic() -> Result<()> {
-    let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]).fail_metadata("bad");
+    let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])])
+        .fail_metadata("bad", transient());
 
     let (topics, elapsed) =
         fetch_topics(storage, MAX_WAIT, &[("bad", &[0, 1]), (TOPIC, &[0])]).await?;
@@ -130,7 +136,7 @@ async fn a_metadata_read_that_fails_answers_the_partitions_of_its_topic() -> Res
 /// follows them has the whole fetch deadline, not a half of it.
 #[tokio::test(start_paused = true)]
 async fn a_metadata_read_that_fails_leaves_the_fetch_deadline_to_the_later_topics() -> Result<()> {
-    let storage = Partitions::new([(0, vec![Read::Stall])]).fail_metadata("bad");
+    let storage = Partitions::new([(0, vec![Read::Stall])]).fail_metadata("bad", transient());
 
     let (topics, elapsed) =
         fetch_topics(storage, MAX_WAIT, &[("bad", &[0, 1]), (TOPIC, &[0])]).await?;
@@ -195,33 +201,21 @@ async fn an_offset_stage_read_that_fails_transiently_answers_kafka_storage_error
     Ok(())
 }
 
-/// Each partition that a Fetch answers with a storage error counts once.
-#[tokio::test(start_paused = true)]
-async fn a_storage_error_answer_is_counted() -> Result<()> {
-    let (exporter, provider) = capture_metrics();
-
-    // Partition 0 of `abc` fails at its offset stage, and partition 1 at its read.
-    let storage = Partitions::new([(0, vec![]), (1, vec![Read::FailTransient])])
-        .fail_offset_stage_transiently(0)
-        .fail_metadata("bad");
-
-    let _ = fetch_topics(storage, MAX_WAIT, &[("bad", &[0, 1, 2]), (TOPIC, &[0, 1])]).await?;
-
-    assert_eq!(
-        5,
-        counted(&exporter, &provider, "nisshi_fetch_storage_error")
-    );
-
-    Ok(())
-}
-
-/// The `topic` attribute of each data point of the counter `name`.
-fn counted_topics(
+/// The value of each data point of the counter `nisshi_fetch_storage_error`, by its `topic`,
+/// `operation` and `error_code` attributes.
+fn counted_storage_errors(
     exporter: &InMemoryMetricExporter,
     provider: &SdkMeterProvider,
-    name: &str,
-) -> Vec<String> {
+) -> BTreeMap<(String, String, String), u64> {
     provider.force_flush().expect("flush");
+
+    let attribute = |point: &SumDataPoint<u64>, key: &str| {
+        point
+            .attributes()
+            .find(|attribute| attribute.key.as_str() == key)
+            .map(|attribute| attribute.value.to_string())
+            .unwrap_or_default()
+    };
 
     exporter
         .get_finished_metrics()
@@ -229,26 +223,155 @@ fn counted_topics(
         .iter()
         .flat_map(|resource| resource.scope_metrics())
         .flat_map(|scope| scope.metrics())
-        .filter(|metric| metric.name() == name)
+        .filter(|metric| metric.name() == "nisshi_fetch_storage_error")
         .filter_map(|metric| match metric.data() {
             AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
             _ => None,
         })
         .flat_map(|sum| sum.data_points())
-        .flat_map(|point| point.attributes())
-        .filter(|attribute| attribute.key.as_str() == "topic")
-        .map(|attribute| attribute.value.to_string())
+        .map(|point| {
+            // A fourth attribute could carry a client-chosen value, so the counter must have
+            // exactly these three.
+            assert_eq!(3, point.attributes().count());
+            (
+                (
+                    attribute(point, "topic"),
+                    attribute(point, "operation"),
+                    attribute(point, "error_code"),
+                ),
+                point.value(),
+            )
+        })
         .collect()
 }
 
-/// A Fetch that names its topic by ID, as Fetch v13 and later do, has no name, so the counter
-/// names the topic by its ID.
+/// A series of the counter `nisshi_fetch_storage_error`: its `topic`, `operation` and
+/// `error_code` attributes.
+fn series(topic: &str, operation: StorageOperation, error_code: &str) -> (String, String, String) {
+    (topic.into(), operation.as_str().into(), error_code.into())
+}
+
+/// Each partition that a Fetch answers with a storage error counts once, under the topic, the
+/// operation that failed and the error code that it answers.
 #[tokio::test(start_paused = true)]
-async fn a_metadata_read_that_fails_for_a_topic_id_counts_under_the_id() -> Result<()> {
+async fn a_storage_error_answer_is_counted() -> Result<()> {
+    let (exporter, provider) = capture_metrics();
+
+    // Partition 0 of `abc` fails at its offset stage, and partition 1 at its read.
+    let storage = Partitions::new([(0, vec![]), (1, vec![Read::FailTransient])])
+        .fail_offset_stage_transiently(0)
+        .fail_metadata("bad", transient());
+
+    let _ = fetch_topics(storage, MAX_WAIT, &[("bad", &[0, 1, 2]), (TOPIC, &[0, 1])]).await?;
+
+    assert_eq!(
+        BTreeMap::from([
+            (
+                series(
+                    "unresolved",
+                    StorageOperation::Metadata,
+                    "KafkaStorageError"
+                ),
+                3
+            ),
+            (
+                series(TOPIC, StorageOperation::OffsetStage, "KafkaStorageError"),
+                1
+            ),
+            (
+                series(TOPIC, StorageOperation::Fetch, "KafkaStorageError"),
+                1
+            ),
+        ]),
+        counted_storage_errors(&exporter, &provider)
+    );
+
+    Ok(())
+}
+
+/// A metadata read that no retry can clear answers every partition of its topic with
+/// `UNKNOWN_SERVER_ERROR`.
+#[tokio::test(start_paused = true)]
+async fn a_metadata_read_that_fails_permanently_answers_unknown_server_error() -> Result<()> {
+    let (exporter, provider) = capture_metrics();
+
+    let storage =
+        Partitions::new([]).fail_metadata("bad", Error::Message("the read failed".into()));
+
+    let (topics, _) = fetch_topics(storage, MAX_WAIT, &[("bad", &[0, 1])]).await?;
+
+    for partition in &topics[0] {
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            ErrorCode::try_from(partition.error_code)?
+        );
+    }
+    assert_eq!(
+        BTreeMap::from([(
+            series(
+                "unresolved",
+                StorageOperation::Metadata,
+                "UnknownServerError"
+            ),
+            2
+        )]),
+        counted_storage_errors(&exporter, &provider)
+    );
+
+    Ok(())
+}
+
+/// A metadata read that fails with an `Error::Api` answers every partition of its topic with
+/// that code.
+#[tokio::test(start_paused = true)]
+async fn a_metadata_read_that_fails_with_an_api_error_keeps_its_code() -> Result<()> {
+    let (exporter, provider) = capture_metrics();
+    // A code that is neither of the two that a storage error answers by default.
+    let storage = Partitions::new([]).fail_metadata("bad", Error::Api(ErrorCode::RequestTimedOut));
+
+    let (topics, _) = fetch_topics(storage, MAX_WAIT, &[("bad", &[0])]).await?;
+
+    assert_eq!(
+        ErrorCode::RequestTimedOut,
+        ErrorCode::try_from(topics[0][0].error_code)?
+    );
+    assert_eq!(
+        BTreeMap::from([(
+            series("unresolved", StorageOperation::Metadata, "RequestTimedOut"),
+            1
+        )]),
+        counted_storage_errors(&exporter, &provider)
+    );
+
+    Ok(())
+}
+
+/// A failure that a retry may clear logs at `warn` once in each interval for each operation, so a
+/// client that retries a failed Fetch does not flood the log.
+#[tokio::test(start_paused = true)]
+async fn a_storage_failure_warns_once_in_each_interval_for_each_operation() {
+    // These two operations are ones that no Fetch read uses, so no other test shares their state.
+    assert!(storage_failure_warns_now(StorageOperation::ListOffsets));
+    assert!(!storage_failure_warns_now(StorageOperation::ListOffsets));
+    assert!(storage_failure_warns_now(StorageOperation::Brokers));
+
+    tokio::time::advance(STORAGE_FAILURE_WARN_INTERVAL - Duration::from_millis(1)).await;
+    assert!(!storage_failure_warns_now(StorageOperation::ListOffsets));
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(storage_failure_warns_now(StorageOperation::ListOffsets));
+}
+
+/// A Fetch that names its topic by ID, as Fetch v13 and later do, has no name. The answer echoes
+/// the ID, because a client drops a topic that it cannot match, and the counter does not use the
+/// ID as a label, because a client chooses it.
+#[tokio::test(start_paused = true)]
+async fn a_metadata_read_that_fails_for_a_topic_id_echoes_the_id_and_counts_it_as_unresolved()
+-> Result<()> {
     let (exporter, provider) = capture_metrics();
 
     let id = Uuid::from_bytes([7; 16]);
-    let storage = Partitions::new([]).fail_metadata(&id.to_string());
+    let storage = Partitions::new([]).fail_metadata(&id.to_string(), transient());
 
     let topics = FetchService { storage }
         .fetch(
@@ -267,13 +390,22 @@ async fn a_metadata_read_that_fails_for_a_topic_id_counts_under_the_id() -> Resu
         )
         .await?;
 
+    assert_eq!(None, topics[0].topic);
+    assert_eq!(Some(*id.as_bytes()), topics[0].topic_id);
     assert_eq!(
         ErrorCode::KafkaStorageError,
         ErrorCode::try_from(topics[0].partitions.as_ref().expect("partitions")[0].error_code)?
     );
     assert_eq!(
-        vec![id.to_string()],
-        counted_topics(&exporter, &provider, "nisshi_fetch_storage_error")
+        BTreeMap::from([(
+            series(
+                "unresolved",
+                StorageOperation::Metadata,
+                "KafkaStorageError"
+            ),
+            1
+        )]),
+        counted_storage_errors(&exporter, &provider)
     );
 
     Ok(())

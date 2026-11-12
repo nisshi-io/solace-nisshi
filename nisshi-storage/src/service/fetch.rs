@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, sync::LazyLock};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    sync::{LazyLock, Mutex, PoisonError},
+};
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
@@ -51,20 +55,62 @@ static FETCH_OFFSET_OUT_OF_BOUNDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Partitions that a Fetch answers with an error code because a storage read failed, by `topic`,
-/// by `operation`, the [`StorageOperation`] that failed, and by `error_code`: `KAFKA_STORAGE_ERROR` for an error that
-/// a retry may clear, `UNKNOWN_SERVER_ERROR` for any other. Each is answered once per Fetch,
-/// without waiting for `max_wait`, and the connection stays open. A read that fails after the
-/// partition has records answers with them and is not counted.
+/// Partitions that a Fetch answers with an error code because a storage read failed, without
+/// waiting for `max_wait`. A failed metadata read counts each partition of its topic. A read
+/// that fails after the partition has records answers with them and is not counted.
+///
+/// The attribute `topic` is the topic name, or [`UNRESOLVED_TOPIC`] when the metadata read
+/// failed. The attribute `operation` is the [`StorageOperation`] that failed. The attribute
+/// `error_code` is the code of an `Error::Api`. For any other error, it is `KafkaStorageError` if
+/// a retry may clear the error, and `UnknownServerError` if not.
 static FETCH_STORAGE_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_fetch_storage_error")
         .with_description(
-            "Fetch partitions answered with an error code because a storage read failed, by \
-             operation and error_code (once per Fetch)",
+            "Fetch partitions answered with an error code because a storage read failed. A \
+             failed metadata read counts each partition of its topic. Attributes: topic (the \
+             topic name, or unresolved when the metadata read failed), operation (the storage \
+             operation that failed), error_code (the code of an Error::Api; for any other \
+             error, KafkaStorageError if a retry may clear it, UnknownServerError if not)",
         )
         .build()
 });
+
+/// The `topic` attribute of [`FETCH_STORAGE_ERROR`] for a failed metadata read. A client chooses
+/// the topic name or ID of a Fetch, and a value that storage has not confirmed would make a new
+/// series of the counter for each name.
+const UNRESOLVED_TOPIC: &str = "unresolved";
+
+/// The shortest time between two `warn` lines for failures of one storage operation that a retry
+/// may clear.
+const STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// When each storage operation last logged a `warn` line for a failure that a retry may clear.
+static STORAGE_FAILURE_LAST_WARNED: LazyLock<Mutex<HashMap<StorageOperation, Instant>>> =
+    LazyLock::new(Mutex::default);
+
+/// Returns whether a failure of `operation` that a retry may clear logs at `warn` now, which it
+/// does at most once in each [`STORAGE_FAILURE_WARN_INTERVAL`].
+///
+/// A client retries a failed Fetch as often as it likes, so a `warn` line for each failure would
+/// flood the log while the store is down. The map has one entry for each operation, so its size
+/// is bounded.
+fn storage_failure_warns_now(operation: StorageOperation) -> bool {
+    let now = Instant::now();
+    let mut last_warned = STORAGE_FAILURE_LAST_WARNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    if last_warned
+        .get(&operation)
+        .is_some_and(|last| now.duration_since(*last) < STORAGE_FAILURE_WARN_INTERVAL)
+    {
+        return false;
+    }
+
+    _ = last_warned.insert(operation, now);
+    true
+}
 
 static FETCH_AHEAD_OF_CACHED_HIGH_WATERMARK: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -689,10 +735,12 @@ where
     /// has no records and unknown (-1) offsets.
     ///
     /// `KAFKA_STORAGE_ERROR` answers a failure that a retry may clear, which a client retries
-    /// after a metadata refresh, as many times per second as it likes. That answer logs at debug
-    /// and counts in `nisshi_fetch_storage_error`, because a log line per Fetch would flood the
-    /// log while the store is down, and the engine has already logged the cause. Any other
-    /// answer is a failure that a retry does not fix, so it logs at error.
+    /// after a metadata refresh, as many times per second as it likes. That answer counts in
+    /// `nisshi_fetch_storage_error`, and logs at `warn` at most once in each
+    /// [`STORAGE_FAILURE_WARN_INTERVAL`] for each operation, and at debug after that. A storage
+    /// engine may log the cause only at debug, so this `warn` line is the broker's signal at the
+    /// default log level. Any other answer is a failure that a retry does not fix, so it logs at
+    /// error each time.
     ///
     /// [ReplicaManager.scala#L1698-L1727]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
     fn storage_failure(
@@ -703,10 +751,12 @@ where
     ) -> PartitionData {
         let error_code = Self::count_storage_failure(tp.topic(), operation, 1, error);
 
-        if error_code == ErrorCode::KafkaStorageError {
-            debug!(?tp, %operation, offset, ?error, "fetch storage read failed");
-        } else {
+        if error_code != ErrorCode::KafkaStorageError {
             error!(?tp, %operation, offset, ?error, ?error_code, "fetch storage read failed");
+        } else if storage_failure_warns_now(operation) {
+            warn!(?tp, %operation, offset, ?error, "fetch storage read failed");
+        } else {
+            debug!(?tp, %operation, offset, ?error, "fetch storage read failed");
         }
 
         Self::unknown_offsets(tp.partition(), error_code)
@@ -714,23 +764,30 @@ where
 
     /// The answer for each partition of `fetch`, when the read of the topic's metadata failed
     /// with `error`: each answers as [`Self::storage_failure`] does, and the other topics of the
-    /// Fetch keep their answers. It counts and logs once for the topic, not once for each of its
-    /// partitions, because a request can list millions of them.
+    /// Fetch keep their answers. It logs once for the topic, and adds the topic's partition count
+    /// to the counter in one call, because a request can list millions of partitions.
     fn metadata_failure(fetch: &FetchTopic, error: &Error) -> FetchableTopicResponse {
         let partitions = fetch.partitions.as_ref().map_or(0, Vec::len);
 
         let error_code = Self::count_storage_failure(
-            &match TopicId::from(fetch) {
-                TopicId::Name(name) => name,
-                TopicId::Id(id) => id.to_string(),
-            },
+            UNRESOLVED_TOPIC,
             StorageOperation::Metadata,
             u64::try_from(partitions).unwrap_or(u64::MAX),
             error,
         );
 
-        if error_code == ErrorCode::KafkaStorageError {
-            debug!(
+        if error_code != ErrorCode::KafkaStorageError {
+            error!(
+                topic = ?fetch.topic,
+                topic_id = ?fetch.topic_id,
+                operation = %StorageOperation::Metadata,
+                partitions,
+                ?error,
+                ?error_code,
+                "fetch storage read failed"
+            );
+        } else if storage_failure_warns_now(StorageOperation::Metadata) {
+            warn!(
                 topic = ?fetch.topic,
                 topic_id = ?fetch.topic_id,
                 operation = %StorageOperation::Metadata,
@@ -739,13 +796,12 @@ where
                 "fetch storage read failed"
             );
         } else {
-            error!(
+            debug!(
                 topic = ?fetch.topic,
                 topic_id = ?fetch.topic_id,
                 operation = %StorageOperation::Metadata,
                 partitions,
                 ?error,
-                ?error_code,
                 "fetch storage read failed"
             );
         }
@@ -2301,8 +2357,8 @@ mod tests {
         /// Partitions of [`TOPIC`] whose offset stage read fails with an error that a retry may
         /// clear.
         transient_offset_stages: Arc<Mutex<BTreeSet<i32>>>,
-        /// Topics whose metadata read fails with an error that a retry may clear.
-        failing_metadata: Arc<Mutex<BTreeSet<String>>>,
+        /// Topics whose metadata read fails, with the error that it fails with.
+        failing_metadata: Arc<Mutex<BTreeMap<String, Error>>>,
         calls: Arc<Mutex<Vec<Call>>>,
         read_ends: Arc<Mutex<Vec<ReadEnd>>>,
         /// Whether each offset stage read takes a permit from its read
@@ -2379,13 +2435,13 @@ mod tests {
             self
         }
 
-        /// Makes each metadata read of `topic` fail with an error that a retry may clear.
-        fn fail_metadata(self, topic: &str) -> Self {
+        /// Makes each metadata read of `topic` fail with `error`.
+        fn fail_metadata(self, topic: &str, error: Error) -> Self {
             _ = self
                 .failing_metadata
                 .lock()
                 .expect("failing metadata")
-                .insert(topic.into());
+                .insert(topic.into(), error);
             self
         }
 
@@ -2564,22 +2620,18 @@ mod tests {
         /// Lists each scripted topic with partitions up to its highest
         /// scripted index.
         async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-            if topics
-                .unwrap_or_default()
-                .iter()
-                .any(|topic| {
-                    let topic = match topic {
-                        TopicId::Name(name) => name.clone(),
-                        TopicId::Id(id) => id.to_string(),
-                    };
+            let failing_metadata = self.failing_metadata.lock()?;
 
-                    self.failing_metadata
-                        .lock()
-                        .is_ok_and(|failing| failing.contains(&topic))
+            if let Some(error) = topics.unwrap_or_default().iter().find_map(|topic| {
+                failing_metadata.get(&match topic {
+                    TopicId::Name(name) => name.clone(),
+                    TopicId::Id(id) => id.to_string(),
                 })
-            {
-                return Err(Error::from(std::io::Error::other("the metadata read failed")));
+            }) {
+                return Err(error.clone());
             }
+
+            drop(failing_metadata);
 
             let known = {
                 let scripts = self.scripts.lock()?;
