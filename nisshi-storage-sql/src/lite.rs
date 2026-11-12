@@ -4063,7 +4063,7 @@ impl Storage for Delegate {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
+                                        .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4419,7 +4419,7 @@ impl Storage for Delegate {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
+                                .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

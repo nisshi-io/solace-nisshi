@@ -4906,7 +4906,7 @@ impl Storage for Postgres {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
+                                        .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -5237,7 +5237,7 @@ impl Storage for Postgres {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(sql::TOPIC_ID_QUERY_FAILED.into())
+                                .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -15329,5 +15329,40 @@ pub(crate) mod tests {
         );
 
         Ok(())
+    }
+
+    /// A by-ID lookup whose query fails must answer `KAFKA_STORAGE_ERROR`, which clients retry.
+    /// An answer of an unknown topic ID tells a client that the topic is gone.
+    #[tokio::test]
+    async fn metadata_by_id_answers_a_storage_error_when_the_query_fails() -> Result<()> {
+        with_empty_database(
+            "metadata_by_id_answers_a_storage_error_when_the_query_fails",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // The test drops the table that the lookup reads, on a database of its own, so
+                // the query fails while the connection works.
+                database.execute("drop table topic cascade").await?;
+
+                let id = Uuid::now_v7();
+
+                let topics = storage.metadata(Some(&[TopicId::from(id)])).await?.topics;
+
+                assert_eq!(
+                    vec![(
+                        i16::from(ErrorCode::KafkaStorageError),
+                        Some(id.into_bytes())
+                    )],
+                    topics
+                        .iter()
+                        .map(|topic| (topic.error_code, topic.topic_id))
+                        .collect::<Vec<_>>()
+                );
+
+                Ok(())
+            },
+        )
+        .await
     }
 }

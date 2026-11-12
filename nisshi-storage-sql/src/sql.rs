@@ -177,17 +177,6 @@ pub(crate) fn is_column_error(error: &Error) -> bool {
     column_error_kind(error).is_some()
 }
 
-/// The error code that a by-ID topic lookup answers when its query fails, as opposed to
-/// finding no topic.
-///
-/// `KAFKA_STORAGE_ERROR` is the code of Kafka's [`KafkaStorageException`], which Kafka raises for
-/// a failed access to its log. Kafka clients retry it and refresh their metadata. A failed query answered as an unknown topic ID would tell a
-/// client that the topic is gone, and franz-go then gives the application an error after a few
-/// repeats.
-///
-/// [`KafkaStorageException`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/errors/KafkaStorageException.java#L31
-pub(crate) const TOPIC_ID_QUERY_FAILED: ErrorCode = ErrorCode::KafkaStorageError;
-
 /// Counts each column error of one query in an engine's SQL error counter, with the labels that
 /// the engine gives the query and the error's [`column_error_kind`] as `kind`.
 pub(crate) struct ColumnErrorCount {

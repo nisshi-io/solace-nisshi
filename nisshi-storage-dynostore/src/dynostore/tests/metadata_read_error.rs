@@ -19,11 +19,12 @@ use std::assert_matches;
 
 use bytes::Bytes;
 use nisshi_sans_io::{
-    ConfigResource, ErrorCode,
+    ConfigResource, ErrorCode, NULL_TOPIC_ID,
     record::{Record, deflated, inflated},
 };
-use nisshi_storage::{Error, Storage as _, Topition};
+use nisshi_storage::{Error, Storage as _, TopicId, Topition};
 use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
+use uuid::Uuid;
 
 use crate::dynostore::{
     DynoStore,
@@ -69,6 +70,45 @@ async fn failed_read_answers_kafka_storage_error_to_produce() -> Result<(), Erro
     assert_matches!(
         storage.produce(None, &Topition::new("abc", 0), batch).await,
         Err(Error::Api(ErrorCode::KafkaStorageError))
+    );
+
+    Ok(())
+}
+
+/// A metadata read that fails for a topic ID answers `KAFKA_STORAGE_ERROR`, because an unknown
+/// topic ID tells a client that the topic is gone. A name keeps `UNKNOWN_SERVER_ERROR`.
+#[tokio::test]
+async fn failed_read_answers_kafka_storage_error_to_metadata_by_id() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(
+        "nisshi",
+        111,
+        FailingObjectStore::failing_get(InMemory::new()),
+    )?;
+
+    let id = Uuid::now_v7();
+
+    let response = storage
+        .metadata(Some(&[TopicId::from(id), TopicId::from("abc")]))
+        .await?;
+
+    assert_eq!(
+        vec![
+            (
+                i16::from(ErrorCode::KafkaStorageError),
+                Some(id.into_bytes())
+            ),
+            (
+                i16::from(ErrorCode::UnknownServerError),
+                Some(NULL_TOPIC_ID)
+            ),
+        ],
+        response
+            .topics()
+            .iter()
+            .map(|topic| (topic.error_code, topic.topic_id))
+            .collect::<Vec<_>>()
     );
 
     Ok(())
