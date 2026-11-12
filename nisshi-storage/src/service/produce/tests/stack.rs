@@ -17,24 +17,61 @@
 
 use std::{
     assert_matches,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use nisshi_sans_io::{
-    Ack, ErrorCode, ProduceRequest, RequestInput,
+    Ack, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::PartitionProduceResponse,
-    record::{Record, deflated, deflated::Frame, inflated},
+    record::{MAX_DECODED_BATCH_BYTES, Record, deflated, deflated::Frame, inflated},
 };
 use rama::{Service as _, extensions::Extensions};
+use tokio::time::Instant;
 
 use crate::{
     ProduceService, Result,
+    decoded_budget::DecodedBytesBudget,
     service::counting_storage::{CountingStorage, Listing, Produced},
 };
 
 const TOPIC: &str = "abc";
+
+/// Returns a request that produces `batch` to partition `index` of [`TOPIC`].
+fn produce_request(index: i32, batch: deflated::Batch) -> RequestInput<ProduceRequest> {
+    RequestInput {
+        request: ProduceRequest::default()
+            .acks(i16::from(Ack::Leader))
+            .topic_data(Some(
+                [TopicProduceData::default()
+                    .name(TOPIC.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(index)
+                            .records(Some(Frame {
+                                batches: vec![batch],
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+        extensions: Extensions::default(),
+    }
+}
+
+/// Returns the response for the only partition of the only topic of `response`.
+fn only_partition(response: ProduceResponse) -> PartitionProduceResponse {
+    let mut partitions = response
+        .responses
+        .unwrap_or_default()
+        .remove(0)
+        .partition_responses
+        .unwrap_or_default();
+
+    partitions.remove(0)
+}
 
 /// Produces `batch` to partition `index` of [`TOPIC`] through [`ProduceService::new`].
 async fn produce(
@@ -44,34 +81,10 @@ async fn produce(
 ) -> Result<PartitionProduceResponse> {
     let response = ProduceService::new(storage.clone())
         .with_validation()
-        .serve(RequestInput {
-            request: ProduceRequest::default()
-                .acks(i16::from(Ack::Leader))
-                .topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(TOPIC.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(index)
-                                .records(Some(Frame {
-                                    batches: vec![batch],
-                                }))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            extensions: Extensions::default(),
-        })
+        .serve(produce_request(index, batch))
         .await?;
 
-    let mut partitions = response
-        .responses
-        .unwrap_or_default()
-        .remove(0)
-        .partition_responses
-        .unwrap_or_default();
-
-    Ok(partitions.remove(0))
+    Ok(only_partition(response))
 }
 
 fn batch(max_timestamp: i64) -> Result<deflated::Batch> {
@@ -163,10 +176,26 @@ async fn a_rejected_batch_for_a_missing_topic_answers_unknown_topic_or_partition
 /// A topic that storage does not hold is answered before the batch is decoded, so that a produce
 /// to it does not wait for the decoded-bytes budget.
 #[tokio::test]
-async fn a_valid_batch_for_a_missing_topic_does_not_reach_storage() -> Result<()> {
+async fn a_valid_batch_for_a_missing_topic_does_not_wait_for_the_budget() -> Result<()> {
     let storage = CountingStorage::new(Listing::Topics, &[]);
 
-    let response = produce(&storage, 0, batch(-1)?).await?;
+    // Another request holds the whole budget, so a produce that reserves bytes waits and then
+    // answers `REQUEST_TIMED_OUT`.
+    let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
+    let _held = budget
+        .reserve(
+            MAX_DECODED_BATCH_BYTES,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+
+    let response = only_partition(
+        ProduceService::new(storage.clone())
+            .with_decoded_budget(budget, Duration::from_millis(100))
+            .with_validation()
+            .serve(produce_request(0, batch(-1)?))
+            .await?,
+    );
 
     assert_matches!(
         ErrorCode::try_from(response.error_code)?,
