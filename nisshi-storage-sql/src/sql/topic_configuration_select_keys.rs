@@ -12,19 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `pg/topic_configuration_select_keys.sql` query and the names of the columns that PostgreSQL
-//! reads from its result. A change to the query's `select` list must keep these names.
+//! The PostgreSQL query that reads the configs among some keys that a topic sets. It returns no row
+//! when the topic does not exist, and one row with a null name when the topic sets none of the
+//! keys.
 //!
 //! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
 //! the array of config keys to read.
 
+use super::Query;
+
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "pg/topic_configuration_select_keys.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("pg/topic_configuration_select_keys.sql");
 
-/// The config's key. It is null in the one row for a topic that sets none of the keys.
-#[cfg(feature = "postgres")]
-pub(crate) const NAME: &str = "name";
+sql_row! {
+    /// One config among the requested keys that the topic sets, or the one row with a null name
+    /// for a topic that sets none of them.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The config's key, or `None` in the row for a topic that sets none of the keys.
+        name: Option<String>,
+        /// The config's stored value.
+        value: Option<String>,
+    }
+}
 
-/// The config's stored value.
+/// One config that the topic sets.
 #[cfg(feature = "postgres")]
-pub(crate) const VALUE: &str = "value";
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Config {
+    /// The config's key.
+    pub(crate) name: String,
+    /// The config's stored value.
+    pub(crate) value: Option<String>,
+}
+
+#[cfg(feature = "postgres")]
+impl Row {
+    /// Returns the row's config, or `None` for the row of a topic that sets none of the keys,
+    /// which is not a config.
+    pub(crate) fn config(self) -> Option<Config> {
+        self.name.map(|name| Config {
+            name,
+            value: self.value,
+        })
+    }
+}

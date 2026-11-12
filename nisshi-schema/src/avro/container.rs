@@ -157,8 +157,8 @@ mod tests {
 
     fn container_with_codec(codec: Codec) -> Result<Vec<u8>> {
         let schema = Schema::parse_str(r#""int""#)?;
-        let mut writer = Writer::with_codec(&schema, vec![], codec);
-        _ = writer.append(Value::Int(32123))?;
+        let mut writer = Writer::with_codec(&schema, vec![], codec)?;
+        _ = writer.append_value(Value::Int(32123))?;
         writer.into_inner().map_err(Into::into)
     }
 
@@ -194,14 +194,12 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "iceberg")]
     #[test]
     fn snappy_container_is_refused() -> Result<()> {
         is_invalid_record(require_null_codec(&container_with_codec(Codec::Snappy)?));
         Ok(())
     }
 
-    #[cfg(feature = "iceberg")]
     #[test]
     fn zstandard_container_is_refused() -> Result<()> {
         is_invalid_record(require_null_codec(&container_with_codec(

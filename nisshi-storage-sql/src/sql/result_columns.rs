@@ -16,6 +16,12 @@
 
 use nisshi_storage::{Error, Result};
 
+/// A driver's result or prepared statement, which names the columns of a query's result.
+pub(crate) trait ColumnNames {
+    /// Returns the name of each column, in order.
+    fn column_names(&self) -> Vec<String>;
+}
+
 /// The column names of one query's result, in order, as the engine's driver reports them.
 #[derive(Clone, Debug)]
 pub(crate) struct ResultColumns {
@@ -24,37 +30,42 @@ pub(crate) struct ResultColumns {
 }
 
 impl ResultColumns {
-    fn new(query: &'static str, names: Vec<String>) -> Self {
-        Self { query, names }
-    }
-
-    /// Returns the column names of `rows`, libSQL's result of `query`.
-    #[cfg(feature = "libsql")]
-    pub(crate) fn libsql(query: &'static str, rows: &libsql::Rows) -> Self {
-        Self::new(
+    /// Returns the column names of `source`, the result or the prepared statement of `query`.
+    pub(crate) fn new(query: &'static str, source: &impl ColumnNames) -> Self {
+        Self {
             query,
-            (0..rows.column_count())
-                .map(|index| rows.column_name(index).unwrap_or_default().to_owned())
-                .collect(),
-        )
+            names: source.column_names(),
+        }
     }
 
-    /// Returns the column names of `rows`, Turso's result of `query`.
-    #[cfg(feature = "turso")]
-    pub(crate) fn turso(query: &'static str, rows: &turso::Rows) -> Self {
-        Self::new(query, rows.column_names())
+    /// Returns the query's name in the SQL cache.
+    pub(crate) fn query(&self) -> &'static str {
+        self.query
     }
 
-    /// Returns the index of the column `name`, or an error if the result has no such column.
-    pub(crate) fn index(&self, name: &str) -> Result<usize> {
-        self.names
+    /// Returns the index of the column `name`. Returns [`Error::MissingColumn`] if the result does
+    /// not have that column, and [`Error::DuplicateColumn`] if it has more than one.
+    pub(crate) fn index(&self, name: &'static str) -> Result<usize> {
+        let mut indexes = self
+            .names
             .iter()
-            .position(|found| found == name)
-            .ok_or_else(|| {
-                Error::Message(format!(
-                    "{}: no column {name:?} in {:?}",
-                    self.query, self.names
-                ))
-            })
+            .enumerate()
+            .filter(|(_, found)| *found == name)
+            .map(|(index, _)| index);
+
+        let index = indexes.next().ok_or_else(|| Error::MissingColumn {
+            query: self.query,
+            column: name,
+            found: self.names.clone(),
+        })?;
+
+        if indexes.next().is_some() {
+            return Err(Error::DuplicateColumn {
+                query: self.query,
+                column: name,
+            });
+        }
+
+        Ok(index)
     }
 }

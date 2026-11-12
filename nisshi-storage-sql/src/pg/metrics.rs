@@ -23,6 +23,8 @@ use futures::{Stream, StreamExt as _};
 use tokio::time::Instant;
 
 use nisshi_storage::{METER, StorageOperation};
+
+use crate::sql::ColumnErrorCount;
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
@@ -106,6 +108,18 @@ pub(super) fn failed(sql: &str, cluster: &str, error: &tokio_postgres::Error) {
     }
 
     SQL_ERROR.add(1, &attributes);
+}
+
+/// Returns the count of the column errors of the statement `sql` on `cluster`, in the SQL error
+/// counter.
+pub(super) fn column_errors(sql: &str, cluster: &str) -> ColumnErrorCount {
+    ColumnErrorCount::new(
+        &SQL_ERROR,
+        vec![
+            KeyValue::new("sql", sql.to_owned()),
+            KeyValue::new("cluster_id", cluster.to_owned()),
+        ],
+    )
 }
 
 /// Counts a failure of the pool of `cluster` to give out a connection.

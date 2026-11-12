@@ -277,6 +277,20 @@ pub enum StartupFailure {
     SchemaSetup,
 }
 
+/// The kind of a value that libSQL or Turso returned, by SQLite's storage classes.
+///
+/// A text or blob value keeps only its length, because it can hold record data or SCRAM
+/// credentials, and the broker logs each error that holds this summary.
+#[cfg(any(feature = "libsql", feature = "turso"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SqliteValueSummary {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text { length: usize },
+    Blob { length: usize },
+}
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -310,6 +324,13 @@ pub enum Error {
     },
 
     ChronoParse(#[from] chrono::ParseError),
+
+    /// The result of `query` has more than one column named `column`, so a reader can't tell which
+    /// one holds the field.
+    DuplicateColumn {
+        query: &'static str,
+        column: &'static str,
+    },
 
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
@@ -381,6 +402,15 @@ pub enum Error {
         limit: usize,
     },
     Message(String),
+
+    /// The result of `query` does not have a column named `column`. `found` holds the names it
+    /// has.
+    MissingColumn {
+        query: &'static str,
+        column: &'static str,
+        found: Vec<String>,
+    },
+
     NoSuchEntry {
         nth: u32,
     },
@@ -464,11 +494,22 @@ pub enum Error {
 
     UnexpectedServiceResponse(Box<Response>),
 
-    #[cfg(feature = "turso")]
-    UnexpectedValue(turso::Value),
+    /// A column that a query's row declares as not null held a null.
+    UnexpectedNull,
 
-    #[cfg(feature = "libsql")]
-    UnexpectedLibSqlValue(libsql::Value),
+    /// The reader of `query`'s result could not read the column `column` of a row as the column's
+    /// declared type. `source` is the error of that read: the driver's error, an integer overflow,
+    /// or [`Error::UnexpectedNull`].
+    UnreadableColumn {
+        query: &'static str,
+        column: &'static str,
+        source: Box<Error>,
+    },
+
+    /// libSQL or Turso returned a value of this kind for a column whose declared type can't hold
+    /// it.
+    #[cfg(any(feature = "libsql", feature = "turso"))]
+    UnexpectedSqliteValue(SqliteValueSummary),
 
     UnknownCacheKey(String),
 
@@ -597,6 +638,7 @@ impl Error {
             | Self::AcksZeroProduceFailed { .. }
             | Self::ChronoParse(_)
             | Self::Decode(_)
+            | Self::DuplicateColumn { .. }
             | Self::Boxed(_)
             | Self::FeatureNotEnabled { .. }
             | Self::Glob(_)
@@ -610,6 +652,7 @@ impl Error {
             | Self::LessThanMinTime { .. }
             | Self::MessageTooLarge { .. }
             | Self::Message(_)
+            | Self::MissingColumn { .. }
             | Self::NoSuchEntry { .. }
             | Self::NoSuchOffset(_)
             | Self::OsString(_)
@@ -632,7 +675,9 @@ impl Error {
             | Self::TryFromSlice(_)
             | Self::TryGet(_)
             | Self::UnexpectedBody(_)
+            | Self::UnexpectedNull
             | Self::UnexpectedServiceResponse(_)
+            | Self::UnreadableColumn { .. }
             | Self::UnknownCacheKey(_)
             | Self::InvalidStorageOptionValue { .. }
             | Self::UnrecognizedStorageOption { .. }
@@ -645,14 +690,11 @@ impl Error {
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             Self::DeadPoolBuild(_) => false,
 
+            #[cfg(any(feature = "libsql", feature = "turso"))]
+            Self::UnexpectedSqliteValue(_) => false,
+
             #[cfg(feature = "slatedb")]
             Self::Postcard(_) => false,
-
-            #[cfg(feature = "turso")]
-            Self::UnexpectedValue(_) => false,
-
-            #[cfg(feature = "libsql")]
-            Self::UnexpectedLibSqlValue(_) => false,
         }
     }
 
@@ -2273,6 +2315,16 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
+    ///
+    /// `None` asks for every topic, and an empty slice for no topic, only the brokers, the
+    /// cluster and the controller, as an empty Metadata request does from v1
+    /// ([`MetadataRequest.isAllTopics`]).
+    ///
+    /// A backend that lists every topic whatever it is given, as `null://` and the deprecated
+    /// `slatedb://` do, still answers no topics to an empty slice: `MetadataService` enforces
+    /// it for them.
+    ///
+    /// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
     async fn upsert_user_scram_credential(

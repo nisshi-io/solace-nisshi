@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_configuration_select.sql` query and the names of the columns that PostgreSQL reads
-//! from its result. A change to the query's `select` list must keep these names.
+//! The query that reads each config that a topic sets.
 //!
-//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name. It
-//! returns one row for each config that the topic sets.
+//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name.
+
+use super::Query;
 
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_configuration_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_configuration_select.sql");
 
-/// The config's key.
-#[cfg(feature = "postgres")]
-pub(crate) const NAME: &str = "name";
-
-/// The config's stored value.
-#[cfg(feature = "postgres")]
-pub(crate) const VALUE: &str = "value";
+sql_row! {
+    /// One config that the topic sets.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The config's key.
+        name: String,
+        /// The config's stored value.
+        value: Option<String>,
+    }
+}

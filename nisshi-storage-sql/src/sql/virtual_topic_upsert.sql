@@ -29,4 +29,4 @@ do update set
 
 last_updated = excluded.last_updated
 
-returning virtual_topic.uuid;
+returning virtual_topic.uuid as uuid;

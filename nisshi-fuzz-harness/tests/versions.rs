@@ -36,7 +36,7 @@ use nisshi_sans_io::{
     ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
     ProduceRequest, Request, metadata_request::MetadataRequestTopic,
 };
-use nisshi_service::{CAPPED_API_VERSIONS, refuse_topic_ids, routable_range};
+use nisshi_service::{CAPPED_API_VERSIONS, all_topics_at_v0, refuse_topic_ids, routable_range};
 use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -133,9 +133,11 @@ fn selector_stays_in_a_capped_range() {
 /// Serves `request` at `version` the way the broker does: a request that Kafka refuses gets the
 /// refusal, and any other goes to the Metadata service, over an empty in-memory storage.
 async fn serve_metadata(
-    request: MetadataRequest,
+    mut request: MetadataRequest,
     version: i16,
 ) -> Result<nisshi_sans_io::MetadataResponse, nisshi_storage::Error> {
+    all_topics_at_v0(version, &mut request);
+
     if let Some(refusal) = refuse_topic_ids(version, &request) {
         return Ok(refusal);
     }

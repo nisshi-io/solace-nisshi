@@ -43,7 +43,7 @@ use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, FRAMES_REJECTED, REQUEST_DURATION, REQUEST_SIZE,
-    RESPONSE_SIZE, TcpListenerInput, frame_length, frame_size,
+    RESPONSE_SIZE, ShutdownExtension, TcpListenerInput, frame_length, frame_size,
 };
 
 /// The largest request payload a listener accepts unless [`TcpContext::maximum_frame_size`]
@@ -95,6 +95,16 @@ pub const DEFAULT_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// in progress, keeping [`TcpBytesService::read`]'s buffer growth bounded and
 /// the idle-timeout deadline reset at a reasonable cadence.
 const IO_CHUNK_SIZE: usize = 64 * 1024;
+
+/// How long a drained connection waits for the client to close its side, after the broker
+/// has closed its own.
+///
+/// A socket that closes with unread bytes in its receive buffer sends a reset instead of a
+/// FIN, and a reset can make the client discard a response that it has not read yet. The
+/// broker reads and discards what the client sends until the client closes, so that the
+/// connection ends with a FIN. A client that keeps its side open gets the reset after this
+/// time.
+const DRAIN_LINGER: Duration = Duration::from_secs(1);
 
 /// Reads one chunk into `buf`, bounding the wait by `idle_timeout` (if any).
 ///
@@ -864,13 +874,53 @@ impl ConnectionLimits {
     }
 }
 
+/// What [`TcpBytesService::req`] did with the connection's next request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Exchange {
+    /// The request was read and served.
+    Served,
+
+    /// The connection's [`ShutdownExtension`] was cancelled before the next request started to
+    /// arrive, so no request was read.
+    Drained,
+}
+
+/// Closes a drained connection: the broker closes its side, then reads and discards until the
+/// client closes its side or [`DRAIN_LINGER`] ends.
+async fn close_drained<Stream>(stream: &mut Stream)
+where
+    Stream: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut discarded = [0u8; 4096];
+
+    let until_client_closes = async {
+        // A peer that has already hung up fails the shutdown, which changes nothing.
+        _ = stream.shutdown().await;
+
+        while let Ok(read) = stream.read(&mut discarded).await
+            && read > 0
+        {}
+    };
+
+    if timeout(DRAIN_LINGER, until_client_closes).await.is_err() {
+        debug!("the client kept its side open after the drain");
+    }
+}
+
 impl<S> TcpBytesService<S>
 where
     S: Service<BytesInput, Output = Bytes>,
     S::Error: From<Error> + From<io::Error> + Debug,
 {
+    /// Reads the size prefix of the next request, or returns `None` if `shutdown` is cancelled
+    /// before the first byte of the prefix arrives.
     #[instrument(skip_all)]
-    async fn wait<R>(&self, req: &mut R, limits: ConnectionLimits) -> Result<[u8; 4], S::Error>
+    async fn wait<R>(
+        &self,
+        req: &mut R,
+        limits: ConnectionLimits,
+        shutdown: Option<&CancellationToken>,
+    ) -> Result<Option<[u8; 4]>, S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -882,9 +932,32 @@ where
         // prefix is a transfer in progress like any other: otherwise a peer
         // trickling one prefix byte per (long) connection idle window would
         // hold the connection four times as long as a quiet one.
-        read_exact_with_idle_timeout(req, &mut size[..1], limits.connection_idle_timeout)
-            .await
-            .inspect_err(|err| debug!(?err))?;
+        let first_byte =
+            read_exact_with_idle_timeout(req, &mut size[..1], limits.connection_idle_timeout);
+
+        // The shutdown races the first byte only, so a request that has started to arrive is
+        // read to its end and answered. Dropping the read of one byte loses nothing, because
+        // that read is a single `read` call, which is cancel safe. `biased` checks the token
+        // first, so a request that the client pipelined is not read after the shutdown.
+        //
+        // Apache Kafka is looser here: a broker that stops drops the requests that it has read
+        // and not yet answered ([`RequestChannel.clear`]). Nisshi answers them, because a client
+        // retries a request that gets no answer, and a produce that took effect would then be
+        // stored twice.
+        //
+        // [`RequestChannel.clear`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/RequestChannel.scala#L502-L505
+        let first_byte = match shutdown {
+            Some(shutdown) => tokio::select! {
+                biased;
+
+                () = shutdown.cancelled() => return Ok(None),
+                read = first_byte => read,
+            },
+
+            None => first_byte.await,
+        };
+
+        first_byte.inspect_err(|err| debug!(?err))?;
 
         read_exact_with_idle_timeout(req, &mut size[1..], limits.io_idle_timeout)
             .await
@@ -899,7 +972,7 @@ where
             return Err(Into::into(limit.rejection(frame_size)));
         }
 
-        Ok(size)
+        Ok(Some(size))
     }
 
     /// Reads the frame body declared by `size`, growing the buffer as bytes
@@ -1018,7 +1091,7 @@ where
         extensions: &Extensions,
         limits: ConnectionLimits,
         attributes: &[KeyValue],
-    ) -> Result<(), S::Error>
+    ) -> Result<Exchange, S::Error>
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
@@ -1027,7 +1100,15 @@ where
             ..limits
         };
 
-        let size = self.wait(req, limits).await?;
+        let shutdown = extensions.get_ref::<ShutdownExtension>();
+
+        let Some(size) = self
+            .wait(req, limits, shutdown.map(ShutdownExtension::token))
+            .await?
+        else {
+            return Ok(Exchange::Drained);
+        };
+
         let request = self.read(req, size, limits).await?;
         let response = self
             .process(attributes, request, extensions.clone())
@@ -1038,11 +1119,11 @@ where
         // response that is never actually written to the peer. That's a known, accepted
         // minor inaccuracy rather than one worth threading a "don't record this" signal
         // through every layer for.
-        if SuppressResponseExtension::take(extensions) {
-            return Ok(());
+        if !SuppressResponseExtension::take(extensions) {
+            self.write(req, response, limits).await?;
         }
 
-        self.write(req, response, limits).await
+        Ok(Exchange::Served)
     }
 }
 
@@ -1086,8 +1167,15 @@ where
         loop {
             let attributes = attributes.clone();
 
-            self.req(&mut req, &extensions, limits, &attributes[..])
-                .await?;
+            if self
+                .req(&mut req, &extensions, limits, &attributes[..])
+                .await?
+                == Exchange::Drained
+            {
+                debug!("closing the connection: the broker is shutting down");
+                close_drained(&mut req).await;
+                return Ok(());
+            }
 
             // The response is already written and flushed, so the peer gets it
             // before the shutdown's FIN (over TLS, before `close_notify` and the
@@ -1197,9 +1285,11 @@ mod tests {
     async fn frame_within_limit_is_accepted() -> Result<(), Error> {
         let mut reader = &header(12)[..];
 
-        let size = service().wait(&mut reader, limits(Some(1024))).await?;
+        let size = service()
+            .wait(&mut reader, limits(Some(1024)), None)
+            .await?;
 
-        assert_eq!(header(12), size);
+        assert_eq!(Some(header(12)), size);
         Ok(())
     }
 
@@ -1207,9 +1297,11 @@ mod tests {
     async fn frame_exactly_at_limit_is_accepted() -> Result<(), Error> {
         let mut reader = &header(1024)[..];
 
-        let size = service().wait(&mut reader, limits(Some(1024))).await?;
+        let size = service()
+            .wait(&mut reader, limits(Some(1024)), None)
+            .await?;
 
-        assert_eq!(header(1024), size);
+        assert_eq!(Some(header(1024)), size);
         Ok(())
     }
 
@@ -1218,7 +1310,7 @@ mod tests {
         let mut reader = &header(1025)[..];
 
         let err = service()
-            .wait(&mut reader, limits(Some(1024)))
+            .wait(&mut reader, limits(Some(1024)), None)
             .await
             .expect_err("oversized frame must be rejected before the body is read");
 
@@ -1248,7 +1340,7 @@ mod tests {
         let mut reader = &header(-1)[..];
 
         let err = service()
-            .wait(&mut reader, limits(None))
+            .wait(&mut reader, limits(None), None)
             .await
             .expect_err("negative frame length must be rejected");
 

@@ -28,8 +28,9 @@ changes.
   parameters. A closure passed straight to another function, as in `.map(|offset| offset + 1)`, is
   fine.
 - **Give each file one cohesive unit.** Usually that is one type, with its `impl` blocks, its trait
-  impls, its unit tests, and the private helpers and small types that only it uses. Put two types
-  in one file only when neither is used without the other.
+  impls, its unit tests (in its `tests` module; see `unit-test-layout.md`), and the private helpers
+  and small types that only it uses. Put two types in one file only when neither is used without
+  the other.
 - **Keep a type's inherent `impl` in the type's own file.** Rust accepts an `impl` block in any
   module of the crate, but a reader looks for a method in its type's file. An `impl` of a generic
   type for one type argument, such as `impl Response<Fetch>`, is part of what that argument means,
@@ -53,10 +54,12 @@ changes.
   the type's file, or give the type a method that does the work.
 - **Name a module with children after its folder.** Write `topics.rs` beside `topics/`, never
   `topics/mod.rs`, so that each editor tab shows a different name. A folder never holds a file
-  with the folder's own name, because clippy's `module_inception` rejects `topics/topics.rs`. A
-  crate's top-level `tests/` folder is the exception: Cargo builds each `.rs` file in it as a test
-  binary of its own, so the helpers that several test binaries share go in `tests/common/mod.rs`,
-  which Cargo does not build alone.
+  with the folder's own name, because clippy's `module_inception` rejects `topics/topics.rs`. The
+  `common` module of a crate's integration tests is the exception, and stays `common/mod.rs`. In
+  a crate that builds one integration-test binary, `it`, as `AGENTS.md` describes, it is
+  `tests/it/common/mod.rs`. In a crate that builds a binary from each file in `tests/`, it is
+  `tests/common/mod.rs`, because Cargo builds each `.rs` file directly in `tests/` as a binary of
+  its own, and does not build a file in a subfolder alone.
 
 [C-METHOD]: https://rust-lang.github.io/api-guidelines/predictability.html#c-method
 

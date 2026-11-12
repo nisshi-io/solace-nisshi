@@ -21,7 +21,7 @@ use nisshi_sans_io::{
     DescribeTopicPartitionsRequest, ErrorCode, RequestInput,
     describe_topic_partitions_request::TopicRequest,
 };
-use nisshi_storage::{ArcDynStorage, DescribeTopicPartitionsService, Storage};
+use nisshi_storage::{ArcDynStorage, DescribeTopicPartitionsService, Storage, TopicId};
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
 use uuid::Uuid;
@@ -50,6 +50,23 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
     Ok(())
 }
 
+async fn unknown_topic_id_answers_unknown_topic_or_partition(storage: impl Storage) -> Result<()> {
+    let id = Uuid::new_v4();
+
+    let topics = storage
+        .describe_topic_partitions(Some(&[TopicId::Id(id)]), i32::MAX, None)
+        .await?;
+
+    assert_eq!(1, topics.len());
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(topics[0].error_code)?
+    );
+    assert_eq!(id.into_bytes(), topics[0].topic_id);
+
+    Ok(())
+}
+
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use super::*;
@@ -73,6 +90,15 @@ mod in_memory {
         super::simple(storage).await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id_answers_unknown_topic_or_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+
+        super::unknown_topic_id_answers_unknown_topic_or_partition(storage).await
     }
 }
 
@@ -99,6 +125,15 @@ mod lite {
         super::simple(storage).await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id_answers_unknown_topic_or_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+
+        super::unknown_topic_id_answers_unknown_topic_or_partition(storage).await
     }
 }
 
@@ -151,5 +186,14 @@ mod pg {
         super::simple(storage).await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_id_answers_unknown_topic_or_partition() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await?;
+
+        super::unknown_topic_id_answers_unknown_topic_or_partition(storage).await
     }
 }

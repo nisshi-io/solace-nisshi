@@ -14,7 +14,7 @@
 -- limitations under the License.
 
 select
-tp.id
+tp.id as topition
 from topition tp
 join topic t on tp.topic = t.id
 join cluster c on t.cluster = c.id

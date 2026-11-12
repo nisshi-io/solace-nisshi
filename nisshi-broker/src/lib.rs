@@ -31,7 +31,7 @@ use std::{
     result,
     str::{FromStr, Utf8Error},
     sync::{Arc, LazyLock, PoisonError},
-    time::{Duration, SystemTimeError},
+    time::SystemTimeError,
 };
 
 use glob::PatternError;
@@ -53,15 +53,6 @@ pub mod service;
 pub enum CancelKind {
     Interrupt,
     Terminate,
-}
-
-impl From<CancelKind> for Duration {
-    fn from(cancellation: CancelKind) -> Self {
-        Duration::from_millis(match cancellation {
-            CancelKind::Interrupt => 0,
-            CancelKind::Terminate => 5_000,
-        })
-    }
 }
 
 pub const NODE_ID: i32 = 111;

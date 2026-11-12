@@ -34,7 +34,7 @@ use nisshi_schema::{
     lake::{House, LakeHouseType},
     redact_url,
 };
-use nisshi_service::{PeerAddressExtension, ProgressBarExtension};
+use nisshi_service::{PeerAddressExtension, ProgressBarExtension, ShutdownExtension};
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
     TopicCreationConfig,
@@ -45,9 +45,11 @@ use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    future::Future,
     io::{self, ErrorKind},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
+    result,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -55,7 +57,7 @@ use std::{
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::{TcpListener, lookup_host},
-    task::{AbortHandle, JoinSet},
+    task::{AbortHandle, JoinError, JoinSet},
     time::{self, Instant, sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
@@ -68,6 +70,14 @@ use uuid::Uuid;
 /// connection is accepted. Bounds the rustls state held for a peer that
 /// connects and never speaks, much like Kafka's `connections.max.idle.ms`.
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a broker that shuts down waits for its connections to answer the requests that
+/// they hold, unless [`Broker::with_shutdown_grace`] sets another value.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a broker waits for its serve task to end after the shutdown grace, before it aborts
+/// that task.
+const SHUTDOWN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Report a failed TLS handshake at a level that matches its cause.
 ///
@@ -290,6 +300,18 @@ pub struct Broker<G, S> {
     storage_engine: String,
 
     cancellation: CancellationToken,
+    shutdown_grace: Duration,
+
+    /// Cancelled when the shutdown grace ends, which aborts the connections and sweeps that are
+    /// still running.
+    shutdown_deadline: CancellationToken,
+
+    /// The token of the storage container that [`Builder::build`] made, cancelled after the
+    /// connections have drained.
+    ///
+    /// It differs from `cancellation`, because an engine that stops on its token would fail the
+    /// requests that the connections answer while they drain.
+    storage_cancellation: CancellationToken,
 
     /// Present when OTLP metrics are enabled; flushed and shut down when
     /// `main` returns so the last export interval is not lost on exit.
@@ -337,6 +359,9 @@ where
             storage_engine: String::from("unknown"),
 
             cancellation: CancellationToken::new(),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            shutdown_deadline: CancellationToken::new(),
+            storage_cancellation: CancellationToken::new(),
 
             meter_provider: None,
         }
@@ -354,21 +379,35 @@ where
         Builder::default()
     }
 
-    pub async fn main(mut self, started: Instant) -> Result<ErrorCode> {
-        {
-            let root_meta = RootMessageMeta::messages();
-            debug!(
-                messages = root_meta
-                    .requests()
-                    .values()
-                    .map(|meta| meta.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+    /// Returns the broker with the given cancellation token: cancelling it starts the broker's
+    /// shutdown.
+    ///
+    /// The token replaces the one that the broker had. It does not stop the broker's storage.
+    pub fn with_cancellation(self, cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..self
         }
+    }
 
-        let mut set = JoinSet::new();
+    /// Returns the broker with the given shutdown grace: how long a broker that shuts down
+    /// waits for its connections to answer the requests that they hold, before it aborts them.
+    ///
+    /// The default is [`DEFAULT_SHUTDOWN_GRACE`]. An interrupt signal to [`Self::main`] ends the
+    /// grace at once.
+    pub fn with_shutdown_grace(self, shutdown_grace: Duration) -> Self {
+        Self {
+            shutdown_grace,
+            ..self
+        }
+    }
 
+    /// Runs the broker until a terminate or an interrupt signal arrives, or until its
+    /// cancellation token is cancelled, and then shuts it down.
+    ///
+    /// A terminate signal or the token gives the connections the shutdown grace. An interrupt
+    /// signal aborts them at once.
+    pub async fn main(self, started: Instant) -> Result<ErrorCode> {
         #[cfg(unix)]
         let mut interrupt_signal = signal(SignalKind::interrupt())?;
         #[cfg(windows)]
@@ -385,9 +424,75 @@ where
         let mut terminate_signal = tokio::signal::windows::ctrl_close()?;
         debug!(?terminate_signal);
 
+        let token = self.cancellation.clone();
+        let shutdown_grace = self.shutdown_grace;
+
+        let shutdown = async move {
+            let kind = tokio::select! {
+                interrupt = interrupt_signal.recv() => {
+                    debug!(?interrupt);
+                    CancelKind::Interrupt
+                }
+
+                terminate = terminate_signal.recv() => {
+                    debug!(?terminate);
+                    CancelKind::Terminate
+                }
+
+                () = token.cancelled() => CancelKind::Terminate,
+            };
+
+            match kind {
+                CancelKind::Interrupt => Duration::ZERO,
+                CancelKind::Terminate => shutdown_grace,
+            }
+        };
+
+        self.run_until(started, shutdown).await
+    }
+
+    /// Runs the broker until its cancellation token is cancelled, and then shuts it down within
+    /// its shutdown grace.
+    ///
+    /// Unlike [`Self::main`], this does not listen for signals, so a program that embeds the
+    /// broker decides when it stops.
+    pub async fn run(self, started: Instant) -> Result<ErrorCode> {
+        let token = self.cancellation.clone();
+        let shutdown_grace = self.shutdown_grace;
+
+        self.run_until(started, async move {
+            token.cancelled().await;
+            shutdown_grace
+        })
+        .await
+    }
+
+    /// Serves until `shutdown` returns the grace to give the connections, and then cancels the
+    /// broker's token and waits for the connections for that long.
+    async fn run_until(
+        mut self,
+        started: Instant,
+        shutdown: impl Future<Output = Duration>,
+    ) -> Result<ErrorCode> {
+        {
+            let root_meta = RootMessageMeta::messages();
+            debug!(
+                messages = root_meta
+                    .requests()
+                    .values()
+                    .map(|meta| meta.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let mut set = JoinSet::new();
+
         let silent = self.silent;
 
-        let token = self.cancellation.clone();
+        let cancellation = self.cancellation.clone();
+        let shutdown_deadline = self.shutdown_deadline.clone();
+        let storage_cancellation = self.storage_cancellation.clone();
 
         let meter_provider = self.meter_provider.take();
 
@@ -395,80 +500,51 @@ where
 
         // A serve task that ends on its own is a failed (or lost) broker: the
         // process must exit non-zero so a supervisor restarts it.
-        let mut failure = None;
+        let failure = tokio::select! {
+            served = set.join_next() => serve_failure(served),
 
-        let kind = tokio::select! {
-            v = set.join_next() => {
-                debug!(?v);
-                failure = match v {
-                    // The caller reports these errors with the fix, so they are logged
-                    // here only at debug, to avoid printing them twice.
-                    Some(Ok(Err(
-                        err @ (Error::ListenerInUse { .. } | Error::ListenerHostUnresolved { .. }),
-                    ))) => {
-                        debug!(?err);
-                        Some(err)
+            shutdown_grace = shutdown => {
+                info!(?shutdown_grace, "shutting down");
+                cancellation.cancel();
+
+                let served = match timeout(shutdown_grace, set.join_next()).await {
+                    Ok(served) => served,
+
+                    Err(elapsed) => {
+                        debug!(%elapsed);
+                        shutdown_deadline.cancel();
+
+                        // The serve task aborts what it still runs when the deadline fires. This
+                        // aborts the serve task itself if it does not end soon after, so that an
+                        // await that ignores the deadline cannot hold the shutdown.
+                        match timeout(SHUTDOWN_ABORT_TIMEOUT, set.join_next()).await {
+                            Ok(served) => served,
+
+                            Err(elapsed) => {
+                                warn!(
+                                    %elapsed,
+                                    "the broker did not stop at its shutdown deadline, aborting it"
+                                );
+                                set.abort_all();
+                                set.join_next().await
+                            }
+                        }
                     }
-                    Some(Ok(Err(err))) => {
-                        error!(?err);
-                        Some(err)
-                    }
-                    Some(Err(err)) => {
-                        error!(?err);
-                        Some(Error::from(err))
-                    }
-                    Some(Ok(Ok(()))) | None => None,
                 };
-                None
-            }
 
-            interrupt = interrupt_signal.recv() => {
-                debug!(?interrupt);
-                Some(CancelKind::Interrupt)
-            }
+                if !silent {
+                    let stdout = Term::stdout();
 
-            terminate = terminate_signal.recv() => {
-                debug!(?terminate);
-                Some(CancelKind::Terminate)
+                    if stdout.is_term() {
+                        _ = stdout.clear_screen().ok();
+                    }
+                }
+
+                serve_failure(served)
             }
         };
 
-        if let Some(kind) = kind {
-            token.cancel();
-
-            let cleanup = async {
-                while !set.is_empty() {
-                    debug!(len = set.len());
-
-                    _ = set.join_next().await;
-                }
-            };
-
-            let patience = sleep(Duration::from(kind));
-
-            tokio::select! {
-                v = cleanup => {
-                    debug!(?v)
-                }
-
-                _ = patience => {
-                    debug!(aborting = set.len());
-                    set.abort_all();
-
-                    while !set.is_empty() {
-                        _ = set.join_next().await;
-                    }
-                }
-            }
-
-            if !silent {
-                let stdout = Term::stdout();
-
-                if stdout.is_term() {
-                    _ = stdout.clear_screen().ok();
-                }
-            }
-        }
+        storage_cancellation.cancel();
 
         // A failed final export should not turn a clean shutdown into an
         // error exit; it is reported and the broker still exits cleanly.
@@ -486,7 +562,13 @@ where
     }
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
-        self.register().await?;
+        let cancellation = self.cancellation.clone();
+
+        tokio::select! {
+            registered = self.register() => registered?,
+            () = cancellation.cancelled() => return Ok(()),
+        }
+
         self.listen(started).await
     }
 
@@ -635,6 +717,7 @@ where
 
                     let extensions = Extensions::default();
                     _ = extensions.insert(PeerAddressExtension::new(addr));
+                    _ = extensions.insert(ShutdownExtension::new(self.cancellation.clone()));
 
                     let pb = if self.silent {
                         None
@@ -808,10 +891,35 @@ where
             }
         }
 
-        while !set.is_empty() {
-            debug!(len = set.len());
+        // The listener closes before the connections drain, so that a client that connects
+        // now is refused at once. An open listener would complete the handshake into its
+        // backlog, and the client would wait for a response until its request timeout.
+        drop(listener);
 
-            _ = set.join_next().await;
+        info!(
+            tasks = set.len(),
+            "listener closed, draining the connections"
+        );
+
+        let drained = async { while set.join_next().await.is_some() {} };
+
+        tokio::select! {
+            biased;
+
+            () = drained => {
+                info!("the connections have drained");
+            }
+
+            () = self.shutdown_deadline.cancelled() => {
+                warn!(
+                    tasks = set.len(),
+                    "the shutdown grace ended, aborting the connections and sweeps still running"
+                );
+
+                set.abort_all();
+
+                while set.join_next().await.is_some() {}
+            }
         }
 
         Ok(())
@@ -1092,6 +1200,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             builder
         };
 
+        let storage_cancellation = CancellationToken::new();
+
         let storage = builder
             .cluster_id(self.cluster_id.clone())
             .node_id(self.node_id)
@@ -1099,7 +1209,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .schema_registry(self.schema_registry.clone())
             .lake_house(self.lake_house.clone())
             .storage(storage)
-            .cancellation(self.cancellation.clone())
+            .cancellation(storage_cancellation.clone())
             .silent(self.silent)
             .user_credentials_required(self.authentication)
             .build()
@@ -1136,8 +1246,38 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             transaction_maintenance_interval: intervals.transaction_maintenance,
             storage_engine,
             cancellation: self.cancellation,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            shutdown_deadline: CancellationToken::new(),
+            storage_cancellation,
             meter_provider,
         })
+    }
+}
+
+/// Returns the error that ends the broker with a failure, from the result of its serve task.
+fn serve_failure(served: Option<result::Result<Result<()>, JoinError>>) -> Option<Error> {
+    debug!(?served);
+
+    match served {
+        // The caller reports these errors with the fix, so they are logged
+        // here only at debug, to avoid printing them twice.
+        Some(Ok(Err(
+            err @ (Error::ListenerInUse { .. } | Error::ListenerHostUnresolved { .. }),
+        ))) => {
+            debug!(?err);
+            Some(err)
+        }
+        Some(Ok(Err(err))) => {
+            error!(?err);
+            Some(err)
+        }
+        // A serve task that the shutdown aborted has not failed.
+        Some(Err(err)) if err.is_cancelled() => None,
+        Some(Err(err)) => {
+            error!(?err);
+            Some(Error::from(err))
+        }
+        Some(Ok(Ok(()))) | None => None,
     }
 }
 

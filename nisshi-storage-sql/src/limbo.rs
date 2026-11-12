@@ -27,16 +27,22 @@ use std::{
 use crate::{
     database_file,
     sql::{
-        Cache, ROWS_PER_FETCH, consumer_group_select, consumer_offset_select,
-        consumer_offset_select_by_group, default_hash, idempotent_epoch_check,
-        idempotent_sequence_check, producer_epochs_select, remove_comments,
-        result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
-        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+        self, Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, ROWS_PER_FETCH,
+        consumer_group_select, default_hash, driver::KafkaTimestamp, driver::sqlite::StoredTime,
+        header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
+        producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
+        topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
+        topic_insert, topic_select_name, topic_select_uuid, topition_insert,
+        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
+        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
+        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
+        watermark_insert, watermark_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::NaiveDateTime;
 use nisshi_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
     ErrorCode, IsolationLevel, NULL_TOPIC_ID, OpType, ScramMechanism,
@@ -57,7 +63,6 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
-    to_system_time, to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -81,7 +86,7 @@ use rand::{rng, seq::SliceRandom as _};
 use regex::Regex;
 use tracing::{debug, error, info};
 use turso::{
-    Connection, Database, Row, Value, params::IntoParams, transaction::Transaction,
+    Connection, Database, Row, params::IntoParams, transaction::Transaction,
     transaction::TransactionBehavior,
 };
 use url::Url;
@@ -125,49 +130,18 @@ struct Txn {
     status: TxnState,
 }
 
-impl TryFrom<Row> for Txn {
+impl TryFrom<txn_produce_offset_select_overlapping_txn::Row> for Txn {
     type Error = Error;
 
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let name = row
-            .get_value(0)
-            .map_err(Into::into)
-            .and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value))
-            })
-            .inspect_err(|err| error!(?err))?;
-
-        let producer_id = row
-            .get_value(1)
-            .map_err(Into::into)
-            .and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .ok_or(Error::UnexpectedValue(value))
-            })
-            .inspect_err(|err| error!(?err))?;
-
-        let producer_epoch = row
-            .get_value(2)
-            .map_err(Into::into)
-            .and_then(|value| {
-                value
-                    .as_integer()
-                    .copied()
-                    .ok_or(Error::UnexpectedValue(value))
-                    .and_then(|value| i16::try_from(value).map_err(Error::from))
-            })
-            .inspect_err(|err| error!(?err))?;
-
-        let status = row
-            .get_value(3)
-            .map(|value| value.as_text().cloned())
-            .map_err(Into::into)
-            .and_then(|status| status.map_or(Ok(TxnState::Begin), TxnState::try_from))
+    fn try_from(row: txn_produce_offset_select_overlapping_txn::Row) -> Result<Self, Self::Error> {
+        let txn_produce_offset_select_overlapping_txn::Row {
+            name,
+            producer_id,
+            producer_epoch,
+            status,
+        } = row;
+        let status = status
+            .map_or(Ok(TxnState::Begin), TxnState::try_from)
             .inspect_err(|err| error!(?err))?;
 
         Ok(Self {
@@ -203,7 +177,7 @@ impl Engine {
 
         if tx
             .query(
-                &sql_lookup("topic_select_name.sql")?,
+                &sql_lookup(topic_select_name::QUERY.key())?,
                 (self.cluster.as_str(), topic),
             )
             .await?
@@ -219,16 +193,13 @@ impl Engine {
             let name = config.name.as_str();
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                tx.query(
-                    &sql_lookup("topic_configuration_select_name.sql")?,
+                self.query_first(
+                    &tx,
+                    topic_configuration_select_name::QUERY,
                     (self.cluster.as_str(), topic, name),
                 )
                 .await?
-                .next()
-                .await?
-                .map(|row| row.get_value(0).map(|value| value.as_text().cloned()))
-                .transpose()?
-                .flatten()
+                .and_then(|row| row.value)
             } else {
                 None
             };
@@ -243,7 +214,7 @@ impl Engine {
                 Some(value) => {
                     _ = tx
                         .query(
-                            &sql_lookup("topic_configuration_upsert.sql")?,
+                            &sql_lookup(topic_configuration_upsert::QUERY.key())?,
                             (self.cluster.as_str(), topic, name, value.as_str()),
                         )
                         .await?
@@ -254,7 +225,7 @@ impl Engine {
                 None => {
                     _ = tx
                         .execute(
-                            &sql_lookup("topic_configuration_delete.sql")?,
+                            &sql_lookup(sql::TOPIC_CONFIGURATION_DELETE)?,
                             (self.cluster.as_str(), topic, name),
                         )
                         .await?;
@@ -282,9 +253,10 @@ impl Engine {
         topition: &Topition,
         offset: i64,
     ) -> Result<Vec<Header>> {
-        let mut rows = c
-            .query(
-                &sql_lookup("header_fetch.sql")?,
+        let mut rows = self
+            .query_rows(
+                c,
+                header_fetch::QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -296,26 +268,8 @@ impl Engine {
 
         let mut headers = vec![];
 
-        while let Some(row) = rows.next().await? {
-            let mut header_builder = Header::builder();
-
-            if let Some(k) = row
-                .get_value(0)
-                .map(|value| value.as_blob().cloned())
-                .inspect_err(|err| error!(?err))?
-            {
-                header_builder = header_builder.key(Bytes::from(k));
-            }
-
-            if let Some(v) = row
-                .get_value(1)
-                .map(|value| value.as_blob().cloned())
-                .inspect_err(|err| error!(?err))?
-            {
-                header_builder = header_builder.value(Bytes::from(v));
-            }
-
-            headers.push(header_builder.build());
+        while let Some(header_fetch::Row { key, value }) = rows.next().await? {
+            headers.push(Header { key, value });
         }
 
         Ok(headers)
@@ -417,20 +371,70 @@ impl Engine {
         Ok(row)
     }
 
-    async fn prepare_query_one<P>(
+    /// Runs `query` on `connection`, and returns its rows, each read as `T` when the caller
+    /// reaches it.
+    async fn query_rows<T: QueryRow>(
         &self,
         connection: &Connection,
-        sql: &str,
-        params: P,
-    ) -> result::Result<Row, turso::Error>
-    where
-        P: IntoParams,
-    {
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<QueryRowCursor<turso::Rows, T>> {
+        let query = query.key();
+        let sql = sql_lookup(query)?;
+        let rows = connection.query(&sql, params).await?;
+        QueryRowCursor::new(
+            ResultColumns::new(query, &rows),
+            rows,
+            self.column_error_count(&sql),
+        )
+    }
+
+    /// Returns the count of `sql`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, sql: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(
+            &SQL_ERROR,
+            vec![
+                KeyValue::new("sql", sql.to_owned()),
+                KeyValue::new("cluster_id", self.cluster.clone()),
+            ],
+        )
+    }
+
+    /// Runs `query` on `connection`, and returns the first row of its result as `T`, or `None`
+    /// when the result has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    async fn query_first<T: QueryRow>(
+        &self,
+        connection: &Connection,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<Option<T>> {
+        let mut rows = self
+            .query_leading_rows(connection, query, params, 1)
+            .await?;
+        Ok(rows.pop())
+    }
+
+    /// Runs `query` on `connection`, and returns at most `limit` of its rows, in order, each read
+    /// as `T`. It records the query's SQL metrics, and drops the result before it returns.
+    async fn query_leading_rows<T: QueryRow>(
+        &self,
+        connection: &Connection,
+        query: Query<T>,
+        params: impl IntoParams,
+        limit: usize,
+    ) -> Result<Vec<T>> {
+        let query = query.key();
+        let sql = sql_lookup(query)?;
+
         // The params hold record data, so we log only the SQL.
         debug!(?connection, sql);
 
         let mut statement = connection
-            .prepare(sql)
+            .prepare(&sql)
             .await
             .inspect_err(|err| error!(?err, sql))?;
 
@@ -438,37 +442,112 @@ impl Engine {
 
         let mut rows = statement.query(params).await.inspect_err(|err| {
             error!(?err, sql);
-            SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
+            SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
         })?;
 
-        if let Some(row) = rows
-            .next()
-            .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| {
-                error!(?err, sql);
-                SQL_ERROR.add(1, &self.attributes_for_error(sql, err)[..]);
-            })?
+        let reader = T::reader(&ResultColumns::new(query, &rows))
+            .inspect_err(|err| self.column_error_count(&sql).record(err))?;
+
+        let mut leading = Vec::with_capacity(limit);
+
+        while leading.len() < limit
+            && let Some(row) = rows
+                .next()
+                .await
+                .inspect(|row| debug!(?row))
+                .inspect_err(|err| {
+                    error!(?err, sql);
+                    SQL_ERROR.add(1, &self.attributes_for_error(&sql, err)[..]);
+                })?
         {
-            let attributes = [
-                KeyValue::new("sql", sql.to_owned()),
-                KeyValue::new("cluster_id", self.cluster.clone()),
-            ];
-
-            SQL_DURATION.record(
-                execute_start
-                    .elapsed()
-                    .map_or(0, |duration| duration.as_millis() as u64),
-                &attributes,
+            leading.push(
+                T::read(&reader, &row)
+                    .inspect_err(|err| self.column_error_count(&sql).record(err))?,
             );
-
-            SQL_REQUESTS.add(1, &attributes);
-
-            Ok(row).inspect(|row| debug!(?row))
-        } else {
-            error!(sql, "query returned no rows");
-            Err(turso::Error::QueryReturnedNoRows)
         }
+
+        let attributes = [
+            KeyValue::new("sql", sql),
+            KeyValue::new("cluster_id", self.cluster.clone()),
+        ];
+
+        SQL_DURATION.record(
+            execute_start
+                .elapsed()
+                .map_or(0, |duration| duration.as_millis() as u64),
+            &attributes,
+        );
+
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok(leading)
+    }
+
+    /// Runs `query` on `connection`, and returns the first row of its result as `T`.
+    ///
+    /// Returns Turso's `QueryReturnedNoRows` error when the result has no rows.
+    async fn query_one<T: QueryRow>(
+        &self,
+        connection: &Connection,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<T> {
+        match self.query_first(connection, query, params).await? {
+            Some(row) => Ok(row),
+            None => {
+                error!(sql = query.key(), "query returned no rows");
+                Err(turso::Error::QueryReturnedNoRows.into())
+            }
+        }
+    }
+
+    /// Returns the newest epoch of `producer`, or `None` when the producer does not exist or has
+    /// no epoch.
+    async fn producer_epoch_current(
+        &self,
+        connection: &Connection,
+        producer: i64,
+    ) -> Result<Option<i16>> {
+        self.query_first(
+            connection,
+            producer_epoch_current_for_producer::QUERY,
+            (self.cluster.as_str(), producer),
+        )
+        .await
+        .map(|row| row.map(|row| row.epoch))
+    }
+
+    /// Returns the producer that owns `transaction_id`, the newest of its epochs with a
+    /// transaction, and that transaction's status, or `None` when there is no such epoch.
+    async fn producer_epoch_for_current_txn(
+        &self,
+        connection: &Connection,
+        transaction_id: &str,
+    ) -> Result<Option<producer_epoch_for_current_txn::Row>> {
+        self.query_first(
+            connection,
+            producer_epoch_for_current_txn::QUERY,
+            (self.cluster.as_str(), transaction_id),
+        )
+        .await
+    }
+
+    /// Adds a producer to the cluster, and returns its ID.
+    async fn producer_insert(&self, connection: &Connection) -> Result<i64> {
+        self.query_one(connection, producer_insert::QUERY, &[self.cluster.as_str()])
+            .await
+            .map(|row| row.id)
+    }
+
+    /// Adds the next epoch to `producer`, and returns it.
+    async fn producer_epoch_insert(&self, connection: &Connection, producer: i64) -> Result<i16> {
+        self.query_one(
+            connection,
+            producer_epoch_insert::QUERY,
+            (self.cluster.as_str(), producer),
+        )
+        .await
+        .map(|row| row.epoch)
     }
 
     async fn idempotent_message_check(
@@ -480,9 +559,10 @@ impl Engine {
     ) -> Result<()> {
         debug!(transaction_id, ?deflated);
 
-        let mut rows = connection
-            .query(
-                &sql_lookup(producer_epochs_select::QUERY)?,
+        let epochs = self
+            .query_first(
+                connection,
+                producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
                     deflated.producer_id,
@@ -490,30 +570,17 @@ impl Engine {
                     topition.partition(),
                 ),
             )
-            .await?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-        let columns = ResultColumns::turso(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)?;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)?;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)?;
-
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-            let stored = StoredEpochs {
-                transactional: integer_value(&row, transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: epoch_value(&row, newest_epoch).inspect_err(|err| error!(?err))?,
-                partition: match row.get_value(partition_epoch)? {
-                    Value::Null => None,
-                    _ => Some(epoch_value(&row, partition_epoch).inspect_err(|err| error!(?err))?),
-                },
-            };
+        if let Some(epochs) = epochs {
+            let stored = StoredEpochs::from(epochs);
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
                 _ = self
                     .prepare_execute(
                         connection,
-                        &sql_lookup("producer_epoch_insert_given.sql")?,
+                        &sql_lookup(sql::PRODUCER_EPOCH_INSERT_GIVEN)?,
                         (
                             self.cluster.as_str(),
                             deflated.producer_id,
@@ -524,10 +591,10 @@ impl Engine {
                     .inspect_err(|err| error!(?err))?;
             }
 
-            let row = self
-                .prepare_query_one(
+            let producer_select_for_update::Row { sequence } = self
+                .query_one(
                     connection,
-                    &sql_lookup("producer_select_for_update.sql")?,
+                    producer_select_for_update::QUERY,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -547,18 +614,6 @@ impl Engine {
                     )
                 })?;
 
-            let sequence = row
-                .get_value(0)
-                .inspect_err(|err| error!(self.cluster, deflated.producer_id, ?err))
-                .map_err(Into::into)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .map(|value| value as i32)
-                        .ok_or(Error::UnexpectedValue(value))
-                })?;
-
             debug!(
                 self.cluster,
                 ?topition,
@@ -576,7 +631,7 @@ impl Engine {
                 1,
                 self.prepare_execute(
                     connection,
-                    &sql_lookup("producer_detail_insert.sql")?,
+                    &sql_lookup(sql::PRODUCER_DETAIL_INSERT)?,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -605,44 +660,18 @@ impl Engine {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition, ?tx);
 
-        let mut rows = tx
-            .query(
-                &sql_lookup(watermark_select_for_write::LITE_QUERY)?,
-                (
-                    self.cluster.as_str(),
-                    topition.topic(),
-                    topition.partition(),
-                ),
-            )
-            .await?;
-
-        let columns = ResultColumns::turso(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)?;
-        let high = columns.index(watermark_select_for_write::HIGH)?;
-        let max_message_bytes = columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)?;
-
-        let Some(row) = rows
-            .next()
-            .await
-            .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        Ok(watermark_select_for_write::Row {
-            low: row
-                .get_value(low)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            high: row
-                .get_value(high)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?,
-            max_message_bytes: row
-                .get_value(max_message_bytes)
-                .map(|value| value.as_text().cloned())
-                .inspect_err(|err| error!(?err))?,
-        })
+        self.query_first(
+            tx,
+            watermark_select_for_write::LITE_QUERY,
+            (
+                self.cluster.as_str(),
+                topition.topic(),
+                topition.partition(),
+            ),
+        )
+        .await
+        .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
+        .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     /// Refuses a client's transactional batch for a partition that is not in its producer's
@@ -655,9 +684,10 @@ impl Engine {
         deflated: &deflated::Batch,
         connection: &Connection,
     ) -> Result<()> {
-        let mut rows = connection
-            .query(
-                &sql_lookup(txn_produce_partition_select::QUERY)?,
+        let row = self
+            .query_first(
+                connection,
+                txn_produce_partition_select::QUERY,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -669,21 +699,6 @@ impl Engine {
             )
             .await
             .inspect_err(|err| error!(?err))?;
-
-        let columns = ResultColumns::turso(txn_produce_partition_select::QUERY, &rows);
-        let producer = columns.index(txn_produce_partition_select::PRODUCER)?;
-        let added = columns.index(txn_produce_partition_select::ADDED)?;
-
-        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
-            Some(row) => Some((
-                match row.get_value(producer)? {
-                    Value::Null => None,
-                    _ => Some(integer_value(&row, producer).inspect_err(|err| error!(?err))?),
-                },
-                integer_value(&row, added).inspect_err(|err| error!(?err))? as i32,
-            )),
-            None => None,
-        };
 
         txn_produce_partition_check(row, deflated.producer_id)
             .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
@@ -746,7 +761,7 @@ impl Engine {
             _ = self
                 .prepare_execute(
                     tx,
-                    &sql_lookup("record_insert.sql")?,
+                    &sql_lookup(sql::RECORD_INSERT)?,
                     (
                         self.cluster.as_str(),
                         topic,
@@ -780,7 +795,7 @@ impl Engine {
                 _ = self
                     .prepare_execute(
                         tx,
-                        &sql_lookup("header_insert.sql")?,
+                        &sql_lookup(sql::HEADER_INSERT)?,
                         (
                             self.cluster.as_str(),
                             topic,
@@ -806,7 +821,7 @@ impl Engine {
 
             _ = self
                     .prepare_execute(tx,
-                        &sql_lookup("txn_produce_offset_insert.sql")?,
+                        &sql_lookup(sql::TXN_PRODUCE_OFFSET_INSERT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -826,7 +841,7 @@ impl Engine {
         _ = self
             .prepare_execute(
                 tx,
-                &sql_lookup("watermark_update.sql")?,
+                &sql_lookup(sql::WATERMARK_UPDATE)?,
                 (
                     self.cluster.as_str(),
                     topic,
@@ -873,10 +888,10 @@ impl Engine {
 
         let mut overlaps = vec![];
 
-        let mut rows = tx
-            .deref()
-            .query(
-                &sql_lookup("txn_select_produced_topitions.sql")?,
+        let mut rows = self
+            .query_rows(
+                tx,
+                txn_select_produced_topitions::QUERY,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -886,21 +901,9 @@ impl Engine {
             )
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_value(0).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
-
-            let partition = row.get_value(1).map_err(Into::into).and_then(|value| {
-                value
-                    .as_integer()
-                    .map(|i| *i as i32)
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
-
+        while let Some(txn_select_produced_topitions::Row { topic, partition }) =
+            rows.next().await?
+        {
             let topition = Topition::new(topic.clone(), partition);
 
             debug!(?topition);
@@ -942,9 +945,10 @@ impl Engine {
 
             debug!(offset, ?topition);
 
-            let mut rows = tx
-                .query(
-                    &sql_lookup("txn_produce_offset_select_offset_range.sql")?,
+            let row = self
+                .query_first(
+                    tx,
+                    txn_produce_offset_select_offset_range::QUERY,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -956,26 +960,17 @@ impl Engine {
                 )
                 .await?;
 
-            if let Some(row) = rows.next().await? {
-                let offset_start = row.get_value(0).map_err(Into::into).and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .ok_or(Error::UnexpectedValue(value))
-                })?;
-
-                let offset_end = row.get_value(1).map_err(Into::into).and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .ok_or(Error::UnexpectedValue(value))
-                })?;
-
+            if let Some(txn_produce_offset_select_offset_range::Row {
+                offset_start,
+                offset_end,
+            }) = row
+            {
                 debug!(offset_start, offset_end);
 
-                let mut rows = tx
-                    .query(
-                        &sql_lookup("txn_produce_offset_select_overlapping_txn.sql")?,
+                let mut rows = self
+                    .query_rows(
+                        tx,
+                        txn_produce_offset_select_overlapping_txn::QUERY,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -1021,7 +1016,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_produce_offset_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_PRODUCE_OFFSET_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1033,7 +1028,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_topition_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_TOPITION_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1046,7 +1041,7 @@ impl Engine {
                 if txn.status == TxnState::PrepareCommit {
                     _ = tx
                         .execute(
-                            &sql_lookup("consumer_offset_insert_from_txn.sql")?,
+                            &sql_lookup(sql::CONSUMER_OFFSET_INSERT_FROM_TXN)?,
                             (
                                 self.cluster.as_str(),
                                 txn.name.as_str(),
@@ -1059,7 +1054,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_offset_commit_tp_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1071,7 +1066,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_offset_commit_delete_by_txn.sql")?,
+                        &sql_lookup(sql::TXN_OFFSET_COMMIT_DELETE_BY_TXN)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1091,7 +1086,7 @@ impl Engine {
 
                 _ = tx
                     .execute(
-                        &sql_lookup("txn_status_update.sql")?,
+                        &sql_lookup(sql::TXN_STATUS_UPDATE)?,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1113,7 +1108,7 @@ impl Engine {
 
             _ = tx
                 .execute(
-                    &sql_lookup("txn_status_update.sql")?,
+                    &sql_lookup(sql::TXN_STATUS_UPDATE)?,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1262,7 +1257,7 @@ fn fix_parameters(sql: &str) -> Result<String> {
 }
 
 fn sql_lookup(key: &str) -> Result<String> {
-    crate::sql::SQL
+    sql::SQL
         .get(key)
         .and_then(|sql| fix_parameters(sql).inspect(|sql| debug!(key, sql)))
 }
@@ -1305,67 +1300,24 @@ impl Builder<String, i32, Url, Url> {
     }
 }
 
-/// Returns the integer in column `index` of `row`.
-fn integer_value(row: &Row, index: usize) -> Result<i64> {
-    row.get_value(index).map_err(Error::from).and_then(|value| {
-        value
-            .as_integer()
-            .copied()
-            .ok_or(Error::UnexpectedValue(value))
-    })
-}
-
-/// Returns the producer epoch in column `index` of `row`, or an error when the stored
-/// integer is outside `i16`.
-fn epoch_value(row: &Row, index: usize) -> Result<i16> {
-    integer_value(row, index).and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
-}
-
-/// Returns the leader epoch in column `index` of `row`, or `None` when the column is null.
-/// Returns an error when the stored integer is outside `i32`.
-fn leader_epoch_value(row: &Row, index: usize) -> Result<Option<i32>> {
-    row.get_value(index).map_err(Error::from).and_then(|value| {
-        if value.is_null() {
-            Ok(None)
-        } else {
-            value
-                .as_integer()
-                .copied()
-                .ok_or(Error::UnexpectedValue(value))
-                .and_then(|epoch| i32::try_from(epoch).map(Some).map_err(Error::from))
-        }
-    })
-}
-
-/// Returns the text in column `index` of `row`, or `None` when the column is null.
-fn optional_text_value(row: &Row, index: usize) -> Result<Option<String>> {
-    row.get_value(index).map_err(Error::from).and_then(|value| {
-        if value.is_null() {
-            Ok(None)
-        } else {
-            value
-                .as_text()
-                .cloned()
-                .map(Some)
-                .ok_or(Error::UnexpectedValue(value))
-        }
-    })
-}
-
 /// Returns a mapper that turns a unique constraint failure into [`Error::Api`] with
 /// `error_code`, and passes any other error through.
 ///
 /// turso reports a unique or primary key failure as [`turso::Error::Constraint`] with a
 /// message, and does not give its SQLite extended result code, so the mapper matches the
 /// message's prefix.
-fn unique_constraint(error_code: ErrorCode) -> impl Fn(turso::Error) -> Error {
-    move |err| match err {
-        turso::Error::Constraint(ref reason) if reason.starts_with("UNIQUE constraint failed") => {
-            debug!(reason);
-            Error::Api(error_code)
-        }
+fn unique_constraint<E: Into<Error>>(error_code: ErrorCode) -> impl Fn(E) -> Error {
+    move |err| match err.into() {
+        Error::Turso(turso_error) => match &*turso_error {
+            turso::Error::Constraint(reason) if reason.starts_with("UNIQUE constraint failed") => {
+                debug!(reason);
+                Error::Api(error_code)
+            }
 
-        otherwise => otherwise.into(),
+            _ => Error::Turso(turso_error),
+        },
+
+        otherwise => otherwise,
     }
 }
 
@@ -1393,33 +1345,19 @@ fn error_kind(error: &turso::Error) -> &'static str {
 
 /// Reads a `consumer_group_detail.sql` row as the stored group and the version that
 /// `update_group` compares against.
-fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
-    let version = row
-        .get_value(0)
-        .map_err(Error::from)
-        .and_then(|value| {
-            value
-                .as_text()
-                .ok_or(Error::UnexpectedValue(value.clone()))
-                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-        })
-        .inspect_err(|err| error!(?err))
-        .map(|uuid| Version {
-            e_tag: Some(uuid.to_string()),
-            version: None,
-        })
-        .inspect(|version| debug!(?version))?;
+fn group_detail_with_version(
+    row: sql::consumer_group_detail::Row,
+) -> Result<(GroupDetail, Version)> {
+    let version = Version {
+        e_tag: Some(row.e_tag.to_string()),
+        version: None,
+    };
+    debug!(?version);
 
     let current = row
-        .get_value(1)
+        .detail
+        .and_then(serde_json::from_value::<GroupDetail>)
         .map_err(Error::from)
-        .and_then(|value| {
-            value
-                .as_text()
-                .map(|v| v.as_str())
-                .ok_or(Error::UnexpectedValue(value.clone()))
-                .and_then(|s| serde_json::from_str::<GroupDetail>(s).map_err(Into::into))
-        })
         .inspect(|current| debug!(?current))?;
 
     Ok((current, version))
@@ -1478,7 +1416,7 @@ impl Storage for Engine {
 
         self.prepare_execute(
             &connection,
-            &sql_lookup("register_broker.sql")?,
+            &sql_lookup(sql::REGISTER_BROKER)?,
             &[broker_registration.cluster_id],
         )
         .await
@@ -1525,22 +1463,12 @@ impl Storage for Engine {
                 (topic.replication_factor as i32),
             );
 
-            self.prepare_query_one(&tx, &sql_lookup("topic_insert.sql")?, parameters.clone())
+            self.query_one(&tx, topic_insert::QUERY, parameters.clone())
                 .await
                 .inspect_err(|err| error!(?err))
                 .map_err(unique_constraint(ErrorCode::TopicAlreadyExists))
                 .inspect(|row| debug!(?parameters, ?row))
-                .and_then(|row| {
-                    row.get_value(0)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value.as_text().cloned().ok_or_else(|| {
-                                Error::Message("expected a text column value".into())
-                            })
-                        })
-                        .inspect_err(|err| error!(?err))
-                })
-                .and_then(|id| Uuid::parse_str(id.as_str()).map_err(Into::into))
+                .map(|row| row.uuid)
         }
         .inspect(|uuid| debug!(?uuid))
         .inspect_err(|err| error!(?err))?;
@@ -1548,17 +1476,11 @@ impl Storage for Engine {
         for partition in 0..topic.num_partitions {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
-            _ = self
-                .prepare_query_one(&tx, &sql_lookup("topition_insert.sql")?, params)
-                .await
-                .map(|row| row.get_value(0))
-                .inspect(|topition| debug!(?topition))?;
+            let topition = self.query_one(&tx, topition_insert::QUERY, params).await?;
+            debug!(?topition);
 
-            _ = self
-                .prepare_query_one(&tx, &sql_lookup("watermark_insert.sql")?, params)
-                .await
-                .map(|row| row.get_value(0))
-                .inspect(|watermark| debug!(?watermark))?;
+            let watermark = self.query_one(&tx, watermark_insert::QUERY, params).await?;
+            debug!(?watermark);
         }
 
         if let Some(configs) = topic.configs {
@@ -1572,12 +1494,11 @@ impl Storage for Engine {
                     config.value.as_deref(),
                 );
 
-                _ = self
-                    .prepare_query_one(&tx, &sql_lookup("topic_configuration_upsert.sql")?, params)
+                let id = self
+                    .query_one(&tx, topic_configuration_upsert::QUERY, params)
                     .await
-                    .map(|row| row.get_value(0))
-                    .inspect_err(|err| error!(?err, ?config))
-                    .inspect(|id| debug!(?id, ?config))?;
+                    .inspect_err(|err| error!(?err, ?config))?;
+                debug!(?id, ?config);
             }
         }
 
@@ -1630,7 +1551,7 @@ impl Storage for Engine {
                                         _ = self
                                             .prepare_execute(
                                                 &tx,
-                                                &sql_lookup("record_delete_by_offset.sql")?,
+                                                &sql_lookup(sql::RECORD_DELETE_BY_OFFSET)?,
                                                 (
                                                     self.cluster.as_str(),
                                                     topic.name.as_str(),
@@ -1645,7 +1566,7 @@ impl Storage for Engine {
                                     _ = self
                                         .prepare_execute(
                                             &tx,
-                                            &sql_lookup("watermark_update.sql")?,
+                                            &sql_lookup(sql::WATERMARK_UPDATE)?,
                                             (
                                                 self.cluster.as_str(),
                                                 topic.name.as_str(),
@@ -1692,45 +1613,43 @@ impl Storage for Engine {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
 
-        let mut rows = match topic {
-            TopicId::Id(id) => {
-                tx.query(
-                    &sql_lookup("topic_select_uuid.sql")?,
+        let topic_name = match topic {
+            TopicId::Id(id) => self
+                .query_first(
+                    &tx,
+                    topic_select_uuid::NAME_QUERY,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
-            }
+                .map(|row| row.name),
 
-            TopicId::Name(name) => {
-                tx.query(
-                    &sql_lookup("topic_select_name.sql")?,
+            TopicId::Name(name) => self
+                .query_first(
+                    &tx,
+                    topic_select_name::NAME_QUERY,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?
-            }
+                .map(|row| row.name),
         };
 
-        let Some(row) = rows.next().await? else {
+        let Some(topic_name) = topic_name else {
             return Ok(ErrorCode::UnknownTopicOrPartition);
         };
 
-        let value = row.get_value(1)?;
-        let topic_name = value
-            .as_text()
-            .map(|topic_name| topic_name.as_str())
-            .ok_or(Error::UnexpectedValue(value.clone()))?;
+        let topic_name = topic_name.as_str();
 
         for sql in [
-            "consumer_offset_delete_by_topic.sql",
-            "topic_configuration_delete_by_topic.sql",
-            "watermark_delete_by_topic.sql",
-            "header_delete_by_topic.sql",
-            "record_delete_by_topic.sql",
-            "txn_offset_commit_tp_delete_by_topic.sql",
-            "txn_produce_offset_delete_by_topic.sql",
-            "txn_topition_delete_by_topic.sql",
-            "producer_detail_delete_by_topic.sql",
-            "topition_delete_by_topic.sql",
+            sql::CONSUMER_OFFSET_DELETE_BY_TOPIC,
+            sql::TOPIC_CONFIGURATION_DELETE_BY_TOPIC,
+            sql::WATERMARK_DELETE_BY_TOPIC,
+            sql::HEADER_DELETE_BY_TOPIC,
+            sql::RECORD_DELETE_BY_TOPIC,
+            sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC,
+            sql::TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC,
+            sql::TXN_TOPITION_DELETE_BY_TOPIC,
+            sql::PRODUCER_DETAIL_DELETE_BY_TOPIC,
+            sql::TOPITION_DELETE_BY_TOPIC,
         ] {
             let rows = self
                 .prepare_execute(&tx, &sql_lookup(sql)?, (self.cluster.as_str(), topic_name))
@@ -1742,7 +1661,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("topic_delete_by.sql")?,
+                &sql_lookup(sql::TOPIC_DELETE_BY)?,
                 (self.cluster.as_str(), topic_name),
             )
             .await?;
@@ -1848,9 +1767,10 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut records = c
-            .query(
-                &sql_lookup("record_fetch.sql")?,
+        let mut records = self
+            .query_rows(
+                &c,
+                record_fetch::QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -1862,23 +1782,23 @@ impl Storage for Engine {
                 ),
             )
             .await
-            .inspect_err(|err| error!(?err))
-            .map_err(Error::from)?;
+            .inspect_err(|err| error!(?err))?;
 
         let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
-        while let Some(row) = records.next().await? {
-            let offset = row
-                .get_value(0)
-                .map_err(Into::into)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .ok_or(Error::UnexpectedValue(value))
-                })
-                .inspect(|offset| debug!(offset))
-                .inspect_err(|err| error!(?err))?;
+        while let Some(record_fetch::Row {
+            offset_id: offset,
+            attributes,
+            timestamp,
+            key,
+            value,
+            producer_id,
+            producer_epoch,
+        }) = records.next().await?
+        {
+            debug!(offset, ?timestamp);
+            debug!(key_len = ?key.as_ref().map(Bytes::len));
+            debug!(value_len = ?value.as_ref().map(Bytes::len));
 
             let headers = self
                 .record_headers(&c, topition, offset)
@@ -1889,45 +1809,12 @@ impl Storage for Engine {
 
             data.send_record(FetchedRecord {
                 offset,
-                timestamp: row
-                    .get_value(2)
-                    .map_err(Error::from)
-                    .and_then(LiteTimestamp::millis)
-                    .inspect(|timestamp| debug!(?timestamp))
-                    .inspect_err(|err| error!(?err))?,
-                attributes: row
-                    .get_value(1)
-                    .map(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .map(|attributes| attributes as i16)
-                    })
-                    .map(|attributes| attributes.unwrap_or(0))
-                    .inspect_err(|err| error!(?err))?,
-                producer_id: row
-                    .get_value(6)
-                    .map(|value| value.as_integer().copied())
-                    .map(|producer_id| producer_id.unwrap_or(-1))
-                    .inspect_err(|err| error!(?err))?,
-                producer_epoch: i16::try_from(
-                    row.get_value(7)
-                        .map(|value| value.as_integer().copied())
-                        .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                )?,
-                key: row
-                    .get_value(3)
-                    .map(|value| value.as_blob().cloned())
-                    .map(|o| o.map(Bytes::from))
-                    .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
-                value: row
-                    .get_value(4)
-                    .map(|value| value.as_blob().cloned())
-                    .map(|o| o.map(Bytes::from))
-                    .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                    .inspect_err(|err| error!(?err))?,
+                timestamp,
+                attributes: attributes.unwrap_or(0),
+                producer_id: producer_id.unwrap_or(-1),
+                producer_epoch: producer_epoch.unwrap_or(-1),
+                key,
+                value,
                 headers,
             })
             .await?;
@@ -1940,10 +1827,10 @@ impl Storage for Engine {
         debug!(cluster = self.cluster, ?topition);
         let c = self.connection().await?;
 
-        let row = self
-            .prepare_query_one(
+        let watermark_select::Row { low, high, stable } = self
+            .query_one(
                 &c,
-                &sql_lookup("watermark_select.sql")?,
+                watermark_select::QUERY,
                 (
                     self.cluster.as_str(),
                     topition.topic(),
@@ -1953,23 +1840,9 @@ impl Storage for Engine {
             .await
             .inspect_err(|err| error!(?topition, ?err))?;
 
-        let log_start = row
-            .get_value(0)
-            .map(|value| value.as_integer().copied())
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let high_watermark = row
-            .get_value(1)
-            .map(|value| value.as_integer().copied())
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let last_stable = row
-            .get_value(2)
-            .map(|value| value.as_integer().copied())
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or(high_watermark);
+        let log_start = low.unwrap_or_default();
+        let high_watermark = high.unwrap_or_default();
+        let last_stable = stable.unwrap_or(high_watermark);
 
         debug!(cluster = self.cluster, ?topition, log_start, high_watermark,);
 
@@ -1999,7 +1872,7 @@ impl Storage for Engine {
 
             let mut rows = tx
                 .query(
-                    &sql_lookup("topition_select.sql")?,
+                    &sql_lookup(sql::TOPITION_SELECT)?,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -2014,7 +1887,7 @@ impl Storage for Engine {
                     let rows = self
                         .prepare_execute(
                             &tx,
-                            &sql_lookup("consumer_group_insert.sql")?,
+                            &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                             (self.cluster.as_str(), group),
                         )
                         .await?;
@@ -2026,7 +1899,7 @@ impl Storage for Engine {
                 let rows = self
                     .prepare_execute(
                         &tx,
-                        &sql_lookup("consumer_offset_insert.sql")?,
+                        &sql_lookup(sql::CONSUMER_OFFSET_INSERT)?,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -2034,7 +1907,7 @@ impl Storage for Engine {
                             group,
                             offset.offset,
                             offset.leader_epoch,
-                            offset.timestamp.map(LiteTimestamp),
+                            offset.timestamp.map(StoredTime::from),
                             offset.metadata.as_deref(),
                         ),
                     )
@@ -2071,43 +1944,26 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut rows = c
-            .query(
-                &sql_lookup(consumer_offset_select_by_group::QUERY)?,
+        let mut rows = self
+            .query_rows(
+                &c,
+                sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        let columns = ResultColumns::turso(consumer_offset_select_by_group::QUERY, &rows);
-        let topic = columns.index(consumer_offset_select_by_group::TOPIC)?;
-        let partition = columns.index(consumer_offset_select_by_group::PARTITION)?;
-        let committed_offset = columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)?;
-        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)?;
-        let metadata = columns.index(consumer_offset_select_by_group::METADATA)?;
-
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
-
-            let partition = row
-                .get_value(partition)
-                .map_err(Into::into)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .map(|partition| partition as i32)
-                        .ok_or(Error::UnexpectedValue(value))
-                })?;
-
+        while let Some(sql::consumer_offset_select_by_group::Row {
+            topic,
+            partition,
+            committed_offset,
+            leader_epoch,
+            metadata,
+        }) = rows.next().await?
+        {
             let committed = CommittedOffset {
-                offset: integer_value(&row, committed_offset)?,
-                leader_epoch: leader_epoch_value(&row, leader_epoch)?,
-                metadata: optional_text_value(&row, metadata)?,
+                offset: committed_offset,
+                leader_epoch,
+                metadata,
             };
 
             debug!(group_id, topic, partition, ?committed);
@@ -2126,39 +1982,20 @@ impl Storage for Engine {
 
         let c = self.connection().await?;
 
-        let mut rows = c
-            .query(
-                &sql_lookup(txn_offset_commit_tp_select_pending::QUERY)?,
+        let mut rows = self
+            .query_rows(
+                &c,
+                txn_offset_commit_tp_select_pending::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await
             .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
 
-        let columns = ResultColumns::turso(txn_offset_commit_tp_select_pending::QUERY, &rows);
-        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)?;
-        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)?;
-
         let mut pending = BTreeSet::new();
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_value(topic).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value))
-            })?;
-
-            let partition = row
-                .get_value(partition)
-                .map_err(Into::into)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .copied()
-                        .map(|partition| partition as i32)
-                        .ok_or(Error::UnexpectedValue(value))
-                })?;
-
+        while let Some(txn_offset_commit_tp_select_pending::Row { topic, partition }) =
+            rows.next().await?
+        {
             _ = pending.insert(Topition::new(topic, partition));
         }
 
@@ -2179,9 +2016,10 @@ impl Storage for Engine {
         let mut offsets = BTreeMap::new();
 
         for topic in topics {
-            let mut rows = c
-                .query(
-                    &sql_lookup(consumer_offset_select::QUERY)?,
+            let mut rows = self
+                .query_rows(
+                    &c,
+                    sql::consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -2200,22 +2038,14 @@ impl Storage for Engine {
                     )
                 })?;
 
-            let columns = ResultColumns::turso(consumer_offset_select::QUERY, &rows);
-            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)?;
-            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)?;
-            let metadata = columns.index(consumer_offset_select::METADATA)?;
-
             let committed = rows
                 .next()
                 .await
-                .map_err(Error::from)
-                .and_then(|row| {
-                    row.map_or(Ok(CommittedOffset::uncommitted()), |row| {
-                        Ok(CommittedOffset {
-                            offset: integer_value(&row, committed_offset)?,
-                            leader_epoch: leader_epoch_value(&row, leader_epoch)?,
-                            metadata: optional_text_value(&row, metadata)?,
-                        })
+                .map(|row| {
+                    row.map_or(CommittedOffset::uncommitted(), |row| CommittedOffset {
+                        offset: row.committed_offset,
+                        leader_epoch: row.leader_epoch,
+                        metadata: row.metadata,
                     })
                 })
                 .inspect(|committed| {
@@ -2255,25 +2085,23 @@ impl Storage for Engine {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffsetRequest::Earliest, _) => sql_lookup("list_earliest_offset.sql")?,
+                (ListOffsetRequest::Earliest, _) => list_offset::EARLIEST_QUERY,
                 (ListOffsetRequest::Latest, IsolationLevel::ReadCommitted) => {
-                    sql_lookup("list_latest_offset_committed.sql")?
+                    list_offset::LATEST_COMMITTED_QUERY
                 }
                 (ListOffsetRequest::Latest, IsolationLevel::ReadUncommitted) => {
-                    sql_lookup("list_latest_offset_uncommitted.sql")?
+                    list_offset::LATEST_UNCOMMITTED_QUERY
                 }
-                (ListOffsetRequest::Timestamp(_), _) => {
-                    sql_lookup("list_latest_offset_timestamp.sql")?
-                }
+                (ListOffsetRequest::Timestamp(_), _) => list_offset::LATEST_TIMESTAMP_QUERY,
             };
 
             debug!(?query);
 
             let list_offset = match offset_type {
                 ListOffsetRequest::Earliest | ListOffsetRequest::Latest => self
-                    .prepare_query_opt(
+                    .query_first(
                         &c,
-                        query.as_str(),
+                        query,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -2284,14 +2112,14 @@ impl Storage for Engine {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffsetRequest::Timestamp(timestamp) => self
-                    .prepare_query_opt(
+                    .query_first(
                         &c,
-                        query.as_str(),
+                        query,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
                             topition.partition(),
-                            LiteTimestamp::from(timestamp),
+                            StoredTime::from(*timestamp),
                         ),
                     )
                     .await
@@ -2320,41 +2148,37 @@ impl Storage for Engine {
                         ..Default::default()
                     })
                 },
-                |row| {
-                    debug!(?row);
+                |list_offset::Row {
+                     offset_id,
+                     timestamp,
+                 }|
+                 -> Result<ListOffsetResponse> {
+                    let offset = Some(offset_id);
 
-                    row.get_value(0)
-                        .map_err(Into::into)
-                        .map(|value| value.as_integer().copied())
-                        .and_then(|offset| {
-                            row.get_value(1)
-                                .map_err(Into::into)
-                                .and_then(|value| match value {
-                                    Value::Null => Ok(None),
-                                    // A record that was produced without a timestamp stores
-                                    // NO_TIMESTAMP, -1, and `SystemTime` cannot hold a negative
-                                    // millisecond count, so this answers no timestamp for it.
-                                    Value::Integer(timestamp) if timestamp < 0 => Ok(None),
-                                    value => LiteTimestamp::try_from(value)
-                                        .map(SystemTime::from)
-                                        .map(Some),
-                                })
-                                .map(|timestamp| {
-                                    debug!(
-                                        cluster = self.cluster,
-                                        ?topition,
-                                        ?offset_type,
-                                        offset,
-                                        ?timestamp
-                                    );
+                    // Only a Timestamp lookup converts the timestamp, because the service drops
+                    // it for Earliest and Latest. Converting it for those two would fail a
+                    // request on an instant that this platform's `SystemTime` cannot hold,
+                    // although the request never uses it.
+                    let timestamp = match offset_type {
+                        ListOffsetRequest::Timestamp(_) => {
+                            timestamp.map(KafkaTimestamp::system_time).transpose()?
+                        }
+                        ListOffsetRequest::Earliest | ListOffsetRequest::Latest => None,
+                    };
 
-                                    ListOffsetResponse {
-                                        timestamp,
-                                        offset,
-                                        ..Default::default()
-                                    }
-                                })
-                        })
+                    debug!(
+                        cluster = self.cluster,
+                        ?topition,
+                        ?offset_type,
+                        offset,
+                        ?timestamp
+                    );
+
+                    Ok(ListOffsetResponse {
+                        timestamp,
+                        offset,
+                        ..Default::default()
+                    })
                 },
             )?;
 
@@ -2385,66 +2209,32 @@ impl Storage for Engine {
         debug!(?brokers);
 
         let responses = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 let mut responses = vec![];
 
                 for topic in topics {
                     responses.push(match topic {
                         TopicId::Name(name) => {
-                            let mut rows = c
-                                .query(
-                                    &sql_lookup("topic_select_name.sql")?,
+                            let mut rows = self
+                                .query_rows(
+                                    &c,
+                                    topic_select_name::QUERY,
                                     (self.cluster.as_str(), name.as_str()),
                                 )
                                 .await?;
 
-                            match rows.next().await.inspect_err(|err| error!(?err)) {
-                                Ok(Some(row)) => {
+                            match rows.next().await {
+                                Ok(Some(topic_select_name::Row {
+                                    uuid,
+                                    name,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-
-                                    let topic_id = row.get_value(0).map_err(Error::from).and_then(
-                                        |value| {
-                                            value
-                                                .as_text()
-                                                .map(|value| {
-                                                    Uuid::parse_str(value)
-                                                        .map(|uuid| uuid.into_bytes())
-                                                        .map_err(Into::into)
-                                                })
-                                                .transpose()
-                                        },
-                                    )?;
-
-                                    let name =
-                                        row.get_value(1).map(|value| value.as_text().cloned())?;
-
-                                    let is_internal =
-                                        row.get_value(2).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| match *i {
-                                                    0 => Ok(false),
-                                                    1 => Ok(true),
-                                                    _ => Err(Error::UnexpectedValue(value.clone())),
-                                                })
-                                                .transpose()
-                                        })?;
-
-                                    let partitions =
-                                        row.get_value(3).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| *i as i32)
-                                                .ok_or(Error::UnexpectedValue(value))
-                                        })?;
-
-                                    let replication_factor =
-                                        row.get_value(4).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| *i as i32)
-                                                .ok_or(Error::UnexpectedValue(value))
-                                        })?;
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -2485,8 +2275,11 @@ impl Storage for Engine {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
 
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
@@ -2499,59 +2292,26 @@ impl Storage for Engine {
                         }
                         TopicId::Id(id) => {
                             debug!(?id);
-                            let mut rows = c
-                                .query(
-                                    &sql_lookup("topic_select_uuid.sql")?,
+                            let mut rows = self
+                                .query_rows(
+                                    &c,
+                                    topic_select_uuid::QUERY,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
                                 .await?;
 
                             match rows.next().await {
-                                Ok(Some(row)) => {
+                                Ok(Some(topic_select_uuid::Row {
+                                    uuid,
+                                    name,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-                                    let topic_id = row.get_value(0).map_err(Error::from).and_then(
-                                        |value| {
-                                            value
-                                                .as_text()
-                                                .map(|value| {
-                                                    Uuid::parse_str(value)
-                                                        .map(|uuid| uuid.into_bytes())
-                                                        .map_err(Into::into)
-                                                })
-                                                .transpose()
-                                        },
-                                    )?;
-
-                                    let name =
-                                        row.get_value(1).map(|value| value.as_text().cloned())?;
-
-                                    let is_internal =
-                                        row.get_value(2).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| match *i {
-                                                    0 => Ok(false),
-                                                    1 => Ok(true),
-                                                    _ => Err(Error::UnexpectedValue(value.clone())),
-                                                })
-                                                .transpose()
-                                        })?;
-
-                                    let partitions =
-                                        row.get_value(3).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| *i as i32)
-                                                .ok_or(Error::UnexpectedValue(value))
-                                        })?;
-
-                                    let replication_factor =
-                                        row.get_value(4).map_err(Into::into).and_then(|value| {
-                                            value
-                                                .as_integer()
-                                                .map(|i| *i as i32)
-                                                .ok_or(Error::UnexpectedValue(value))
-                                        })?;
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -2590,8 +2350,11 @@ impl Storage for Engine {
                                     .is_internal(Some(false))
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(None)
@@ -2608,56 +2371,25 @@ impl Storage for Engine {
                 responses
             }
 
-            _ => {
+            None => {
                 let mut responses = vec![];
 
-                let mut rows = c
-                    .query(
-                        &sql_lookup("topic_by_cluster.sql")?,
-                        &[self.cluster.as_str()],
-                    )
+                let mut rows = self
+                    .query_rows(&c, topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                while let Some(row) = rows.next().await? {
+                while let Some(topic_by_cluster::Row {
+                    uuid,
+                    name,
+                    is_internal,
+                    partitions,
+                    replication_factor,
+                }) = rows.next().await?
+                {
                     let error_code = ErrorCode::None.into();
-                    let topic_id = row.get_value(0).map_err(Error::from).and_then(|value| {
-                        value
-                            .as_text()
-                            .map(|value| {
-                                Uuid::parse_str(value)
-                                    .map(|uuid| uuid.into_bytes())
-                                    .map_err(Into::into)
-                            })
-                            .transpose()
-                    })?;
-
-                    let name = row.get_value(1).map(|value| value.as_text().cloned())?;
-
-                    let is_internal = row.get_value(2).map_err(Into::into).and_then(|value| {
-                        value
-                            .as_integer()
-                            .map(|i| match *i {
-                                0 => Ok(false),
-                                1 => Ok(true),
-                                _ => Err(Error::UnexpectedValue(value.clone())),
-                            })
-                            .transpose()
-                    })?;
-
-                    let partitions = row.get_value(3).map_err(Into::into).and_then(|value| {
-                        value
-                            .as_integer()
-                            .map(|i| *i as i32)
-                            .ok_or(Error::UnexpectedValue(value))
-                    })?;
-
-                    let replication_factor =
-                        row.get_value(4).map_err(Into::into).and_then(|value| {
-                            value
-                                .as_integer()
-                                .map(|i| *i as i32)
-                                .ok_or(Error::UnexpectedValue(value))
-                        })?;
+                    let topic_id = Some(uuid.into_bytes());
+                    let name = Some(name);
+                    let is_internal = Some(is_internal);
 
                     debug!(
                         ?error_code,
@@ -2716,38 +2448,23 @@ impl Storage for Engine {
 
         let mut rows = c
             .query(
-                &sql_lookup("topic_select.sql")?,
+                &sql_lookup(sql::TOPIC_SELECT)?,
                 (self.cluster.as_str(), name),
             )
             .await?;
 
         if rows.next().await?.is_some() {
-            let mut rows = c
-                .query(
-                    &sql_lookup("topic_configuration_select.sql")?,
+            let mut rows = self
+                .query_rows(
+                    &c,
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
             let mut configs = vec![];
 
-            while let Some(row) = rows.next().await? {
-                let name = row
-                    .get_value(0)
-                    .map_err(Into::into)
-                    .and_then(|value| {
-                        value
-                            .as_text()
-                            .cloned()
-                            .ok_or(Error::UnexpectedValue(value))
-                    })
-                    .inspect_err(|err| error!(?err))?;
-
-                let value = row
-                    .get_value(1)
-                    .map(|value| value.as_text().cloned())
-                    .inspect_err(|err| error!(?err))?;
-
+            while let Some(topic_configuration_select::Row { name, value }) = rows.next().await? {
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
@@ -2797,57 +2514,25 @@ impl Storage for Engine {
         for topic in topics.unwrap_or_default() {
             responses.push(match topic {
                 TopicId::Name(name) => {
-                    match self
-                        .prepare_query_opt(
+                    let selected = self
+                        .query_first(
                             &c,
-                            &sql_lookup("topic_select_name.sql")?,
+                            topic_select_name::QUERY,
                             (self.cluster.as_str(), name.as_str()),
                         )
-                        .await
-                        .inspect_err(|err| error!(?err))
-                    {
-                        Ok(Some(row)) => {
-                            let topic_id =
-                                row.get_value(0).map_err(Error::from).and_then(|value| {
-                                    value.as_text().map_or(
-                                        Err(Error::UnexpectedValue(value.clone())),
-                                        |value| {
-                                            Uuid::parse_str(value)
-                                                .map(|uuid| uuid.into_bytes())
-                                                .map_err(Into::into)
-                                        },
-                                    )
-                                })?;
+                        .await;
 
-                            let name = row.get_value(1).map(|value| value.as_text().cloned())?;
-
-                            let is_internal =
-                                row.get_value(2).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| match *i {
-                                            0 => Ok(false),
-                                            1 => Ok(true),
-                                            _ => Err(Error::UnexpectedValue(value.clone())),
-                                        })
-                                        .transpose()
-                                })?;
-
-                            let partitions =
-                                row.get_value(3).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| *i as i32)
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })?;
-
-                            let replication_factor =
-                                row.get_value(4).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| *i as i32)
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })?;
+                    match selected {
+                        Ok(Some(topic_select_name::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -2905,8 +2590,11 @@ impl Storage for Engine {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
-                            debug!(?reason);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(ErrorCode::UnknownServerError.into())
                                 .name(match topic {
@@ -2925,56 +2613,25 @@ impl Storage for Engine {
                 }
                 TopicId::Id(id) => {
                     debug!(?id);
-                    match self
-                        .prepare_query_one(
+                    let selected = self
+                        .query_first(
                             &c,
-                            &sql_lookup("topic_select_uuid.sql")?,
+                            topic_select_uuid::QUERY,
                             (self.cluster.as_str(), id.to_string().as_str()),
                         )
-                        .await
-                    {
-                        Ok(row) => {
-                            let topic_id =
-                                row.get_value(0).map_err(Error::from).and_then(|value| {
-                                    value.as_text().map_or(
-                                        Err(Error::UnexpectedValue(value.clone())),
-                                        |value| {
-                                            Uuid::parse_str(value)
-                                                .map(|uuid| uuid.into_bytes())
-                                                .map_err(Into::into)
-                                        },
-                                    )
-                                })?;
+                        .await;
 
-                            let name = row.get_value(1).map(|value| value.as_text().cloned())?;
-
-                            let is_internal =
-                                row.get_value(2).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| match *i {
-                                            0 => Ok(false),
-                                            1 => Ok(true),
-                                            _ => Err(Error::UnexpectedValue(value.clone())),
-                                        })
-                                        .transpose()
-                                })?;
-
-                            let partitions =
-                                row.get_value(3).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| *i as i32)
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })?;
-
-                            let replication_factor =
-                                row.get_value(4).map_err(Into::into).and_then(|value| {
-                                    value
-                                        .as_integer()
-                                        .map(|i| *i as i32)
-                                        .ok_or(Error::UnexpectedValue(value))
-                                })?;
+                    match selected {
+                        Ok(Some(topic_select_uuid::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -3018,8 +2675,25 @@ impl Storage for Engine {
                                 .topic_authorized_operations(-2147483648)
                         }
 
+                        Ok(None) => DescribeTopicPartitionsResponseTopic::default()
+                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .name(match topic {
+                                TopicId::Name(name) => Some(name.into()),
+                                TopicId::Id(_) => None,
+                            })
+                            .topic_id(match topic {
+                                TopicId::Name(_) => NULL_TOPIC_ID,
+                                TopicId::Id(id) => id.into_bytes(),
+                            })
+                            .is_internal(false)
+                            .partitions(Some([].into()))
+                            .topic_authorized_operations(-2147483648),
+
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
-                            debug!(?reason);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                 .name(match topic {
@@ -3047,39 +2721,15 @@ impl Storage for Engine {
 
         let mut listed_groups = vec![];
 
-        let mut rows = c
-            .query(
-                &sql_lookup(consumer_group_select::QUERY)?,
-                &[self.cluster.as_str()],
-            )
+        let mut rows = self
+            .query_rows(&c, consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::turso(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)?;
-        let detail = columns.index(consumer_group_select::DETAIL)?;
+        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_value(name).map_err(Into::into).and_then(|value| {
-                value
-                    .as_text()
-                    .cloned()
-                    .ok_or(Error::UnexpectedValue(value.clone()))
-            })?;
-
-            let detail = row.get_value(detail).map_err(Error::from)?;
-
-            let stored = if detail.is_null() {
-                None
-            } else {
-                Some(
-                    detail
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(detail.clone()))
-                        .and_then(|text| serde_json::from_str(text).map_err(Error::from)),
-                )
-            };
-
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups)
@@ -3096,17 +2746,17 @@ impl Storage for Engine {
             let c = self.connection().await?;
 
             let mut consumer_offset = c
-                .prepare(&sql_lookup("consumer_offset_delete_by_cg.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_OFFSET_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let mut group_detail = c
-                .prepare(&sql_lookup("consumer_group_detail_delete_by_cg.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_GROUP_DETAIL_DELETE_BY_CG)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
             let mut group = c
-                .prepare(&sql_lookup("consumer_group_delete.sql")?)
+                .prepare(&sql_lookup(sql::CONSUMER_GROUP_DELETE)?)
                 .await
                 .inspect_err(|err| error!(?err))?;
 
@@ -3156,39 +2806,28 @@ impl Storage for Engine {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
-                if let Some(row) = self
-                    .prepare_query_opt(
+                let row = self
+                    .query_first(
                         &c,
-                        &sql_lookup("consumer_group_select_by_name.sql")?,
+                        sql::consumer_group_select_by_name::QUERY,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
-                    .inspect_err(|err| error!(?err, group_id))?
-                {
+                    .inspect_err(|err| error!(?err, group_id))?;
+
+                if let Some(row) = row {
                     // A group row with no detail row (e.g. a group that only ever
                     // committed offsets, never a JoinGroup) joins to a NULL
                     // `detail` column here: that group exists and is empty, not
                     // an error.
-                    let value = row
-                        .get_value(1)
-                        .map_err(Error::from)
-                        .inspect_err(|err| error!(?err, group_id))?;
-
-                    let current = if value.is_null() {
-                        GroupDetail::default()
-                    } else {
-                        value
-                            .as_text()
-                            .cloned()
-                            .ok_or(Error::UnexpectedValue(value.clone()))
-                            .and_then(|s| {
-                                serde_json::from_str::<GroupDetail>(&s).map_err(Into::into)
-                            })
+                    let stored = row.detail.map(|detail| {
+                        detail
+                            .and_then(serde_json::from_value::<GroupDetail>)
+                            .map_err(Error::from)
                             .inspect(|current| debug!(?current))
-                            .inspect_err(|err| error!(?err, group_id))?
-                    };
+                    });
 
-                    results.push(NamedGroupDetail::found(group_id.into(), current));
+                    results.push(NamedGroupDetail::decoded(group_id.into(), stored));
                 } else {
                     results.push(NamedGroupDetail::error_code(
                         group_id.into(),
@@ -3206,15 +2845,13 @@ impl Storage for Engine {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        self.prepare_query_opt(
+        self.query_first(
             &c,
-            &sql_lookup("consumer_group_detail.sql")?,
+            sql::consumer_group_detail::QUERY,
             (group_id, self.cluster.as_str()),
         )
         .await
-        .map_err(Error::from)
         .inspect_err(|err| error!(?err, group_id))?
-        .as_ref()
         .map(group_detail_with_version)
         .transpose()
         .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
@@ -3235,7 +2872,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("consumer_group_insert.sql")?,
+                &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -3258,10 +2895,10 @@ impl Storage for Engine {
 
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(?detail))?;
 
-        let outcome = if let Some(row) = self
-            .prepare_query_opt(
+        let row = self
+            .query_first(
                 &tx,
-                &sql_lookup("consumer_group_detail_insert.sql")?,
+                sql::consumer_group_detail_insert::QUERY,
                 (
                     self.cluster.as_str(),
                     group_id,
@@ -3271,38 +2908,25 @@ impl Storage for Engine {
                 ),
             )
             .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| error!(?err))?
-        {
-            row.get_value(2)
-                .map_err(Error::from)
-                .and_then(|value| {
-                    value
-                        .as_text()
-                        .ok_or(Error::UnexpectedValue(value.clone()))
-                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                })
-                .inspect_err(|err| error!(?err))
-                .map_err(Into::into)
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))
+            .inspect_err(|err| error!(?err))?;
+
+        let outcome = if let Some(row) = row {
+            let version = Version {
+                e_tag: Some(row.e_tag.to_string()),
+                version: None,
+            };
+            debug!(?version);
+            Ok(version)
         } else {
-            let row = self
-                .prepare_query_one(
+            let (current, version) = self
+                .query_one(
                     &tx,
-                    &sql_lookup("consumer_group_detail.sql")?,
+                    sql::consumer_group_detail::QUERY,
                     (group_id, self.cluster.as_str()),
                 )
                 .await
-                .inspect(|row| debug!(?row))
-                .inspect_err(|err| error!(?err))?;
-
-            let (current, version) = group_detail_with_version(&row)?;
+                .inspect_err(|err| error!(?err))
+                .and_then(group_detail_with_version)?;
 
             Err(UpdateError::Outdated {
                 current: Box::new(current),
@@ -3340,43 +2964,18 @@ impl Storage for Engine {
 
                 let mut rolled_back = false;
 
-                if let Some(row) = self
-                    .prepare_query_opt(
-                        &tx,
-                        &sql_lookup("producer_epoch_for_current_txn.sql")?,
-                        (self.cluster.as_str(), transaction_id),
-                    )
+                if let Some(producer_epoch_for_current_txn::Row {
+                    producer: id,
+                    epoch,
+                    status,
+                }) = self
+                    .producer_epoch_for_current_txn(&tx, transaction_id)
                     .await
-                    .inspect_err(|err| error!(?err))?
+                    .inspect_err(|err| error!(?err, transaction_id))?
                 {
-                    let id = row
-                        .get_value(0)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .ok_or(Error::UnexpectedValue(value))
-                        })
-                        .inspect_err(|err| error!(?err))?;
-                    let epoch = row
-                        .get_value(1)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .ok_or(Error::UnexpectedValue(value))
-                                .and_then(|i| i16::try_from(i).map_err(Error::from))
-                        })
-                        .inspect_err(|err| error!(?err, transaction_id, id))?;
-                    let status = row
-                        .get_value(2)
-                        .map_err(Error::from)
-                        .and_then(|value| {
-                            value.as_text().map_or(Ok(None), |status| {
-                                TxnState::from_str(status.as_str()).map(Some)
-                            })
+                    let status = status
+                        .map_or(Ok(None), |status| {
+                            TxnState::from_str(status.as_str()).map(Some)
                         })
                         .inspect_err(|err| error!(?err))?;
 
@@ -3413,59 +3012,33 @@ impl Storage for Engine {
                     }
                 }
 
-                let (producer, epoch) = if let Some(row) = self
-                    .prepare_query_opt(
+                let txn_producer = self
+                    .query_first(
                         &tx,
-                        &sql_lookup("txn_select_name.sql")?,
+                        txn_select_name::QUERY,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
                     .inspect_err(|err| error!(?err))?
-                {
-                    let producer = row
-                        .get_value(0)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value
-                                .as_integer()
-                                .cloned()
-                                .ok_or(Error::UnexpectedValue(value.clone()))
-                        })
-                        .inspect_err(|err| error!(?err))
-                        .inspect(|producer| debug!(producer))?;
+                    .map(|row| row.producer_id);
+
+                let (producer, epoch) = if let Some(producer) = txn_producer {
+                    debug!(producer);
 
                     // A bump gives the producer its newest epoch plus one, so the limit
                     // applies to that epoch, not to the newest epoch with a transaction.
                     let newest = self
-                        .prepare_query_opt(
-                            &tx,
-                            &sql_lookup("producer_epoch_current_for_producer.sql")?,
-                            (self.cluster.as_str(), producer),
-                        )
+                        .producer_epoch_current(&tx, producer)
                         .await
-                        .inspect_err(|err| error!(?err))?
-                        .map(|row| epoch_value(&row, 0))
-                        .transpose()
                         .inspect_err(|err| error!(?err, transaction_id, producer))?;
 
                     if newest.is_some_and(epoch_is_exhausted) {
                         // The status after the rollback above, if it ran.
                         let status = self
-                            .prepare_query_opt(
-                                &tx,
-                                &sql_lookup("producer_epoch_for_current_txn.sql")?,
-                                (self.cluster.as_str(), transaction_id),
-                            )
+                            .producer_epoch_for_current_txn(&tx, transaction_id)
                             .await
-                            .map_err(Error::from)
                             .and_then(|row| {
-                                row.map(|row| row.get_value(2).map_err(Error::from))
-                                    .transpose()
-                            })
-                            .and_then(|value| {
-                                value
-                                    .as_ref()
-                                    .and_then(Value::as_text)
+                                row.and_then(|row| row.status)
                                     .map(|status| TxnState::from_str(status.as_str()))
                                     .transpose()
                             })
@@ -3484,7 +3057,7 @@ impl Storage for Engine {
                                 _ = self
                                     .prepare_query_opt(
                                         &tx,
-                                        &sql_lookup("producer_epoch_insert.sql")?,
+                                        &sql_lookup(producer_epoch_insert::QUERY.key())?,
                                         (self.cluster.as_str(), producer),
                                     )
                                     .await
@@ -3504,25 +3077,13 @@ impl Storage for Engine {
                         let previous = producer;
 
                         let producer = self
-                            .prepare_query_one(
-                                &tx,
-                                &sql_lookup("producer_insert.sql")?,
-                                &[self.cluster.as_str()],
-                            )
+                            .producer_insert(&tx)
                             .await
-                            .map_err(Error::from)
-                            .and_then(|row| integer_value(&row, 0))
                             .inspect_err(|err| error!(?err))?;
 
                         let epoch = self
-                            .prepare_query_one(
-                                &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
-                                (self.cluster.as_str(), producer),
-                            )
+                            .producer_epoch_insert(&tx, producer)
                             .await
-                            .map_err(Error::from)
-                            .and_then(|row| epoch_value(&row, 0))
                             .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
                         // A produce with an epoch below the producer's newest is fenced, so
@@ -3531,7 +3092,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_query_opt(
                                 &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
+                                &sql_lookup(producer_epoch_insert::QUERY.key())?,
                                 (self.cluster.as_str(), previous),
                             )
                             .await
@@ -3540,7 +3101,7 @@ impl Storage for Engine {
                         let updated = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_update_producer.sql")?,
+                                &sql_lookup(sql::TXN_UPDATE_PRODUCER)?,
                                 (self.cluster.as_str(), transaction_id, producer),
                             )
                             .await
@@ -3563,62 +3124,29 @@ impl Storage for Engine {
                         (producer, epoch)
                     } else {
                         let epoch = self
-                            .prepare_query_one(
-                                &tx,
-                                &sql_lookup("producer_epoch_insert.sql")?,
-                                (self.cluster.as_str(), producer),
-                            )
+                            .producer_epoch_insert(&tx, producer)
                             .await
-                            .map_err(Error::from)
-                            .and_then(|row| epoch_value(&row, 0))
                             .inspect(|epoch| debug!(epoch))
                             .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
                         (producer, epoch)
                     }
                 } else {
-                    let row = self
-                        .prepare_query_one(
-                            &tx,
-                            &sql_lookup("producer_insert.sql")?,
-                            &[self.cluster.as_str()],
-                        )
+                    let producer = self
+                        .producer_insert(&tx)
                         .await
                         .inspect_err(|err| error!(?err))?;
 
-                    let producer = row
-                        .get_value(0)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .ok_or(Error::UnexpectedValue(value))
-                        })
-                        .inspect_err(|err| error!(?err))?;
-
-                    let row = self
-                        .prepare_query_one(
-                            &tx,
-                            &sql_lookup("producer_epoch_insert.sql")?,
-                            (self.cluster.as_str(), producer),
-                        )
+                    let epoch = self
+                        .producer_epoch_insert(&tx, producer)
                         .await
                         .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch = row.get_value(0).map_err(Into::into).and_then(|value| {
-                        value
-                            .as_integer()
-                            .copied()
-                            .ok_or(Error::UnexpectedValue(value))
-                            .and_then(|i| i16::try_from(i).map_err(Error::from))
-                    })?;
 
                     assert_eq!(
                         1,
                         self.prepare_execute(
                             &tx,
-                            &sql_lookup("txn_insert.sql")?,
+                            &sql_lookup(sql::TXN_INSERT)?,
                             (self.cluster.as_str(), transaction_id, producer),
                         )
                         .await
@@ -3639,7 +3167,7 @@ impl Storage for Engine {
                     1,
                     self.prepare_execute(
                         &tx,
-                        &sql_lookup("txn_detail_insert.sql")?,
+                        &sql_lookup(sql::TXN_DETAIL_INSERT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -3685,25 +3213,14 @@ impl Storage for Engine {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .await?;
 
-                let mut rows = tx
-                    .query(
-                        &sql_lookup("producer_insert.sql")?,
-                        &[self.cluster.as_str()],
-                    )
+                let mut rows = self
+                    .query_rows(&tx, producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                if let Some(row) = rows.next().await? {
-                    let producer = row
-                        .get_value(0)
-                        .map_err(Into::into)
-                        .and_then(|value| {
-                            value
-                                .as_integer()
-                                .copied()
-                                .ok_or(Error::UnexpectedValue(value))
-                        })
-                        .inspect(|producer| debug!(producer))
-                        .inspect_err(|err| error!(?err))?;
+                if let Some(producer_insert::Row { id: producer }) =
+                    rows.next().await.inspect_err(|err| error!(?err))?
+                {
+                    debug!(producer);
 
                     while let Some(row) = rows
                         .next()
@@ -3714,26 +3231,17 @@ impl Storage for Engine {
                         debug!(?row)
                     }
 
-                    let mut rows = tx
-                        .query(
-                            &sql_lookup("producer_epoch_insert.sql")?,
+                    let mut rows = self
+                        .query_rows(
+                            &tx,
+                            producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
                         )
                         .await
                         .inspect_err(|err| error!(?err, cluster = self.cluster, producer))?;
 
-                    if let Some(row) = rows.next().await? {
-                        let epoch = row
-                            .get_value(0)
-                            .map_err(Into::into)
-                            .and_then(|value| {
-                                value
-                                    .as_integer()
-                                    .copied()
-                                    .ok_or(Error::UnexpectedValue(value))
-                                    .and_then(|i| i16::try_from(i).map_err(Error::from))
-                            })
-                            .inspect(|epoch| debug!(epoch))?;
+                    if let Some(producer_epoch_insert::Row { epoch }) = rows.next().await? {
+                        debug!(epoch);
 
                         while let Some(row) = rows.next().await? {
                             debug!(?row)
@@ -3816,7 +3324,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_topition_insert.sql")?,
+                                &sql_lookup(sql::TXN_TOPITION_INSERT)?,
                                 (
                                     self.cluster.as_str(),
                                     topic.name.as_str(),
@@ -3854,7 +3362,7 @@ impl Storage for Engine {
                 _ = self
                     .prepare_execute(
                         &tx,
-                        &sql_lookup("txn_detail_update_started_at.sql")?,
+                        &sql_lookup(sql::TXN_DETAIL_UPDATE_STARTED_AT)?,
                         (
                             self.cluster.as_str(),
                             transaction_id.as_str(),
@@ -3894,32 +3402,11 @@ impl Storage for Engine {
         let tx = c.transaction().await.inspect_err(|err| error!(?err))?;
 
         let (producer_id, producer_epoch) = if let Some(row) = self
-            .prepare_query_opt(
-                &tx,
-                &sql_lookup("producer_epoch_for_current_txn.sql")?,
-                (self.cluster.as_str(), offsets.transaction_id.as_str()),
-            )
+            .producer_epoch_for_current_txn(&tx, offsets.transaction_id.as_str())
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let producer_id = row
-                .get_value(0)
-                .map(|value| value.as_integer().copied())
-                .inspect_err(|err| error!(?err))?;
-
-            let epoch = row
-                .get_value(1)
-                .map_err(Error::from)
-                .and_then(|value| {
-                    value
-                        .as_integer()
-                        .map(|i| i16::try_from(*i))
-                        .transpose()
-                        .map_err(Error::from)
-                })
-                .inspect_err(|err| error!(?err))?;
-
-            (producer_id, epoch)
+            (Some(row.producer), Some(row.epoch))
         } else {
             (None, None)
         };
@@ -3927,7 +3414,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("consumer_group_insert.sql")?,
+                &sql_lookup(sql::CONSUMER_GROUP_INSERT)?,
                 (self.cluster.as_str(), offsets.group_id.as_str()),
             )
             .await?;
@@ -3937,7 +3424,7 @@ impl Storage for Engine {
         _ = self
             .prepare_execute(
                 &tx,
-                &sql_lookup("txn_offset_commit_insert.sql")?,
+                &sql_lookup(sql::TXN_OFFSET_COMMIT_INSERT)?,
                 (
                     self.cluster.as_str(),
                     offsets.transaction_id.as_str(),
@@ -3964,7 +3451,7 @@ impl Storage for Engine {
                         _ = self
                             .prepare_execute(
                                 &tx,
-                                &sql_lookup("txn_offset_commit_tp_insert.sql")?,
+                                &sql_lookup(sql::TXN_OFFSET_COMMIT_TP_INSERT)?,
                                 (
                                     self.cluster.as_str(),
                                     offsets.transaction_id.as_str(),
@@ -4098,78 +3585,8 @@ impl Storage for Engine {
 
     async fn ping(&self) -> Result<()> {
         let c = self.connection().await?;
-        let _ = c.query(&sql_lookup("ping.sql")?, ()).await?;
+        let _ = c.query(&sql_lookup(sql::PING)?, ()).await?;
         Ok(())
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct LiteTimestamp(SystemTime);
-
-impl Deref for LiteTimestamp {
-    type Target = SystemTime;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<SystemTime> for LiteTimestamp {
-    fn from(value: SystemTime) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&SystemTime> for LiteTimestamp {
-    fn from(value: &SystemTime) -> Self {
-        Self(*value)
-    }
-}
-
-impl From<LiteTimestamp> for SystemTime {
-    fn from(value: LiteTimestamp) -> Self {
-        value.0
-    }
-}
-
-impl From<LiteTimestamp> for Value {
-    fn from(value: LiteTimestamp) -> Self {
-        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
-    }
-}
-
-impl TryFrom<Value> for LiteTimestamp {
-    type Error = Error;
-
-    fn try_from(value: Value) -> result::Result<Self, Self::Error> {
-        match value {
-            Value::Integer(timestamp) => to_system_time(timestamp)
-                .map_err(Into::into)
-                .map(LiteTimestamp::from),
-
-            Value::Text(text) => NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|date_time| date_time.and_utc())
-                .inspect(|dt| debug!(?dt))
-                .map(SystemTime::from)
-                .map(LiteTimestamp::from)
-                .map_err(Into::into),
-
-            Value::Real(_) | Value::Null | Value::Blob(_) => Err(Error::UnexpectedValue(value)),
-        }
-    }
-}
-
-impl LiteTimestamp {
-    /// Returns the Kafka timestamp, in milliseconds since the epoch, that the stored `value` holds.
-    ///
-    /// A record that a producer sent without a timestamp stores NO_TIMESTAMP, -1. A [`SystemTime`]
-    /// cannot hold a negative millisecond count, so an integer is returned as stored.
-    fn millis(value: Value) -> Result<i64> {
-        match value {
-            Value::Integer(timestamp) => Ok(timestamp),
-            value => LiteTimestamp::try_from(value)
-                .and_then(|timestamp| to_timestamp(&timestamp.0).map_err(Into::into)),
-        }
     }
 }
 
@@ -4180,31 +3597,72 @@ mod tests {
     use tempfile::{TempDir, tempdir, tempdir_in};
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
+    use turso::Value;
 
     use super::*;
 
-    #[test]
-    fn timestamp_from_null_is_an_error() {
-        assert_matches!(
-            LiteTimestamp::try_from(Value::Null),
-            Err(Error::UnexpectedValue(Value::Null))
-        );
-    }
+    /// Each query that Turso runs returns every column that its module's `RowReader` reads, once.
+    /// The broker reads a query's rows only on the paths that run it, so this test finds a query
+    /// that doesn't match its row before a rare path does.
+    #[tokio::test]
+    async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        use crate::sql::{
+            nisshi_schema_version_select, row_check::RowCheck, scram_credential_select,
+            topic_select_uuid, txn_detail_select_status_for_update, txn_detail_select_timed_out,
+            virtual_topic_upsert, watermark_select_for_write,
+        };
 
-    #[test]
-    fn stored_millis_keep_a_negative_no_timestamp() -> Result<()> {
-        assert_eq!(-1, LiteTimestamp::millis(Value::Integer(-1))?);
-        assert_eq!(1_234, LiteTimestamp::millis(Value::Integer(1_234))?);
+        let directory = tempdir()?;
+        let path = directory.path().join("nisshi.db");
+        let db = turso::Builder::new_local(
+            path.to_str()
+                .ok_or_else(|| Error::Message(format!("non-UTF-8 database path: {path:?}")))?,
+        )
+        .build()
+        .await?;
+        let connection = db.connect()?;
 
-        Ok(())
-    }
+        let mut failures = Vec::new();
+        for (name, ddl) in DDL.iter() {
+            if let Err(error) = connection.execute(ddl.as_str(), ()).await {
+                failures.push(format!("{name}: {error:?}"));
+            }
+        }
 
-    #[test]
-    fn timestamp_round_trips_through_a_value() -> Result<()> {
-        let timestamp = LiteTimestamp::from(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234));
+        // Turso's schema has no `virtual_topic` table, which this query reads, so a lookup of a
+        // topic by its ID fails on Turso. The test expects the failure instead of skipping the
+        // query, so that it fails when Turso's schema gains the table, and this entry goes.
+        let known_failures = [topic_select_uuid::QUERY.key()];
 
-        assert_eq!(timestamp, LiteTimestamp::try_from(Value::from(timestamp))?);
+        // Turso doesn't run these queries. The first three use PostgreSQL's syntax, and Turso runs
+        // `watermark_select_for_write::LITE_QUERY` instead of `watermark_select_for_write::QUERY`.
+        // The others read tables that Turso's schema doesn't have.
+        let skipped = [
+            txn_detail_select_status_for_update::QUERY.key(),
+            txn_detail_select_timed_out::QUERY.key(),
+            watermark_select_for_write::QUERY.key(),
+            nisshi_schema_version_select::QUERY.key(),
+            scram_credential_select::QUERY.key(),
+            virtual_topic_upsert::QUERY.key(),
+        ];
+        let checks = RowCheck::in_folders(&["sql", "lite"], &skipped);
 
+        for check in &checks {
+            let checked = match connection.prepare(sql::SQL.get(check.query())?).await {
+                Ok(statement) => {
+                    check.check_columns(&ResultColumns::new(check.query(), &statement))
+                }
+                Err(error) => Err(error.into()),
+            };
+
+            match (checked, known_failures.contains(&check.query())) {
+                (Ok(()), false) | (Err(_), true) => {}
+                (Ok(()), true) => failures.push(format!("{}: now passes", check.query())),
+                (Err(error), false) => failures.push(format!("{}: {error:?}", check.query())),
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
         Ok(())
     }
 
@@ -4353,9 +3811,9 @@ mod tests {
     /// A fetch statement returns at most `ROWS_PER_FETCH` rows, and a read from the last offset
     /// that it returned gets the rest, with no gap and no repeat. Each record has a header of 99
     /// bytes, so the statement runs its header probe for the rows that it keeps, and costs a
-    /// record 103 bytes with its key. The statements run here, on the Turso engine, because it
-    /// rejects some SQL that SQLite takes, and a row limit inside a derived table is one such
-    /// construct.
+    /// record 110 bytes with its key and the 7 of every record. The statements run here, on the
+    /// Turso engine, because it rejects some SQL that SQLite takes, and a row limit inside a
+    /// derived table is one such construct.
     #[tokio::test]
     async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
         const RECORDS: i64 = ROWS_PER_FETCH + 50;
@@ -4391,10 +3849,10 @@ mod tests {
                 "{statement}: the row limit counts from the fetch offset",
             );
 
-            // A record costs 103 bytes, so a budget of 1031 bytes holds 10 of them.
+            // A record costs 110 bytes, so a budget of 1101 bytes holds 10 of them.
             assert_eq!(
                 (40..50).collect::<Vec<_>>(),
-                fetch_from(40, 1031).await?,
+                fetch_from(40, 1101).await?,
                 "{statement}: the byte budget must count the headers",
             );
 
@@ -4434,9 +3892,9 @@ mod tests {
     }
 
     /// The fetch statements count a record's headers toward `max_bytes`: three records with a
-    /// one byte key, no value and a 100 byte header each cost 103 bytes (the header's 2 bytes of
-    /// framing, 100 of its own, and the key). The statements run here, on the Turso engine,
-    /// because it rejects some SQL that SQLite takes.
+    /// one byte key, no value and a 100 byte header each cost 110 bytes (the 7 bytes of every
+    /// record, the header's 2 bytes of framing, 100 of its own, and the key). The statements run
+    /// here, on the Turso engine, because it rejects some SQL that SQLite takes.
     #[tokio::test]
     async fn fetch_counts_header_bytes() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4466,9 +3924,9 @@ mod tests {
     }
 
     /// Each header costs 2 bytes of framing, even when its key is empty and its value is null: 50
-    /// such headers and a one byte key cost a record 101 bytes, so a budget of 150 bytes returns
+    /// such headers and a one byte key cost a record 108 bytes, so a budget of 150 bytes returns
     /// one record. A fetch that dropped the framing, or that took the largest header of a record
-    /// instead of the sum of its headers, would count 1 to 3 bytes for a record and return all
+    /// instead of the sum of its headers, would count 8 to 10 bytes for a record and return all
     /// three.
     #[tokio::test]
     async fn fetch_counts_the_framing_of_every_header() -> Result<()> {
@@ -4494,9 +3952,9 @@ mod tests {
 
     /// A header costs the length of its key and the length of its value. Each record has one
     /// header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
-    /// and so costs 85 bytes with its own key, and a budget of 100 bytes returns one record. A
+    /// and so costs 92 bytes with its own key, and a budget of 110 bytes returns one record. A
     /// fetch that left out the key, or the value, or took the larger header of the two, would
-    /// count 43 to 45 bytes and return two.
+    /// count 50 to 52 bytes and return two.
     #[tokio::test]
     async fn fetch_counts_the_key_and_the_value_of_every_header() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4517,7 +3975,45 @@ mod tests {
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
                 vec![0],
-                fetched_offsets(&connection, statement, key, 100).await?,
+                fetched_offsets(&connection, statement, key, 110).await?,
+                "{statement}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A record with no value and no headers still costs the 7 bytes of the smallest record, and
+    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 4 records whose running
+    /// total stays under it, where a statement that counts 1 byte for each returns all 10.
+    #[tokio::test]
+    async fn fetch_counts_a_fixed_cost_for_every_record() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        for offset in 0..10 {
+            _ = connection
+                .execute(
+                    "insert into record (topition, offset_id, timestamp, k) values (1, ?1, 0, x'6b')",
+                    [offset],
+                )
+                .await?;
+        }
+
+        for (statement, key) in FETCH_STATEMENTS {
+            assert_eq!(
+                vec![0, 1, 2, 3],
+                fetched_offsets_from(&connection, statement, key, 0, 40, 10).await?,
+                "{statement}"
+            );
+
+            // the first record is returned whatever its size (KIP-74)
+            assert_eq!(
+                vec![0],
+                fetched_offsets_from(&connection, statement, key, 0, 1, 10).await?,
                 "{statement}"
             );
         }
@@ -4735,7 +4231,8 @@ mod tests {
             .query("select last_updated from cluster where name = ?1", &[name])
             .await?;
         let row = rows.next().await?.unwrap();
-        let _timestamp = LiteTimestamp::try_from(row.get_value(0)?)?;
+        let last_updated = row.get::<String>(0)?;
+        _ = chrono::NaiveDateTime::parse_from_str(&last_updated, "%Y-%m-%d %H:%M:%S%.f")?;
 
         Ok(())
     }
@@ -5541,6 +5038,188 @@ mod tests {
         Ok(engine)
     }
 
+    /// Returns an engine on a new database in `temp_dir`, with the topics `t` and `unreadable`.
+    /// The stored row of `unreadable` can't be read.
+    async fn engine_with_unreadable_topic(temp_dir: &TempDir) -> Result<Engine> {
+        let engine = registered_engine(temp_dir).await?;
+
+        for name in ["t", "unreadable"] {
+            _ = engine
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(name.into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+        }
+
+        // Turso stores text that isn't a number as text in an `int` column, and the reader of
+        // `partitions` then can't read it as an integer.
+        _ = engine
+            .connection()
+            .await?
+            .execute(
+                "update topic set partitions = 'x' where name = ?1",
+                ["unreadable"],
+            )
+            .await?;
+
+        Ok(engine)
+    }
+
+    /// Returns an engine on a new database in `temp_dir`, with the groups `healthy` and
+    /// `undecodable`, and the detail that it stored for `healthy`. The stored detail of
+    /// `undecodable` isn't text.
+    async fn engine_with_group_detail_not_text(
+        temp_dir: &TempDir,
+    ) -> Result<(Engine, GroupDetail)> {
+        let engine = registered_engine(temp_dir).await?;
+
+        // `GroupDetail::default` records the current time as the group's inception, so the helper
+        // returns the detail that it stores.
+        let stored = GroupDetail::default();
+
+        for group_id in ["healthy", "undecodable"] {
+            _ = engine
+                .update_group(group_id, stored.clone(), None)
+                .await
+                .map_err(|err| Error::Message(format!("{err:?}")))?;
+        }
+
+        // SQLite never converts a blob to text for the column's affinity, so the detail stays a
+        // value that isn't text.
+        let changed = engine
+            .connection()
+            .await?
+            .execute(
+                "update consumer_group_detail set detail = x'7b7d'
+                where consumer_group = (
+                    select cg.id from consumer_group cg join cluster c on c.id = cg.cluster
+                    where c.name = ?1 and cg.name = ?2
+                )",
+                ["nisshi", "undecodable"],
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // readable, and a test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        Ok((engine, stored))
+    }
+
+    /// A ListGroups must answer a stored group whose detail isn't text with `UNKNOWN_SERVER_ERROR`
+    /// as it answers a detail that isn't JSON, and list the other groups as usual.
+    #[tokio::test]
+    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let (engine, stored) = engine_with_group_detail_not_text(&temp_dir).await?;
+
+        let mut listed = engine.list_groups().await?;
+        // The query doesn't order its rows.
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+            ],
+            listed
+        );
+
+        Ok(())
+    }
+
+    /// A DescribeGroups must answer a stored group whose detail isn't text with
+    /// `UNKNOWN_SERVER_ERROR`, which clients report at once, and answer the other groups in the
+    /// request as usual.
+    #[tokio::test]
+    async fn describe_groups_answers_unknown_server_error_for_a_detail_that_is_not_text()
+    -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let (engine, stored) = engine_with_group_detail_not_text(&temp_dir).await?;
+
+        let group_ids = ["healthy", "undecodable", "missing"].map(String::from);
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+                NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
+            ],
+            engine.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A topic whose stored row can't be read fails each Metadata and DescribeTopicPartitions
+    /// request that reads it by name, and a Metadata request for every topic.
+    #[tokio::test]
+    async fn a_request_that_reads_an_unreadable_topic_fails() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
+
+        let by_name = TopicId::from("unreadable");
+
+        for topics in [Some(vec![by_name.clone()]), None] {
+            assert_matches!(
+                engine.metadata(topics.as_deref()).await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topics:?}"
+            );
+        }
+
+        assert_matches!(
+            engine
+                .describe_topic_partitions(Some(&[by_name]), i32::MAX, None)
+                .await,
+            Err(Error::UnreadableColumn { .. })
+        );
+
+        Ok(())
+    }
+
+    /// DeleteTopics deletes a topic whose stored row can't be read, because it reads only the
+    /// topic's name, so that an operator can remove a corrupt topic without editing the database.
+    #[tokio::test]
+    async fn delete_topic_deletes_a_topic_with_an_unreadable_row() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let temp_dir = tempdir_in(env::current_dir()?)?;
+        let engine = engine_with_unreadable_topic(&temp_dir).await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            engine.delete_topic(&TopicId::from("unreadable")).await?
+        );
+
+        // A deleted topic is unknown, where a topic that is still stored with its unreadable row
+        // is a server error.
+        assert_eq!(
+            vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
+            engine
+                .metadata(Some(&[TopicId::from("unreadable")]))
+                .await?
+                .topics
+                .iter()
+                .map(|topic| topic.error_code)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
     /// Sets the epoch of each `producer_epoch` row of `producer` to `epoch`. A producer
     /// that has one epoch then has only `epoch`, without 32k InitProducerId requests.
     async fn seed_producer_epoch(engine: &Engine, producer: i64, epoch: i64) -> Result<()> {
@@ -5662,7 +5341,8 @@ mod tests {
 
         assert!(matches!(
             engine.init_producer(Some("txn"), 10_000, None, None).await,
-            Err(Error::TryFromInt(_))
+            Err(Error::UnreadableColumn { column: "epoch", source, .. })
+                if matches!(*source, Error::TryFromInt(_))
         ));
 
         Ok(())

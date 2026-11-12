@@ -13,7 +13,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select h.k, h.v
+select h.k as key, h.v as value
 from header h
 join record r on h.topition = r.topition and h.offset_id = r.offset_id
 join topition tp on tp.id = r.topition

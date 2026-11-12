@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use apache_avro::{
     Reader,
-    schema::{Schema as AvroSchema, SchemaKind},
+    schema::{ResolvedSchema, Schema as AvroSchema, SchemaKind},
     types::Value,
 };
 use bytes::Bytes;
@@ -26,7 +26,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 
 use nisshi_sans_io::{ErrorCode, record::inflated::Batch};
 use serde_json::{Map, Number, Value as JsonValue};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{AsJsonValue, AsKafkaRecord, Error, Generator, Result, Validator};
@@ -38,6 +38,7 @@ use apache_avro::schema::RecordSchema;
 
 #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
 mod arrow;
+mod field_shorthand;
 
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MessageKind {
@@ -104,146 +105,110 @@ impl TryFrom<Bytes> for Schema {
                 schema
             })
             .map_err(Into::into)
-            .map(Self::from)
+            .and_then(Self::try_from)
     }
 }
 
-impl From<JsonValue> for Schema {
-    fn from(mut schema: JsonValue) -> Self {
+impl TryFrom<JsonValue> for Schema {
+    type Error = Error;
+
+    /// Parses a topic's schema: a record whose `key` and `value` fields hold the schemas of a
+    /// Kafka record's key and value. Nisshi adds a `meta` field, with the record's partition and
+    /// timestamp, and accepts the field shorthand that the `field_shorthand` module describes.
+    ///
+    /// Returns [`Error::Avro`] if the schema does not parse, and [`Error::Message`] if it is not
+    /// a record.
+    fn try_from(mut schema: JsonValue) -> Result<Self, Self::Error> {
         debug!(%schema);
 
         const FIELDS: &str = "fields";
 
-        let meta =
-            serde_json::from_slice::<JsonValue>(&Bytes::from_static(include_bytes!("meta.avsc")))
-                .inspect(|meta| debug!(%meta))
-                .ok();
-
-        let schema = {
-            if let Some(meta) = meta
-                && let Some(fields) = schema.get_mut(FIELDS)
-                && let Some(array) = fields.as_array_mut()
-            {
-                array.push(JsonValue::Object(Map::from_iter([
-                    ("name".into(), MessageKind::Meta.as_ref().into()),
-                    ("type".into(), meta),
-                ])))
-            }
-
-            debug!(%schema);
-
-            schema
-        };
+        let meta = serde_json::from_slice::<JsonValue>(include_bytes!("meta.avsc"))?;
 
         schema
-            .get(FIELDS)
-            .inspect(|fields| debug!(?fields))
-            .and_then(|fields| fields.as_array())
-            .inspect(|fields| debug!(?fields))
-            .map_or(
-                Self {
-                    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-                    complete: None,
-                    key: None,
-                    value: None,
-                    meta: None,
-                    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-                    ids: HashMap::new(),
-                },
-                |fields| {
-                    if let Ok(schema) =
-                        AvroSchema::parse(&schema).inspect_err(|err| error!(?err, ?schema))
-                    {
-                        #[cfg(not(any(
-                            feature = "parquet",
-                            feature = "iceberg",
-                            feature = "delta"
-                        )))]
-                        let _ = schema;
+            .get_mut(FIELDS)
+            .and_then(JsonValue::as_array_mut)
+            .ok_or_else(|| Error::Message(String::from("a topic schema must be a record")))?
+            .push(JsonValue::Object(Map::from_iter([
+                ("name".into(), MessageKind::Meta.as_ref().into()),
+                ("type".into(), meta),
+            ])));
 
-                        Self {
-                            #[cfg(any(
-                                feature = "parquet",
-                                feature = "iceberg",
-                                feature = "delta"
-                            ))]
-                            ids: field_ids(&schema),
+        let schema = field_shorthand::expand(schema);
+        debug!(%schema);
 
-                            #[cfg(any(
-                                feature = "parquet",
-                                feature = "iceberg",
-                                feature = "delta"
-                            ))]
-                            complete: if let AvroSchema::Record(record) = schema {
-                                Some(record)
-                            } else {
-                                None
-                            },
+        let complete = AvroSchema::parse(&schema)?;
+        let named_types = ResolvedSchema::try_from(&complete)?
+            .get_names()
+            .values()
+            .map(|named_type| (*named_type).clone())
+            .collect::<Vec<_>>();
 
-                            key: fields
-                                .iter()
-                                .find(|field| {
-                                    field
-                                        .get("name")
-                                        .is_some_and(|name| name == MessageKind::Key.as_ref())
-                                })
-                                .inspect(|value| debug!(?value))
-                                .and_then(|schema| {
-                                    AvroSchema::parse(schema)
-                                        .inspect_err(|err| error!(?err, ?schema))
-                                        .ok()
-                                }),
+        let key = field_schema(&schema, &complete, &named_types, MessageKind::Key)?;
+        let value = field_schema(&schema, &complete, &named_types, MessageKind::Value)?;
+        let meta = field_schema(&schema, &complete, &named_types, MessageKind::Meta)?;
 
-                            value: fields
-                                .iter()
-                                .find(|field| {
-                                    field
-                                        .get("name")
-                                        .is_some_and(|name| name == MessageKind::Value.as_ref())
-                                })
-                                .inspect(|value| debug!(?value))
-                                .and_then(|schema| {
-                                    AvroSchema::parse(schema)
-                                        .inspect_err(|err| error!(?err, ?schema))
-                                        .ok()
-                                }),
+        #[cfg(not(any(feature = "parquet", feature = "iceberg", feature = "delta")))]
+        let _ = complete;
 
-                            meta: fields
-                                .iter()
-                                .find(|field| {
-                                    field
-                                        .get("name")
-                                        .is_some_and(|name| name == MessageKind::Meta.as_ref())
-                                })
-                                .inspect(|value| debug!(?value))
-                                .and_then(|schema| {
-                                    AvroSchema::parse(schema)
-                                        .inspect_err(|err| error!(?err, ?schema))
-                                        .ok()
-                                }),
-                        }
-                    } else {
-                        Self {
-                            #[cfg(any(
-                                feature = "parquet",
-                                feature = "iceberg",
-                                feature = "delta"
-                            ))]
-                            complete: None,
-                            key: None,
-                            value: None,
-                            meta: None,
-                            #[cfg(any(
-                                feature = "parquet",
-                                feature = "iceberg",
-                                feature = "delta"
-                            ))]
-                            ids: HashMap::new(),
-                        }
-                    }
-                },
-            )
+        Ok(Self {
+            #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+            ids: field_ids(&complete),
+
+            #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+            complete: if let AvroSchema::Record(record) = complete {
+                Some(record)
+            } else {
+                None
+            },
+
+            key,
+            value,
+            meta,
+        })
     }
+}
+
+/// Parses the type of the field of `schema`, a topic's record schema, that holds a message of
+/// `message_kind`. Returns `None` if the record does not have that field.
+///
+/// The type parses on its own when it can, so that its named types do not take the record's
+/// namespace. A type that refers to a named type of another field does not parse on its own, so
+/// its schema comes from `complete`, the parse of the whole record. Each reference in it is
+/// replaced by its definition from `named_types`, because a reader of a message has only this
+/// schema.
+fn field_schema(
+    schema: &JsonValue,
+    complete: &AvroSchema,
+    named_types: &[AvroSchema],
+    message_kind: MessageKind,
+) -> Result<Option<AvroSchema>> {
+    let Some(field) = schema["fields"].as_array().and_then(|fields| {
+        fields
+            .iter()
+            .find(|field| field["name"] == message_kind.as_ref())
+    }) else {
+        return Ok(None);
+    };
+
+    AvroSchema::parse(&field["type"])
+        .or_else(|error| {
+            let AvroSchema::Record(record) = complete else {
+                return Err(error);
+            };
+
+            let mut field_schema = record
+                .fields
+                .iter()
+                .find(|field| field.name == message_kind.as_ref())
+                .map(|field| field.schema.clone())
+                .ok_or(error)?;
+
+            field_schema.denormalize(named_types)?;
+            Ok(field_schema)
+        })
+        .map(Some)
+        .map_err(Into::into)
 }
 
 impl Schema {
@@ -346,7 +311,9 @@ fn decode(validator: Option<&AvroSchema>, encoded: Option<Bytes>) -> Result<Opti
 
             // The apache_avro error writes the record's values into its
             // message, so we log that the record failed and not the error.
-            Reader::with_schema(schema, &encoded[..])
+            Reader::builder(&encoded[..])
+                .reader_schema(schema)
+                .build()
                 .and_then(|reader| reader.into_iter().next().transpose())
                 .inspect_err(|_| debug!("record does not match its Avro schema"))
                 .map_err(|_| Error::Api(ErrorCode::InvalidRecord))
@@ -421,7 +388,7 @@ fn from_json(schema: &AvroSchema, json: &JsonValue) -> Result<Value> {
             .map(Value::Float)
             .inspect_err(|err| debug!(?schema, ?err)),
 
-        (AvroSchema::Uuid, JsonValue::String(value)) => {
+        (AvroSchema::Uuid(_), JsonValue::String(value)) => {
             Uuid::parse_str(value).map_err(Into::into).map(Value::Uuid)
         }
 
@@ -691,8 +658,8 @@ pub fn r<'a>(
 #[doc(hidden)]
 pub fn schema_write(schema: &AvroSchema, value: Value) -> Result<Bytes> {
     debug!(?schema);
-    let mut writer = apache_avro::Writer::new(schema, vec![]);
-    _ = writer.append(value).map_err(|_| Error::AvroRecord)?;
+    let mut writer = apache_avro::Writer::new(schema, vec![])?;
+    _ = writer.append_value(value).map_err(|_| Error::AvroRecord)?;
     writer.into_inner().map(Bytes::from).map_err(Into::into)
 }
 
@@ -735,6 +702,193 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    /// Returns the schema of the field called `name` in `schema`, a record.
+    fn record_field<'a>(schema: &'a AvroSchema, name: &str) -> Option<&'a AvroSchema> {
+        match schema {
+            AvroSchema::Record(record) => record
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| &field.schema),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+    #[test]
+    fn field_with_inline_array_type_parses_as_array() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [{"name": "value", "type": "array", "items": "int", "default": []}]
+        }))?;
+
+        let array = AvroSchema::parse(&json!({"type": "array", "items": "int"}))?;
+        assert_eq!(Some(&array), schema.value());
+        assert_eq!(
+            Some(&array),
+            schema
+                .complete
+                .as_ref()
+                .and_then(|complete| complete.fields.iter().find(|field| field.name == "value"))
+                .map(|field| &field.schema)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn field_with_inline_enum_type_parses_as_enum_named_after_the_field() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "Suit",
+            "fields": [{
+                "name": "value",
+                "type": "enum",
+                "symbols": ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]
+            }]
+        }))?;
+
+        assert_eq!(
+            Some(&AvroSchema::parse(&json!({
+                "type": "enum",
+                "name": "value",
+                "symbols": ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]
+            }))?),
+            schema.value()
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+    #[test]
+    fn meta_timestamp_field_is_timestamp_micros() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [{"name": "key", "type": "int"}]
+        }))?;
+
+        assert_eq!(
+            Some(&AvroSchema::TimestampMicros),
+            schema
+                .meta()
+                .and_then(|meta| record_field(meta, "timestamp"))
+        );
+        assert_eq!(
+            Some(&AvroSchema::TimestampMicros),
+            schema
+                .complete
+                .as_ref()
+                .and_then(|complete| complete.fields.iter().find(|field| field.name == "meta"))
+                .and_then(|meta| record_field(&meta.schema, "timestamp"))
+        );
+        Ok(())
+    }
+
+    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
+    #[test]
+    fn field_with_uuid_logical_type_parses_as_uuid() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [{"name": "key", "type": "string", "logicalType": "uuid"}]
+        }))?;
+
+        let uuid = AvroSchema::parse(&json!({"type": "string", "logicalType": "uuid"}))?;
+        assert_eq!(Some(&uuid), schema.key());
+        assert_eq!(
+            Some(&uuid),
+            schema
+                .complete
+                .as_ref()
+                .and_then(|complete| complete.fields.iter().find(|field| field.name == "key"))
+                .map(|field| &field.schema)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_field_with_date_logical_type_parses_as_date() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [{
+                "name": "value",
+                "type": {
+                    "type": "record",
+                    "name": "event",
+                    "fields": [{"name": "day", "type": "int", "logicalType": "date"}]
+                }
+            }]
+        }))?;
+
+        assert_eq!(
+            Some(&AvroSchema::Date),
+            schema.value().and_then(|value| record_field(value, "day"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn value_that_refers_to_a_type_defined_in_key_parses() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {
+                    "name": "key",
+                    "type": {"type": "record", "name": "Id", "fields": [{"name": "n", "type": "int"}]}
+                },
+                {"name": "value", "type": "Id"}
+            ]
+        }))?;
+
+        assert!(schema.key().is_some());
+        assert_eq!(schema.key(), schema.value());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_reference_to_a_type_defined_in_key_is_replaced_by_its_definition() -> Result<()> {
+        let schema = Schema::try_from(json!({
+            "type": "record",
+            "name": "test",
+            "fields": [
+                {
+                    "name": "key",
+                    "type": {"type": "record", "name": "Id", "fields": [{"name": "n", "type": "int"}]}
+                },
+                {"name": "value", "type": {"type": "array", "items": "Id"}}
+            ]
+        }))?;
+
+        assert_matches!(
+            schema.value(),
+            Some(AvroSchema::Array(array)) if Some(array.items.as_ref()) == schema.key()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn field_with_unknown_type_is_an_error() {
+        assert_matches!(
+            Schema::try_from(json!({
+                "type": "record",
+                "name": "test",
+                "fields": [{"name": "value", "type": "no-such-type"}]
+            })),
+            Err(Error::Avro(_))
+        );
+    }
+
+    #[test]
+    fn schema_that_is_not_a_record_is_an_error() {
+        assert_matches!(
+            Schema::try_from(json!({"type": "int"})),
+            Err(Error::Message(_))
+        );
     }
 
     #[tokio::test]
@@ -785,9 +939,9 @@ mod tests {
             "type": "int"
         }))
         .and_then(|schema| {
-            let mut writer = apache_avro::Writer::new(&schema, vec![]);
+            let mut writer = apache_avro::Writer::new(&schema, vec![])?;
             writer
-                .append(Value::Int(32123))
+                .append_value(Value::Int(32123))
                 .and(writer.into_inner())
                 .map(Bytes::from)
         })?;
@@ -840,9 +994,9 @@ mod tests {
             "type": "int"
         }))
         .and_then(|schema| {
-            let mut writer = apache_avro::Writer::new(&schema, vec![]);
+            let mut writer = apache_avro::Writer::new(&schema, vec![])?;
             writer
-                .append(Value::Int(32123))
+                .append_value(Value::Int(32123))
                 .and(writer.into_inner())
                 .map(Bytes::from)
         })?;
@@ -853,13 +1007,13 @@ mod tests {
             "fields": [{"name": "name", "type": "string"}, {"name": "email", "type": "string"}]
         }))
         .and_then(|schema| {
-            let mut writer = apache_avro::Writer::new(&schema, vec![]);
+            let mut writer = apache_avro::Writer::new(&schema, vec![])?;
             let mut record = apache_avro::types::Record::new(&schema).unwrap();
             record.put("name", "alice");
             record.put("email", "alice@example.com");
 
             writer
-                .append(record)
+                .append_value(record)
                 .and(writer.into_inner())
                 .map(Bytes::from)
         })?;
@@ -910,13 +1064,13 @@ mod tests {
             "fields": [{"name": "name", "type": "string"}, {"name": "email", "type": "string"}]
         }))
         .and_then(|schema| {
-            let mut writer = apache_avro::Writer::new(&schema, vec![]);
+            let mut writer = apache_avro::Writer::new(&schema, vec![])?;
             let mut record = apache_avro::types::Record::new(&schema).unwrap();
             record.put("name", "alice");
             record.put("email", "alice@example.com");
 
             writer
-                .append(record)
+                .append_value(record)
                 .and(writer.into_inner())
                 .map(Bytes::from)
         })?;
@@ -959,17 +1113,17 @@ mod tests {
     fn key() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{"name": "key", "type": "int"}]
-        }));
+        }))?;
 
         let input = {
-            let mut writer = apache_avro::Writer::new(schema.key.as_ref().unwrap(), vec![]);
+            let mut writer = apache_avro::Writer::new(schema.key.as_ref().unwrap(), vec![])?;
 
             writer
-                .append(Value::Int(32123))
+                .append_value(Value::Int(32123))
                 .and(writer.into_inner())
                 .map(Bytes::from)?
         };
@@ -986,15 +1140,15 @@ mod tests {
         let _guard = init_tracing()?;
 
         let input = {
-            let schema = Schema::from(json!({
+            let schema = Schema::try_from(json!({
                 "type": "record",
                 "name": "test",
                 "fields": [{"name": "key", "type": "long"}]
-            }));
+            }))?;
 
-            let mut writer = apache_avro::Writer::new(schema.key.as_ref().unwrap(), vec![]);
+            let mut writer = apache_avro::Writer::new(schema.key.as_ref().unwrap(), vec![])?;
             writer
-                .append(Value::Long(32123))
+                .append_value(Value::Long(32123))
                 .and(writer.into_inner())
                 .map(Bytes::from)?
         };
@@ -1003,14 +1157,14 @@ mod tests {
             .record(Record::builder().key(input.clone().into()))
             .build()?;
 
-        let s = Schema::from(json!({
+        let s = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
                 "name": "key",
                 "type": "string"
             }]
-        }));
+        }))?;
 
         assert!(matches!(
             s.validate(&batch),
@@ -1035,11 +1189,11 @@ mod tests {
         record.put("title", "Lorem ipsum dolor sit amet");
         record.put("message", "consectetur adipiscing elit");
 
-        let mut writer = apache_avro::Writer::new(&schema, vec![]);
-        assert!(writer.append(record)? > 0);
+        let mut writer = apache_avro::Writer::new(&schema, vec![])?;
+        assert!(writer.append_value(record)? > 0);
 
         let input = writer.into_inner()?;
-        let reader = Reader::with_schema(&schema, &input[..])?;
+        let reader = Reader::builder(&input[..]).reader_schema(&schema).build()?;
 
         let v = reader.into_iter().next().unwrap()?;
 
@@ -1319,7 +1473,7 @@ mod tests {
                     "fields": [
                         {"name": "id", "type": "int"},
                         {"name": "name", "type": "string"},
-                        {"name": "lucky", "type": "array", "items": "int"}
+                        {"name": "lucky", "type": {"type": "array", "items": "int"}}
                     ]}
                 }))?,
                 &json!([
@@ -1428,9 +1582,32 @@ mod tests {
 
     fn encode_with_codec(schema: &JsonValue, value: Value, codec: Codec) -> Result<Bytes> {
         let schema = AvroSchema::parse(schema)?;
-        let mut writer = apache_avro::Writer::with_codec(&schema, vec![], codec);
-        _ = writer.append(value)?;
+        let mut writer = apache_avro::Writer::with_codec(&schema, vec![], codec)?;
+        _ = writer.append_value(value)?;
         writer.into_inner().map(Bytes::from).map_err(Into::into)
+    }
+
+    /// The Avro specification reads a container header without an `avro.codec` entry as the
+    /// `null` codec, so the record still decodes without one.
+    #[test]
+    fn schema_write_omits_the_null_codec_from_the_header() -> Result<()> {
+        let schema = AvroSchema::parse(&json!({"type": "int"}))?;
+        let encoded = schema_write(&schema, Value::Int(32123))?;
+
+        assert!(
+            !encoded
+                .windows(b"avro.codec".len())
+                .any(|window| window == b"avro.codec")
+        );
+
+        let decoded = Reader::builder(&encoded[..])
+            .reader_schema(&schema)
+            .build()?
+            .next()
+            .transpose()?;
+        assert_eq!(Some(Value::Int(32123)), decoded);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -1464,7 +1641,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn snappy_value_is_invalid_record() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1477,7 +1653,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn zstandard_value_is_invalid_record() -> Result<()> {
         let _guard = init_tracing()?;
@@ -1520,8 +1695,8 @@ mod tests {
 
         let encode = |schema: &JsonValue, value: Value| {
             let schema = AvroSchema::parse(schema)?;
-            let mut writer = apache_avro::Writer::new(&schema, vec![]);
-            _ = writer.append(value)?;
+            let mut writer = apache_avro::Writer::new(&schema, vec![])?;
+            _ = writer.append_value(value)?;
             writer.into_inner().map(Bytes::from).map_err(Error::from)
         };
 

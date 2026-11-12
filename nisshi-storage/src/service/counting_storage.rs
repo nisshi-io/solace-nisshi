@@ -383,12 +383,12 @@ impl Storage for CountingStorage {
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let topics = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 *self.lookups.lock()? += 1;
                 self.lookup(topics)?
             }
 
-            _ => {
+            None => {
                 *self.listings.lock()? += 1;
                 self.list()?
             }

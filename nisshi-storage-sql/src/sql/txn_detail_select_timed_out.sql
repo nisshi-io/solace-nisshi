@@ -16,7 +16,7 @@
 -- prepare txn_detail_select_timed_out (text, timestamptz) as
 -- Returns transactions still in BEGIN past their timeout, for the abort sweep.
 
-select txn.name, p.id, pe.epoch
+select txn.name, p.id as producer_id, pe.epoch as producer_epoch
 
 from
 

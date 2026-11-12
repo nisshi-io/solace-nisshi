@@ -12,10 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `topic_select.sql` query, which finds a topic by its name. An engine reads no column of its
-//! result: a row means that the topic exists.
+//! The query that reads one config of a topic. It returns no row when the topic does not set the
+//! config.
 //!
-//! The query takes two parameters: `$1` is the cluster's name, and `$2` the topic's name.
+//! The query takes three parameters: `$1` is the cluster's name, `$2` the topic's name, and `$3`
+//! the config's key.
+
+use super::Query;
 
 /// The query's name in the SQL cache.
-pub(crate) const QUERY: &str = "topic_select.sql";
+pub(crate) const QUERY: Query<Row> = Query::new("topic_configuration_select_name.sql");
+
+sql_row! {
+    /// One config that the topic sets.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct Row {
+        /// The config's stored value.
+        value: Option<String>,
+    }
+}

@@ -27,7 +27,7 @@ pub use auto_create_refusals::AutoCreateRefusals;
 use super::create_topics::validation::ValidatedCreateTopicsRequest;
 use crate::{
     CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, TopicCreationConfig,
-    TopicId,
+    TopicId, authorized_operations,
 };
 
 mod auto_create_refusals;
@@ -110,6 +110,15 @@ where
             .request
             .topics
             .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
+
+        // An empty list asks for no topics, and null for all of them
+        // ([`MetadataRequest.isAllTopics`]). The v0 rule, where an empty list means all of them,
+        // needs the API version, so `MetadataTopicIdLayer` applies it before the request gets here.
+        // We answer no topics whatever the storage lists, since a backend that lists every topic
+        // for an empty slice would otherwise send them all to a client that only wants the brokers.
+        //
+        // [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
+        let no_topics = topics.as_deref().is_some_and(<[TopicId]>::is_empty);
 
         let mut response = self
             .storage
@@ -214,8 +223,9 @@ where
             response
                 .topics()
                 .iter()
+                .filter(|_| !no_topics)
                 .map(|topic| {
-                    if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    let topic = if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
                         && topic
                             .name
                             .as_deref()
@@ -226,11 +236,20 @@ where
                             .error_code(ErrorCode::InvalidTopicException.into())
                     } else {
                         topic.clone()
-                    }
+                    };
+
+                    let operations = authorized_operations::topic(
+                        input.request.include_topic_authorized_operations,
+                        topic.name.as_deref(),
+                    );
+
+                    topic.topic_authorized_operations(Some(operations))
                 })
                 .collect::<Vec<_>>(),
         );
-        let cluster_authorized_operations = Some(-1);
+        let cluster_authorized_operations = Some(authorized_operations::cluster(
+            input.request.include_cluster_authorized_operations,
+        ));
 
         let throttle_time_ms = Some(0);
 
@@ -296,7 +315,7 @@ mod tests {
     };
     use crate::{
         Result, TopicCreationConfig,
-        service::counting_storage::{CountingStorage, Listing},
+        service::counting_storage::{CountingStorage, Listing, Lookup},
     };
 
     fn service(
@@ -344,6 +363,47 @@ mod tests {
 
     fn unknown(name: &str) -> (String, ErrorCode) {
         (name.to_owned(), ErrorCode::UnknownTopicOrPartition)
+    }
+
+    /// An empty list asks for no topics, so the response has none and the storage lists none,
+    /// where a null list asks for all of them.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_list_answers_no_topics() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b", "c.d"]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(
+            Vec::<(String, ErrorCode)>::new(),
+            metadata(&service, &[]).await?
+        );
+        assert_eq!(0, storage.listings());
+        assert!(storage.created().is_empty());
+
+        let all = service
+            .serve(MetadataRequest::default().topics(None))
+            .await?;
+
+        assert_eq!(2, all.topics.unwrap_or_default().len());
+        assert_eq!(1, storage.listings());
+        Ok(())
+    }
+
+    /// The null engine lists every topic whatever the lookup names, and the deprecated slatedb
+    /// engine does the same for an empty slice, so the service itself keeps an empty list from
+    /// answering topics.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_list_answers_no_topics_from_a_storage_that_lists_every_topic() -> Result<()> {
+        let storage =
+            CountingStorage::new(Listing::Topics, &["a.b", "c.d"]).with_lookup(Lookup::Listed);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(
+            Vec::<(String, ErrorCode)>::new(),
+            metadata(&service, &[]).await?
+        );
+        assert_eq!(1, storage.lookups());
+        assert!(storage.created().is_empty());
+        Ok(())
     }
 
     /// A producer retries Metadata for a name that collides with an existing topic. Only the

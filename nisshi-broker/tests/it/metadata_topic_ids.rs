@@ -14,7 +14,8 @@
 
 //! A Metadata v10 or v11 request that names a topic by its ID, or leaves its name null, over a
 //! real connection: the broker answers `INVALID_REQUEST` in a frame that decodes at that
-//! version, as Kafka does, and a request that names a topic reaches the storage.
+//! version, as Kafka does, and a request that names a topic reaches the storage. A v0 request with
+//! a null list of topics gets no response, as in Kafka, which closes the connection.
 //!
 //! The check is independent of the storage backend, so only the memory backend is used.
 
@@ -22,10 +23,14 @@ use std::{assert_matches, time::Duration};
 
 use anyhow::{Result, anyhow};
 use nisshi_sans_io::{
-    ApiKey as _, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
+    ApiKey as _, ErrorCode, Frame, Header, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
     metadata_request::MetadataRequestTopic,
 };
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpStream,
+    time::timeout,
+};
 
 use crate::common::{
     alphanumeric_string, init_tracing,
@@ -129,6 +134,51 @@ async fn an_unknown_named_topic_with_the_zero_id_reaches_the_storage() -> Result
         assert_eq!(
             (ErrorCode::UnknownTopicOrPartition, Some(name)),
             only_topic(response)?
+        );
+
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("timed out after {TEST_TIMEOUT:?}"))?
+}
+
+/// The topic list is nullable from v1, so Kafka fails to decode a v0 request that sends it null,
+/// and closes the connection without a response ([`RequestContext.parseRequest`],
+/// [`SocketServer.processCompletedReceives`]).
+///
+/// [`RequestContext.parseRequest`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/RequestContext.java#L111-L131
+/// [`SocketServer.processCompletedReceives`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1129-L1180
+#[tokio::test]
+async fn a_null_list_at_v0_closes_the_connection() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(None).await?;
+
+        // The encoder writes an empty list for a null one at v0, so encode an empty list and
+        // set its length, the last four bytes of the frame, to -1.
+        let mut request = Frame::request(
+            Header::Request {
+                api_key: MetadataRequest::KEY,
+                api_version: 0,
+                correlation_id: 1,
+                client_id: Some(env!("CARGO_PKG_NAME").into()),
+            },
+            MetadataRequest::default().topics(Some(Vec::new())).into(),
+        )?
+        .to_vec();
+        let length = request.len() - 4;
+        request[length..].copy_from_slice(&(-1_i32).to_be_bytes());
+
+        let mut stream = TcpStream::connect(broker.addr).await?;
+        stream.write_all(&request).await?;
+        stream.flush().await?;
+
+        let mut response = Vec::new();
+        _ = stream.read_to_end(&mut response).await?;
+        assert!(
+            response.is_empty(),
+            "a v0 request with a null list got a response: {response:02x?}"
         );
 
         Ok::<_, anyhow::Error>(())
