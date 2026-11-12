@@ -235,6 +235,10 @@ On a pull_request, a `changes` job in `ci.yml`, `codeql.yml`, `dependencies.yml`
 
 Follow `.claude/rules/comments.md` for every comment and doc comment in the file types it lists. Before you hand off a change, reread each comment that you added or changed against that file's "Before You Hand Off" checklist.
 
+## File Headers
+
+Start every `.rs`, `.proto` and `.sql` file with the header that `.claude/rules/file-header.md` describes, and follow its rules for the `Contributors outside Solace:` list.
+
 ## Lint Configuration
 
 Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`, `private_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors) and `just doc`, which runs rustdoc with warnings denied.

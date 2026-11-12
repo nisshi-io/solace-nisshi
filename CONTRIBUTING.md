@@ -218,6 +218,36 @@ check, so a pull request can't merge while it fails. To fix a failure, run
 the `git rebase --signoff main` command above, then force-push. Commits already
 on `main` predate this expectation and aren't checked.
 
+## File headers
+
+Every `.rs`, `.proto` and `.sql` file starts with this header, in the file's
+comment syntax (`--` in SQL), followed by the Apache-2.0 notice:
+
+```rust
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Your Name
+```
+
+If you don't work at Solace, add your name under `Contributors outside
+Solace:` in each file you change, in alphabetical order. Start the list if
+the file has none. If you work at Solace, don't add your name: your work
+belongs to Solace, and the copyright line already covers it.
+
+- **A new file starts without a list.** Don't copy another file's list into
+  it. If you move code from another file, bring along the names of the
+  people who wrote the lines that move.
+- **Don't remove a name,** even when you rewrite that person's lines.
+- **Keep the header ASCII.** The broker sends `pg/schema.sql` to PostgreSQL
+  with its comments, and PostgreSQL rejects a character that the database's
+  encoding can't hold.
+- **Put nothing above the header,** except an Emacs mode line, which Emacs
+  reads only from the first line.
+
+The `copyright_header` test in the `nisshi` crate fails for a source file
+that doesn't start with the copyright line.
+
 ## Code of conduct
 
 Participation in this project is governed by our
