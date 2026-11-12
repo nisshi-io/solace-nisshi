@@ -102,7 +102,6 @@ impl Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
@@ -256,7 +255,6 @@ impl Engine {
                 let tx = self
                     .db
                     .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
                     .inspect_err(|err| debug!(?err))?;
 
                 let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, partition))?;
@@ -343,7 +341,6 @@ impl Engine {
                 let tx = self
                     .db
                     .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
                     .inspect_err(|err| debug!(?err))?;
 
                 // Working from the newest batch to the oldest, a record is
@@ -448,7 +445,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut brokers: Brokers = self.load_metadata(&tx, Self::BROKERS).await?;
@@ -527,7 +523,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         // NOTE: Contention Hotspot
@@ -561,7 +556,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let all_topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
@@ -713,7 +707,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
@@ -868,7 +861,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let topics: Topics = self.load_metadata(&tx, Self::TOPICS).await?;
@@ -1262,7 +1254,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut group_inserted = false;
@@ -1827,7 +1818,6 @@ impl Storage for Engine {
             let tx = self
                 .db
                 .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                .await
                 .inspect_err(|err| debug!(?err))?;
 
             for group_id in group_ids {
@@ -1949,7 +1939,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))
             .map_err(|err| UpdateError::Error(Error::Slate(Arc::new(err))))?;
 
@@ -2031,7 +2020,6 @@ impl Storage for Engine {
             let tx = self
                 .db
                 .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                .await
                 .inspect_err(|err| debug!(?err))?;
 
             let mut transactions: Transactions =
@@ -2214,7 +2202,6 @@ impl Storage for Engine {
             let tx = self
                 .db
                 .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                .await
                 .inspect_err(|err| debug!(?err))?;
 
             let mut producers: Producers = self.load_metadata(&tx, Self::PRODUCERS).await?;
@@ -2284,7 +2271,6 @@ impl Storage for Engine {
                 let tx = self
                     .db
                     .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
                     .inspect_err(|err| debug!(?err))?;
 
                 // Helper to create error responses for all topics/partitions
@@ -2376,7 +2362,6 @@ impl Storage for Engine {
                 let tx = self
                     .db
                     .begin(slatedb::IsolationLevel::SerializableSnapshot)
-                    .await
                     .inspect_err(|err| debug!(?err))?;
 
                 let mut stored_transactions: Transactions =
@@ -2484,7 +2469,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut transactions: Transactions = self.load_metadata(&tx, Self::TRANSACTIONS).await?;
@@ -2586,7 +2570,6 @@ impl Storage for Engine {
         let tx = self
             .db
             .begin(slatedb::IsolationLevel::SerializableSnapshot)
-            .await
             .inspect_err(|err| debug!(?err))?;
 
         let mut transactions: Transactions = self.load_metadata(&tx, Self::TRANSACTIONS).await?;
