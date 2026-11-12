@@ -15,6 +15,8 @@
 use super::*;
 use std::assert_matches;
 
+mod variable_expansion;
+
 #[test]
 fn invalid_url_option_reads_as_a_sentence() {
     let err = EnvVarExp::<url::Url>::from_str("foo").unwrap_err();

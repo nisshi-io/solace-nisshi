@@ -21,7 +21,7 @@ mod insecure_tls;
 
 pub use cli::{Cli, Outcome};
 pub use exit_status::ExitStatus;
-use regex::{Regex, Replacer};
+use regex::Regex;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -159,6 +159,11 @@ pub enum Error {
     TlsRequiresCertAndKey,
     #[error(transparent)]
     Topic(#[from] nisshi_topic::Error),
+    /// A value refers to an environment variable that is not set. A typo in the name must not
+    /// become an empty string in an address. The value around the reference may hold a
+    /// credential, so the message names only the variable.
+    #[error("environment variable {0} is not set: set it, or remove ${{{0}}} from the value")]
+    UnsetVariable(String),
     /// The message carries the parse error, so the field is not `#[from]` or named `source`.
     #[error("invalid URL: {0}")]
     Url(url::ParseError),
@@ -206,20 +211,25 @@ impl From<HashMap<String, String>> for VarRep {
 }
 
 impl VarRep {
+    /// Replaces every `${NAME}` with the value of `NAME`. The text that replaces a reference is
+    /// not scanned again. A `NAME` with no entry is an error, and one set to an empty string is
+    /// an empty replacement. `${}` and an unclosed `${` are not references.
     fn replace(&self, haystack: &str) -> Result<String> {
-        Regex::new(r"\$\{(?<var>[^\}]+)\}")
-            .map(|re| re.replace(haystack, self).into_owned())
-            .map_err(Into::into)
-    }
-}
-
-impl Replacer for &VarRep {
-    fn replace_append(&mut self, caps: &regex::Captures<'_>, dst: &mut String) {
-        if let Some(variable) = caps.name("var")
-            && let Some(value) = self.0.get(variable.as_str())
-        {
-            dst.push_str(value);
+        let reference = Regex::new(r"\$\{(?<var>[^\}]+)\}")?;
+        let mut expanded = String::with_capacity(haystack.len());
+        let mut copied = 0;
+        for captures in reference.captures_iter(haystack) {
+            let (whole, name) = (captures.get_match(), &captures["var"]);
+            let value = self
+                .0
+                .get(name)
+                .ok_or_else(|| Error::UnsetVariable(name.to_owned()))?;
+            expanded.push_str(&haystack[copied..whole.start()]);
+            expanded.push_str(value);
+            copied = whole.end();
         }
+        expanded.push_str(&haystack[copied..]);
+        Ok(expanded)
     }
 }
 
