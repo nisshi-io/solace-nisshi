@@ -28,7 +28,7 @@ use nisshi_sans_io::{
     produce_response::PartitionProduceResponse,
     record::{MAX_DECODED_BATCH_BYTES, Record, deflated, deflated::Frame, inflated},
 };
-use rama::extensions::Extensions;
+use rama::{Service as _, extensions::Extensions};
 use tokio::{
     sync::Semaphore,
     task::JoinSet,
@@ -82,7 +82,7 @@ fn compressible() -> Result<deflated::Batch> {
 /// partitions' responses in order.
 async fn produce_two_partitions(
     storage: &CountingStorage,
-    budget: &DecodedBytesBudget,
+    budget: &Arc<DecodedBytesBudget>,
     wait: Duration,
 ) -> Result<Vec<PartitionProduceResponse>> {
     let partition = |index| -> Result<_> {
@@ -93,13 +93,10 @@ async fn produce_two_partitions(
             })))
     };
 
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .serve_with(
-        budget,
-        wait,
-        RequestInput {
+    let response = ProduceService::new(storage.clone())
+        .with_decoded_budget(Arc::clone(budget), wait)
+        .with_validation()
+        .serve(RequestInput {
             request: ProduceRequest::default()
                 .acks(i16::from(Ack::Leader))
                 .topic_data(Some(
@@ -109,9 +106,8 @@ async fn produce_two_partitions(
                     .into(),
                 )),
             extensions: Extensions::default(),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     Ok(response
         .responses
@@ -123,17 +119,14 @@ async fn produce_two_partitions(
 
 async fn produce(
     storage: &CountingStorage,
-    budget: &DecodedBytesBudget,
+    budget: &Arc<DecodedBytesBudget>,
     wait: Duration,
     batch: deflated::Batch,
 ) -> Result<PartitionProduceResponse> {
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .serve_with(
-        budget,
-        wait,
-        RequestInput {
+    let response = ProduceService::new(storage.clone())
+        .with_decoded_budget(Arc::clone(budget), wait)
+        .with_validation()
+        .serve(RequestInput {
             request: ProduceRequest::default()
                 .acks(i16::from(Ack::Leader))
                 .topic_data(Some(
@@ -150,9 +143,8 @@ async fn produce(
                     .into(),
                 )),
             extensions: Extensions::default(),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     Ok(response
         .responses

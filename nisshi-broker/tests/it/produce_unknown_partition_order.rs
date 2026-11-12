@@ -96,28 +96,27 @@ async fn produce(
     index: i32,
     batch: deflated::Batch,
 ) -> Result<PartitionProduceResponse> {
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: ProduceRequest::default()
-            .acks(i16::from(Ack::Leader))
-            .topic_data(Some(
-                [TopicProduceData::default()
-                    .name(name.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(index)
-                            .records(Some(Frame {
-                                batches: vec![batch],
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = ProduceService::new(storage.clone())
+        .with_validation()
+        .serve(RequestInput {
+            request: ProduceRequest::default()
+                .acks(i16::from(Ack::Leader))
+                .topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(name.into())
+                        .partition_data(Some(
+                            [PartitionProduceData::default()
+                                .index(index)
+                                .records(Some(Frame {
+                                    batches: vec![batch],
+                                }))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let topics = response.responses.unwrap_or_default();
     assert_eq!(1, topics.len());

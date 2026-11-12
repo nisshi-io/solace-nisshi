@@ -33,7 +33,7 @@ use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::ProduceRequest;
 use nisshi_storage::{ProduceService, StorageContainer};
 use nisshi_storage_dynostore::MemoryEngineFactory;
-use rama::Service as _;
+use rama::Service;
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -86,7 +86,11 @@ fuzz_target!(|input: (u16, ProduceRequest)| {
             .await
             .expect("in-memory storage always builds");
 
-        let service = ProduceService { storage };
+        // The service is boxed, as the broker boxes it, because the compiler lays out the future
+        // of every step of the produce path in one type otherwise, and overflows its query depth
+        // limit.
+        let service =
+            Service::<ProduceRequest>::boxed(ProduceService::new(storage).with_validation());
 
         match service.serve(request).await {
             // The service returns this error so that the broker closes the connection of an

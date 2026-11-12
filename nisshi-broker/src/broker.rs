@@ -285,6 +285,7 @@ pub struct Broker<G, S> {
     advertised_listener: Url,
     storage: S,
     groups: G,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
 
@@ -322,6 +323,9 @@ where
     G: Coordinator,
     S: Storage + Clone + 'static,
 {
+    /// Returns a broker that serves `storage`, and does not validate the records of a Produce
+    /// against a schema. The storage engine does not validate them either, so call
+    /// [`Broker::schemas`] to validate them against a registry.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: i32,
@@ -340,6 +344,7 @@ where
             advertised_listener,
             storage,
             groups,
+            schemas: None,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
 
@@ -360,6 +365,14 @@ where
 
             meter_provider: None,
         }
+    }
+
+    /// Returns this broker with `schemas` as the registry that it validates the records of each
+    /// Produce against. A topic that has no schema in the registry has nothing to validate
+    /// against, and a topic with `nisshi.schema.validation` set to `false` is not validated unless
+    /// it has a lake sink.
+    pub fn schemas(self, schemas: Option<Registry>) -> Self {
+        Self { schemas, ..self }
     }
 
     pub fn builder() -> PhantomBuilder {
@@ -723,6 +736,7 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
+                        self.schemas.clone(),
                         self.topic_creation,
                         self.auto_create_refusals.clone(),
                         self.sasl_config.clone()
@@ -1220,6 +1234,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            schemas: self.schema_registry,
             topic_creation: self.topic_creation,
             auto_create_refusals: AutoCreateRefusals::default(),
             sasl_config,

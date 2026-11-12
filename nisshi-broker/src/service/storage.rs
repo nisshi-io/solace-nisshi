@@ -19,8 +19,10 @@ use nisshi_sans_io::{
     DescribeClusterRequest, DescribeConfigsRequest, DescribeTopicPartitionsRequest,
     DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListOffsetsRequest,
-    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
+    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, RequestInput,
+    TxnOffsetCommitRequest,
 };
+use nisshi_schema::Registry;
 use nisshi_service::{
     FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, TransactionAbortableDowngradeLayer,
 };
@@ -34,13 +36,14 @@ use nisshi_storage::{
     ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
     TxnEndService, TxnOffsetCommitService,
 };
-use rama::{Layer as _, Service as _, layer::MapErrLayer};
+use rama::{Layer as _, Service, layer::MapErrLayer};
 
 use crate::Error;
 
 pub fn services<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
 ) -> Result<FrameRouteBuilder<Error>, Error>
@@ -67,7 +70,6 @@ where
         init_producer_id,
         list_offsets,
         list_partition_reassignments,
-        produce,
         end_txn,
         txn_offset_commit,
     ]
@@ -75,6 +77,7 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+    .and_then(|builder| produce(builder, storage.clone(), schemas))
     .and_then(|builder| {
         metadata(
             builder,
@@ -471,14 +474,20 @@ where
 pub fn produce<S>(
     builder: FrameRouteBuilder<Error>,
     storage: S,
+    schemas: Option<Registry>,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
-    S: Storage,
+    S: Storage + Clone,
 {
     builder
         .with_capped_route_layer::<ProduceRequest, _, _>(
             TransactionAbortableDowngradeLayer,
-            ProduceService { storage },
+            // The route is boxed after its layers, so without this box the compiler lays out the
+            // future of every layer of the produce path in one type, which overflows its query
+            // depth limit in a crate that builds the route.
+            Service::<RequestInput<ProduceRequest>>::boxed(
+                ProduceService::with_schemas(storage, schemas).with_validation(),
+            ),
         )
         .map_err(Into::into)
 }

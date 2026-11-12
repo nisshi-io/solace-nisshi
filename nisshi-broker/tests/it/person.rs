@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{self, register_broker};
+use crate::{
+    common::{self, register_broker},
+    produce::produce_batches_with_schemas,
+};
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
@@ -20,10 +23,12 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     record::{Record, inflated::Batch},
 };
-use nisshi_storage::{Error, Storage, Topition};
+use nisshi_schema::Registry;
+use nisshi_storage::{Storage, Topition};
 use rand::{prelude::*, rng};
 use serde_json::json;
-use tracing::{debug, error};
+use tracing::debug;
+use url::Url;
 use uuid::Uuid;
 
 pub async fn person_valid<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
@@ -132,13 +137,25 @@ where
         .and_then(TryInto::try_into)
         .inspect(|deflated| debug!(?deflated))?;
 
-    assert!(matches!(
-        sc.produce(None, &topition, batch)
-            .await
-            .inspect(|offset| debug!(?offset))
-            .inspect_err(|err| error!(?err)),
-        Err(Error::Api(ErrorCode::InvalidRecord))
-    ));
+    let schemas = Url::parse("file://../etc/schema")
+        .map_err(nisshi_broker::Error::from)
+        .and_then(|url| {
+            Registry::builder_try_from_url(&url)
+                .map(|builder| builder.build())
+                .map_err(Into::into)
+        })?;
+
+    let response = produce_batches_with_schemas(
+        sc,
+        Some(schemas),
+        topic_name,
+        topition.partition(),
+        vec![batch],
+    )
+    .await
+    .inspect(|response| debug!(?response))?;
+
+    assert_eq!(i16::from(ErrorCode::InvalidRecord), response.error_code);
 
     Ok(())
 }

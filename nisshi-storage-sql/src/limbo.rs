@@ -66,7 +66,6 @@ use nisshi_sans_io::{
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
-    Registry,
     lake::{House, LakeHouse as _},
     redact_url,
 };
@@ -75,9 +74,10 @@ use nisshi_storage::{
     DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff,
-    epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -162,8 +162,6 @@ pub struct Engine {
     node: i32,
     advertised_listener: Url,
     db: Arc<Mutex<Database>>,
-
-    schemas: Option<Registry>,
     lake: Option<House>,
 }
 
@@ -751,12 +749,6 @@ impl Engine {
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
-        if !attributes.control
-            && let Some(ref schemas) = self.schemas
-        {
-            schemas.validate(topition.topic(), &inflated).await?;
-        }
-
         let last_offset_delta = i64::from(inflated.last_offset_delta);
 
         for (delta, record) in inflated.records.iter().enumerate() {
@@ -870,16 +862,20 @@ impl Engine {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
-                config,
-            )
-            .await
-            .inspect(|store| debug!(?store))
-            .inspect_err(|err| debug!(?err))?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    &inflated,
+                    config,
+                )
+                .await
+                .inspect(|store| debug!(?store))
+                .inspect_err(|err| debug!(?err))?;
+            } else {
+                lake_skip::warn_once(topition.topic());
+            }
         }
 
         Ok(high.unwrap_or_default())
@@ -1145,7 +1141,6 @@ pub struct Builder<C, N, L, D> {
     node: N,
     advertised_listener: L,
     storage: D,
-    schemas: Option<Registry>,
     lake: Option<House>,
 }
 
@@ -1159,7 +1154,6 @@ impl<C, N, L, D> Builder<C, N, L, D> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             storage: self.storage,
-            schemas: self.schemas,
             lake: self.lake,
         }
     }
@@ -1171,7 +1165,6 @@ impl<C, N, L, D> Builder<C, N, L, D> {
             node,
             advertised_listener: self.advertised_listener,
             storage: self.storage,
-            schemas: self.schemas,
             lake: self.lake,
         }
     }
@@ -1183,7 +1176,6 @@ impl<C, N, L, D> Builder<C, N, L, D> {
             node: self.node,
             advertised_listener,
             storage: self.storage,
-            schemas: self.schemas,
             lake: self.lake,
         }
     }
@@ -1195,13 +1187,8 @@ impl<C, N, L, D> Builder<C, N, L, D> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             storage,
-            schemas: self.schemas,
             lake: self.lake,
         }
-    }
-
-    pub(crate) fn schemas(self, schemas: Option<Registry>) -> Builder<C, N, L, D> {
-        Self { schemas, ..self }
     }
 
     pub(crate) fn lake(self, lake: Option<House>) -> Self {
@@ -1313,7 +1300,6 @@ impl Builder<String, i32, Url, Url> {
             node: self.node,
             advertised_listener: self.advertised_listener,
             db: Arc::new(Mutex::new(db)),
-            schemas: self.schemas,
             lake: self.lake,
         })
     }

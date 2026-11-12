@@ -122,6 +122,7 @@ impl Fixture {
         let route = service::routes(
             broker.clone(),
             storage.clone(),
+            None,
             TopicCreationConfig::default(),
             AutoCreateRefusals::default(),
         )

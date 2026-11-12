@@ -35,6 +35,7 @@ mod failing_object_store;
 mod fetch_listing;
 mod held_put_store;
 mod init_producer;
+mod lake_schema_validation;
 mod lake_sink_idempotence;
 mod latency;
 mod list_groups;

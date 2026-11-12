@@ -404,11 +404,24 @@ impl Storage for CountingStorage {
 
     async fn describe_config(
         &self,
-        _name: &str,
-        _resource: ConfigResource,
+        name: &str,
+        resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
-        Ok(DescribeConfigsResult::default().error_code(ErrorCode::None.into()))
+        let holds_topic = !matches!(resource, ConfigResource::Topic)
+            || self
+                .topics
+                .lock()
+                .expect("the topics lock is not poisoned")
+                .contains(name);
+
+        let error_code = if holds_topic {
+            ErrorCode::None
+        } else {
+            ErrorCode::UnknownTopicOrPartition
+        };
+
+        Ok(DescribeConfigsResult::default().error_code(error_code.into()))
     }
 
     async fn describe_topic_partitions(

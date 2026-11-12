@@ -17,54 +17,38 @@
 //!
 //! Each test sends record bytes that do not decode next to the batch that does. `produce` decodes
 //! the bytes and answers `INVALID_RECORD`. `produce_inflated` stores the decoded records and never
-//! reads the bytes. The tests run against the backends that decode a produced batch: Postgres,
-//! libSQL, and the object store when a schema registry is configured.
+//! reads the bytes. The tests run against the backends that decode a produced batch: Postgres and
+//! libSQL. The object store keeps the bytes as sent.
 
 use nisshi_storage::fetched::FetchUntilDeadline as _;
 use std::{assert_matches, time::Duration};
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};
 use bytes::Bytes;
-use nisshi_broker::{Error, Result};
+use nisshi_broker::Result;
 use nisshi_sans_io::{
     ErrorCode, IsolationLevel,
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
-use nisshi_schema::Registry;
 use nisshi_storage::{ArcDynStorage, Storage, Topition};
 use rand::{RngExt as _, rng};
 use tokio::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
-async fn storage(storage_type: StorageType, with_registry: bool) -> Result<ArcDynStorage> {
-    let schemas = if with_registry {
-        Url::parse("file://../etc/schema")
-            .map_err(Error::from)
-            .and_then(|url| {
-                Registry::builder_try_from_url(&url)
-                    .map(|builder| builder.build())
-                    .map_err(Into::into)
-            })
-            .map(Some)?
-    } else {
-        None
-    };
-
+async fn storage(storage_type: StorageType) -> Result<ArcDynStorage> {
     crate::common::storage_container(
         storage_type,
         Uuid::now_v7(),
         rng().random_range(0..i32::MAX),
         Url::parse("tcp://127.0.0.1/")?,
-        schemas,
+        None,
     )
     .await
 }
 
-/// `reads_back` is whether the backend stores the decoded records. The object store keeps the bytes
-/// as sent, so a fetch of the undecodable bytes fails there, and the test stops after the produce.
-async fn assert_stores_the_decoded_batch(storage: impl Storage, reads_back: bool) -> Result<()> {
+async fn assert_stores_the_decoded_batch(storage: impl Storage) -> Result<()> {
     let name = &alphanumeric_string(15)[..];
 
     _ = storage
@@ -100,10 +84,6 @@ async fn assert_stores_the_decoded_batch(storage: impl Storage, reads_back: bool
             .await?
     );
 
-    if !reads_back {
-        return Ok(());
-    }
-
     let records = storage
         .fetch_until_deadline(
             &topition,
@@ -131,17 +111,6 @@ async fn assert_stores_the_decoded_batch(storage: impl Storage, reads_back: bool
     Ok(())
 }
 
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use super::*;
-
-    #[tokio::test]
-    async fn stores_the_decoded_batch_with_registry() -> Result<()> {
-        let _guard = init_tracing()?;
-        assert_stores_the_decoded_batch(storage(StorageType::InMemory, true).await?, false).await
-    }
-}
-
 #[cfg(feature = "libsql")]
 mod lite {
     use super::*;
@@ -149,7 +118,7 @@ mod lite {
     #[tokio::test]
     async fn stores_the_decoded_batch() -> Result<()> {
         let _guard = init_tracing()?;
-        assert_stores_the_decoded_batch(storage(StorageType::Lite, false).await?, true).await
+        assert_stores_the_decoded_batch(storage(StorageType::Lite).await?).await
     }
 }
 
@@ -160,6 +129,6 @@ mod pg {
     #[tokio::test]
     async fn stores_the_decoded_batch() -> Result<()> {
         let _guard = init_tracing()?;
-        assert_stores_the_decoded_batch(storage(StorageType::Postgres, false).await?, true).await
+        assert_stores_the_decoded_batch(storage(StorageType::Postgres).await?).await
     }
 }

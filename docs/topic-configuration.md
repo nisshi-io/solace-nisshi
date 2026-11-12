@@ -10,17 +10,17 @@ nisshi topic create telemetry --config nisshi.virtual=true
 
 ## Keys
 
-Nisshi keys start with `nisshi.`. SlateDB, Turso and the null engine ignore
-`nisshi.schema.validation`, `nisshi.virtual` and `nisshi.lake.sink`.
+Nisshi keys start with `nisshi.`. SlateDB, Turso and the null engine ignore `nisshi.virtual` and
+`nisshi.lake.sink`. SlateDB also ignores `nisshi.schema.validation`, and always validates.
 
 | Key | Default | Applies to | Effect |
 |-----|---------|------------|--------|
 | `nisshi.batch` | `false` | proxy | Batches the Produce requests that the proxy receives for the topic. |
 | `nisshi.batch.timeout_ms` | `10000` | proxy | Longest time in milliseconds that the proxy holds a batch before it sends it. |
 | `nisshi.batch.max_records` | `1000` | proxy | Number of records at which the proxy sends a batch. |
-| `nisshi.schema.validation` | `true` | PostgreSQL, libSQL | With a schema registry, validates each produced message against the topic's schema. Set to `false` to accept any message. |
+| `nisshi.schema.validation` | `true` | every engine except SlateDB | With a schema registry, validates each produced message against the topic's schema. Set to `false` to accept any message, except on a topic with `nisshi.lake.sink`, which always validates. A topic that does not validate is not written to a data lake. |
 | `nisshi.virtual` | `false` | PostgreSQL, libSQL | Makes `topic/key` a topic that has the records of `topic` with the record key `key`. |
-| `nisshi.lake.sink` | `false` | PostgreSQL, libSQL, S3, Google Cloud Storage, memory | With a schema registry and a data lake, stores the topic's records only in the lake table, not in the topic, so a fetch returns none of them. When a lake is configured, the broker writes every topic's records to it whatever this key says. DeleteRecords and retention do not remove records from the lake table, see [Data lake](data-lake.md#removing-records-from-a-topic). |
+| `nisshi.lake.sink` | `false` | PostgreSQL, libSQL, S3, Google Cloud Storage, memory | With a schema registry and a data lake, stores the topic's records only in the lake table, not in the topic, so a fetch returns none of them. When a lake is configured, the broker writes the records of every topic that validates to it, which is every topic except one that sets `nisshi.schema.validation` to `false` without this key. DeleteRecords and retention do not remove records from the lake table, see [Data lake](data-lake.md#removing-records-from-a-topic). |
 | `nisshi.lake.partition` | none | Delta Lake | Comma separated columns that the table is partitioned by. |
 | `nisshi.lake.z_order` | none | Delta Lake | Comma separated columns that the table is Z-ordered by. |
 | `nisshi.lake.normalize` | `false` | Delta Lake | Flattens nested fields into top level columns. |

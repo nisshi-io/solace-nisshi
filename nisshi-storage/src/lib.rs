@@ -208,6 +208,7 @@ mod decoded_batch_probe;
 mod decoded_budget;
 pub mod fetched;
 mod inflate;
+pub mod lake_skip;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
@@ -243,20 +244,26 @@ pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequest, ChannelRequestLayer,
-    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DELETE_RECORDS_CONCURRENCY,
-    DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
-    FetchService, FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    AcksZeroLayer, AcksZeroService, Admission, AlterUserScramCredentialsService,
+    AutoCreateRefusals, BatchValidationLayer, BatchValidationService, ChannelRequest,
+    ChannelRequestLayer, ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService,
+    CreateTopicsService, CreateTopicsValidationLayer, CreateTopicsValidationService,
+    DELETE_RECORDS_CONCURRENCY, DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
+    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
+    InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
+    MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService,
+    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -2143,10 +2150,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Produce a deflated batch to this storage.
     ///
     /// Trusts the batch attributes as given: a batch with the control bit set
-    /// is written as a transaction marker, skipping schema validation and lake
-    /// writes. Only the broker may write control batches, so client Produce
-    /// batches must reach storage through [`ProduceService`], which rejects
-    /// them.
+    /// is written as a transaction marker, skipping lake writes. Only the broker
+    /// may write control batches, so client Produce batches must reach storage
+    /// through [`ProduceService`], which rejects them.
+    ///
+    /// A backend does not validate the records against the topic's schema.
+    /// [`ProduceService`] does that, on the records that it decodes for the
+    /// timestamp check, before it calls this method. A batch that reaches a
+    /// backend any other way is stored without validation.
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.

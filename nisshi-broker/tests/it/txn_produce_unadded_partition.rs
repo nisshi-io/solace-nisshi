@@ -333,6 +333,7 @@ async fn error_code_by_version(storage_type: StorageType) -> Result<()> {
     let route = nisshi_broker::service::storage::produce(
         FrameRouteService::<Error>::builder(),
         storage.clone(),
+        None,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
 

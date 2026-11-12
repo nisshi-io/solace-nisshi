@@ -70,12 +70,12 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim,
     config::{self, apply_op},
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
-    producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    parse_storage_option, producer_claim,
     read_deadline::{QueueWait as _, ReadWait},
     read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
 };
@@ -2926,31 +2926,6 @@ impl Postgres {
 
         let attributes = BatchAttribute::try_from(inflated.attributes)?;
 
-        if !attributes.control
-            && let Some(ref schemas) = self.schemas
-            && self
-                .describe_config(topic, ConfigResource::Topic, None)
-                .await
-                .map(|resources| {
-                    resources
-                        .configs
-                        .as_ref()
-                        .and_then(|configs| {
-                            topic_config::lookup(
-                                configs.iter().inspect(|config| debug!(?config)).filter_map(
-                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
-                                ),
-                                topic_config::SCHEMA_VALIDATION,
-                            )
-                            .and_then(|value| bool::from_str(value).ok())
-                        })
-                        .unwrap_or(true)
-                })
-                .inspect(|schema_validation| debug!(schema_validation))?
-        {
-            schemas.validate(topition.topic(), &inflated).await?;
-        }
-
         let last_offset_delta = i64::from(inflated.last_offset_delta);
 
         if self.schemas.is_none()
@@ -3910,14 +3885,18 @@ impl Postgres {
                 .describe_config(topition.topic(), ConfigResource::Topic, None)
                 .await?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                inflated,
-                config,
-            )
-            .await?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    inflated,
+                    config,
+                )
+                .await?;
+            } else {
+                lake_skip::warn_once(topition.topic());
+            }
         }
 
         Ok(())
@@ -6049,6 +6028,7 @@ pub(crate) mod tests {
 
     use bytes::BytesMut;
     use futures_util::future;
+    use nisshi_sans_io::create_topics_request::CreatableTopicConfig;
     use nisshi_sans_io::{
         add_partitions_to_txn_request::AddPartitionsToTxnTopic,
         record::{Header, header},
@@ -8224,6 +8204,127 @@ pub(crate) mod tests {
         _ = storage.produce(None, &topition, batch).await?;
 
         Ok(topition)
+    }
+
+    /// A record that the person schema cannot convert, because its value is not JSON.
+    fn unconvertible_person() -> Result<deflated::Batch> {
+        Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::from_static(b"\"345-67-6543\"")))
+                    .value(Some(Bytes::from_static(b"not json"))),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// Returns a storage engine with a Parquet lake that knows the person schema, and the topic
+    /// `person` with one partition and the given configs. Returns `None` when the server can't be
+    /// reached. The caller then skips `test`.
+    async fn person_storage_with_lake(
+        test: &str,
+        configs: Vec<CreatableTopicConfig>,
+    ) -> Result<Option<(Postgres, Topition)>> {
+        let registry = Registry::builder_try_from_url(&Url::parse("file://../etc/schema")?)
+            .map(|builder| builder.build())?;
+
+        // The lake writes nothing in these tests, because the record in them fails to convert. Its
+        // location is the build directory, so that a write that a test did not expect stays out of
+        // the source tree.
+        let lake = House::parquet()
+            .location(Url::parse("file://../target")?)
+            .schema_registry(registry.clone())
+            .build()?;
+
+        let cluster = alphanumeric_string(15);
+
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster(cluster.as_str())
+            .node(rng().random_range(0..i32::MAX))
+            .schemas(Some(registry))
+            .lake(Some(lake))
+            .build();
+
+        // The test skips only when the server can't be reached. Any later error fails it.
+        if let Err(err) = storage.connection().await {
+            eprintln!("skipping {test}: {err:?}");
+            return Ok(None);
+        }
+
+        storage.ensure_schema().await?;
+
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: cluster,
+                incarnation_id: Uuid::now_v7(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("person".into())
+                    .num_partitions(1)
+                    .replication_factor(0)
+                    .assignments(Some([].into()))
+                    .configs(Some(configs)),
+                false,
+            )
+            .await?;
+
+        Ok(Some((storage, Topition::new("person", 0))))
+    }
+
+    /// Shows that the lake fails on the record, so that the test below passes because the engine
+    /// does not write the record to the lake and not because the lake accepts it.
+    #[tokio::test]
+    async fn a_record_that_breaks_the_schema_fails_in_the_lake_when_validation_is_on() -> Result<()>
+    {
+        let Some((storage, topition)) = person_storage_with_lake(
+            "a_record_that_breaks_the_schema_fails_in_the_lake_when_validation_is_on",
+            vec![],
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        assert!(
+            storage
+                .produce(None, &topition, unconvertible_person()?)
+                .await
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_validation_off_is_not_written_to_the_lake() -> Result<()> {
+        let Some((storage, topition)) = person_storage_with_lake(
+            "a_topic_with_validation_off_is_not_written_to_the_lake",
+            vec![
+                CreatableTopicConfig::default()
+                    .name(topic_config::SCHEMA_VALIDATION.into())
+                    .value(Some("false".into())),
+            ],
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        assert_eq!(
+            0,
+            storage
+                .produce(None, &topition, unconvertible_person()?)
+                .await?
+        );
+
+        Ok(())
     }
 
     /// Reads `topition` from offset 0 with a 5 second budget.

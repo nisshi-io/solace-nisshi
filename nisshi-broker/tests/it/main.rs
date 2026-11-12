@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// A test that awaits `ProduceService` makes the compiler lay out the future of every step of the
+// produce path in one type, which overflows the default query depth.
+#![recursion_limit = "256"]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
@@ -94,6 +97,7 @@ pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
 #[cfg(feature = "postgres")]
 pub mod produce_row_locks;
+pub mod produce_schema_validation;
 pub mod produce_unknown_partition_order;
 pub mod rebalance_timing;
 pub mod replication_factor;

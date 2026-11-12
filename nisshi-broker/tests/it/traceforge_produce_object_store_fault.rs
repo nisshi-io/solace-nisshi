@@ -101,6 +101,10 @@ use tokio::time::Instant;
 use traceforge::{Config, Nondet, TypeNondet, cover, future, verify};
 use url::Url;
 
+/// The stack of each thread of the model, in bytes. The default of traceforge is 32 KiB, which the
+/// nested futures of the produce service overflow when `block_on` polls them.
+const STACK_SIZE: usize = 1024 * 1024;
+
 #[derive(Debug)]
 struct FaultInjectingObjectStore<O> {
     inner: O,
@@ -228,212 +232,213 @@ fn batch_data(
 
 #[test]
 fn record_write_failure_never_causes_silent_data_loss() {
-    let stats = verify(Config::builder().build(), || {
-        let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
-        let storage: ArcDynStorage = Arc::new(Box::new(
-            DynoStore::new("spike", 111, object_store.clone())
-                .expect("dynostore")
-                .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
-                .schemas(None)
-                .lake(None),
-        ));
+    let stats = verify(
+        Config::builder().with_stack_size(STACK_SIZE).build(),
+        || {
+            let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
+            let storage: ArcDynStorage = Arc::new(Box::new(
+                DynoStore::new("spike", 111, object_store.clone())
+                    .expect("dynostore")
+                    .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
+                    .schemas(None)
+                    .lake(None),
+            ));
 
-        let topic = alphanumeric_string(15);
-        let extensions = Extensions::default();
-        let index = 0;
+            let topic = alphanumeric_string(15);
+            let extensions = Extensions::default();
+            let index = 0;
 
-        let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
-            storage: storage.clone(),
-        });
-        let response = future::block_on(
-            create_topics.serve(RequestInput {
-                request: CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(topic.clone())
-                            .num_partitions(1)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into())),
-                    ])),
-                extensions: extensions.clone(),
-            }),
-        )
-        .expect("create topic");
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(response.topics.as_deref().unwrap_or_default()[0].error_code)
-                .unwrap()
-        );
+            let create_topics = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
+                storage: storage.clone(),
+            });
+            let response = future::block_on(
+                create_topics.serve(RequestInput {
+                    request: CreateTopicsRequest::default()
+                        .validate_only(Some(false))
+                        .topics(Some(vec![
+                            CreatableTopic::default()
+                                .name(topic.clone())
+                                .num_partitions(1)
+                                .replication_factor(1)
+                                .assignments(Some([].into()))
+                                .configs(Some([].into())),
+                        ])),
+                    extensions: extensions.clone(),
+                }),
+            )
+            .expect("create topic");
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(response.topics.as_deref().unwrap_or_default()[0].error_code)
+                    .unwrap()
+            );
 
-        let init_producer_id = InitProducerIdService {
-            storage: storage.clone(),
-        };
-        let producer = future::block_on(
-            init_producer_id.serve(RequestInput {
-                request: InitProducerIdRequest::default()
-                    .transactional_id(None)
-                    .transaction_timeout_ms(0)
-                    .producer_id(Some(-1))
-                    .producer_epoch(Some(-1)),
-                extensions: extensions.clone(),
-            }),
-        )
-        .expect("init producer id");
+            let init_producer_id = InitProducerIdService {
+                storage: storage.clone(),
+            };
+            let producer = future::block_on(
+                init_producer_id.serve(RequestInput {
+                    request: InitProducerIdRequest::default()
+                        .transactional_id(None)
+                        .transaction_timeout_ms(0)
+                        .producer_id(Some(-1))
+                        .producer_epoch(Some(-1)),
+                    extensions: extensions.clone(),
+                }),
+            )
+            .expect("init producer id");
 
-        let produce = ProduceService {
-            storage: storage.clone(),
-        };
+            let produce = ProduceService::new(storage.clone()).with_validation();
 
-        // A client believes a batch is durably stored once it sees either
-        // a direct success or a `DuplicateSequenceNumber` on retry (proof,
-        // to a real client, that an earlier attempt already landed).
-        let mut client_believes_durable = 0usize;
+            // A client believes a batch is durably stored once it sees either
+            // a direct success or a `DuplicateSequenceNumber` on retry (proof,
+            // to a real client, that an earlier attempt already landed).
+            let mut client_believes_durable = 0usize;
 
-        for base_sequence in 0..3i32 {
-            let fault_this_batch = bool::nondet();
+            for base_sequence in 0..3i32 {
+                let fault_this_batch = bool::nondet();
 
-            if fault_this_batch {
-                object_store.schedule_record_write(true);
+                if fault_this_batch {
+                    object_store.schedule_record_write(true);
 
-                let response1 = future::block_on(
-                    produce.serve(RequestInput {
-                        request: ProduceRequest::default()
-                            .transactional_id(None)
-                            .acks(1)
-                            .timeout_ms(0)
-                            .topic_data(batch_data(
-                                &topic,
-                                index,
-                                producer.producer_id,
-                                producer.producer_epoch,
-                                base_sequence,
-                            )),
-                        extensions: extensions.clone(),
-                    }),
-                )
-                .expect("produce");
-                let error1 = ErrorCode::try_from(
-                    response1.responses.as_ref().unwrap()[0]
-                        .partition_responses
-                        .as_ref()
-                        .unwrap()[0]
-                        .error_code,
-                )
-                .unwrap();
-                assert_ne!(
-                    error1,
-                    ErrorCode::None,
-                    "the faulted record write must be reported as an error"
-                );
-                cover!("first_attempt_faulted");
+                    let response1 = future::block_on(
+                        produce.serve(RequestInput {
+                            request: ProduceRequest::default()
+                                .transactional_id(None)
+                                .acks(1)
+                                .timeout_ms(0)
+                                .topic_data(batch_data(
+                                    &topic,
+                                    index,
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    base_sequence,
+                                )),
+                            extensions: extensions.clone(),
+                        }),
+                    )
+                    .expect("produce");
+                    let error1 = ErrorCode::try_from(
+                        response1.responses.as_ref().unwrap()[0]
+                            .partition_responses
+                            .as_ref()
+                            .unwrap()[0]
+                            .error_code,
+                    )
+                    .unwrap();
+                    assert_ne!(
+                        error1,
+                        ErrorCode::None,
+                        "the faulted record write must be reported as an error"
+                    );
+                    cover!("first_attempt_faulted");
 
-                // A well-behaved idempotent producer always retries on an
-                // ambiguous error, using the same base_sequence.
-                object_store.schedule_record_write(false);
+                    // A well-behaved idempotent producer always retries on an
+                    // ambiguous error, using the same base_sequence.
+                    object_store.schedule_record_write(false);
 
-                let response2 = future::block_on(
-                    produce.serve(RequestInput {
-                        request: ProduceRequest::default()
-                            .transactional_id(None)
-                            .acks(1)
-                            .timeout_ms(0)
-                            .topic_data(batch_data(
-                                &topic,
-                                index,
-                                producer.producer_id,
-                                producer.producer_epoch,
-                                base_sequence,
-                            )),
-                        extensions: extensions.clone(),
-                    }),
-                )
-                .expect("produce");
-                let error2 = ErrorCode::try_from(
-                    response2.responses.as_ref().unwrap()[0]
-                        .partition_responses
-                        .as_ref()
-                        .unwrap()[0]
-                        .error_code,
-                )
-                .unwrap();
+                    let response2 = future::block_on(
+                        produce.serve(RequestInput {
+                            request: ProduceRequest::default()
+                                .transactional_id(None)
+                                .acks(1)
+                                .timeout_ms(0)
+                                .topic_data(batch_data(
+                                    &topic,
+                                    index,
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    base_sequence,
+                                )),
+                            extensions: extensions.clone(),
+                        }),
+                    )
+                    .expect("produce");
+                    let error2 = ErrorCode::try_from(
+                        response2.responses.as_ref().unwrap()[0]
+                            .partition_responses
+                            .as_ref()
+                            .unwrap()[0]
+                            .error_code,
+                    )
+                    .unwrap();
 
-                match error2 {
-                    ErrorCode::None => {
-                        cover!("retry_directly_succeeded");
+                    match error2 {
+                        ErrorCode::None => {
+                            cover!("retry_directly_succeeded");
+                        }
+                        ErrorCode::DuplicateSequenceNumber => {
+                            cover!("retry_told_duplicate");
+                        }
+                        other => panic!("unexpected retry error: {other:?}"),
                     }
-                    ErrorCode::DuplicateSequenceNumber => {
-                        cover!("retry_told_duplicate");
-                    }
-                    other => panic!("unexpected retry error: {other:?}"),
+
+                    client_believes_durable += 1;
+                } else {
+                    let response = future::block_on(
+                        produce.serve(RequestInput {
+                            request: ProduceRequest::default()
+                                .transactional_id(None)
+                                .acks(1)
+                                .timeout_ms(0)
+                                .topic_data(batch_data(
+                                    &topic,
+                                    index,
+                                    producer.producer_id,
+                                    producer.producer_epoch,
+                                    base_sequence,
+                                )),
+                            extensions: extensions.clone(),
+                        }),
+                    )
+                    .expect("produce");
+                    let error = ErrorCode::try_from(
+                        response.responses.as_ref().unwrap()[0]
+                            .partition_responses
+                            .as_ref()
+                            .unwrap()[0]
+                            .error_code,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        error,
+                        ErrorCode::None,
+                        "an undisturbed produce must succeed"
+                    );
+                    client_believes_durable += 1;
+                    cover!("undisturbed");
                 }
-
-                client_believes_durable += 1;
-            } else {
-                let response = future::block_on(
-                    produce.serve(RequestInput {
-                        request: ProduceRequest::default()
-                            .transactional_id(None)
-                            .acks(1)
-                            .timeout_ms(0)
-                            .topic_data(batch_data(
-                                &topic,
-                                index,
-                                producer.producer_id,
-                                producer.producer_epoch,
-                                base_sequence,
-                            )),
-                        extensions: extensions.clone(),
-                    }),
-                )
-                .expect("produce");
-                let error = ErrorCode::try_from(
-                    response.responses.as_ref().unwrap()[0]
-                        .partition_responses
-                        .as_ref()
-                        .unwrap()[0]
-                        .error_code,
-                )
-                .unwrap();
-                assert_eq!(
-                    error,
-                    ErrorCode::None,
-                    "an undisturbed produce must succeed"
-                );
-                client_believes_durable += 1;
-                cover!("undisturbed");
             }
-        }
 
-        let topition = Topition::new(topic.clone(), index);
-        // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
-        // finished, so traceforge does not schedule it.
-        let fetched = block_on_tokio(storage.fetch_until_deadline(
-            &topition,
-            0,
-            0,
-            i32::MAX as u32,
-            IsolationLevel::ReadUncommitted,
-            Instant::now() + Duration::from_millis(1000),
-        ))
-        .expect("fetch");
-        let fetched_records: usize = fetched
-            .batches
-            .iter()
-            .map(|batch| batch.record_count as usize)
-            .sum();
+            let topition = Topition::new(topic.clone(), index);
+            // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+            // finished, so traceforge does not schedule it.
+            let fetched = block_on_tokio(storage.fetch_until_deadline(
+                &topition,
+                0,
+                0,
+                i32::MAX as u32,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_millis(1000),
+            ))
+            .expect("fetch");
+            let fetched_records: usize = fetched
+                .batches
+                .iter()
+                .map(|batch| batch.record_count as usize)
+                .sum();
 
-        // Regression guard for the fixed bug: a `DuplicateSequenceNumber`
-        // response must mean the data really is there. It used to not,
-        // when the record write itself was what failed after the
-        // sequence number had already been durably committed by a
-        // separate write.
-        assert_eq!(
-            fetched_records, client_believes_durable,
-            "every batch the client believes is durable must actually be retrievable"
-        );
-    });
+            // Regression guard for the fixed bug: a `DuplicateSequenceNumber`
+            // response must mean the data really is there. It used to not,
+            // when the record write itself was what failed after the
+            // sequence number had already been durably committed by a
+            // separate write.
+            assert_eq!(
+                fetched_records, client_believes_durable,
+                "every batch the client believes is durable must actually be retrievable"
+            );
+        },
+    );
 
     println!(
         "traceforge stats: execs={} blocked={}",
@@ -491,161 +496,168 @@ fn record_write_failure_never_causes_silent_data_loss() {
 /// pass.
 #[test]
 fn end_txn_marker_write_failure_completes_transaction_anyway() {
-    let stats = verify(Config::builder().build(), || {
-        let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
-        let storage: ArcDynStorage = Arc::new(Box::new(
-            DynoStore::new("spike", 111, object_store.clone())
-                .expect("dynostore")
-                .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
-                .schemas(None)
-                .lake(None),
-        ));
+    let stats = verify(
+        Config::builder().with_stack_size(STACK_SIZE).build(),
+        || {
+            let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
+            let storage: ArcDynStorage = Arc::new(Box::new(
+                DynoStore::new("spike", 111, object_store.clone())
+                    .expect("dynostore")
+                    .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
+                    .schemas(None)
+                    .lake(None),
+            ));
 
-        let topic = alphanumeric_string(15);
-        _ = future::block_on(
-            storage.create_topic(
-                CreatableTopic::default()
-                    .name(topic.clone())
-                    .num_partitions(2)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into())),
-                false,
-            ),
-        )
-        .expect("create topic");
+            let topic = alphanumeric_string(15);
+            _ = future::block_on(
+                storage.create_topic(
+                    CreatableTopic::default()
+                        .name(topic.clone())
+                        .num_partitions(2)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                ),
+            )
+            .expect("create topic");
 
-        let transaction_id = alphanumeric_string(15);
-        let producer = future::block_on(storage.init_producer(
-            Some(&transaction_id),
-            10_000,
-            Some(-1),
-            Some(-1),
-        ))
-        .expect("init producer");
+            let transaction_id = alphanumeric_string(15);
+            let producer = future::block_on(storage.init_producer(
+                Some(&transaction_id),
+                10_000,
+                Some(-1),
+                Some(-1),
+            ))
+            .expect("init producer");
 
-        let topition0 = Topition::new(topic.clone(), 0);
-        let topition1 = Topition::new(topic.clone(), 1);
+            let topition0 = Topition::new(topic.clone(), 0);
+            let topition1 = Topition::new(topic.clone(), 1);
 
-        _ = future::block_on(
-            storage.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                transaction_id: transaction_id.clone(),
-                producer_id: producer.id,
-                producer_epoch: producer.epoch,
-                topics: [AddPartitionsToTxnTopic::default()
-                    .name(topic.clone())
-                    .partitions(Some([0, 1].into()))]
-                .into(),
-            }),
-        )
-        .expect("add partitions");
+            _ = future::block_on(
+                storage.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: transaction_id.clone(),
+                    producer_id: producer.id,
+                    producer_epoch: producer.epoch,
+                    topics: [AddPartitionsToTxnTopic::default()
+                        .name(topic.clone())
+                        .partitions(Some([0, 1].into()))]
+                    .into(),
+                }),
+            )
+            .expect("add partitions");
 
-        // One record to each partition, both part of the transaction, both
-        // undisturbed.
-        for topition in [&topition0, &topition1] {
-            let batch = inflated::Batch::builder()
-                .record(Record::builder().value(Bytes::from_static(b"payload").into()))
-                .attributes(BatchAttribute::default().transaction(true).into())
-                .producer_id(producer.id)
-                .producer_epoch(producer.epoch)
-                .base_sequence(0)
-                .build()
-                .and_then(deflated::Batch::try_from)
-                .expect("well-formed batch");
+            // One record to each partition, both part of the transaction, both
+            // undisturbed.
+            for topition in [&topition0, &topition1] {
+                let batch = inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"payload").into()))
+                    .attributes(BatchAttribute::default().transaction(true).into())
+                    .producer_id(producer.id)
+                    .producer_epoch(producer.epoch)
+                    .base_sequence(0)
+                    .build()
+                    .and_then(deflated::Batch::try_from)
+                    .expect("well-formed batch");
 
-            _ = future::block_on(storage.produce(Some(&transaction_id), topition, batch))
-                .expect("produce");
-        }
-
-        // The `txn_end` marker-write loop iterates `produced` (a BTreeMap)
-        // in partition order, so scheduling `[false]` only reaches
-        // partition 0's marker before returning, `[true]` fails partition
-        // 0's marker directly, and `[false, true]` lets partition 0's
-        // succeed before failing partition 1's.
-        let fault_slot = (0..3).nondet();
-        match fault_slot {
-            0 => {
-                object_store.schedule_record_write(false);
-                object_store.schedule_record_write(false);
+                _ = future::block_on(storage.produce(Some(&transaction_id), topition, batch))
+                    .expect("produce");
             }
-            1 => {
-                object_store.schedule_record_write(true);
+
+            // The `txn_end` marker-write loop iterates `produced` (a BTreeMap)
+            // in partition order, so scheduling `[false]` only reaches
+            // partition 0's marker before returning, `[true]` fails partition
+            // 0's marker directly, and `[false, true]` lets partition 0's
+            // succeed before failing partition 1's.
+            let fault_slot = (0..3).nondet();
+            match fault_slot {
+                0 => {
+                    object_store.schedule_record_write(false);
+                    object_store.schedule_record_write(false);
+                }
+                1 => {
+                    object_store.schedule_record_write(true);
+                }
+                2 => {
+                    object_store.schedule_record_write(false);
+                    object_store.schedule_record_write(true);
+                }
+                _ => unreachable!(),
             }
-            2 => {
-                object_store.schedule_record_write(false);
-                object_store.schedule_record_write(true);
-            }
-            _ => unreachable!(),
-        }
 
-        let attempt1 =
-            future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, true));
-
-        if fault_slot == 0 {
-            assert_eq!(
-                attempt1.expect("undisturbed txn_end must succeed"),
-                ErrorCode::None
-            );
-            cover!("no_fault");
-        } else {
-            assert!(
-                attempt1.is_err(),
-                "the faulted marker write must surface as an error"
-            );
-            cover!(if fault_slot == 1 {
-                "first_marker_faulted"
-            } else {
-                "second_marker_faulted"
-            });
-
-            // The client retries, as it must on an ambiguous EndTxn error.
-            let attempt2 = future::block_on(storage.txn_end(
+            let attempt1 = future::block_on(storage.txn_end(
                 &transaction_id,
                 producer.id,
                 producer.epoch,
                 true,
-            ))
-            .expect("txn_end retry");
-            assert_eq!(
-                attempt2,
-                ErrorCode::None,
-                "the retry must report the transaction as committed"
-            );
-        }
+            ));
 
-        // Regression guard for the fixed bug: `txn_end` having reported
-        // the transaction committed must mean every partition it touched
-        // has both its data and its end-of-transaction marker -
-        // otherwise a `read_committed` consumer of that partition can
-        // never learn the transaction concluded.
-        for topition in [&topition0, &topition1] {
-            // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
-            // finished, so traceforge does not schedule it.
-            let fetched = block_on_tokio(storage.fetch_until_deadline(
-                topition,
-                0,
-                0,
-                i32::MAX as u32,
-                IsolationLevel::ReadUncommitted,
-                Instant::now() + Duration::from_millis(1000),
-            ))
-            .expect("fetch");
+            if fault_slot == 0 {
+                assert_eq!(
+                    attempt1.expect("undisturbed txn_end must succeed"),
+                    ErrorCode::None
+                );
+                cover!("no_fault");
+            } else {
+                assert!(
+                    attempt1.is_err(),
+                    "the faulted marker write must surface as an error"
+                );
+                cover!(if fault_slot == 1 {
+                    "first_marker_faulted"
+                } else {
+                    "second_marker_faulted"
+                });
 
-            let has_control_marker = fetched.batches.iter().any(|batch| {
-                BatchAttribute::try_from(batch.attributes)
-                    .map(|attributes| attributes.control)
-                    .unwrap_or(false)
-            });
+                // The client retries, as it must on an ambiguous EndTxn error.
+                let attempt2 = future::block_on(storage.txn_end(
+                    &transaction_id,
+                    producer.id,
+                    producer.epoch,
+                    true,
+                ))
+                .expect("txn_end retry");
+                assert_eq!(
+                    attempt2,
+                    ErrorCode::None,
+                    "the retry must report the transaction as committed"
+                );
+            }
 
-            assert!(
-                has_control_marker,
-                "{topition:?} is part of a transaction reported committed \
+            // Regression guard for the fixed bug: `txn_end` having reported
+            // the transaction committed must mean every partition it touched
+            // has both its data and its end-of-transaction marker -
+            // otherwise a `read_committed` consumer of that partition can
+            // never learn the transaction concluded.
+            for topition in [&topition0, &topition1] {
+                // The fetch needs a Tokio runtime for its read deadline. It runs after the model has
+                // finished, so traceforge does not schedule it.
+                let fetched = block_on_tokio(storage.fetch_until_deadline(
+                    topition,
+                    0,
+                    0,
+                    i32::MAX as u32,
+                    IsolationLevel::ReadUncommitted,
+                    Instant::now() + Duration::from_millis(1000),
+                ))
+                .expect("fetch");
+
+                let has_control_marker = fetched.batches.iter().any(|batch| {
+                    BatchAttribute::try_from(batch.attributes)
+                        .map(|attributes| attributes.control)
+                        .unwrap_or(false)
+                });
+
+                assert!(
+                    has_control_marker,
+                    "{topition:?} is part of a transaction reported committed \
                  but has no end-of-transaction marker"
-            );
-        }
+                );
+            }
 
-        cover!("all_partitions_marked");
-    });
+            cover!("all_partitions_marked");
+        },
+    );
 
     println!(
         "traceforge stats: execs={} blocked={}",
@@ -664,89 +676,105 @@ fn end_txn_marker_write_failure_completes_transaction_anyway() {
 /// rejected with `InvalidTxnState`, and a commit retry still completes.
 #[test]
 fn end_txn_retry_with_opposite_decision_is_rejected() {
-    _ = verify(Config::builder().build(), || {
-        let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
-        let storage: ArcDynStorage = Arc::new(Box::new(
-            DynoStore::new("spike", 111, object_store.clone())
-                .expect("dynostore")
-                .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
-                .schemas(None)
-                .lake(None),
-        ));
+    _ = verify(
+        Config::builder().with_stack_size(STACK_SIZE).build(),
+        || {
+            let object_store = Arc::new(FaultInjectingObjectStore::new(InMemory::new()));
+            let storage: ArcDynStorage = Arc::new(Box::new(
+                DynoStore::new("spike", 111, object_store.clone())
+                    .expect("dynostore")
+                    .advertised_listener(Url::parse("tcp://127.0.0.1/").expect("url"))
+                    .schemas(None)
+                    .lake(None),
+            ));
 
-        let topic = alphanumeric_string(15);
-        _ = future::block_on(
-            storage.create_topic(
-                CreatableTopic::default()
-                    .name(topic.clone())
-                    .num_partitions(2)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into())),
-                false,
-            ),
-        )
-        .expect("create topic");
+            let topic = alphanumeric_string(15);
+            _ = future::block_on(
+                storage.create_topic(
+                    CreatableTopic::default()
+                        .name(topic.clone())
+                        .num_partitions(2)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                ),
+            )
+            .expect("create topic");
 
-        let transaction_id = alphanumeric_string(15);
-        let producer = future::block_on(storage.init_producer(
-            Some(&transaction_id),
-            10_000,
-            Some(-1),
-            Some(-1),
-        ))
-        .expect("init producer");
-
-        _ = future::block_on(
-            storage.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                transaction_id: transaction_id.clone(),
-                producer_id: producer.id,
-                producer_epoch: producer.epoch,
-                topics: [AddPartitionsToTxnTopic::default()
-                    .name(topic.clone())
-                    .partitions(Some([0, 1].into()))]
-                .into(),
-            }),
-        )
-        .expect("add partitions");
-
-        for partition in 0..2 {
-            let batch = inflated::Batch::builder()
-                .record(Record::builder().value(Bytes::from_static(b"payload").into()))
-                .attributes(BatchAttribute::default().transaction(true).into())
-                .producer_id(producer.id)
-                .producer_epoch(producer.epoch)
-                .base_sequence(0)
-                .build()
-                .and_then(deflated::Batch::try_from)
-                .expect("well-formed batch");
-
-            _ = future::block_on(storage.produce(
+            let transaction_id = alphanumeric_string(15);
+            let producer = future::block_on(storage.init_producer(
                 Some(&transaction_id),
-                &Topition::new(topic.clone(), partition),
-                batch,
+                10_000,
+                Some(-1),
+                Some(-1),
             ))
-            .expect("produce");
-        }
+            .expect("init producer");
 
-        // Partition 0's marker lands, partition 1's fails: the transaction is
-        // left in `PrepareCommit`.
-        object_store.schedule_record_write(false);
-        object_store.schedule_record_write(true);
+            _ = future::block_on(
+                storage.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                    transaction_id: transaction_id.clone(),
+                    producer_id: producer.id,
+                    producer_epoch: producer.epoch,
+                    topics: [AddPartitionsToTxnTopic::default()
+                        .name(topic.clone())
+                        .partitions(Some([0, 1].into()))]
+                    .into(),
+                }),
+            )
+            .expect("add partitions");
 
-        _ = future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, true))
+            for partition in 0..2 {
+                let batch = inflated::Batch::builder()
+                    .record(Record::builder().value(Bytes::from_static(b"payload").into()))
+                    .attributes(BatchAttribute::default().transaction(true).into())
+                    .producer_id(producer.id)
+                    .producer_epoch(producer.epoch)
+                    .base_sequence(0)
+                    .build()
+                    .and_then(deflated::Batch::try_from)
+                    .expect("well-formed batch");
+
+                _ = future::block_on(storage.produce(
+                    Some(&transaction_id),
+                    &Topition::new(topic.clone(), partition),
+                    batch,
+                ))
+                .expect("produce");
+            }
+
+            // Partition 0's marker lands, partition 1's fails: the transaction is
+            // left in `PrepareCommit`.
+            object_store.schedule_record_write(false);
+            object_store.schedule_record_write(true);
+
+            _ = future::block_on(storage.txn_end(
+                &transaction_id,
+                producer.id,
+                producer.epoch,
+                true,
+            ))
             .expect_err("faulted marker write must surface as an error");
 
-        let opposite =
-            future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, false));
-        assert_matches!(
-            opposite,
-            Err(nisshi_storage::Error::Api(ErrorCode::InvalidTxnState))
-        );
+            let opposite = future::block_on(storage.txn_end(
+                &transaction_id,
+                producer.id,
+                producer.epoch,
+                false,
+            ));
+            assert_matches!(
+                opposite,
+                Err(nisshi_storage::Error::Api(ErrorCode::InvalidTxnState))
+            );
 
-        let retry =
-            future::block_on(storage.txn_end(&transaction_id, producer.id, producer.epoch, true))
-                .expect("commit retry");
-        assert_eq!(retry, ErrorCode::None);
-    });
+            let retry = future::block_on(storage.txn_end(
+                &transaction_id,
+                producer.id,
+                producer.epoch,
+                true,
+            ))
+            .expect("commit retry");
+            assert_eq!(retry, ErrorCode::None);
+        },
+    );
 }
