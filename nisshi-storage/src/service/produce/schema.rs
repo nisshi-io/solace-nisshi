@@ -136,7 +136,7 @@ mod tests {
     use super::*;
     use crate::{
         Result,
-        service::produce::test_support::{RecordingPartitions, error_code, partition_produce},
+        service::produce::tests::support::{RecordingPartitions, error_code, partition_produce},
     };
 
     fn person_schemas() -> Result<Registry> {

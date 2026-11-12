@@ -190,7 +190,7 @@ mod tests {
     use super::*;
     use crate::service::{
         counting_storage::{CountingStorage, Listing, Lookup},
-        produce::test_support::{INDEX, error_code, partition_produce},
+        produce::tests::support::{INDEX, error_code, partition_produce},
     };
 
     /// A partition service that answers every partition with `error_code`, and counts the

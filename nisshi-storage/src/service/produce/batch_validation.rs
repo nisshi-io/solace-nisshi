@@ -384,7 +384,7 @@ mod tests {
         use super::*;
         use crate::{
             TopicConfiguration,
-            service::produce::test_support::{
+            service::produce::tests::support::{
                 INDEX, RecordingPartitions, error_code, partition_produce,
             },
         };

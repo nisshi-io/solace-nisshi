@@ -26,15 +26,15 @@ use nisshi_sans_io::{
 };
 use rama::Service;
 
-use super::{PartitionProduce, TopicConfiguration, admission::Admission, response};
+use super::super::{PartitionProduce, TopicConfiguration, admission::Admission, response};
 
 /// The index of the partition in every request that [`partition_produce`] builds.
-pub(super) const INDEX: i32 = 3;
+pub(in super::super) const INDEX: i32 = 3;
 
 /// A partition service that records the batch of each request that it serves, and answers the
 /// partition with `ErrorCode::None`.
 #[derive(Clone, Debug)]
-pub(super) struct RecordingPartitions<B> {
+pub(in super::super) struct RecordingPartitions<B> {
     served: Arc<Mutex<Vec<B>>>,
 }
 
@@ -48,7 +48,7 @@ impl<B> Default for RecordingPartitions<B> {
 
 impl<B: Clone> RecordingPartitions<B> {
     /// Returns the batch of each request that the service has served, in order.
-    pub(super) fn served(&self) -> Vec<B> {
+    pub(in super::super) fn served(&self) -> Vec<B> {
         self.served
             .lock()
             .expect("a test thread panicked while it held the lock")
@@ -74,7 +74,7 @@ where
 }
 
 /// Returns the configuration of a topic that sets each of `configs`, a name and its value.
-pub(super) fn configuration(configs: &[(&str, &str)]) -> Arc<TopicConfiguration> {
+pub(in super::super) fn configuration(configs: &[(&str, &str)]) -> Arc<TopicConfiguration> {
     let configs = configs
         .iter()
         .map(|(name, value)| {
@@ -96,7 +96,10 @@ pub(super) fn configuration(configs: &[(&str, &str)]) -> Arc<TopicConfiguration>
 
 /// Returns a request for partition [`INDEX`] of the topic `person`, with `batch`, in a topic that
 /// sets `configs`.
-pub(super) fn partition_produce<B>(batch: B, configs: &[(&str, &str)]) -> PartitionProduce<B> {
+pub(in super::super) fn partition_produce<B>(
+    batch: B,
+    configs: &[(&str, &str)],
+) -> PartitionProduce<B> {
     PartitionProduce {
         topic: "person".into(),
         index: INDEX,
@@ -108,6 +111,6 @@ pub(super) fn partition_produce<B>(batch: B, configs: &[(&str, &str)]) -> Partit
 }
 
 /// The error code of `response`.
-pub(super) fn error_code(response: &PartitionProduceResponse) -> ErrorCode {
+pub(in super::super) fn error_code(response: &PartitionProduceResponse) -> ErrorCode {
     ErrorCode::try_from(response.error_code).expect("the response has a known error code")
 }
