@@ -6021,7 +6021,6 @@ dependencies = [
  "rama",
  "rand 0.10.3",
  "rcgen",
- "regex",
  "rsasl",
  "rustls",
  "serde",

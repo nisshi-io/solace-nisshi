@@ -60,7 +60,6 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 rama.workspace = true
 rand.workspace = true
-regex.workspace = true
 rsasl.workspace = true
 rustls.workspace = true
 serde.workspace = true
