@@ -4768,12 +4768,15 @@ impl Storage for DynoStore {
                 let mut responses = vec![];
 
                 for topic in topics {
+                    // A failed read is an error of the whole call, as it is for the listing of
+                    // all topics below. A topic-level code would let a caller take a failed
+                    // read for a topic that does not exist.
                     let response = match self
                         .topic_metadata(topic)
                         .await
-                        .inspect_err(|error| error!(?error))
+                        .inspect_err(|error| error!(?error))?
                     {
-                        Ok(Some(topic_metadata)) => {
+                        Some(topic_metadata) => {
                             let name = Some(topic_metadata.topic.name.to_owned());
                             let error_code = ErrorCode::None.into();
                             let topic_id = Some(topic_metadata.id.into_bytes());
@@ -4812,33 +4815,11 @@ impl Storage for DynoStore {
                                 .topic_authorized_operations(Some(-2147483648))
                         }
 
-                        Ok(None) => MetadataResponseTopic::default()
+                        None => MetadataResponseTopic::default()
                             .error_code(ErrorCode::UnknownTopicOrPartition.into())
                             .name(match topic {
                                 TopicId::Name(name) => Some(name.into()),
                                 TopicId::Id(_) => None,
-                            })
-                            .topic_id(Some(match topic {
-                                TopicId::Name(_) => NULL_TOPIC_ID,
-                                TopicId::Id(id) => id.into_bytes(),
-                            }))
-                            .is_internal(Some(false))
-                            .partitions(Some([].into()))
-                            .topic_authorized_operations(Some(-2147483648)),
-
-                        Err(error) => MetadataResponseTopic::default()
-                            .error_code(
-                                match topic {
-                                    TopicId::Id(_) => {
-                                        nisshi_storage::topic_id_query_error_code(&error)
-                                    }
-                                    TopicId::Name(_) => ErrorCode::UnknownServerError,
-                                }
-                                .into(),
-                            )
-                            .name(match topic {
-                                TopicId::Name(name) => Some(name.into()),
-                                TopicId::Id(_) => Some("".into()),
                             })
                             .topic_id(Some(match topic {
                                 TopicId::Name(_) => NULL_TOPIC_ID,

@@ -47,6 +47,7 @@ pub mod fetch_deadline;
 pub mod fetch_empty_records;
 pub mod fetch_header_bytes;
 pub mod fetch_max_wait;
+pub mod fetch_metadata_storage_error;
 pub mod fetch_storage_error;
 pub mod fetch_unknown_partition;
 pub mod fetch_wire;
