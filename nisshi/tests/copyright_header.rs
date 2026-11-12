@@ -54,6 +54,14 @@ fn source_files(workspace: &Path) -> Vec<String> {
 fn every_source_file_starts_with_the_copyright_header() {
     // This crate's manifest folder is one level below the workspace root.
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    // The test lists files with git, so it checks only a git checkout. The crate that crates.io
+    // serves includes this test but has no `.git` above it. In a linked worktree `.git` is a file,
+    // so the test checks that `.git` exists, not that it is a folder.
+    if !workspace.join(".git").exists() {
+        return;
+    }
+
     let files = source_files(&workspace);
     assert!(!files.is_empty(), "`git ls-files` listed no source file");
 
