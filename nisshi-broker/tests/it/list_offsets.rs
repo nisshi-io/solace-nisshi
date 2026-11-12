@@ -1385,7 +1385,6 @@ mod turso {
         super::multi_record_batch(broker).await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table, which a lookup of a topic by name reads"]
     #[tokio::test]
     async fn no_timestamp_batch() -> Result<()> {
         let _guard = init_tracing()?;
