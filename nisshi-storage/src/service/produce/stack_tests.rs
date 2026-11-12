@@ -159,3 +159,20 @@ async fn a_rejected_batch_for_a_missing_topic_answers_unknown_topic_or_partition
 
     Ok(())
 }
+
+/// A topic that storage does not hold is answered before the batch is decoded, so that a produce
+/// to it does not wait for the decoded-bytes budget.
+#[tokio::test]
+async fn a_valid_batch_for_a_missing_topic_does_not_reach_storage() -> Result<()> {
+    let storage = CountingStorage::new(Listing::Topics, &[]);
+
+    let response = produce(&storage, 0, batch(-1)?).await?;
+
+    assert_matches!(
+        ErrorCode::try_from(response.error_code)?,
+        ErrorCode::UnknownTopicOrPartition
+    );
+    assert!(storage.produced().is_empty());
+
+    Ok(())
+}

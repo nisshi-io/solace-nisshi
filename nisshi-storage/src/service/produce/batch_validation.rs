@@ -177,6 +177,19 @@ where
     ) -> Result<Self::Output, Self::Error> {
         let (request, batches) = request.take_batch();
 
+        // Kafka looks up the partition before it validates a batch, so a topic that storage does
+        // not hold is answered before the batch is checked, decoded or validated against a
+        // schema. Storage answers the same for a topic that it does not hold.
+        if !request.configuration.exists() {
+            return Ok(response::partition_error(
+                request.index,
+                ErrorCode::UnknownTopicOrPartition,
+            )
+            .error_message(Some(
+                "this server does not host this topic-partition".into(),
+            )));
+        }
+
         // Kafka allows exactly one batch per partition from Produce v3, the
         // first version that carries record batches, which is the only format
         // this broker decodes. Kafka checks the count before it validates any
@@ -215,15 +228,8 @@ where
         // records land. See [UnifiedLog.scala#L1181-L1187].
         //
         // [UnifiedLog.scala#L1181-L1187]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1181-L1187
-        //
-        // The check runs only for a topic that exists. Kafka looks up the partition before it
-        // checks the size, and storage answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic that it
-        // does not hold before it checks the size too.
-        if request.configuration.exists()
-            && let Err(error) = max_message_bytes::ensure_batch_fits(
-                &batch,
-                request.configuration.max_message_bytes(),
-            )
+        if let Err(error) =
+            max_message_bytes::ensure_batch_fits(&batch, request.configuration.max_message_bytes())
         {
             return Ok(response::produce_failure(
                 &request.topic,
@@ -452,7 +458,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_batch_over_max_message_bytes_for_an_unknown_topic_is_passed_on() {
+        async fn a_batch_for_an_unknown_topic_is_answered_before_the_batch_is_checked() {
             let inner = RecordingPartitions::<deflated::Batch>::default();
             let batch = valid_batch();
 
@@ -477,12 +483,13 @@ mod tests {
                 batch: vec![batch.clone()],
             };
 
-            let Ok(_) = BatchValidationLayer::new()
+            let Ok(response) = BatchValidationLayer::new()
                 .layer(inner.clone())
                 .serve(request)
                 .await;
 
-            assert_eq!(vec![batch], inner.served());
+            assert_eq!(ErrorCode::UnknownTopicOrPartition, error_code(&response));
+            assert!(inner.served().is_empty());
         }
 
         #[tokio::test]
