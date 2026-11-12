@@ -44,6 +44,22 @@ A broker can be started by simply running `nisshi`, all options have defaults. N
 loading any found in `.env`. An [example.env](../example.env) is provided as part of the distribution
 and can be copied into `.env` for local modification. Sample schemas can be found in [etc/schema](../etc/schema), used in the examples.
 
+The broker's URL options (`--listener-url`, `--advertised-listener-url`, `--storage-engine`,
+`--schema-registry`, `--otlp-endpoint-url`, and a data lake's `--location` and `--catalog`) expand
+every `${NAME}` in their value, whether it came from the command line or from the option's
+environment variable, to the value of the environment variable `NAME`. `proxy`, `generator` and
+`perf` expand their URL options the same way, and `cat` its `--schema-registry`. The `--broker`
+option of `topic`, `user` and `cat` is not expanded. A `NAME` that is not set stops the command
+with an error that names it, and exit status 2. Only the `${NAME}` form expands:
+`${NAME:-default}` is read as the name `NAME:-default`. The `.env` loader expands a double-quoted
+or unquoted value itself, before the broker reads it, and it replaces a name that is not set with
+an empty string. Single-quote a value in `.env` to have the broker expand it and refuse an unset
+name.
+
+```shell
+nisshi broker --advertised-listener-url 'tcp://${POD_IP}:9092'
+```
+
 If an Apache Avro, Protobuf or JSON schema has been assigned to a topic, the
 broker will reject any messages that are invalid. Schema backed topics are written
 as Apache Parquet when the broker runs with the `parquet` subcommand, for example
@@ -156,8 +172,8 @@ Results in the following output:
 
 The client tools (`topic`, `cat`, `user`, `generator`, `perf`) are meant to be driven by
 scripts as well as by people. The exit codes below apply to these five tools. `nisshi broker` and
-`nisshi proxy` are servers: they exit with 0 after a clean stop and with 1 when they fail, as
-they always have.
+`nisshi proxy` are servers: they exit with 0 after a clean stop, with 2 when their command line is wrong, and with 1 when
+they fail, as they always have.
 
 ### `--output json`
 
