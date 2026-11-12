@@ -76,7 +76,8 @@ use nisshi_storage::{
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -872,6 +873,8 @@ impl Engine {
                 .await
                 .inspect(|store| debug!(?store))
                 .inspect_err(|err| debug!(?err))?;
+            } else {
+                lake_skip::warn_once(topition.topic());
             }
         }
 

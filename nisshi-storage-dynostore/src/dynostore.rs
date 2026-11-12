@@ -71,8 +71,8 @@ use nisshi_storage::{
     ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate_produced, max_message_bytes, offload,
-    producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate_produced, lake_skip, max_message_bytes,
+    offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -3628,11 +3628,14 @@ impl DynoStore {
             // A topic that the produce service does not validate does not reach the lake. The
             // lake converts each record through the schema, and a record that breaks the schema
             // fails that conversion after the offsets below are reserved.
-            let inflated = if !attributes.control
-                && self.lake.is_some()
-                && TopicConfiguration::described(topition.topic(), config.clone())?
-                    .validates_schema()
-            {
+            let validates_schema =
+                TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema();
+
+            if !attributes.control && self.lake.is_some() && !validates_schema {
+                lake_skip::warn_once(topition.topic());
+            }
+
+            let inflated = if !attributes.control && self.lake.is_some() && validates_schema {
                 let inflated = Self::decoded(inflated, &deflated)
                     .await
                     .inspect_err(|err| debug!(?err))?;

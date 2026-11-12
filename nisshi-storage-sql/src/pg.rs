@@ -74,8 +74,8 @@ use nisshi_storage::{
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, check_claim,
     config::{self, apply_op},
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
-    producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    parse_storage_option, producer_claim,
     read_deadline::{QueueWait as _, ReadWait},
     read_share::{ClientAdmission, ClientReadShares, FetchReadShare, ListOffsetsReadShare},
 };
@@ -3894,6 +3894,8 @@ impl Postgres {
                     config,
                 )
                 .await?;
+            } else {
+                lake_skip::warn_once(topition.topic());
             }
         }
 

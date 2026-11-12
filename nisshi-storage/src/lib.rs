@@ -208,6 +208,7 @@ mod decoded_batch_probe;
 mod decoded_budget;
 pub mod fetched;
 mod inflate;
+pub mod lake_skip;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;

@@ -77,8 +77,8 @@ use nisshi_storage::{
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
     UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
-    producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    parse_storage_option, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1222,6 +1222,8 @@ impl Delegate {
                 )
                 .await
                 .inspect_err(|err| error!(?err))?;
+            } else {
+                lake_skip::warn_once(topition.topic());
             }
         }
 
