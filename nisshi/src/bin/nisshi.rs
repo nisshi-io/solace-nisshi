@@ -1,4 +1,4 @@
-// Copyright ⓒ Solace Corporation
+// Copyright (c) Solace Corporation
 //
 // Contributors outside Solace:
 //   Shane Kennedy

@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ Solace Corporation
+-- Copyright (c) Solace Corporation
 --
 -- Contributors outside Solace:
 --   Or Hayat
