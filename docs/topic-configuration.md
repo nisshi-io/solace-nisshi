@@ -78,7 +78,8 @@ kafka-configs.sh --bootstrap-server localhost:9092 --alter --entity-type topics 
 If a topic has only the `nisshi.` key, a rollback to 0.7.0 changes the topic:
 
 - `nisshi.schema.validation=false`: PostgreSQL and libSQL validate each message again, so
-  producers can get errors.- `nisshi.lake.sink=true`: the broker stores the records in the topic again. The lake table
+  producers can get errors.
+- `nisshi.lake.sink=true`: the broker stores the records in the topic again. The lake table
   stays complete. The topic has no records for the offsets that the broker produced while
   the key applied, and Kafka consumers skip those offsets.
 - `nisshi.virtual=true`: `topic/key` is no longer a virtual topic.
