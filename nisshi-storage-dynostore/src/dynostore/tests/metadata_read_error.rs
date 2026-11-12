@@ -75,8 +75,8 @@ async fn failed_read_answers_kafka_storage_error_to_produce() -> Result<(), Erro
     Ok(())
 }
 
-/// A metadata read that fails for a topic ID answers `KAFKA_STORAGE_ERROR`, because an unknown
-/// topic ID tells a client that the topic is gone. A name keeps `UNKNOWN_SERVER_ERROR`.
+/// A metadata read that fails transiently for a topic ID answers `KAFKA_STORAGE_ERROR`, because an
+/// unknown topic ID tells a client that the topic is gone. A name keeps `UNKNOWN_SERVER_ERROR`.
 #[tokio::test]
 async fn failed_read_answers_kafka_storage_error_to_metadata_by_id() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -138,6 +138,50 @@ async fn undecodable_metadata_is_not_a_kafka_storage_error() -> Result<(), Error
         described,
         Err(Error::Api(ErrorCode::KafkaStorageError))
     ));
+
+    Ok(())
+}
+
+/// A retry does not fix metadata that can't be decoded, so a by-ID lookup that reads it answers
+/// `UNKNOWN_SERVER_ERROR`, as a lookup by name does, and not the retriable `KAFKA_STORAGE_ERROR`.
+#[tokio::test]
+async fn undecodable_metadata_answers_unknown_server_error_to_metadata_by_id() -> Result<(), Error>
+{
+    let _guard = init_tracing()?;
+
+    let object_store = InMemory::new();
+    let storage = DynoStore::new("nisshi", 111, object_store.clone())?;
+
+    _ = object_store
+        .put(
+            &Path::from("clusters/nisshi/meta.json"),
+            PutPayload::from_static(b"not json"),
+        )
+        .await?;
+
+    let id = Uuid::now_v7();
+
+    let response = storage
+        .metadata(Some(&[TopicId::from(id), TopicId::from("abc")]))
+        .await?;
+
+    assert_eq!(
+        vec![
+            (
+                i16::from(ErrorCode::UnknownServerError),
+                Some(id.into_bytes())
+            ),
+            (
+                i16::from(ErrorCode::UnknownServerError),
+                Some(NULL_TOPIC_ID)
+            ),
+        ],
+        response
+            .topics()
+            .iter()
+            .map(|topic| (topic.error_code, topic.topic_id))
+            .collect::<Vec<_>>()
+    );
 
     Ok(())
 }

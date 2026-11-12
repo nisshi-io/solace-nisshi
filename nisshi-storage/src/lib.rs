@@ -224,16 +224,19 @@ mod storage_double;
 mod topic_creation;
 mod topic_defaults;
 
-/// The error code that a storage engine answers for a topic ID when the query that looks the
-/// topic up fails, as opposed to finding no topic.
+/// Returns the error code that a storage engine answers for a topic ID when the query that
+/// looks the topic up fails with `error`, as opposed to finding no topic.
 ///
-/// `KAFKA_STORAGE_ERROR` is the code of Kafka's [`KafkaStorageException`], a retriable
-/// [`InvalidMetadataException`]. `UNKNOWN_SERVER_ERROR` is not retriable, and an unknown topic
-/// ID tells a client that the topic is gone.
+/// A transient `error` answers `KAFKA_STORAGE_ERROR`, the code of Kafka's
+/// [`KafkaStorageException`], a retriable [`InvalidMetadataException`]. A permanent one answers
+/// `UNKNOWN_SERVER_ERROR`, which clients report at once, because a retry can't fix it. See
+/// [`Error::error_code`]. An unknown topic ID would tell a client that the topic is gone.
 ///
 /// [`KafkaStorageException`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/errors/KafkaStorageException.java#L31
 /// [`InvalidMetadataException`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/errors/InvalidMetadataException.java#L22
-pub const TOPIC_ID_QUERY_FAILED: ErrorCode = ErrorCode::KafkaStorageError;
+pub fn topic_id_query_error_code(error: &Error) -> ErrorCode {
+    error.error_code(ErrorCode::KafkaStorageError)
+}
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;

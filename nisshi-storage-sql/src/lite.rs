@@ -4063,7 +4063,10 @@ impl Storage for Delegate {
                                 Err(reason) => {
                                     error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
-                                        .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
+                                        .error_code(
+                                            nisshi_storage::topic_id_query_error_code(&reason)
+                                                .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4419,7 +4422,9 @@ impl Storage for Delegate {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(nisshi_storage::TOPIC_ID_QUERY_FAILED.into())
+                                .error_code(
+                                    nisshi_storage::topic_id_query_error_code(&reason).into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -8528,8 +8533,9 @@ mod tests {
         Ok(())
     }
 
-    /// A by-ID lookup whose query fails must answer `KAFKA_STORAGE_ERROR`, which clients retry.
-    /// An answer of an unknown topic ID tells a client that the topic is gone.
+    /// A by-ID lookup whose query fails answers `KAFKA_STORAGE_ERROR`, which clients retry,
+    /// because libSQL counts every error as transient. An answer of an unknown topic ID tells a
+    /// client that the topic is gone.
     #[tokio::test]
     async fn metadata_by_id_answers_a_storage_error_when_the_query_fails() -> Result<()> {
         let _guard = init_tracing()?;
