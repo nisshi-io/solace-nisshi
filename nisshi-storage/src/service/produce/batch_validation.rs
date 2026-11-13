@@ -467,6 +467,7 @@ mod tests {
                 index: INDEX,
                 transaction_id: None,
                 admission: Default::default(),
+                deadline: crate::service::produce::deadline::Deadline::none(),
                 configuration: std::sync::Arc::new(
                     TopicConfiguration::described(
                         "person",

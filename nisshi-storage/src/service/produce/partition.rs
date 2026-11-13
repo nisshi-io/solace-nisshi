@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use super::{admission::Admission, topic_configuration::TopicConfiguration};
+use super::{admission::Admission, deadline::Deadline, topic_configuration::TopicConfiguration};
 
 /// A partition of a Produce request on its way to storage, with the configuration of its topic.
 ///
@@ -47,6 +47,9 @@ pub struct PartitionProduce<B> {
     /// The decoded-batch budget that the partitions of the request share.
     pub admission: Admission,
 
+    /// When the request must be answered, which the partitions of the request share.
+    pub(crate) deadline: Deadline,
+
     pub batch: B,
 }
 
@@ -60,6 +63,7 @@ impl<B> PartitionProduce<B> {
                 transaction_id: self.transaction_id,
                 configuration: self.configuration,
                 admission: self.admission,
+                deadline: self.deadline,
                 batch: (),
             },
             self.batch,
@@ -76,6 +80,7 @@ impl PartitionProduce<()> {
             transaction_id: self.transaction_id,
             configuration: self.configuration,
             admission: self.admission,
+            deadline: self.deadline,
             batch,
         }
     }
