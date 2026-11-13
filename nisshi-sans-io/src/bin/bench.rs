@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeSet;
+
 use bytes::{Buf, Bytes};
 use clap::Parser;
 use nisshi_sans_io::{
@@ -2054,6 +2056,10 @@ struct Arg {
 
     #[arg(long)]
     api_key: Option<i16>,
+
+    /// Print the API key of each fixture, one per line, and exit.
+    #[arg(long)]
+    list_api_keys: bool,
 }
 
 pub fn main() -> Result<()> {
@@ -2139,6 +2145,14 @@ pub fn main() -> Result<()> {
     ];
 
     let cli = Arg::parse();
+
+    if cli.list_api_keys {
+        let api_ids = benches.iter().map(Codec::api_key).collect::<BTreeSet<_>>();
+        for api_id in api_ids {
+            println!("{api_id}");
+        }
+        return Ok(());
+    }
 
     for iteration in 0..cli.iterations {
         for bench in benches
