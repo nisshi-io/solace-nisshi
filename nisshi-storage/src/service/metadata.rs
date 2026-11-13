@@ -17,17 +17,20 @@ use std::collections::BTreeSet;
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
     RequestInput, create_topics_request::CreatableTopic,
-    create_topics_response::CreatableTopicResult, topic::is_valid_topic_name,
+    create_topics_response::CreatableTopicResult, metadata_response::MetadataResponseTopic,
+    topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
 pub use auto_create_refusals::AutoCreateRefusals;
 
-use super::create_topics::validation::ValidatedCreateTopicsRequest;
+use super::{
+    create_topics::validation::ValidatedCreateTopicsRequest, fetch::storage_failure_warns_now,
+};
 use crate::{
-    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, TopicCreationConfig,
-    TopicId, authorized_operations,
+    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, StorageOperation,
+    TopicCreationConfig, TopicId, authorized_operations,
 };
 
 mod auto_create_refusals;
@@ -90,6 +93,81 @@ pub struct MetadataService<G> {
     pub auto_create_refusals: AutoCreateRefusals,
 }
 
+impl<G> MetadataService<G>
+where
+    G: Storage,
+{
+    /// Reads the metadata of `topics` from storage. When the read fails and the request names
+    /// topics, it answers each named topic with the code of the error, and keeps the brokers.
+    ///
+    /// A failed read does not close the connection, because the client sends its other requests
+    /// on it. A retriable code makes the Java client request the metadata again, as it does for
+    /// any `InvalidMetadataException`
+    /// ([`Metadata.handleMetadataResponse`]). The brokers come from a read of no topics, which
+    /// reads no topic rows. If that read fails too, this returns the original error.
+    ///
+    /// A request that names no topics asks for every topic, and this returns the original error
+    /// for it. An answer of the brokers with an empty topic list would tell the client that no
+    /// topic exists.
+    ///
+    /// [`Metadata.handleMetadataResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/Metadata.java#L530-L533
+    async fn read_metadata(&self, topics: Option<&[TopicId]>) -> Result<crate::MetadataResponse> {
+        let error = match self.storage.metadata(topics).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+
+        let named = topics.filter(|topics| !topics.is_empty());
+
+        let brokers = match named {
+            Some(_) => self.storage.metadata(Some(&[])).await,
+            None => Err(error.clone()),
+        };
+
+        let (Some(named), Ok(mut response)) = (named, brokers) else {
+            error!(?error);
+            return Err(error);
+        };
+
+        let error_code = error.error_code(ErrorCode::KafkaStorageError);
+
+        if error_code == ErrorCode::KafkaStorageError {
+            if storage_failure_warns_now(StorageOperation::Metadata) {
+                warn!(topics = named.len(), ?error, "metadata read failed");
+            } else {
+                debug!(topics = named.len(), ?error, "metadata read failed");
+            }
+        } else {
+            error!(
+                topics = named.len(),
+                ?error,
+                ?error_code,
+                "metadata read failed"
+            );
+        }
+
+        response.topics = named
+            .iter()
+            .map(|topic| {
+                let (name, topic_id) = match topic {
+                    TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
+                    TopicId::Id(id) => ("", id.into_bytes()),
+                };
+
+                MetadataResponseTopic::default()
+                    .error_code(error_code.into())
+                    .name(Some(name.into()))
+                    .topic_id(Some(topic_id))
+                    .is_internal(Some(false))
+                    .partitions(Some([].into()))
+                    .topic_authorized_operations(Some(-2147483648))
+            })
+            .collect();
+
+        Ok(response)
+    }
+}
+
 impl<G> ApiKey for MetadataService<G> {
     const KEY: i16 = MetadataRequest::KEY;
 }
@@ -120,11 +198,7 @@ where
         // [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
         let no_topics = topics.as_deref().is_some_and(<[TopicId]>::is_empty);
 
-        let mut response = self
-            .storage
-            .metadata(topics.as_deref())
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let mut response = self.read_metadata(topics.as_deref()).await?;
 
         // versions prior to 4 do not have allow_auto_topic_creation,
         // and behave as if it were true
@@ -209,11 +283,7 @@ where
             }
 
             if created {
-                response = self
-                    .storage
-                    .metadata(topics.as_deref())
-                    .await
-                    .inspect_err(|err| error!(?err))?;
+                response = self.read_metadata(topics.as_deref()).await?;
             }
         }
         // The zero ID is left out: Kafka treats it as no ID at all.

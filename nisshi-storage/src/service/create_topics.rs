@@ -375,10 +375,11 @@ where
     /// Answers a dry run of creating the topic `name`, for a `validate_only` request. The
     /// dry run checks whether the topic exists and does not create it.
     ///
-    /// An existing topic fails with [`ErrorCode::TopicAlreadyExists`]. Any other storage error
-    /// code fails with [`ErrorCode::UnknownServerError`]. A new topic succeeds with a random
-    /// topic id instead of the null topic id, because Kafka 3.9.1 answers a `validate_only`
-    /// request with a random id ([`createTopic`]). No stored topic has that id.
+    /// An existing topic fails with [`ErrorCode::TopicAlreadyExists`]. A topic-level code other
+    /// than a missing topic fails with [`ErrorCode::UnknownServerError`]. A failed read returns
+    /// the storage error. A new topic succeeds with a random topic id instead of the null topic
+    /// id, because Kafka 3.9.1 answers a `validate_only` request with a random id
+    /// ([`createTopic`]). No stored topic has that id.
     ///
     /// [`createTopic`]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java#L778
     async fn dry_run(&self, name: &str) -> Result<Uuid> {
