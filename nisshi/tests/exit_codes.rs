@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{Broker, run};
+use common::{Broker, run, schema_registry};
 use std::{net::TcpListener, thread};
 
 const TOOLS: [&[&str]; 5] = [
@@ -88,21 +88,6 @@ fn a_refusal_by_the_broker_is_4() {
         "{\"value\": 1}\n",
     );
     assert_eq!(Some(4), output.status.code(), "{output:?}");
-}
-
-/// A schema registry directory with the `taxi` schema in it, which `generator` needs, and the
-/// `file://` URL that names it relative to the directory that the command runs in.
-fn schema_registry(name: &str) -> (std::path::PathBuf, String) {
-    let registry =
-        std::env::temp_dir().join(format!("nisshi-exit-codes-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&registry).expect("registry directory");
-    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
-    let url = format!(
-        "file://./{}",
-        registry.file_name().unwrap().to_str().unwrap()
-    );
-
-    (registry, url)
 }
 
 /// A TCP port with nothing listening on it.
@@ -215,6 +200,64 @@ fn a_refused_login_ends_generator_and_perf_with_4() {
     assert!(
         String::from_utf8_lossy(&generator.stderr).contains("does not use SASL"),
         "generator: {generator:?}"
+    );
+}
+
+/// A refused produce request ends `generator` and `perf` at once, with 4, not with 0 after a
+/// panic in a producer or when the run's duration ends.
+#[test]
+fn a_refused_produce_ends_generator_and_perf_with_4() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("refused");
+
+    // Partition 7 of a topic that has one partition: the broker answers with an error code.
+    let started = std::time::Instant::now();
+    let perf = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--partition",
+            "7",
+            "--duration",
+            "30s",
+        ],
+        &[],
+    );
+    assert_eq!(Some(4), perf.status.code(), "perf: {perf:?}");
+    assert!(
+        String::from_utf8_lossy(&perf.stderr).contains("UnknownTopicOrPartition"),
+        "perf: {perf:?}"
+    );
+
+    let generator = broker.run_unaided(
+        &[
+            "generator",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "--schema-registry",
+            &schema_registry,
+            "--partition",
+            "7",
+            "--duration-seconds",
+            "30",
+        ],
+        &[],
+    );
+    _ = std::fs::remove_dir_all(&registry);
+    assert_eq!(Some(4), generator.status.code(), "generator: {generator:?}");
+    assert!(
+        String::from_utf8_lossy(&generator.stderr).contains("UnknownTopicOrPartition"),
+        "generator: {generator:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a refusal ends the run before its duration: {:?}",
+        started.elapsed()
     );
 }
 
