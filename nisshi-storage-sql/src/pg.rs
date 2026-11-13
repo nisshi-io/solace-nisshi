@@ -4910,7 +4910,10 @@ impl Storage for Postgres {
                                 Err(reason) => {
                                     error!(?reason, ?topic, topic_id = %id, "topic ID query failed, answering UNKNOWN_TOPIC_OR_PARTITION");
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            nisshi_storage::topic_id_query_error_code(&reason)
+                                                .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -5241,7 +5244,9 @@ impl Storage for Postgres {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    nisshi_storage::topic_id_query_error_code(&reason).into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -15333,5 +15338,54 @@ pub(crate) mod tests {
         );
 
         Ok(())
+    }
+
+    /// A by-ID lookup whose query fails with a permanent error must answer `UNKNOWN_SERVER_ERROR`,
+    /// which clients report at once, because a retry can't fix a missing table (SQLSTATE 42P01).
+    /// An answer of an unknown topic ID would tell a client that the topic is gone.
+    #[tokio::test]
+    async fn metadata_by_id_answers_an_unknown_server_error_when_the_query_fails_permanently()
+    -> Result<()> {
+        with_empty_database(
+            "metadata_by_id_answers_an_unknown_server_error_when_the_query_fails_permanently",
+            async |database| {
+                let storage = database.storage()?;
+                storage.ensure_schema().await?;
+
+                // The test drops the table that the lookup reads, on a database of its own, so
+                // the query fails while the connection works.
+                database.execute("drop table topic cascade").await?;
+
+                let id = Uuid::now_v7();
+
+                let topics = storage.metadata(Some(&[TopicId::from(id)])).await?.topics;
+
+                assert_eq!(
+                    vec![(
+                        i16::from(ErrorCode::UnknownServerError),
+                        Some(id.into_bytes())
+                    )],
+                    topics
+                        .iter()
+                        .map(|topic| (topic.error_code, topic.topic_id))
+                        .collect::<Vec<_>>()
+                );
+
+                let described = storage
+                    .describe_topic_partitions(Some(&[TopicId::from(id)]), i32::MAX, None)
+                    .await?;
+
+                assert_eq!(
+                    vec![i16::from(ErrorCode::UnknownServerError)],
+                    described
+                        .iter()
+                        .map(|topic| topic.error_code)
+                        .collect::<Vec<_>>()
+                );
+
+                Ok(())
+            },
+        )
+        .await
     }
 }

@@ -4826,8 +4826,16 @@ impl Storage for DynoStore {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(Some(-2147483648)),
 
-                        Err(_) => MetadataResponseTopic::default()
-                            .error_code(ErrorCode::UnknownServerError.into())
+                        Err(error) => MetadataResponseTopic::default()
+                            .error_code(
+                                match topic {
+                                    TopicId::Id(_) => {
+                                        nisshi_storage::topic_id_query_error_code(&error)
+                                    }
+                                    TopicId::Name(_) => ErrorCode::UnknownServerError,
+                                }
+                                .into(),
+                            )
                             .name(match topic {
                                 TopicId::Name(name) => Some(name.into()),
                                 TopicId::Id(_) => Some("".into()),
@@ -5001,9 +5009,15 @@ impl Storage for DynoStore {
                         .topic_authorized_operations(-2147483648),
                 ),
 
-                Err(_) => responses.push(
+                Err(error) => responses.push(
                     DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::UnknownServerError.into())
+                        .error_code(
+                            match topic {
+                                TopicId::Id(_) => nisshi_storage::topic_id_query_error_code(&error),
+                                TopicId::Name(_) => ErrorCode::UnknownServerError,
+                            }
+                            .into(),
+                        )
                         .name(match topic {
                             TopicId::Name(name) => Some(name.into()),
                             TopicId::Id(_) => None,

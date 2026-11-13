@@ -2370,7 +2370,10 @@ impl Storage for Engine {
                                 Err(reason) => {
                                     error!(?reason, ?topic, topic_id = %id, "topic ID query failed, answering UNKNOWN_TOPIC_OR_PARTITION");
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            nisshi_storage::topic_id_query_error_code(&reason)
+                                                .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -2709,7 +2712,9 @@ impl Storage for Engine {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    nisshi_storage::topic_id_query_error_code(&reason).into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

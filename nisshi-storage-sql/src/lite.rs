@@ -4067,7 +4067,10 @@ impl Storage for Delegate {
                                 Err(reason) => {
                                     error!(?reason, ?topic, topic_id = %id, "topic ID query failed, answering UNKNOWN_TOPIC_OR_PARTITION");
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            nisshi_storage::topic_id_query_error_code(&reason)
+                                                .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4423,7 +4426,9 @@ impl Storage for Delegate {
                         Err(reason) => {
                             error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    nisshi_storage::topic_id_query_error_code(&reason).into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -8524,6 +8529,62 @@ mod tests {
                 .metadata(Some(&[TopicId::from(topition.topic())]))
                 .await?
                 .topics
+                .iter()
+                .map(|topic| topic.error_code)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A by-ID lookup whose query fails answers `KAFKA_STORAGE_ERROR`, which clients retry,
+    /// because libSQL counts every error as transient. An answer of an unknown topic ID tells a
+    /// client that the topic is gone.
+    #[tokio::test]
+    async fn metadata_by_id_answers_a_storage_error_when_the_query_fails() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "metadata-by-id-query-fails-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let topic_id = engine
+            .metadata(Some(&[TopicId::from(topition.topic())]))
+            .await?
+            .topics
+            .iter()
+            .find_map(|topic| topic.topic_id)
+            .map(Uuid::from_bytes)
+            .expect("the topic's ID");
+
+        // The test drops the table that the lookup reads, so the query fails. A local SQLite
+        // file can't be made to refuse a connection, so the test makes the query fail instead.
+        execute_on(db_file, "drop table topic", ()).await?;
+
+        let topics = engine
+            .metadata(Some(&[TopicId::from(topic_id)]))
+            .await?
+            .topics;
+
+        assert_eq!(
+            vec![(
+                i16::from(ErrorCode::KafkaStorageError),
+                Some(topic_id.into_bytes())
+            )],
+            topics
+                .iter()
+                .map(|topic| (topic.error_code, topic.topic_id))
+                .collect::<Vec<_>>()
+        );
+
+        let described = engine
+            .describe_topic_partitions(Some(&[TopicId::from(topic_id)]), i32::MAX, None)
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::KafkaStorageError)],
+            described
                 .iter()
                 .map(|topic| topic.error_code)
                 .collect::<Vec<_>>()
