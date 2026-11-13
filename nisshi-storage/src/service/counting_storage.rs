@@ -111,6 +111,7 @@ pub(crate) struct CountingStorage {
     produce_failure: Option<(Topition, Error)>,
     produce_gate: Option<Arc<Semaphore>>,
     produce_all_calls: Arc<AtomicUsize>,
+    gated_partitions: Option<BTreeSet<i32>>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -189,6 +190,15 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with the gate holding only the produces to `partitions`. A produce to
+    /// another partition goes through at once.
+    pub(crate) fn with_gated_partitions(self, partitions: &[i32]) -> Self {
+        Self {
+            gated_partitions: Some(partitions.iter().copied().collect()),
+            ..self
+        }
+    }
+
     /// The number of calls to `produce_all` on this storage. A wrapper that does not forward
     /// `produce_all` calls `produce` on this storage instead, and leaves this count unchanged.
     pub(crate) fn produce_all_calls(&self) -> usize {
@@ -212,7 +222,12 @@ impl CountingStorage {
         deflated: deflated::Batch,
         inflated: Option<inflated::Batch>,
     ) -> Result<i64> {
-        if let Some(gate) = &self.produce_gate {
+        let gated = self
+            .gated_partitions
+            .as_ref()
+            .is_none_or(|partitions| partitions.contains(&topition.partition()));
+
+        if gated && let Some(gate) = &self.produce_gate {
             _ = self.parked.fetch_add(1, Ordering::SeqCst);
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
