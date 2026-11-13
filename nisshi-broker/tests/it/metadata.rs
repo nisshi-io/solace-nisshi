@@ -449,6 +449,7 @@ pub async fn topics_some_matching_by_id<G>(
     broker_id: i32,
     advertised_listener: Url,
     sc: G,
+    expected_leader_epoch: i32,
 ) -> Result<()>
 where
     G: Storage + Clone,
@@ -518,7 +519,7 @@ where
             .iter()
             .map(|partition| partition.leader_epoch)
             .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
+            .all(|leader_epoch| leader_epoch == Some(expected_leader_epoch))
     );
 
     assert!(
@@ -701,6 +702,7 @@ mod pg {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -827,6 +829,7 @@ mod in_memory {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -946,6 +949,7 @@ mod lite {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -1019,38 +1023,23 @@ mod turso {
         .await
     }
 
-    /// The shared by-ID test also checks the partition leader epoch, which Turso answers as -1.
-    /// This test checks only the lookup.
     #[tokio::test]
     async fn topics_some_matching_by_id() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster = Uuid::now_v7();
         let node = rng().random_range(0..i32::MAX);
-        let sc = storage_container(cluster, node, Url::parse("tcp://example.com:9092/")?).await?;
-        register_broker(cluster, node, &sc).await?;
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
 
-        let topic_name = alphanumeric_string(15);
-        let id = sc
-            .create_topic(
-                CreatableTopic::default()
-                    .name(topic_name.clone())
-                    .num_partitions(3)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into())),
-                false,
-            )
-            .await?;
-
-        let metadata = sc.metadata(Some([TopicId::Id(id)].as_slice())).await?;
-
-        assert_eq!(1, metadata.topics().len());
-        assert_eq!(i16::from(ErrorCode::None), metadata.topics()[0].error_code);
-        assert_eq!(Some(topic_name), metadata.topics()[0].name);
-        assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
-        Ok(())
+        // The Turso engine answers a partition leader epoch of -1.
+        super::topics_some_matching_by_id(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+            -1,
+        )
+        .await
     }
 }
 
@@ -1158,6 +1147,7 @@ mod slatedb {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
