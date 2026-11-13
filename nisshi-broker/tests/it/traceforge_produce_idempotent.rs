@@ -225,7 +225,7 @@ fn idempotent_producer_rejects_misordered_and_duplicate_batches() {
                 let deliveries = if redeliver { 2 } else { 1 };
 
                 for _ in 0..deliveries {
-                    let response = future::block_on(
+                    let response = block_on_tokio(
                         produce.serve(RequestInput {
                             request: ProduceRequest::default()
                                 .transactional_id(None)
@@ -755,7 +755,7 @@ fn idempotent_producer_survives_dropped_and_ack_lost_faults() {
                     };
                     faulty.schedule_produce(fault);
 
-                    let response = future::block_on(
+                    let response = block_on_tokio(
                         produce.serve(RequestInput {
                             request: ProduceRequest::default()
                                 .transactional_id(None)

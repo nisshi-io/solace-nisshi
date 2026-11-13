@@ -22,8 +22,12 @@ use rama::Service;
 use tracing::{error, instrument};
 
 use super::{
-    partition::PartitionProduce, rejection::storage_error_code, request_validation::ValidatedTopic,
-    response, topic_configuration::TopicConfiguration,
+    deadline::{Deadline, Stage},
+    partition::PartitionProduce,
+    rejection::storage_error_code,
+    request_validation::ValidatedTopic,
+    response,
+    topic_configuration::TopicConfiguration,
 };
 use crate::Storage;
 
@@ -75,11 +79,34 @@ where
     async fn serve(&self, topic: ValidatedTopic) -> Result<Self::Output, Self::Error> {
         let mut responses = Vec::with_capacity(topic.partitions.len());
 
-        match TopicConfiguration::read(&self.storage, &topic.name).await {
-            Ok(configuration) => {
+        // A read is safe to drop, so the deadline stops it. A partition that the deadline stopped
+        // answers `REQUEST_TIMED_OUT` and is not written.
+        let read = topic
+            .deadline
+            .bound(TopicConfiguration::read(&self.storage, &topic.name))
+            .await;
+
+        match read {
+            Err(_) => responses.extend(
+                topic
+                    .partitions
+                    .iter()
+                    .map(|partition| Deadline::timed_out(Stage::NotStarted, partition.index)),
+            ),
+
+            Ok(Ok(configuration)) => {
                 let configuration = Arc::new(configuration);
 
                 for partition in topic.partitions {
+                    // The partitions are written one after another, so the deadline can pass
+                    // while an earlier one is written. A partition that is not started then
+                    // answers `REQUEST_TIMED_OUT`, and the ones that were written keep their
+                    // offsets.
+                    if topic.deadline.has_passed() {
+                        responses.push(Deadline::timed_out(Stage::NotStarted, partition.index));
+                        continue;
+                    }
+
                     // The decoder turns a zero-length records field into `None`, so it counts as
                     // zero batches.
                     let batches = partition
@@ -95,6 +122,7 @@ where
                             transaction_id: topic.transaction_id.clone(),
                             configuration: Arc::clone(&configuration),
                             admission: topic.admission.clone(),
+                            deadline: topic.deadline,
                             batch: batches,
                         })
                         .await;
@@ -103,7 +131,7 @@ where
                 }
             }
 
-            Err(error) => {
+            Ok(Err(error)) => {
                 error!(
                     topic = topic.name,
                     ?error,

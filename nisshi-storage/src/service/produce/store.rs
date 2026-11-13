@@ -22,7 +22,12 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::instrument;
 
-use super::{partition::PartitionProduce, response, timestamps::NO_TIMESTAMP};
+use super::{
+    deadline::{Deadline, Stage},
+    partition::PartitionProduce,
+    response,
+    timestamps::NO_TIMESTAMP,
+};
 use crate::{Storage, Topition};
 
 /// A [`Service`] using its [`Storage`] taking a [`PartitionProduce`] of a validated batch and its
@@ -31,6 +36,10 @@ use crate::{Storage, Topition};
 /// The service stores the batch as it is, and gives the storage engine the decoded records through
 /// [`Storage::produce_inflated`], so that the engine does not decode the batch again. The steps
 /// before it validate the batch and set its timestamps.
+///
+/// A partition that the request's deadline reaches before its write starts is not written. It
+/// answers `REQUEST_TIMED_OUT`. Compared with Kafka this is looser on the start (no write begins
+/// after the deadline).
 #[derive(Clone, Debug)]
 pub struct StorePartitionService<G> {
     storage: G,
@@ -58,6 +67,11 @@ where
         request: PartitionProduce<(deflated::Batch, inflated::Batch)>,
     ) -> Result<Self::Output, Self::Error> {
         let (request, (batch, inflated)) = request.take_batch();
+
+        // The decode and the wait for the decoded-bytes budget take time too.
+        if request.deadline.has_passed() {
+            return Ok(Deadline::timed_out(Stage::NotStarted, request.index));
+        }
 
         // Kafka returns -1 as `log_append_time_ms` for a `CreateTime` topic. For a `LogAppendTime`
         // topic the timestamp step stamped the batch with the time of the append, as its
