@@ -30,20 +30,30 @@ static DETACHED_WRITES: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         .build()
 });
 
+/// The set that every service of this process shares, as the decoded-bytes budget is shared. The
+/// broker builds a produce service for each connection, and a retry usually arrives on a new one.
+static PROCESS: LazyLock<Detached> = LazyLock::new(Detached::default);
+
 /// The partitions that have a write which the broker left running when it answered the write's
 /// request at its deadline, each with how many such writes it has.
 ///
 /// A produce to one of these partitions is not started. The storage engine answers the retry of
 /// an idempotent batch as a duplicate only after the first write advanced the producer's
 /// sequence, so a retry that starts while the first write runs is stored a second time, and a
-/// later batch could be stored ahead of the one that still runs. The set is the service's own, so
-/// it covers the requests that this process serves and not a retry that reaches another node.
+/// later batch could be stored ahead of the one that still runs. The set is the process's, so
+/// it covers the requests that this process serves, on any connection, and not a retry that reaches
+/// another node.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Detached {
     writes: Arc<Mutex<HashMap<Topition, usize>>>,
 }
 
 impl Detached {
+    /// Returns the set that all services of this process share.
+    pub(super) fn process() -> Self {
+        PROCESS.clone()
+    }
+
     /// Returns whether a write that the deadline left running is still in flight for `topition`.
     pub(super) fn contains(&self, topition: &Topition) -> bool {
         self.writes
