@@ -70,6 +70,9 @@ pub(super) enum Stage {
     NotStarted,
     /// The storage write had started, and the broker answered without its result.
     Writing,
+    /// The broker did not start a write, because an earlier write to the partition that its
+    /// request left running has not ended.
+    InFlight,
 }
 
 impl Stage {
@@ -77,6 +80,7 @@ impl Stage {
         match self {
             Self::NotStarted => "not_started",
             Self::Writing => "writing",
+            Self::InFlight => "in_flight",
         }
     }
 
@@ -84,6 +88,7 @@ impl Stage {
         match self {
             Self::NotStarted => NOT_STARTED,
             Self::Writing => WRITING,
+            Self::InFlight => IN_FLIGHT,
         }
     }
 }
@@ -159,14 +164,5 @@ impl Deadline {
 
         response::partition_error(index, ErrorCode::RequestTimedOut)
             .error_message(Some(stage.message().to_owned()))
-    }
-
-    /// Returns the response for the partition at `index` that the broker did not start, because a
-    /// write to the partition that an earlier request left running has not ended, and counts it.
-    pub(super) fn in_flight(index: i32) -> PartitionProduceResponse {
-        DEADLINE_EXCEEDED.add(1, &[KeyValue::new("stage", Stage::NotStarted.as_str())]);
-
-        response::partition_error(index, ErrorCode::RequestTimedOut)
-            .error_message(Some(IN_FLIGHT.to_owned()))
     }
 }

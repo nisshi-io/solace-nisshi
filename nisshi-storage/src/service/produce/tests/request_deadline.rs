@@ -233,56 +233,73 @@ async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()
     Ok(())
 }
 
-/// A retry to a partition whose write the broker still runs does not start a second write. It
-/// answers at once, and the storage sees one produce. After the first write ends, the partition
-/// takes writes again.
+/// A retry to a partition whose write the broker still runs does not start a second write, also
+/// when it arrives on another connection. The broker builds a service for each connection, so the
+/// retry goes through a second service over the same storage. It answers at once, and the storage
+/// sees one produce for the partition. After the first write ends, the partition takes writes
+/// again.
 #[tokio::test(start_paused = true)]
 async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() -> Result<()> {
     let (storage, gate) = stalled();
-    let service = service(&storage);
+    let connection = service(&storage);
+    let other_connection = service(&storage);
 
-    let first = serve(&service, acked(&[0])?).await?;
+    let first = serve(&connection, acked(&[0])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&first)?);
 
     let retried_at = Instant::now();
-    let retry = serve(&service, acked(&[0])?).await?;
+    let retry = serve(&other_connection, acked(&[0])?).await?;
 
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&retry)?);
     assert_eq!(Duration::ZERO, retried_at.elapsed());
 
     // A partition that has no write in flight is not refused.
-    let other = serve(&service, acked(&[1])?).await?;
+    let other = serve(&other_connection, acked(&[1])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&other)?);
 
     gate.add_permits(3);
     settle().await;
 
     // One write for partition 0, and one for partition 1.
-    assert_eq!(2, storage.produced().len());
+    assert_eq!(vec![0, 1], produced_partitions(&storage));
 
-    let after = serve(&service, acked(&[0])?).await?;
+    let after = serve(&other_connection, acked(&[0])?).await?;
     assert_eq!(vec![ErrorCode::None], codes(&after)?);
-    assert_eq!(3, storage.produced().len());
+    assert_eq!(vec![0, 1, 0], produced_partitions(&storage));
 
     Ok(())
+}
+
+/// The partitions that storage got a produce for, in order.
+fn produced_partitions(storage: &CountingStorage) -> Vec<i32> {
+    storage
+        .produced()
+        .iter()
+        .map(|produced| produced.topition.partition)
+        .collect()
 }
 
 /// A `timeout_ms` under the deadline shortens it. A `timeout_ms` of zero or less leaves the
 /// deadline as it is.
 #[tokio::test(start_paused = true)]
 async fn the_request_timeout_shortens_the_deadline() -> Result<()> {
-    for (timeout_ms, expected) in [
+    for (partition, (timeout_ms, expected)) in [
         (3_000, Duration::from_secs(3)),
         (LONG, Duration::from_secs(20)),
         (0, Duration::from_secs(20)),
         (-1, Duration::from_secs(20)),
-    ] {
-        // A storage of its own, so that no write of an earlier round is in flight.
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A partition of its own for each round, because a write that an earlier round left
+        // running holds its partition for every service of the process.
+        let partition = i32::try_from(partition)?;
         let (storage, _gate) = stalled();
         let service = service(&storage);
         let started_at = Instant::now();
 
-        let responses = serve(&service, request(&[0], Ack::Leader, timeout_ms)?).await?;
+        let responses = serve(&service, request(&[partition], Ack::Leader, timeout_ms)?).await?;
 
         assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&responses)?);
         assert_eq!(expected, started_at.elapsed(), "timeout_ms {timeout_ms}");
@@ -455,10 +472,18 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     let responses = serve(&service, acked(&[0, 1, 2])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut; 3], codes(&responses)?);
 
+    // A retry meets the write that the first request left running.
+    let retry = serve(&service, acked(&[0])?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&retry)?);
+
     let mut exceeded = recorded(&provider, &exporter, "nisshi_produce_deadline_exceeded");
     exceeded.sort();
     assert_eq!(
-        vec![(stage("not_started"), 2), (stage("writing"), 1)],
+        vec![
+            (stage("in_flight"), 1),
+            (stage("not_started"), 2),
+            (stage("writing"), 1)
+        ],
         exceeded
     );
     assert_matches!(

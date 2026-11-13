@@ -68,7 +68,7 @@ where
     pub fn new(storage: G) -> Self {
         Self {
             storage,
-            detached: Detached::default(),
+            detached: Detached::process(),
         }
     }
 }
@@ -254,7 +254,7 @@ where
                 }
 
                 if self.detached.contains(&topition) {
-                    return Ok(Deadline::in_flight(request.index));
+                    return Ok(Deadline::timed_out(Stage::InFlight, request.index));
                 }
 
                 match self
