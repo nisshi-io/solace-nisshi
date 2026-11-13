@@ -40,6 +40,7 @@ pub mod describe_configs_topic_defaults;
 pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
+pub mod describe_topic_partitions_invalid_name;
 pub mod dynostore_meta_cache;
 pub mod fetch;
 pub mod fetch_after_delete_records;

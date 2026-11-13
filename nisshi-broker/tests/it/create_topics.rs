@@ -276,9 +276,9 @@ async fn invalid_name_rejected(storage: impl Storage + Clone) -> Result<(), Erro
         let describe_topics = describe_response.topics.unwrap_or_default();
         assert_eq!(1, describe_topics.len());
         assert_eq!(
-            ErrorCode::UnknownTopicOrPartition,
+            ErrorCode::InvalidTopicException,
             ErrorCode::try_from(describe_topics[0].error_code)?,
-            "name = {name:?} must never have reached storage"
+            "name = {name:?} must not have been created"
         );
     }
 
