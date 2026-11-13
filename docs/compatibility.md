@@ -47,7 +47,7 @@ client that reads the ApiVersions response first does not send such a request.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with `--num-partitions` partitions (default 1), if the client allows automatic topic creation and `--auto-create-topics-enable` is `true` (the default). If the missing topics of one request would need more than 10,000 partitions in total, the broker creates none of them, as Kafka does. Metadata does not list `__consumer_offsets`, because the broker keeps committed offsets in its storage engine, not in a topic. |
+| Metadata | 3 | 0-12 | Yes | Yes | Yes | Yes | The broker creates a missing topic, with `--num-partitions` partitions (default 1), if the client allows automatic topic creation and `--auto-create-topics-enable` is `true` (the default). If the missing topics of one request would need more than 10,000 partitions in total, the broker creates none of them, as Kafka does. The broker does not auto-create `__consumer_offsets` or the other internal topic names, see the paragraph after this table. |
 | CreateTopics | 19 | 0-7 | Yes | Yes | Yes | Yes | A topic with `num_partitions` of -1 gets `--num-partitions` partitions (default 1). |
 | DeleteTopics | 20 | 0-6 | Yes | Yes | Yes | Yes | |
 | DescribeConfigs | 32 | 0-4 | Partial | Partial | Partial | Partial | Lists every Kafka 3.9.1 topic config: each config set on the topic, and Kafka's default for each other config, as [Topic configuration](#topic-configuration) describes. The list does not include synonyms. Describing a broker, for example with `kafka-configs --describe --entity-type brokers`, returns an empty list. |
@@ -61,6 +61,18 @@ client that reads the ApiVersions response first does not send such a request.
 DescribeLogDirs (35), AlterReplicaLogDirs (34), ElectLeaders (43), AlterPartitionReassignments
 (45) and UpdateFeatures (57) manage replicas, log directories and features on Kafka brokers.
 Nisshi does not implement them, because the storage engine holds all the state.
+
+Nisshi keeps committed offsets, group state and producer IDs in its storage engine, not in topics,
+so it has no `__consumer_offsets`, `__transaction_state` or `__share_group_state` topic. Metadata
+answers UNKNOWN_TOPIC_OR_PARTITION for each of these names and does not auto-create them, where
+Kafka 3.9.1 auto-creates `__consumer_offsets` with the group coordinator's settings, such as 50
+partitions and `cleanup.policy=compact`. CreateTopics creates a topic with one of these names, as
+Kafka does, and that topic is an ordinary topic that holds none of the broker's state. Nisshi
+refuses to create `__cluster_metadata`, the name of Kafka's KRaft metadata log, as Kafka 3.9.1
+does: CreateTopics answers INVALID_REQUEST with the message `Creation of internal topic
+__cluster_metadata is prohibited.`, and Metadata answers UNKNOWN_TOPIC_OR_PARTITION and does not
+auto-create it. A `__cluster_metadata` topic that an earlier version of Nisshi created stays until
+it is deleted.
 
 ### Consumer groups
 
