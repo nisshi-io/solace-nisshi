@@ -19,7 +19,7 @@ use std::assert_matches;
 
 use bytes::Bytes;
 use nisshi_sans_io::{
-    ConfigResource, ErrorCode, NULL_TOPIC_ID,
+    ConfigResource, ErrorCode,
     record::{Record, deflated, inflated},
 };
 use nisshi_storage::{Error, Storage as _, TopicId, Topition};
@@ -75,10 +75,10 @@ async fn failed_read_answers_kafka_storage_error_to_produce() -> Result<(), Erro
     Ok(())
 }
 
-/// A metadata read that fails transiently for a topic ID answers `KAFKA_STORAGE_ERROR`, because an
-/// unknown topic ID tells a client that the topic is gone. A name keeps `UNKNOWN_SERVER_ERROR`.
+/// A metadata read that fails transiently returns the error to the caller, which answers
+/// `KAFKA_STORAGE_ERROR`, because an unknown topic ID tells a client that the topic is gone.
 #[tokio::test]
-async fn failed_read_answers_kafka_storage_error_to_metadata_by_id() -> Result<(), Error> {
+async fn failed_read_returns_a_transient_error_from_metadata() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let storage = DynoStore::new(
@@ -87,28 +87,14 @@ async fn failed_read_answers_kafka_storage_error_to_metadata_by_id() -> Result<(
         FailingObjectStore::failing_get(InMemory::new()),
     )?;
 
-    let id = Uuid::now_v7();
-
-    let response = storage
-        .metadata(Some(&[TopicId::from(id), TopicId::from("abc")]))
-        .await?;
+    let error = storage
+        .metadata(Some(&[TopicId::from(Uuid::now_v7()), TopicId::from("abc")]))
+        .await
+        .expect_err("a failed read is an error of the whole call");
 
     assert_eq!(
-        vec![
-            (
-                i16::from(ErrorCode::KafkaStorageError),
-                Some(id.into_bytes())
-            ),
-            (
-                i16::from(ErrorCode::UnknownServerError),
-                Some(NULL_TOPIC_ID)
-            ),
-        ],
-        response
-            .topics()
-            .iter()
-            .map(|topic| (topic.error_code, topic.topic_id))
-            .collect::<Vec<_>>()
+        ErrorCode::KafkaStorageError,
+        nisshi_storage::topic_id_query_error_code(&error)
     );
 
     Ok(())
@@ -142,11 +128,10 @@ async fn undecodable_metadata_is_not_a_kafka_storage_error() -> Result<(), Error
     Ok(())
 }
 
-/// A retry does not fix metadata that can't be decoded, so a by-ID lookup that reads it answers
-/// `UNKNOWN_SERVER_ERROR`, as a lookup by name does, and not the retriable `KAFKA_STORAGE_ERROR`.
+/// A retry does not fix metadata that can't be decoded, so the error that a metadata read returns
+/// for it answers `UNKNOWN_SERVER_ERROR` and not the retriable `KAFKA_STORAGE_ERROR`.
 #[tokio::test]
-async fn undecodable_metadata_answers_unknown_server_error_to_metadata_by_id() -> Result<(), Error>
-{
+async fn undecodable_metadata_returns_a_permanent_error_from_metadata() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let object_store = InMemory::new();
@@ -159,28 +144,14 @@ async fn undecodable_metadata_answers_unknown_server_error_to_metadata_by_id() -
         )
         .await?;
 
-    let id = Uuid::now_v7();
-
-    let response = storage
-        .metadata(Some(&[TopicId::from(id), TopicId::from("abc")]))
-        .await?;
+    let error = storage
+        .metadata(Some(&[TopicId::from(Uuid::now_v7()), TopicId::from("abc")]))
+        .await
+        .expect_err("an undecodable read is an error of the whole call");
 
     assert_eq!(
-        vec![
-            (
-                i16::from(ErrorCode::UnknownServerError),
-                Some(id.into_bytes())
-            ),
-            (
-                i16::from(ErrorCode::UnknownServerError),
-                Some(NULL_TOPIC_ID)
-            ),
-        ],
-        response
-            .topics()
-            .iter()
-            .map(|topic| (topic.error_code, topic.topic_id))
-            .collect::<Vec<_>>()
+        ErrorCode::UnknownServerError,
+        nisshi_storage::topic_id_query_error_code(&error)
     );
 
     Ok(())
