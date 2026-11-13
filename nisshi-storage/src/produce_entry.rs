@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,6 @@ use crate::Topition;
 #[derive(Clone, Debug)]
 pub struct ProduceEntry {
     pub topition: Topition,
-
-    /// The transaction that the batch belongs to, if any.
-    pub transaction_id: Option<String>,
 
     pub deflated: deflated::Batch,
 
