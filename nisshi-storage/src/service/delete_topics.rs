@@ -16,9 +16,10 @@ use nisshi_sans_io::{
     ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, NULL_TOPIC_ID, RequestInput,
     delete_topics_response::DeletableTopicResult,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rama::Service;
+use tokio::time::Instant;
 use tracing::{instrument, warn};
 
 use crate::{Error, Result, Storage, TopicId};
@@ -138,6 +139,10 @@ where
         let (mut error_code, mut error_message) = match self.storage.delete_topic(topic_id).await {
             Ok(error_code) => (error_code, Some(error_code.to_string())),
 
+            // An engine's own code is that topic's answer, not an outage, so it neither logs
+            // nor spends the request's time.
+            Err(Error::Api(error_code)) => (error_code, Some(error_code.to_string())),
+
             Err(error) => {
                 warn!(?topic_id, ?error, "deleting a topic failed in storage");
                 budget.after_failure();
@@ -170,7 +175,8 @@ where
 /// Storage fails a topic only at its own deadline, so a request that meets a storage outage
 /// would otherwise wait that long for each topic, and the client would give up first. After a
 /// topic fails and the request's time has passed, the topics that remain answer
-/// `REQUEST_TIMED_OUT` without a try. A request in which no topic fails never reads the time.
+/// `REQUEST_TIMED_OUT` without a try. A request in which no topic fails reads the clock once and
+/// never compares it.
 struct Budget {
     started: Instant,
     timeout: Duration,
@@ -199,10 +205,10 @@ impl Budget {
 ///
 /// A transient error answers `REQUEST_TIMED_OUT`, which Kafka answers for a deletion that did
 /// not finish in the request's time. Kafka answers it for the whole request, with the same code
-/// on every topic and no message ([`ControllerApis.deleteTopics`] and
+/// on every topic and no message ([`ControllerApis.handleDeleteTopics`] and
 /// [`DeleteTopicsRequest.getErrorResponse`]). Nisshi answers each topic by itself, because it
 /// deletes one topic after another and not in one batch. A permanent error answers
-/// `UNKNOWN_SERVER_ERROR`, and an [`Error::Api`] answers its own code.
+/// `UNKNOWN_SERVER_ERROR`. The caller handles an [`Error::Api`] before it gets here.
 ///
 /// The Java admin client does not retry a topic that answers `REQUEST_TIMED_OUT`. It completes
 /// that topic's future with a `TimeoutException` ([`KafkaAdminClient.java#L1983-L2007`]), and
@@ -217,7 +223,7 @@ impl Budget {
 /// is its `Debug` text, which can hold a connection string or a query, and a client must not
 /// see it.
 ///
-/// [`ControllerApis.deleteTopics`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L197-L219
+/// [`ControllerApis.handleDeleteTopics`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L197-L219
 /// [`DeleteTopicsRequest.getErrorResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/DeleteTopicsRequest.java#L78-L91
 /// [`KafkaAdminClient.java#L1983-L2007`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java#L1983-L2007
 /// [`ApiError.fromThrowable`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/ApiError.java#L38-L46
@@ -225,13 +231,9 @@ impl Budget {
 fn storage_error(error: &Error) -> (ErrorCode, Option<String>) {
     let error_code = error.error_code(ErrorCode::RequestTimedOut);
 
-    let error_message = if error.is_transient() {
-        Some("The storage is temporarily unavailable.".to_owned())
-    } else if error_code == ErrorCode::UnknownServerError {
-        None
-    } else {
-        Some(error_code.to_string())
-    };
+    let error_message = error
+        .is_transient()
+        .then(|| "The storage is temporarily unavailable.".to_owned());
 
     (error_code, error_message)
 }

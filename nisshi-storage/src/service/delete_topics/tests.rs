@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::assert_matches;
+use std::{assert_matches, time::Duration};
 
 use nisshi_sans_io::{
     ApiKey as _, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, Frame, Header,
@@ -201,6 +201,66 @@ async fn an_expired_timeout_answers_the_rest_without_a_try() -> Result<()> {
 
     assert_eq!(
         vec![ErrorCode::None, ErrorCode::None],
+        codes(&answers(response))?
+    );
+    assert_eq!(
+        vec![TopicId::from("a"), TopicId::from("b")],
+        storage.deleted()?
+    );
+
+    Ok(())
+}
+
+/// A failing delete that takes longer than the request's `timeout_ms` spends it, and the topic
+/// after it answers `REQUEST_TIMED_OUT` without a try. A failing delete that ends within the
+/// time leaves it, and the topic after it is still deleted.
+#[tokio::test(start_paused = true)]
+async fn a_failure_spends_the_timeout_only_when_it_outlasts_it() -> Result<()> {
+    for (timeout_ms, expected, deleted) in [
+        (
+            3_000,
+            [ErrorCode::RequestTimedOut, ErrorCode::RequestTimedOut],
+            vec![],
+        ),
+        (
+            10_000,
+            [ErrorCode::RequestTimedOut, ErrorCode::None],
+            vec![TopicId::from("a")],
+        ),
+    ] {
+        let storage = CountingStorage::failing_delete_topic("failed".into(), transient())
+            .with_delete_failure_delay(Duration::from_secs(5));
+
+        let response = serve(&storage, by_name(&["failed", "a"], timeout_ms)).await?;
+
+        assert_eq!(
+            expected.to_vec(),
+            codes(&answers(response))?,
+            "{timeout_ms}"
+        );
+        assert_eq!(deleted, storage.deleted()?, "{timeout_ms}");
+    }
+
+    Ok(())
+}
+
+/// An error that is a Kafka code is that topic's answer and not an outage, so it does not spend
+/// the request's time: the topics after it are still deleted, even with a `timeout_ms` of 0.
+#[tokio::test]
+async fn an_api_error_does_not_spend_the_timeout() -> Result<()> {
+    let storage = CountingStorage::failing_delete_topic(
+        "failed".into(),
+        Error::Api(ErrorCode::TopicAuthorizationFailed),
+    );
+
+    let response = serve(&storage, by_name(&["failed", "a", "b"], 0)).await?;
+
+    assert_eq!(
+        vec![
+            ErrorCode::TopicAuthorizationFailed,
+            ErrorCode::None,
+            ErrorCode::None
+        ],
         codes(&answers(response))?
     );
     assert_eq!(

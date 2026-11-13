@@ -104,6 +104,7 @@ pub(crate) struct CountingStorage {
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
     delete_topic_failure: Option<(TopicId, Error)>,
+    delete_topic_failure_delay: Duration,
     deleted: Arc<Mutex<Vec<TopicId>>>,
     produced: Arc<Mutex<Vec<Produced>>>,
     produce_gate: Option<Arc<Semaphore>>,
@@ -145,6 +146,15 @@ impl CountingStorage {
         Self {
             delete_topic_failure: Some((topic, error)),
             ..Self::default()
+        }
+    }
+
+    /// Returns this storage, with a failing `delete_topic` waiting `delay` before it fails, as a
+    /// call that runs into its deadline does. A test with a paused clock moves the time by it.
+    pub(crate) fn with_delete_failure_delay(self, delay: Duration) -> Self {
+        Self {
+            delete_topic_failure_delay: delay,
+            ..self
         }
     }
 
@@ -340,6 +350,7 @@ impl Storage for CountingStorage {
         if let Some((failing, error)) = &self.delete_topic_failure
             && failing == topic
         {
+            tokio::time::sleep(self.delete_topic_failure_delay).await;
             return Err(error.clone());
         }
 
