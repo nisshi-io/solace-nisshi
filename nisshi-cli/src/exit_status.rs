@@ -157,6 +157,7 @@ impl ExitStatus {
             | Error::TlsKeyUnsupportedEncryption { .. }
             | Error::TlsPrivateKey { .. }
             | Error::TlsRequiresCertAndKey
+            | Error::UnsetVariable(_)
             | Error::Url(_) => Self::Usage,
             Error::Box(_)
             | Error::DotEnv(_)

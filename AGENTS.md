@@ -139,7 +139,7 @@ A read stuck in a blocking call can't be dropped, and the channel waits for it t
 
 - Node ID is always **111** (single-node, stateless design - this is intentional)
 - Group coordination in `nisshi-broker/src/coordinator/group/`
-- `EnvVarExp<T>` wrapper allows CLI args with `${VAR}` references expanded at parse time
+- `EnvVarExp<T>` wrapper allows CLI args with `${VAR}` references expanded at parse time; a reference to an unset variable is a parse error
 - All `Error` types implement `Clone` (non-Clone errors wrapped in `Arc`)
 
 ## Checking Against Apache Kafka

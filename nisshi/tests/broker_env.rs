@@ -73,3 +73,25 @@ fn a_bad_broker_variable_fails_the_broker_with_or_without_its_name() {
         }
     }
 }
+
+/// The listener is on port 0, so a broker that ignores the unset variable never holds port 9092.
+#[test]
+fn a_reference_to_an_unset_variable_fails_the_broker_and_names_it() {
+    const UNSET: &str = "NISSHI_TEST_UNSET_VARIABLE";
+    let advertised = format!("tcp://${{{UNSET}}}:9092");
+
+    let output = run_with_env(
+        &["broker", "--listener-url", "tcp://127.0.0.1:0"],
+        &[("ADVERTISED_LISTENER_URL", advertised.as_str())],
+    );
+
+    assert_eq!(Some(2), output.status.code(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap also echoes the raw value, so the variable's name alone proves nothing.
+    assert!(
+        stderr.contains(&format!("environment variable {UNSET} is not set")),
+        "{output:?}"
+    );
+    assert!(stderr.contains("--advertised-listener-url"), "{output:?}");
+    assert_eq!("", String::from_utf8_lossy(&output.stdout), "{output:?}");
+}
