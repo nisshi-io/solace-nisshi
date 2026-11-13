@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, StorageOperation,
-    TopicCreationConfig, TopicId, authorized_operations,
+    TopicCreationConfig, TopicId, authorized_operations, topic_creation,
 };
 
 mod auto_create_refusals;
@@ -211,6 +211,7 @@ where
                 .filter(|topic| topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition))
                 .filter_map(|topic| topic.name.clone())
                 .filter(|name| is_valid_topic_name(name))
+                .filter(|name| topic_creation::auto_creatable(name))
                 .filter(|name| {
                     let refused = self.auto_create_refusals.is_refused(name);
                     if refused {
@@ -571,6 +572,35 @@ mod tests {
             assert_eq!(2, storage.listings(), "{listing:?}");
         }
 
+        Ok(())
+    }
+
+    /// `__cluster_metadata` and the internal names get no `CreateTopics`, so the storage lists
+    /// nothing for a collision check, and the other name of the request is still created.
+    #[tokio::test(start_paused = true)]
+    async fn cluster_metadata_and_the_internal_names_are_not_auto_created() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &[]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        let names = [
+            "__cluster_metadata",
+            "__consumer_offsets",
+            "__transaction_state",
+            "__share_group_state",
+            "ab",
+        ];
+
+        let expected = names
+            .iter()
+            .map(|name| match *name {
+                "ab" => (String::from("ab"), ErrorCode::None),
+                other => unknown(other),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(expected, metadata(&service, &names).await?);
+        assert_eq!(vec![String::from("ab")], storage.created());
+        assert_eq!(0, storage.listings());
         Ok(())
     }
 

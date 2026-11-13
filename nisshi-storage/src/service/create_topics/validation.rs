@@ -24,7 +24,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     DEFAULT_NUM_PARTITIONS, Error, MAX_PARTITIONS_PER_REQUEST, MAX_REPLICATION_FACTOR, Result,
-    config::validate_topic_config, max_message_bytes,
+    config::validate_topic_config, max_message_bytes, topic_creation::CLUSTER_METADATA_TOPIC_NAME,
 };
 
 /// Build the [`CreatableTopicResult`] for a topic that was rejected, either
@@ -53,12 +53,17 @@ pub(super) fn error_result(
 /// value that [`validate_topic`] substitutes for it. A topic whose
 /// `num_partitions` is otherwise invalid (`0`, or another negative value)
 /// counts as zero, so it can't pull the total under the cap; the per-topic
-/// check in `serve` rejects it on its own merits.
+/// check in `serve` rejects it on its own merits. `__cluster_metadata` counts
+/// as zero too, because Kafka removes it from the request before it counts
+/// ([`ControllerApis.createTopics`]), and [`validate_topic`] rejects it.
+///
+/// [`ControllerApis.createTopics`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L407-L424
 fn total_requested_partitions(topics: &[CreatableTopic], num_partitions: i32) -> i64 {
     topics
         .iter()
         .map(
             |topic| match (topic.assignments.as_deref(), topic.num_partitions) {
+                _ if topic.name == CLUSTER_METADATA_TOPIC_NAME => 0,
                 (Some(assignments), _) if !assignments.is_empty() => {
                     i64::try_from(assignments.len()).unwrap_or(i64::MAX)
                 }
@@ -235,6 +240,25 @@ fn validate_topic(mut topic: CreatableTopic, default_num_partitions: i32) -> Val
             error_code,
         ))
     };
+
+    // Kafka removes `__cluster_metadata` from a `CreateTopics` before its controller validates
+    // anything, also with `validate_only`, and answers it with this code and message
+    // ([`ControllerApis.createTopics`]).
+    //
+    // [`ControllerApis.createTopics`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ControllerApis.scala#L407-L437
+    if name == CLUSTER_METADATA_TOPIC_NAME {
+        return ValidatedTopic::Rejected(
+            error_result(
+                name.clone(),
+                num_partitions,
+                replication_factor,
+                ErrorCode::InvalidRequest,
+            )
+            .error_message(Some(format!(
+                "Creation of internal topic {CLUSTER_METADATA_TOPIC_NAME} is prohibited."
+            ))),
+        );
+    }
 
     if !is_valid_topic_name(&name) {
         return reject(ErrorCode::InvalidTopicException);
@@ -458,9 +482,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        assert_matches,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use nisshi_sans_io::{
@@ -718,5 +745,57 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Kafka refuses `__cluster_metadata` with `INVALID_REQUEST` and this message, and the
+    /// other topics of the request are validated as usual.
+    #[test]
+    fn cluster_metadata_is_rejected_with_invalid_request() {
+        let validated = ValidatedCreateTopicsRequest::new(
+            CreateTopicsRequest::default().topics(Some(vec![
+                topic("__cluster_metadata", -1, -1, 0),
+                topic("a", -1, -1, 0),
+            ])),
+            DEFAULT_NUM_PARTITIONS,
+        )
+        .expect("two default topics are under the cap");
+
+        let [ValidatedTopic::Rejected(result), ValidatedTopic::Valid(_)] = &validated.topics[..]
+        else {
+            panic!(
+                "only `__cluster_metadata` is rejected: {:?}",
+                validated.topics
+            );
+        };
+
+        assert_eq!("__cluster_metadata", result.name);
+        assert_matches!(
+            ErrorCode::try_from(result.error_code),
+            Ok(ErrorCode::InvalidRequest)
+        );
+        assert_eq!(
+            Some("Creation of internal topic __cluster_metadata is prohibited."),
+            result.error_message.as_deref()
+        );
+    }
+
+    /// Kafka removes `__cluster_metadata` from the request before it counts the partitions, so
+    /// the partitions it asks for can't push the request over the cap, and the other topic is
+    /// still created.
+    #[test]
+    fn cluster_metadata_does_not_count_toward_the_cap() {
+        let validated = ValidatedCreateTopicsRequest::new(
+            CreateTopicsRequest::default().topics(Some(vec![
+                topic("__cluster_metadata", 10_001, 1, 0),
+                topic("a", 10_000, 1, 0),
+            ])),
+            DEFAULT_NUM_PARTITIONS,
+        )
+        .expect("`__cluster_metadata` counts as no partitions");
+
+        assert_matches!(
+            &validated.topics[..],
+            [ValidatedTopic::Rejected(_), ValidatedTopic::Valid(_)]
+        );
     }
 }
