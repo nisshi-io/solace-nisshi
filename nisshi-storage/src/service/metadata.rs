@@ -16,9 +16,11 @@ use std::collections::BTreeSet;
 
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
-    RequestInput, create_topics_request::CreatableTopic,
-    create_topics_response::CreatableTopicResult, metadata_response::MetadataResponseTopic,
-    topic::is_valid_topic_name,
+    RequestInput,
+    create_topics_request::CreatableTopic,
+    create_topics_response::CreatableTopicResult,
+    metadata_response::MetadataResponseTopic,
+    topic::{is_internal, is_valid_topic_name},
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
@@ -336,7 +338,20 @@ where
                         topic.name.as_deref(),
                     );
 
-                    topic.topic_authorized_operations(Some(operations))
+                    // Kafka answers `is_internal` from the name alone, for a known topic
+                    // ([`KRaftMetadataCache.getTopicMetadata`]) and for an unknown name
+                    // ([`KafkaApis.getTopicMetadata`]), and false for a row without a name
+                    // ([`handleTopicMetadataRequest`]), so the service sets it here and no engine
+                    // has to know the names.
+                    //
+                    // [`KRaftMetadataCache.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/metadata/KRaftMetadataCache.scala#L256
+                    // [`KafkaApis.getTopicMetadata`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1306
+                    // [`handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1339-L1340
+                    let internal = topic.name.as_deref().is_some_and(is_internal);
+
+                    topic
+                        .is_internal(Some(internal))
+                        .topic_authorized_operations(Some(operations))
                 })
                 .collect::<Vec<_>>(),
         );

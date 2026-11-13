@@ -26,6 +26,19 @@ pub fn is_valid_topic_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
+/// Returns whether `name` is one of Kafka's internal topics: `__consumer_offsets`,
+/// `__transaction_state` or `__share_group_state` ([`Topic.isInternal`]).
+///
+/// Kafka decides this from the name alone, for a topic that exists and for one that does not.
+///
+/// [`Topic.isInternal`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/internals/Topic.java#L77-L79
+pub fn is_internal(name: &str) -> bool {
+    matches!(
+        name,
+        "__consumer_offsets" | "__transaction_state" | "__share_group_state"
+    )
+}
+
 /// Returns whether `name` has a collision character: a period or an underscore.
 ///
 /// Kafka maps '.' to '_' in per-topic metric names, so two topic names that differ only in these
