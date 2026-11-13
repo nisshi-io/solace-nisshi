@@ -168,6 +168,9 @@ impl CountingStorage {
 
     /// Records a produce of `deflated` and `inflated`, after the gate lets it through. Both
     /// produce methods call this, so that the gate holds each produce the same way.
+    ///
+    /// Returns the partition of `topition` as the offset, so that the results of produces to
+    /// different partitions differ.
     async fn produce_batch(
         &self,
         transaction_id: Option<&str>,
@@ -195,7 +198,7 @@ impl CountingStorage {
             inflated,
         });
 
-        Ok(0)
+        Ok(i64::from(topition.partition()))
     }
 
     /// Deletes the topic `name`.

@@ -19,7 +19,7 @@
 mod alter_user_scram_credentials;
 mod consumer_group_describe;
 #[cfg(test)]
-pub(crate) mod counting_storage;
+mod counting_storage;
 mod create_acls;
 mod create_topics;
 mod delete_acls;
@@ -41,6 +41,8 @@ mod list_offsets;
 mod list_partition_reassignments;
 mod metadata;
 mod produce;
+#[cfg(test)]
+mod produce_all;
 #[cfg(test)]
 mod produce_budget;
 #[cfg(test)]
