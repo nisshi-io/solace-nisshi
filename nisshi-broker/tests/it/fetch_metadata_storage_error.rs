@@ -15,7 +15,10 @@
 //! A failed read of a topic's `meta.json` on the object store engine reaches the callers of
 //! `Storage::metadata` as an error, so a Fetch answers `KAFKA_STORAGE_ERROR` in each partition at
 //! once, instead of `UNKNOWN_TOPIC_OR_PARTITION`, which tells the client the topic is gone. A
-//! topic that does not exist still answers `UNKNOWN_TOPIC_OR_PARTITION` in the response.
+//! topic that does not exist still answers `UNKNOWN_TOPIC_OR_PARTITION` in the response. The
+//! Metadata service answers each named topic with the code of the error and keeps the connection
+//! open, and the `validate_only` dry runs of CreateTopics and IncrementalAlterConfigs answer
+//! with the code of the error.
 
 use std::{
     assert_matches, fmt,
@@ -31,13 +34,16 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ErrorCode, FetchRequest, IsolationLevel, MetadataRequest, NULL_TOPIC_ID, RequestInput,
+    ConfigResource, CreateTopicsRequest, ErrorCode, FetchRequest, IncrementalAlterConfigsRequest,
+    IsolationLevel, MetadataRequest, NULL_TOPIC_ID, OpType, RequestInput,
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
+    incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, AutoCreateRefusals, Error, FetchService, FetchValidationLayer, MetadataService,
+    ArcDynStorage, AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer, Error,
+    FetchService, FetchValidationLayer, IncrementalAlterConfigsService, MetadataService,
     Storage as _, TopicCreationConfig, TopicId,
 };
 use nisshi_storage_dynostore::DynoStore;
@@ -351,33 +357,55 @@ async fn metadata_returns_the_read_error() -> Result<()> {
     Ok(())
 }
 
-/// The Metadata service answers the failed read as an error from the service, and a request for
-/// a missing topic keeps its topic-level `UNKNOWN_TOPIC_OR_PARTITION`.
-#[tokio::test]
-async fn metadata_service_answers_the_read_error() -> Result<()> {
-    let _guard = init_tracing()?;
-
+/// Returns a DynoStore on an object store whose `meta.json` reads fail, with [`TOPIC`] stored.
+///
+/// The DynoStore has not read `meta.json` yet, so the fault reaches its first read. The fault is
+/// a permission error, which a retry does not fix, when `permission_denied` is true, and an error
+/// that a retry may fix otherwise.
+async fn storage_failing_meta_reads(permission_denied: bool) -> Result<ArcDynStorage> {
     let object_store = Arc::new(FailMetaReadStore::new());
     let storage = storage_with_topic(object_store.clone()).await?;
 
-    let service = |storage| MetadataService {
+    if permission_denied {
+        object_store.deny_permission();
+    }
+    object_store.arm();
+
+    Ok(storage)
+}
+
+fn metadata_service(storage: ArcDynStorage) -> MetadataService<ArcDynStorage> {
+    MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
-    };
+    }
+}
 
-    let request = |name: &str| RequestInput {
+fn metadata_request(topics: Option<Vec<MetadataRequestTopic>>) -> RequestInput<MetadataRequest> {
+    RequestInput {
         request: MetadataRequest::default()
             .allow_auto_topic_creation(Some(false))
             .include_cluster_authorized_operations(Some(false))
             .include_topic_authorized_operations(Some(false))
-            .topics(Some(
-                [MetadataRequestTopic::default().name(Some(name.into()))].into(),
-            )),
+            .topics(topics),
         extensions: Extensions::default(),
-    };
+    }
+}
 
-    let response = service(storage).serve(request("absent")).await?;
+/// A request for a topic that does not exist keeps its topic-level `UNKNOWN_TOPIC_OR_PARTITION`.
+#[tokio::test]
+async fn metadata_service_answers_a_missing_topic_as_unknown() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = storage_with_topic(Arc::new(FailMetaReadStore::new())).await?;
+
+    let response = metadata_service(storage)
+        .serve(metadata_request(Some(vec![
+            MetadataRequestTopic::default().name(Some("absent".into())),
+        ])))
+        .await?;
+
     assert_eq!(
         vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
         response
@@ -388,13 +416,172 @@ async fn metadata_service_answers_the_read_error() -> Result<()> {
             .collect::<Vec<_>>()
     );
 
-    // A DynoStore that has not read `meta.json` yet, so that the fault reaches it.
-    object_store.arm();
-    let storage = dyno_store(object_store)?;
+    Ok(())
+}
+
+/// A failed read answers each named topic with the code of the error, and still lists the broker.
+/// The service returns a response, so the broker keeps the connection open.
+#[tokio::test]
+async fn metadata_service_answers_a_failed_read_in_each_named_topic() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    for (permission_denied, expected) in [
+        (false, ErrorCode::KafkaStorageError),
+        (true, ErrorCode::UnknownServerError),
+    ] {
+        let storage = storage_failing_meta_reads(permission_denied).await?;
+
+        let response = metadata_service(storage)
+            .serve(metadata_request(Some(vec![
+                MetadataRequestTopic::default().name(Some(TOPIC.into())),
+                MetadataRequestTopic::default().name(Some("absent".into())),
+            ])))
+            .await?;
+
+        // The read of the first topic fails, so the whole request answers the error.
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(
+            vec![
+                (Some(TOPIC.to_owned()), i16::from(expected)),
+                (Some("absent".to_owned()), i16::from(expected))
+            ],
+            topics
+                .iter()
+                .map(|topic| (topic.name.clone(), topic.error_code))
+                .collect::<Vec<_>>(),
+            "permission_denied = {permission_denied}"
+        );
+        assert_eq!(1, response.brokers.unwrap_or_default().len());
+    }
+
+    Ok(())
+}
+
+/// A topic that the client names by ID keeps its ID in the answer for a failed read, because a
+/// client that cannot match an answer to a topic it asked for drops the answer.
+#[tokio::test]
+async fn metadata_service_echoes_the_topic_id_of_a_failed_read() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let id = uuid::Uuid::new_v4();
+
+    let response = metadata_service(storage_failing_meta_reads(false).await?)
+        .serve(metadata_request(Some(vec![
+            MetadataRequestTopic::default().topic_id(Some(id.into_bytes())),
+        ])))
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(Some(id.into_bytes()), topics[0].topic_id);
+    assert_eq!(
+        i16::from(ErrorCode::KafkaStorageError),
+        topics[0].error_code
+    );
+
+    Ok(())
+}
+
+/// A request for all topics has no topic to answer, so the service returns the error.
+#[tokio::test]
+async fn metadata_service_returns_the_error_of_a_failed_read_of_all_topics() -> Result<()> {
+    let _guard = init_tracing()?;
 
     assert_matches!(
-        service(storage).serve(request(TOPIC)).await,
+        metadata_service(storage_failing_meta_reads(false).await?)
+            .serve(metadata_request(None))
+            .await,
         Err(Error::ObjectStore(_))
+    );
+
+    Ok(())
+}
+
+/// Serves a `validate_only` CreateTopics for a new topic on `storage`, and returns its error code.
+async fn create_topics_dry_run(storage: ArcDynStorage) -> Result<ErrorCode> {
+    let response = CreateTopicsValidationLayer::new()
+        .layer(CreateTopicsService { storage })
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .topics(Some(vec![
+                    CreatableTopic::default()
+                        .name("dry-run-topic".into())
+                        .num_partitions(1)
+                        .replication_factor(1)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                ]))
+                .validate_only(Some(true)),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+
+    Ok(ErrorCode::try_from(topics[0].error_code)?)
+}
+
+/// A CreateTopics dry run whose read of the topic fails answers with the code of the error: the
+/// retriable `NOT_CONTROLLER` when a retry may fix it, and `UNKNOWN_SERVER_ERROR` when not.
+#[tokio::test]
+async fn create_topics_dry_run_answers_the_code_of_a_failed_read() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    assert_eq!(
+        ErrorCode::NotController,
+        create_topics_dry_run(storage_failing_meta_reads(false).await?).await?
+    );
+    assert_eq!(
+        ErrorCode::UnknownServerError,
+        create_topics_dry_run(storage_failing_meta_reads(true).await?).await?
+    );
+
+    Ok(())
+}
+
+/// Serves a `validate_only` IncrementalAlterConfigs for [`TOPIC`] on `storage`, and returns the
+/// error code of its resource.
+async fn alter_configs_dry_run(storage: ArcDynStorage) -> Result<ErrorCode> {
+    let response = IncrementalAlterConfigsService { storage }
+        .serve(RequestInput {
+            request: IncrementalAlterConfigsRequest::default()
+                .resources(Some(vec![
+                    AlterConfigsResource::default()
+                        .resource_name(TOPIC.into())
+                        .resource_type(ConfigResource::Topic.into())
+                        .configs(Some(vec![
+                            AlterableConfig::default()
+                                .config_operation(OpType::Set.into())
+                                .name("retention.ms".into())
+                                .value(Some("1000".into())),
+                        ])),
+                ]))
+                .validate_only(true),
+            extensions: Extensions::default(),
+        })
+        .await?;
+
+    let responses = response.responses.unwrap_or_default();
+    assert_eq!(1, responses.len());
+
+    Ok(ErrorCode::try_from(responses[0].error_code)?)
+}
+
+/// An IncrementalAlterConfigs dry run whose read of the topic fails answers with the code of the
+/// error: the retriable `REQUEST_TIMED_OUT` when a retry may fix it, and `UNKNOWN_SERVER_ERROR`
+/// when not.
+#[tokio::test]
+async fn incremental_alter_configs_dry_run_answers_the_code_of_a_failed_read() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    assert_eq!(
+        ErrorCode::RequestTimedOut,
+        alter_configs_dry_run(storage_failing_meta_reads(false).await?).await?
+    );
+    assert_eq!(
+        ErrorCode::UnknownServerError,
+        alter_configs_dry_run(storage_failing_meta_reads(true).await?).await?
     );
 
     Ok(())

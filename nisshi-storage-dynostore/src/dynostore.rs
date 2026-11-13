@@ -4774,7 +4774,7 @@ impl Storage for DynoStore {
                     let response = match self
                         .topic_metadata(topic)
                         .await
-                        .inspect_err(|error| error!(?error))?
+                        .inspect_err(|error| debug!(?error))?
                     {
                         Some(topic_metadata) => {
                             let name = Some(topic_metadata.topic.name.to_owned());

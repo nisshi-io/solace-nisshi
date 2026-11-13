@@ -92,10 +92,10 @@ static STORAGE_FAILURE_LAST_WARNED: LazyLock<Mutex<HashMap<StorageOperation, Ins
 /// Returns whether a failure of `operation` that a retry may clear logs at `warn` now, which it
 /// does at most once in each [`STORAGE_FAILURE_WARN_INTERVAL`].
 ///
-/// A client retries a failed Fetch as often as it likes, so a `warn` line for each failure would
-/// flood the log while the store is down. The map has one entry for each operation, so its size
+/// A client retries a failed request as often as it likes, so a `warn` line for each failure
+/// would flood the log while the store is down. The map has one entry for each operation, so its size
 /// is bounded.
-fn storage_failure_warns_now(operation: StorageOperation) -> bool {
+pub(super) fn storage_failure_warns_now(operation: StorageOperation) -> bool {
     let now = Instant::now();
     let mut last_warned = STORAGE_FAILURE_LAST_WARNED
         .lock()
