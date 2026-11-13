@@ -48,9 +48,10 @@ use uuid::Uuid;
 
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEntry,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 /// How the `metadata` listing of every topic answers.
@@ -106,6 +107,7 @@ pub(crate) struct CountingStorage {
     produced: Arc<Mutex<Vec<Produced>>>,
     produce_failure: Option<(Topition, Error)>,
     produce_gate: Option<Arc<Semaphore>>,
+    produce_all_calls: Arc<AtomicUsize>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -159,6 +161,12 @@ impl CountingStorage {
             produce_failure: Some((topition, error)),
             ..self
         }
+    }
+
+    /// The number of calls to `produce_all` on this storage. A wrapper that does not forward
+    /// `produce_all` calls `produce` on this storage instead, and leaves this count unchanged.
+    pub(crate) fn produce_all_calls(&self) -> usize {
+        self.produce_all_calls.load(Ordering::SeqCst)
     }
 
     /// The number of produces now waiting for the gate.
@@ -369,6 +377,16 @@ impl Storage for CountingStorage {
     ) -> Result<i64> {
         self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
+    }
+
+    async fn produce_all(
+        &self,
+        transaction_id: Option<&str>,
+        entries: Vec<ProduceEntry>,
+    ) -> Vec<Result<i64>> {
+        _ = self.produce_all_calls.fetch_add(1, Ordering::SeqCst);
+
+        ProduceEntry::produce_each(self, transaction_id, entries).await
     }
 
     async fn offset_commit(

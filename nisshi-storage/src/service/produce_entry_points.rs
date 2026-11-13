@@ -47,8 +47,9 @@ use tracing_subscriber::{
 };
 
 use crate::{
-    ChannelRequestLayer, LatencyIntroducingStorage, ProduceRequestBatcher, RequestChannelService,
-    RequestStorageService, Result, SemaphoreProxy, Storage, Topition, bounded_channel,
+    ChannelRequestLayer, LatencyIntroducingStorage, ProduceEntry, ProduceRequestBatcher,
+    RequestChannelService, RequestStorageService, Result, SemaphoreProxy, Storage, Topition,
+    bounded_channel,
     decoded_batch_probe::probe,
     service::{
         ChannelRequest, Request, RequestReceiver, Response,
@@ -97,6 +98,29 @@ async fn through_both(wrapper: impl Storage, storage: &CountingStorage) -> Resul
     Ok(())
 }
 
+/// Produces one entry through `wrapper` with [`Storage::produce_all`], and checks that the call
+/// reached the `produce_all` of `storage`, so that a wrapper that only passes calls on does not
+/// hide the override of the storage that it wraps.
+async fn produce_all_reaches(wrapper: impl Storage, storage: &CountingStorage) {
+    let results = wrapper
+        .produce_all(
+            Some("transaction"),
+            vec![ProduceEntry {
+                topition: Topition::new("abc", 0),
+                deflated: deflated::Batch::default(),
+                inflated: None,
+            }],
+        )
+        .await;
+
+    assert_eq!(1, results.len());
+    assert_eq!(
+        1,
+        storage.produce_all_calls(),
+        "the wrapper did not forward produce_all"
+    );
+}
+
 fn storage() -> CountingStorage {
     CountingStorage::new(Listing::Topics, &["abc"])
 }
@@ -131,6 +155,20 @@ async fn box_passes_on_both_produce_methods() -> Result<()> {
     let storage = storage();
 
     through_both(Box::new(storage.clone()), &storage).await
+}
+
+#[tokio::test]
+async fn arc_forwards_produce_all() {
+    let storage = storage();
+
+    produce_all_reaches(Arc::new(storage.clone()), &storage).await;
+}
+
+#[tokio::test]
+async fn box_forwards_produce_all() {
+    let storage = storage();
+
+    produce_all_reaches(Box::new(storage.clone()), &storage).await;
 }
 
 #[tokio::test]

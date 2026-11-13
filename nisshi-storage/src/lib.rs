@@ -2238,27 +2238,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         transaction_id: Option<&str>,
         entries: Vec<ProduceEntry>,
     ) -> Vec<Result<i64>> {
-        let mut results = Vec::with_capacity(entries.len());
-
-        for entry in entries {
-            let ProduceEntry {
-                topition,
-                deflated,
-                inflated,
-            } = entry;
-
-            let result = match inflated {
-                Some(inflated) => {
-                    self.produce_inflated(transaction_id, &topition, deflated, inflated)
-                        .await
-                }
-                None => self.produce(transaction_id, &topition, deflated).await,
-            };
-
-            results.push(result);
-        }
-
-        results
+        ProduceEntry::produce_each(self, transaction_id, entries).await
     }
 
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
