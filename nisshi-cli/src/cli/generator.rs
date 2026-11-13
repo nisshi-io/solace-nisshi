@@ -29,7 +29,7 @@ struct Throughput(pub u32);
 #[derive(Args, Clone, Debug)]
 pub(super) struct Arg {
     /// The URL of the broker to produce messages into
-    #[arg(long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
+    #[arg(hide_env_values = true, long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
     broker: EnvVarExp<Url>,
 
     /// The topic to generate messages into
@@ -41,7 +41,7 @@ pub(super) struct Arg {
     partition: i32,
 
     /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
-    #[arg(long, env = "SCHEMA_REGISTRY")]
+    #[arg(hide_env_values = true, long, env = "SCHEMA_REGISTRY")]
     schema_registry: EnvVarExp<Url>,
 
     /// Message batch size used by every producer
@@ -65,7 +65,7 @@ pub(super) struct Arg {
     duration_seconds: Option<u64>,
 
     /// OTEL Exporter OTLP endpoint
-    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
+    #[arg(hide_env_values = true, long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
 
     #[command(flatten)]
