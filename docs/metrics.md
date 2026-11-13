@@ -33,3 +33,17 @@ upgrade and dashboards or alerts keyed on `nisshi-broker` go quiet. Unset the
 inherited variable or set `OTEL_SERVICE_NAME=nisshi-broker`. Rolling back
 reverts to `nisshi-broker` regardless of these variables. On shutdown the
 broker now flushes pending metrics before exiting.
+
+## Produce deadline
+
+A Produce request that waits for an answer has a deadline, see the Produce row of
+[Compatibility](compatibility.md).
+
+- `nisshi_produce_deadline_exceeded` counts the partitions that answered
+  `REQUEST_TIMED_OUT` because the deadline passed, or because an earlier write to the
+  partition still runs. The `stage` attribute is `not_started` when the broker did not
+  start a write, and `writing` when it answered while a write ran.
+- `nisshi_produce_detached_writes` is the number of writes that run on after the broker
+  answered their request at the deadline. A value that stays above zero means a
+  storage backend call that does not end, and the partition it writes takes no other
+  write from that broker until it does.
