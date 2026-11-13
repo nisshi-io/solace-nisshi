@@ -255,7 +255,8 @@ fn invalid_storage_option_value_message(
 /// Runs the command. A client tool exits with the [`ExitStatus`] that names how it ended:
 /// failure when it returns an error that no other status names, and refused when it returns a
 /// Kafka error code. `nisshi broker` and `nisshi proxy` are servers, not scripted tools: they
-/// exit with 0, or with 1 for any failure, as they always have.
+/// exit with 0 after a clean stop, with 2 when clap rejects the command line, and with 1 for
+/// any other failure, as they always have.
 ///
 /// `main` reports an error and then returns an exit code, instead of returning the error,
 /// because Rust prints the `Debug` form of an error that `main` returns, after the message that

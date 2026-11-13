@@ -49,11 +49,12 @@ The broker's URL options (`--listener-url`, `--advertised-listener-url`, `--stor
 every `${NAME}` in their value, whether it came from the command line or from the option's
 environment variable, to the value of the environment variable `NAME`. `proxy`, `generator` and
 `perf` expand their URL options the same way, and `cat` its `--schema-registry`. The `--broker`
-option of `topic`, `user` and `cat` is not expanded. A `NAME` that is not set stops the command
-with an error that names it, and exit status 2. Only the `${NAME}` form expands:
-`${NAME:-default}` is read as the name `NAME:-default`. The `.env` loader expands a double-quoted
-or unquoted value itself, before the broker reads it, and it replaces a name that is not set with
-an empty string. Single-quote a value in `.env` to have the broker expand it and refuse an unset
+option of `topic`, `user` and `cat` is not expanded, so `cat` reads `ADVERTISED_LISTENER_URL`
+without expanding a `${NAME}` in it, also when the broker expands the same variable. A `NAME`
+that is not set stops the command with an error that names it, and exit status 2. Only the
+`${NAME}` form expands: `${NAME:-default}` is read as the name `NAME:-default`. The `.env` loader
+expands a double-quoted or unquoted value itself, before the broker reads it, and it replaces a
+name that is not set with an empty string. Single-quote a value in `.env` to have the broker expand it and refuse an unset
 name.
 
 ```shell
@@ -172,8 +173,9 @@ Results in the following output:
 
 The client tools (`topic`, `cat`, `user`, `generator`, `perf`) are meant to be driven by
 scripts as well as by people. The exit codes below apply to these five tools. `nisshi broker` and
-`nisshi proxy` are servers: they exit with 0 after a clean stop, with 2 when their command line is wrong, and with 1 when
-they fail, as they always have.
+`nisshi proxy` are servers: they exit with 0 after a clean stop, with 2 when the command line
+does not parse (an unknown option, an invalid value, or a reference to an unset variable), and
+with 1 for any other failure, as they always have.
 
 ### `--output json`
 
