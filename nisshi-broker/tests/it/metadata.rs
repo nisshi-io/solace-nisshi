@@ -449,6 +449,7 @@ pub async fn topics_some_matching_by_id<G>(
     broker_id: i32,
     advertised_listener: Url,
     sc: G,
+    expected_leader_epoch: i32,
 ) -> Result<()>
 where
     G: Storage + Clone,
@@ -518,7 +519,7 @@ where
             .iter()
             .map(|partition| partition.leader_epoch)
             .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
+            .all(|leader_epoch| leader_epoch == Some(expected_leader_epoch))
     );
 
     assert!(
@@ -701,6 +702,7 @@ mod pg {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -827,6 +829,7 @@ mod in_memory {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -946,6 +949,7 @@ mod lite {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }
@@ -998,6 +1002,42 @@ mod turso {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn topics_some_not_matching_by_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster = Uuid::now_v7();
+        let node = rng().random_range(0..i32::MAX);
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+
+        super::topics_some_not_matching_by_id(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn topics_some_matching_by_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster = Uuid::now_v7();
+        let node = rng().random_range(0..i32::MAX);
+        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+
+        // The Turso engine answers a partition leader epoch of -1.
+        super::topics_some_matching_by_id(
+            cluster,
+            node,
+            advertised_listener.clone(),
+            storage_container(cluster, node, advertised_listener).await?,
+            -1,
         )
         .await
     }
@@ -1107,6 +1147,7 @@ mod slatedb {
             node,
             advertised_listener.clone(),
             storage_container(cluster, node, advertised_listener).await?,
+            0,
         )
         .await
     }

@@ -1228,6 +1228,10 @@ static DDL: LazyLock<Cache> = LazyLock::new(|| {
         ("030-topition.sql", include_sql!("ddl/030-topition.sql")),
         ("030-txn.sql", include_sql!("ddl/030-txn.sql")),
         (
+            "030-virtual-topic.sql",
+            include_sql!("ddl/030-virtual-topic.sql"),
+        ),
+        (
             "040-consumer-offset.sql",
             include_sql!("ddl/040-consumer-offset.sql"),
         ),
@@ -3618,8 +3622,8 @@ mod tests {
     async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
         use crate::sql::{
             nisshi_schema_version_select, row_check::RowCheck, scram_credential_select,
-            topic_select_uuid, txn_detail_select_status_for_update, txn_detail_select_timed_out,
-            virtual_topic_upsert, watermark_select_for_write,
+            txn_detail_select_status_for_update, txn_detail_select_timed_out,
+            watermark_select_for_write,
         };
 
         let directory = tempdir()?;
@@ -3639,21 +3643,15 @@ mod tests {
             }
         }
 
-        // Turso's schema has no `virtual_topic` table, which this query reads, so a lookup of a
-        // topic by its ID fails on Turso. The test expects the failure instead of skipping the
-        // query, so that it fails when Turso's schema gains the table, and this entry goes.
-        let known_failures = [topic_select_uuid::QUERY.key()];
-
         // Turso doesn't run these queries. The first three use PostgreSQL's syntax, and Turso runs
         // `watermark_select_for_write::LITE_QUERY` instead of `watermark_select_for_write::QUERY`.
-        // The others read tables that Turso's schema doesn't have.
+        // The other two read tables that Turso's schema doesn't have.
         let skipped = [
             txn_detail_select_status_for_update::QUERY.key(),
             txn_detail_select_timed_out::QUERY.key(),
             watermark_select_for_write::QUERY.key(),
             nisshi_schema_version_select::QUERY.key(),
             scram_credential_select::QUERY.key(),
-            virtual_topic_upsert::QUERY.key(),
         ];
         let checks = RowCheck::in_folders(&["sql", "lite"], &skipped);
 
@@ -3665,10 +3663,8 @@ mod tests {
                 Err(error) => Err(error.into()),
             };
 
-            match (checked, known_failures.contains(&check.query())) {
-                (Ok(()), false) | (Err(_), true) => {}
-                (Ok(()), true) => failures.push(format!("{}: now passes", check.query())),
-                (Err(error), false) => failures.push(format!("{}: {error:?}", check.query())),
+            if let Err(error) = checked {
+                failures.push(format!("{}: {error:?}", check.query()));
             }
         }
 
