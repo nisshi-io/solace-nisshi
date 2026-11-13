@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use nisshi_sans_io::{
-    ApiKey, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse, RequestInput,
+    ApiKey, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse, ErrorCode,
+    RequestInput, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::instrument;
@@ -94,6 +95,29 @@ where
             )
             .await
             .map(|topics| {
+                // Kafka answers an invalid name that it does not find with INVALID_TOPIC_EXCEPTION
+                // ([`getTopicMetadataForDescribeTopicResponse`]).
+                //
+                // [`getTopicMetadataForDescribeTopicResponse`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/metadata/KRaftMetadataCache.scala#L314-L327
+                let topics = topics
+                    .into_iter()
+                    .map(|topic| {
+                        // Any error on an invalid name answers INVALID_TOPIC_EXCEPTION, because a
+                        // topic with an invalid name cannot exist, and an engine can fail the
+                        // lookup of such a name instead of missing it.
+                        if topic.error_code != i16::from(ErrorCode::None)
+                            && topic
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| !is_valid_topic_name(name))
+                        {
+                            topic.error_code(ErrorCode::InvalidTopicException.into())
+                        } else {
+                            topic
+                        }
+                    })
+                    .collect();
+
                 DescribeTopicPartitionsResponse::default()
                     .throttle_time_ms(0)
                     .topics(Some(topics))
