@@ -2357,8 +2357,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
 
     /// Query the configuration of a resource in this storage.
     ///
-    /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] resource itself, so an
-    /// implementation needs to answer only the other resource types.
+    /// [`DescribeConfigsService`] answers a [`ConfigResource::Broker`] or
+    /// [`ConfigResource::BrokerLogger`] resource itself, so an implementation needs to answer
+    /// only the other resource types.
     ///
     /// For a topic, an implementation returns only the configs that the topic sets, and answers
     /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store.

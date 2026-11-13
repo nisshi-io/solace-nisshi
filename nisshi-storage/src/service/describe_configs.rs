@@ -95,6 +95,9 @@ where
         for resource in input.request.resources.unwrap_or_default() {
             let result = match ConfigResource::from(resource.resource_type) {
                 ConfigResource::Broker => self.describe_broker(&resource.resource_name).await,
+                ConfigResource::BrokerLogger => {
+                    self.describe_broker_logger(&resource.resource_name).await
+                }
                 ConfigResource::Topic => {
                     self.describe_topic(
                         &resource.resource_name,
@@ -198,7 +201,7 @@ where
 
         let node = self.storage.node().await?;
 
-        let error_message = match name.parse::<i32>() {
+        let error_message = match parse_broker_id(name) {
             Ok(id) if id == node => {
                 return Ok(result
                     .error_code(ErrorCode::None.into())
@@ -207,13 +210,69 @@ where
             Ok(_) => format!(
                 "Unexpected broker id, expected {node} or empty string, but received {name}"
             ),
-            Err(_) => format!("Broker id must be an integer, but it is: {name}"),
+            Err(error_message) => error_message,
         };
 
         Ok(result
             .error_code(ErrorCode::InvalidRequest.into())
             .error_message(Some(error_message)))
     }
+
+    /// Describes the broker logger resource `name`, as Kafka 3.9.1 does
+    /// ([ConfigHelper.scala#L122-L131]). The name is a broker id, so the function compares it
+    /// with this broker's node id.
+    ///
+    /// For our node id, the result lists no loggers, because Nisshi has no log4j loggers to
+    /// report where Kafka lists them.
+    ///
+    /// An empty name, a name that is not an integer and an id that is not ours each get
+    /// `INVALID_REQUEST` with Kafka's message. An empty name is an error here, because a logger
+    /// resource has no default for every broker. The error stays in this resource's result, and
+    /// the other resources in the request still get an answer.
+    ///
+    /// [ConfigHelper.scala#L122-L131]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L122-L131
+    async fn describe_broker_logger(&self, name: &str) -> Result<DescribeConfigsResult> {
+        let result = DescribeConfigsResult::default()
+            .resource_name(name.into())
+            .resource_type(ConfigResource::BrokerLogger.into())
+            .configs(Some(vec![]));
+
+        if name.is_empty() {
+            return Ok(result
+                .error_code(ErrorCode::InvalidRequest.into())
+                .error_message(Some("Broker id must not be empty".into())));
+        }
+
+        let node = self.storage.node().await?;
+
+        let error_message = match parse_broker_id(name) {
+            Ok(id) if id == node => {
+                return Ok(result
+                    .error_code(ErrorCode::None.into())
+                    .error_message(None));
+            }
+            Ok(_) => format!("Unexpected broker id, expected {node} but received {name}"),
+            Err(error_message) => error_message,
+        };
+
+        Ok(result
+            .error_code(ErrorCode::InvalidRequest.into())
+            .error_message(Some(error_message)))
+    }
+}
+
+/// Parses the name of a broker or broker logger resource as a broker id.
+///
+/// Returns Kafka's `INVALID_REQUEST` message for a name that is not an integer
+/// ([ConfigHelper.scala#L266-L271]).
+///
+/// The parser reads ASCII digits only. Java's `String.toInt` also reads the digits of other
+/// scripts, so Kafka accepts a name such as `١١١` for node id 111 and this function does not.
+///
+/// [ConfigHelper.scala#L266-L271]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ConfigHelper.scala#L266-L271
+fn parse_broker_id(name: &str) -> std::result::Result<i32, String> {
+    name.parse::<i32>()
+        .map_err(|_| format!("Broker id must be an integer, but it is: {name}"))
 }
 
 #[cfg(test)]
