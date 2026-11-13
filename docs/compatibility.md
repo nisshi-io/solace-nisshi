@@ -55,7 +55,7 @@ client that reads the ApiVersions response first does not send such a request.
 | CreatePartitions | 37 | – | No | No | No | No | You cannot add partitions to an existing topic. |
 | IncrementalAlterConfigs | 44 | 0-1 | Partial | Partial | Partial | Partial | Changes topic configs, including APPEND and SUBTRACT on list configs. The broker accepts a change to a broker config, for example with `kafka-configs --alter --entity-type brokers`, and ignores it. |
 | ListPartitionReassignments | 46 | 0 | Yes | Yes | Yes | Yes | Always answers an empty list of reassignments. |
-| DescribeCluster | 60 | 0-1 | Yes | Yes | Yes | Yes | |
+| DescribeCluster | 60 | 0-1 | Yes | Yes | Yes | Yes | A storage failure answers `KAFKA_STORAGE_ERROR` (it may clear on a retry) or `UNKNOWN_SERVER_ERROR`, with no brokers, and the connection stays open. The Java admin client reports either code at once. |
 | DescribeTopicPartitions | 75 | 0 | Partial | Partial | Partial | Partial | Does not return a cursor for the next page. |
 
 DescribeLogDirs (35), AlterReplicaLogDirs (34), ElectLeaders (43), AlterPartitionReassignments
@@ -71,7 +71,7 @@ with an example and the limits of this build.
 | --- | --: | --- | --- | --- | --- | --- | --- |
 | OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
 | OffsetFetch | 9 | 0-9 | Yes | Yes | Yes | Yes | |
-| FindCoordinator | 10 | 0-6 | Yes | Yes | Yes | Yes | Answers with the broker that receives the request. |
+| FindCoordinator | 10 | 0-6 | Yes | Yes | Yes | Yes | Answers with the broker that receives the request. A storage failure answers `COORDINATOR_NOT_AVAILABLE` (it may clear on a retry, and clients retry it) or `UNKNOWN_SERVER_ERROR`, with no node, and the connection stays open. |
 | JoinGroup | 11 | 0-9 | Partial | Partial | Partial | Partial | A consumer group cannot change to the `cooperative-sticky` assignor with a rolling restart ([#1051]). |
 | Heartbeat | 12 | 0-4 | Yes | Yes | Yes | Yes | |
 | LeaveGroup | 13 | 0-5 | Yes | Yes | Yes | Yes | |

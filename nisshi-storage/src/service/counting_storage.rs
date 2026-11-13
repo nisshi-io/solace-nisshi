@@ -14,7 +14,8 @@
 
 //! A [`Storage`] for service tests that holds only topic names, counts the `metadata` calls that
 //! list every topic and those that look up named topics, records the topics that it creates and
-//! deletes, and records each batch that it is asked to produce.
+//! deletes, records each batch that it is asked to produce, and answers the broker's own
+//! registration.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -81,6 +82,23 @@ pub(crate) enum Lookup {
     Listed,
 }
 
+/// A `Storage` call that answers from this broker's own registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrokerCall {
+    Brokers,
+    ClusterId,
+    Node,
+    AdvertisedListener,
+}
+
+/// The node id that [`CountingStorage`] answers for `node` and lists in `brokers`.
+pub(crate) const NODE_ID: i32 = 111;
+
+/// The host and port of the listener that [`CountingStorage`] answers for `advertised_listener`
+/// and lists in `brokers`.
+pub(crate) const HOST: &str = "localhost";
+pub(crate) const PORT: i32 = 9092;
+
 /// A batch that [`CountingStorage`] was asked to produce, and the method that it was asked with.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Produced {
@@ -106,6 +124,7 @@ pub(crate) struct CountingStorage {
     delete_topic_failure: Option<(TopicId, Error)>,
     delete_topic_failure_delay: Duration,
     deleted: Arc<Mutex<Vec<TopicId>>>,
+    broker_call_failure: Option<(BrokerCall, Error)>,
     produced: Arc<Mutex<Vec<Produced>>>,
     produce_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
@@ -149,6 +168,15 @@ impl CountingStorage {
         }
     }
 
+    /// A storage whose `call` fails with `error`. The other broker calls answer as they do by
+    /// default: node [`NODE_ID`] on [`HOST`]:[`PORT`], in the cluster `nisshi`.
+    pub(crate) fn failing_broker_call(call: BrokerCall, error: Error) -> Self {
+        Self {
+            broker_call_failure: Some((call, error)),
+            ..Self::default()
+        }
+    }
+
     /// Returns this storage, with a failing `delete_topic` waiting `delay` before it fails, as a
     /// call that runs into its deadline does. A test with a paused clock moves the time by it.
     pub(crate) fn with_delete_failure_delay(self, delay: Duration) -> Self {
@@ -161,6 +189,14 @@ impl CountingStorage {
     /// The topics that `delete_topic` deleted, in call order. A failed delete is not in it.
     pub(crate) fn deleted(&self) -> Result<Vec<TopicId>> {
         Ok(self.deleted.lock()?.clone())
+    }
+
+    /// Returns `Err` if this storage was built to fail `call`.
+    fn broker_call_failure(&self, call: BrokerCall) -> Result<()> {
+        match &self.broker_call_failure {
+            Some((failing, error)) if *failing == call => Err(error.clone()),
+            _ => Ok(()),
+        }
     }
 
     /// Returns this storage, with the lookup of named topics answering as `lookup`.
@@ -324,7 +360,15 @@ impl Storage for CountingStorage {
     }
 
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        unimplemented!()
+        self.broker_call_failure(BrokerCall::Brokers)?;
+
+        Ok(vec![
+            DescribeClusterBroker::default()
+                .broker_id(NODE_ID)
+                .host(HOST.into())
+                .port(PORT)
+                .rack(None),
+        ])
     }
 
     async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
@@ -564,15 +608,18 @@ impl Storage for CountingStorage {
     }
 
     async fn cluster_id(&self) -> Result<String> {
-        unimplemented!()
+        self.broker_call_failure(BrokerCall::ClusterId)?;
+        Ok("nisshi".into())
     }
 
     async fn node(&self) -> Result<i32> {
-        unimplemented!()
+        self.broker_call_failure(BrokerCall::Node)?;
+        Ok(NODE_ID)
     }
 
     async fn advertised_listener(&self) -> Result<Url> {
-        unimplemented!()
+        self.broker_call_failure(BrokerCall::AdvertisedListener)?;
+        Ok(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
     }
 
     async fn ping(&self) -> Result<()> {

@@ -218,7 +218,48 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rama::extensions::Extensions;
+
     use super::*;
+    use crate::service::counting_storage::{BrokerCall, CountingStorage, NODE_ID};
+
+    /// A storage error inside a broker resource's describe does not leave `serve`, which would
+    /// close the connection: the resource answers the error's code with no configs, and a
+    /// resource that needs no storage read still answers.
+    #[tokio::test]
+    async fn a_failed_node_read_answers_the_broker_resource() -> Result<()> {
+        let storage = CountingStorage::failing_broker_call(
+            BrokerCall::Node,
+            Error::from(std::io::Error::other("connection reset")),
+        );
+
+        let response = DescribeConfigsService { storage }
+            .serve(RequestInput {
+                request: DescribeConfigsRequest::default().resources(Some(vec![
+                    DescribeConfigsResource::default()
+                        .resource_name(NODE_ID.to_string())
+                        .resource_type(ConfigResource::Broker.into()),
+                    // An empty name selects every broker's defaults without a node read.
+                    DescribeConfigsResource::default()
+                        .resource_name(String::new())
+                        .resource_type(ConfigResource::Broker.into()),
+                ])),
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let results = response.results.unwrap_or_default();
+        assert_eq!(
+            vec![ErrorCode::KafkaStorageError, ErrorCode::None],
+            results
+                .iter()
+                .map(|result| ErrorCode::try_from(result.error_code))
+                .collect::<Result<Vec<_>, _>>()?
+        );
+        assert_eq!(Some(vec![]), results[0].configs);
+
+        Ok(())
+    }
 
     fn topic_resource() -> DescribeConfigsResource {
         DescribeConfigsResource::default()
