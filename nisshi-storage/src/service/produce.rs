@@ -15,6 +15,8 @@
 mod acks_zero;
 mod admission;
 mod batch_validation;
+mod deadline;
+mod detached;
 mod partition;
 mod rejection;
 mod request_validation;

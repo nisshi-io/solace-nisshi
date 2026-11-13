@@ -105,6 +105,7 @@ pub(crate) struct CountingStorage {
     create_topic_failure: Option<(String, Error)>,
     produced: Arc<Mutex<Vec<Produced>>>,
     produce_gate: Option<Arc<Semaphore>>,
+    gated_partitions: Option<BTreeSet<i32>>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -151,6 +152,15 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with the gate holding only the produces to `partitions`. A produce to
+    /// another partition goes through at once.
+    pub(crate) fn with_gated_partitions(self, partitions: &[i32]) -> Self {
+        Self {
+            gated_partitions: Some(partitions.iter().copied().collect()),
+            ..self
+        }
+    }
+
     /// The number of produces now waiting for the gate.
     pub(crate) fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
@@ -165,7 +175,12 @@ impl CountingStorage {
         deflated: deflated::Batch,
         inflated: Option<inflated::Batch>,
     ) -> Result<i64> {
-        if let Some(gate) = &self.produce_gate {
+        let gated = self
+            .gated_partitions
+            .as_ref()
+            .is_none_or(|partitions| partitions.contains(&topition.partition));
+
+        if gated && let Some(gate) = &self.produce_gate {
             _ = self.parked.fetch_add(1, Ordering::SeqCst);
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
@@ -179,7 +194,9 @@ impl CountingStorage {
             inflated,
         });
 
-        Ok(0)
+        // A base offset that differs by partition, so that a test can tell whose offset a
+        // response carries. Partition 0 gets 0.
+        Ok(i64::from(topition.partition) * 1000)
     }
 
     /// Deletes the topic `name`.

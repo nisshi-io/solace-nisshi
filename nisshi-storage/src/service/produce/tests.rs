@@ -14,5 +14,6 @@
 
 mod fan_out;
 mod inflate_produced;
+mod request_deadline;
 mod stack;
 pub(super) mod support;

@@ -26,7 +26,9 @@ use nisshi_sans_io::{
 };
 use rama::Service;
 
-use super::super::{PartitionProduce, TopicConfiguration, admission::Admission, response};
+use super::super::{
+    PartitionProduce, TopicConfiguration, admission::Admission, deadline::Deadline, response,
+};
 
 /// The index of the partition in every request that [`partition_produce`] builds.
 pub(in super::super) const INDEX: i32 = 3;
@@ -106,6 +108,8 @@ pub(in super::super) fn partition_produce<B>(
         transaction_id: None,
         configuration: configuration(configs),
         admission: Admission::default(),
+        deadline: Deadline::none(),
+        reservation: None,
         batch,
     }
 }
