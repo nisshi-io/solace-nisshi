@@ -46,6 +46,14 @@ pub(super) const PRODUCE_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 const NOT_STARTED: &str =
     "the request's deadline passed before the broker started this partition's write, retry it";
 
+/// The message of a partition whose write the deadline left running.
+const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the \
+                       write may still complete, retry it";
+
+/// The message of a partition that the broker did not start because an earlier write to it runs.
+const IN_FLIGHT: &str =
+    "the broker still runs an earlier write to this partition, retry the request";
+
 static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("nisshi_produce_deadline_exceeded")
@@ -60,18 +68,22 @@ static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(super) enum Stage {
     /// No storage write had started for the partition.
     NotStarted,
+    /// The storage write had started, and the broker answered without its result.
+    Writing,
 }
 
 impl Stage {
     fn as_str(self) -> &'static str {
         match self {
             Self::NotStarted => "not_started",
+            Self::Writing => "writing",
         }
     }
 
     fn message(self) -> &'static str {
         match self {
             Self::NotStarted => NOT_STARTED,
+            Self::Writing => WRITING,
         }
     }
 }
@@ -113,6 +125,11 @@ impl Deadline {
         Self { at: None }
     }
 
+    /// When the request must be answered, or `None` for a request with no deadline.
+    pub(super) fn at(&self) -> Option<Instant> {
+        self.at
+    }
+
     /// Returns whether the deadline has passed.
     pub(super) fn has_passed(&self) -> bool {
         self.at.is_some_and(|at| Instant::now() >= at)
@@ -142,5 +159,14 @@ impl Deadline {
 
         response::partition_error(index, ErrorCode::RequestTimedOut)
             .error_message(Some(stage.message().to_owned()))
+    }
+
+    /// Returns the response for the partition at `index` that the broker did not start, because a
+    /// write to the partition that an earlier request left running has not ended, and counts it.
+    pub(super) fn in_flight(index: i32) -> PartitionProduceResponse {
+        DEADLINE_EXCEEDED.add(1, &[KeyValue::new("stage", Stage::NotStarted.as_str())]);
+
+        response::partition_error(index, ErrorCode::RequestTimedOut)
+            .error_message(Some(IN_FLIGHT.to_owned()))
     }
 }

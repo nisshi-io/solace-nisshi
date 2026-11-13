@@ -109,6 +109,7 @@ pub(in super::super) fn partition_produce<B>(
         configuration: configuration(configs),
         admission: Admission::default(),
         deadline: Deadline::none(),
+        reservation: None,
         batch,
     }
 }

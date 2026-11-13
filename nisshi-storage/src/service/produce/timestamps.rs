@@ -15,6 +15,7 @@
 use std::{
     convert::Infallible,
     fmt::{self, Debug},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -432,8 +433,16 @@ where
                         .unwrap_or_else(|_| reservation.bytes()),
                 );
 
+                // A write that the deadline leaves running keeps the bytes until it ends, so the
+                // reservation is shared with it.
+                let reservation = Arc::new(reservation);
+
                 self.inner
-                    .serve(request.with_batch((batch, inflated)))
+                    .serve(
+                        request
+                            .with_reservation(Arc::clone(&reservation))
+                            .with_batch((batch, inflated)),
+                    )
                     .await
             }
 

@@ -468,6 +468,7 @@ mod tests {
                 transaction_id: None,
                 admission: Default::default(),
                 deadline: crate::service::produce::deadline::Deadline::none(),
+                reservation: None,
                 configuration: std::sync::Arc::new(
                     TopicConfiguration::described(
                         "person",

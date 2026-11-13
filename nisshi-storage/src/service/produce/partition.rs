@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use super::{admission::Admission, deadline::Deadline, topic_configuration::TopicConfiguration};
+use crate::decoded_budget::Reservation;
 
 /// A partition of a Produce request on its way to storage, with the configuration of its topic.
 ///
@@ -50,6 +51,10 @@ pub struct PartitionProduce<B> {
     /// When the request must be answered, which the partitions of the request share.
     pub(crate) deadline: Deadline,
 
+    /// The bytes of the decoded-batch budget that the partition holds, once it reserved them. A
+    /// write that runs on after its request answered keeps them until it ends.
+    pub(crate) reservation: Option<Arc<Reservation>>,
+
     pub batch: B,
 }
 
@@ -64,6 +69,7 @@ impl<B> PartitionProduce<B> {
                 configuration: self.configuration,
                 admission: self.admission,
                 deadline: self.deadline,
+                reservation: self.reservation,
                 batch: (),
             },
             self.batch,
@@ -81,7 +87,16 @@ impl PartitionProduce<()> {
             configuration: self.configuration,
             admission: self.admission,
             deadline: self.deadline,
+            reservation: self.reservation,
             batch,
+        }
+    }
+
+    /// Returns this request holding `reservation`.
+    pub(crate) fn with_reservation(self, reservation: Arc<Reservation>) -> Self {
+        Self {
+            reservation: Some(reservation),
+            ..self
         }
     }
 }
