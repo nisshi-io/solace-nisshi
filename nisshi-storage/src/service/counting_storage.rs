@@ -48,9 +48,10 @@ use uuid::Uuid;
 
 use crate::{
     BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEntry,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 /// How the `metadata` listing of every topic answers.
@@ -104,7 +105,9 @@ pub(crate) struct CountingStorage {
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
     produced: Arc<Mutex<Vec<Produced>>>,
+    produce_failure: Option<(Topition, Error)>,
     produce_gate: Option<Arc<Semaphore>>,
+    produce_all_calls: Arc<AtomicUsize>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -151,6 +154,21 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with each produce to `topition` failing with `error`, and recording
+    /// nothing. A produce to any other partition succeeds.
+    pub(crate) fn with_failing_produce(self, topition: Topition, error: Error) -> Self {
+        Self {
+            produce_failure: Some((topition, error)),
+            ..self
+        }
+    }
+
+    /// The number of calls to `produce_all` on this storage. A wrapper that does not forward
+    /// `produce_all` calls `produce` on this storage instead, and leaves this count unchanged.
+    pub(crate) fn produce_all_calls(&self) -> usize {
+        self.produce_all_calls.load(Ordering::SeqCst)
+    }
+
     /// The number of produces now waiting for the gate.
     pub(crate) fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
@@ -158,6 +176,9 @@ impl CountingStorage {
 
     /// Records a produce of `deflated` and `inflated`, after the gate lets it through. Both
     /// produce methods call this, so that the gate holds each produce the same way.
+    ///
+    /// Returns the partition of `topition` as the offset, so that the results of produces to
+    /// different partitions differ.
     async fn produce_batch(
         &self,
         transaction_id: Option<&str>,
@@ -172,6 +193,12 @@ impl CountingStorage {
             permit?.forget();
         }
 
+        if let Some((failing, error)) = &self.produce_failure
+            && failing == topition
+        {
+            return Err(error.clone());
+        }
+
         self.produced.lock()?.push(Produced {
             transaction_id: transaction_id.map(str::to_owned),
             topition: topition.clone(),
@@ -179,7 +206,7 @@ impl CountingStorage {
             inflated,
         });
 
-        Ok(0)
+        Ok(i64::from(topition.partition()))
     }
 
     /// Deletes the topic `name`.
@@ -350,6 +377,16 @@ impl Storage for CountingStorage {
     ) -> Result<i64> {
         self.produce_batch(transaction_id, topition, deflated, Some(inflated))
             .await
+    }
+
+    async fn produce_all(
+        &self,
+        transaction_id: Option<&str>,
+        entries: Vec<ProduceEntry>,
+    ) -> Vec<Result<i64>> {
+        _ = self.produce_all_calls.fetch_add(1, Ordering::SeqCst);
+
+        ProduceEntry::produce_each(self, transaction_id, entries).await
     }
 
     async fn offset_commit(

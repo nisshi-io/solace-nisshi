@@ -219,6 +219,7 @@ pub mod max_message_bytes;
 pub mod message_timestamp_type;
 pub mod offset_metadata;
 mod operation;
+mod produce_entry;
 mod produce_path;
 mod producer;
 mod proxy;
@@ -252,6 +253,7 @@ pub use fetched::{FetchedDataSender, FetchedRecord, FetchedSender};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
+pub use produce_entry::ProduceEntry;
 pub use producer::{
     FirstSequence, OLDER_EPOCH_ERROR, ProduceEpoch, StoredEpochs, check_claim, epoch_is_exhausted,
     producer_claim,
@@ -2224,6 +2226,35 @@ pub trait Storage: Debug + Send + Sync + 'static {
         self.produce(transaction_id, topition, deflated).await
     }
 
+    /// Produces every entry to this storage, and returns one result per entry, in the order of
+    /// `entries`. `transaction_id` is the transaction that all the entries belong to, if any.
+    ///
+    /// Each result belongs to its entry alone. A failed entry does not stop the entries after it,
+    /// and does not undo the entries before it. Each result is the result that
+    /// [`Storage::produce_inflated`] gives for an entry with a decoded batch, and the result that
+    /// [`Storage::produce`] gives for one without. A storage that overrides this method can commit
+    /// the entries together, but it keeps the results apart, for example with a savepoint for each
+    /// entry.
+    ///
+    /// Like those methods, this one trusts its entries. [`ProduceService`] validates a client's
+    /// batches before it produces them.
+    ///
+    /// This default writes the entries one after another, and each commits on its own. A caller
+    /// cannot rely on one transaction for a storage that has not overridden this method.
+    ///
+    /// A wrapper that overrides this method takes its own permit, span or metric, once for each
+    /// entry or once for the call, but never zero times. A wrapper that does not override it keeps
+    /// them, because the default calls the wrapper's own `produce` and `produce_inflated`, and it
+    /// hides the `produce_all` of the storage that it wraps. A wrapper that only passes calls on,
+    /// such as `Arc<T>` and `Box<T>`, forwards this method.
+    async fn produce_all(
+        &self,
+        transaction_id: Option<&str>,
+        entries: Vec<ProduceEntry>,
+    ) -> Vec<Result<i64>> {
+        ProduceEntry::produce_each(self, transaction_id, entries).await
+    }
+
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
     /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
@@ -2569,6 +2600,14 @@ where
             .await
     }
 
+    async fn produce_all(
+        &self,
+        transaction_id: Option<&str>,
+        entries: Vec<ProduceEntry>,
+    ) -> Vec<Result<i64>> {
+        self.as_ref().produce_all(transaction_id, entries).await
+    }
+
     async fn fetch(
         &self,
         topition: &'_ Topition,
@@ -2875,6 +2914,14 @@ where
         self.as_ref()
             .produce_inflated(transaction_id, topition, deflated, inflated)
             .await
+    }
+
+    async fn produce_all(
+        &self,
+        transaction_id: Option<&str>,
+        entries: Vec<ProduceEntry>,
+    ) -> Vec<Result<i64>> {
+        self.as_ref().produce_all(transaction_id, entries).await
     }
 
     async fn fetch(
