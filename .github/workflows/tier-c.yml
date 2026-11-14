@@ -109,7 +109,7 @@ jobs:
           # that ci.yml restores on every pull request.
           cache-shared-key: dev
           cache-save-if: false
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-nextest@0.9.146
       # The test and report steps match ci.yml's `test` job, which explains
@@ -322,7 +322,7 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$env:TARGET"
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -354,7 +354,7 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$TARGET"
-      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
