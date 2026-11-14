@@ -14,10 +14,14 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, LazyLock, Mutex, PoisonError},
+    time::Duration,
 };
 
 use opentelemetry::metrics::UpDownCounter;
+use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
 
 use crate::{METER, Topition};
 
@@ -46,12 +50,45 @@ static PROCESS: LazyLock<Detached> = LazyLock::new(Detached::default);
 #[derive(Clone, Debug, Default)]
 pub(super) struct Detached {
     writes: Arc<Mutex<HashMap<Topition, usize>>>,
+    /// The task of each write that has started and not ended, whether or not its request still
+    /// waits for it.
+    tasks: TaskTracker,
+}
+
+/// Waits until every produce write that runs in a task of its own has ended, for at most
+/// `remaining_grace`. Returns how many writes still run when the wait ends, and zero when all of
+/// them ended in time.
+///
+/// A write runs in a task of its own so that its request can answer at its deadline, and the
+/// task keeps running when its request has answered or its connection has closed. A write that
+/// starts during the wait is waited for as well, within the same `remaining_grace`. A write that
+/// still runs when the wait ends is left running. The writes are tracked for the whole process,
+/// so the wait covers the writes of every broker in it.
+pub async fn wait_for_detached_writes(remaining_grace: Duration) -> usize {
+    let tasks = &PROCESS.tasks;
+
+    // The tracker completes its wait only once it is closed. A closed tracker still accepts a
+    // task, so a write that starts after this point is tracked too.
+    _ = tasks.close();
+
+    match timeout(remaining_grace, tasks.wait()).await {
+        Ok(()) => 0,
+        Err(_) => tasks.len(),
+    }
 }
 
 impl Detached {
     /// Returns the set that all services of this process share.
     pub(super) fn process() -> Self {
         PROCESS.clone()
+    }
+
+    /// Runs `write` in a task of its own, and tracks the task until it ends, also when it panics.
+    pub(super) fn spawn<F>(&self, write: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        _ = self.tasks.spawn(write);
     }
 
     /// Returns whether a write that the deadline left running is still in flight for `topition`.
