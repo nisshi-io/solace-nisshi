@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{assert_matches, time::Duration};
+use std::{
+    assert_matches, io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use nisshi_sans_io::{
     ApiKey as _, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, Frame, Header,
@@ -20,6 +24,7 @@ use nisshi_sans_io::{
     delete_topics_response::DeletableTopicResult,
 };
 use rama::{Service as _, extensions::Extensions};
+use tracing::Level;
 use uuid::Uuid;
 
 use super::DeleteTopicsService;
@@ -30,7 +35,7 @@ const LONG: i32 = 600_000;
 
 /// An error that a retry may clear.
 fn transient() -> Error {
-    Error::from(std::io::Error::other("connection reset"))
+    Error::from(io::Error::other("connection reset"))
 }
 
 /// An error that a retry can't clear, with text that must not reach a client.
@@ -207,6 +212,54 @@ async fn an_expired_timeout_answers_the_rest_without_a_try() -> Result<()> {
         vec![TopicId::from("a"), TopicId::from("b")],
         storage.deleted()?
     );
+
+    Ok(())
+}
+
+/// A buffer that collects what a test subscriber writes.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A request that skips topics after a failure logs one `warn` line with their count, and a
+/// request that skips none does not log that line.
+#[tokio::test]
+async fn skipped_topics_are_logged_in_one_line() -> Result<()> {
+    let log = LogBuffer::default();
+    let writer = log.clone();
+
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    let storage = CountingStorage::failing_delete_topic("failed".into(), permanent());
+    _ = serve(&storage, by_name(&["failed", "a", "b"], 0)).await?;
+
+    let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+    assert_eq!(1, text.matches("did not try").count(), "{text}");
+    assert!(text.contains("skipped=2"), "{text}");
+
+    log.0.lock().expect("log").clear();
+
+    let storage = CountingStorage::default();
+    _ = serve(&storage, by_name(&["a", "b"], 0)).await?;
+
+    let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+    assert!(!text.contains("did not try"), "{text}");
 
     Ok(())
 }

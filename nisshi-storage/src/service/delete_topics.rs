@@ -115,6 +115,15 @@ where
             );
         }
 
+        if budget.skipped() > 0 {
+            warn!(
+                skipped = budget.skipped(),
+                timeout = ?budget.timeout,
+                elapsed = ?budget.started.elapsed(),
+                "delete topics answered REQUEST_TIMED_OUT for topics it did not try after a storage failure past timeout_ms"
+            );
+        }
+
         Ok(DeleteTopicsResponse::default()
             .throttle_time_ms(Some(0))
             .responses(Some(responses)))
@@ -130,6 +139,8 @@ where
     /// on to the next topic.
     async fn delete(&self, topic_id: &TopicId, budget: &mut Budget) -> (ErrorCode, Option<String>) {
         if budget.is_spent() {
+            budget.skip();
+
             return (
                 ErrorCode::RequestTimedOut,
                 Some(ErrorCode::RequestTimedOut.to_string()),
@@ -172,15 +183,17 @@ where
 
 /// How long a request has to delete its topics, from its `timeout_ms`.
 ///
-/// Storage fails a topic only at its own deadline, so a request that meets a storage outage
-/// would otherwise wait that long for each topic, and the client would give up first. After a
-/// topic fails and the request's time has passed, the topics that remain answer
+/// A failing storage call can take as long as the engine's own timeouts, so a request that meets
+/// a storage outage would otherwise wait that long for each topic, and the client would give up
+/// first. After a topic fails and the request's time has passed, the topics that remain answer
 /// `REQUEST_TIMED_OUT` without a try. A request in which no topic fails reads the clock once and
-/// never compares it.
+/// never compares it. The budget counts the topics that it skipped, so the request logs them in
+/// one line.
 struct Budget {
     started: Instant,
     timeout: Duration,
     spent: bool,
+    skipped: usize,
 }
 
 impl Budget {
@@ -189,6 +202,7 @@ impl Budget {
             started: Instant::now(),
             timeout: Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0)),
             spent: false,
+            skipped: 0,
         }
     }
 
@@ -198,6 +212,14 @@ impl Budget {
 
     fn is_spent(&self) -> bool {
         self.spent
+    }
+
+    fn skip(&mut self) {
+        self.skipped += 1;
+    }
+
+    fn skipped(&self) -> usize {
+        self.skipped
     }
 }
 
