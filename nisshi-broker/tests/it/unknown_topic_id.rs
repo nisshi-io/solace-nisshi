@@ -123,7 +123,8 @@ async fn an_unknown_id_is_answered_before_a_known_one(storage: impl Storage + Cl
 /// Kafka reads a request that carries a topic ID other than the zero one as a request by IDs
 /// only ([`KafkaApis.handleTopicMetadataRequest`]): a named entry is dropped and not created,
 /// the name of an entry that also carries an ID is ignored, and an ID asked for twice is
-/// answered once. An entry that names a topic with the zero ID is still asked for by name.
+/// answered once. An entry that names a topic with the zero ID is still asked for by name, and a
+/// name asked for twice is answered once.
 ///
 /// [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1331-L1347
 async fn a_name_is_dropped_when_an_id_is_set(storage: impl Storage + Clone) -> Result<()> {
@@ -166,6 +167,12 @@ async fn a_name_is_dropped_when_an_id_is_set(storage: impl Storage + Clone) -> R
         vec![by_name(&unknown_name).topic_id(Some(known))],
     )
     .await?;
+    assert_matches!(
+        answered.as_slice(),
+        [(ErrorCode::None, Some(answered_name), Some(id))] if *answered_name == name && *id == known
+    );
+
+    let answered = metadata(storage.clone(), vec![by_name(&name), by_name(&name)]).await?;
     assert_matches!(
         answered.as_slice(),
         [(ErrorCode::None, Some(answered_name), Some(id))] if *answered_name == name && *id == known

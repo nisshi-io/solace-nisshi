@@ -364,7 +364,8 @@ where
 ///
 /// When an entry carries a topic ID other than the zero one, the request asks only by its IDs,
 /// each once, and its names are dropped, also the name of an entry that carries an ID, as Kafka
-/// reads it ([`KafkaApis.handleTopicMetadataRequest`]). Otherwise each entry asks by its name.
+/// reads it ([`KafkaApis.handleTopicMetadataRequest`]). Otherwise each entry asks by its name,
+/// and a name asked for twice is asked for once.
 ///
 /// [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1331-L1347
 fn requested_topics(topics: &[MetadataRequestTopic]) -> Vec<TopicId> {
@@ -378,7 +379,13 @@ fn requested_topics(topics: &[MetadataRequestTopic]) -> Vec<TopicId> {
         .collect::<Vec<_>>();
 
     if ids.is_empty() {
-        topics.iter().map(TopicId::from).collect()
+        let mut asked = BTreeSet::new();
+
+        topics
+            .iter()
+            .map(TopicId::from)
+            .filter(|topic| asked.insert(topic.clone()))
+            .collect()
     } else {
         ids
     }
