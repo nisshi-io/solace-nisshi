@@ -83,7 +83,7 @@ async fn run_broker_on(storage: Url, shutdown_grace: Duration) -> Result<Running
 
 /// Opens a connection that holds a request in progress: the client sends the first byte of a
 /// size prefix and nothing more, so the broker waits for the rest until its I/O idle timeout.
-async fn stuck_connection(addr: SocketAddr) -> Result<TcpStream> {
+pub(crate) async fn stuck_connection(addr: SocketAddr) -> Result<TcpStream> {
     let mut client = TcpStream::connect(addr).await?;
     client.write_all(&[0]).await?;
 

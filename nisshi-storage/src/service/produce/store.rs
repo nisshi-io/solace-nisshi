@@ -143,7 +143,7 @@ where
             .instrument(Span::current())
         };
 
-        _ = tokio::spawn(task);
+        self.detached.spawn(task);
 
         let mut receiver = receiver;
 
