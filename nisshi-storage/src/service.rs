@@ -117,7 +117,7 @@ pub use produce::{
     ProduceService, ProduceTopicService, SchemaValidationLayer, SchemaValidationService,
     StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
     UnknownPartitionLayer, UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic,
-    inflate_produced,
+    inflate_produced, wait_for_detached_writes,
 };
 use rama::{Layer, Service};
 use tokio::{

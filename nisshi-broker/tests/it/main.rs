@@ -110,6 +110,7 @@ pub mod retention_ms;
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
 pub mod shutdown;
+pub mod shutdown_produce_writes;
 pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;
 pub mod storage_capabilities;

@@ -40,7 +40,7 @@ use nisshi_schema::{
 use nisshi_service::{PeerAddressExtension, ProgressBarExtension, ShutdownExtension};
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
-    TopicCreationConfig,
+    TopicCreationConfig, wait_for_detached_writes,
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
@@ -75,7 +75,8 @@ use uuid::Uuid;
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a broker that shuts down waits for its connections to answer the requests that
-/// they hold, unless [`Broker::with_shutdown_grace`] sets another value.
+/// they hold, and then for the produce writes that run on after their request, unless
+/// [`Broker::with_shutdown_grace`] sets another value.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a broker waits for its serve task to end after the shutdown grace, before it aborts
@@ -310,10 +311,11 @@ pub struct Broker<G, S> {
     shutdown_deadline: CancellationToken,
 
     /// The token of the storage container that [`Builder::build`] made, cancelled after the
-    /// connections have drained.
+    /// connections have drained and the produce writes that ran on after their request have
+    /// ended.
     ///
     /// It differs from `cancellation`, because an engine that stops on its token would fail the
-    /// requests that the connections answer while they drain.
+    /// requests that the connections answer while they drain, and those writes.
     storage_cancellation: CancellationToken,
 
     /// Present when OTLP metrics are enabled; flushed and shut down when
@@ -395,6 +397,8 @@ where
 
     /// Returns the broker with the given shutdown grace: how long a broker that shuts down
     /// waits for its connections to answer the requests that they hold, before it aborts them.
+    /// The produce writes that run on after their request get what is left of the same grace
+    /// once the connections have ended, and a write that still runs then is left running.
     ///
     /// The default is [`DEFAULT_SHUTDOWN_GRACE`]. An interrupt signal to [`Self::main`] ends the
     /// grace at once.
@@ -508,6 +512,7 @@ where
 
             shutdown_grace = shutdown => {
                 info!(?shutdown_grace, "shutting down");
+                let shutdown_started = Instant::now();
                 cancellation.cancel();
 
                 let served = match timeout(shutdown_grace, set.join_next()).await {
@@ -534,6 +539,18 @@ where
                         }
                     }
                 };
+
+                // The writes get only what the connections left of the grace, so that a
+                // shutdown takes at most the grace and the abort timeout.
+                let remaining_grace = shutdown_grace.saturating_sub(shutdown_started.elapsed());
+                let still_running = wait_for_detached_writes(remaining_grace).await;
+
+                if still_running > 0 {
+                    warn!(
+                        writes = still_running,
+                        "the shutdown grace ended with produce writes still running"
+                    );
+                }
 
                 if !silent {
                     let stdout = Term::stdout();

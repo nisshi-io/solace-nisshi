@@ -282,7 +282,7 @@ pub use service::{
     TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
     UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
     ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response,
+    describe_groups_response, inflate_produced, list_groups_response, wait_for_detached_writes,
 };
 
 #[cfg(feature = "dynostore")]

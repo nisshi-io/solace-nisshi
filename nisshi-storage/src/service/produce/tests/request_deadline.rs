@@ -100,12 +100,12 @@ fn request(partitions: &[i32], acks: Ack, timeout_ms: i32) -> Result<RequestInpu
 
 /// A request for `partitions` that waits for the broker's answer, with a `timeout_ms` that no
 /// test reaches.
-fn acked(partitions: &[i32]) -> Result<RequestInput<ProduceRequest>> {
+pub(super) fn acked(partitions: &[i32]) -> Result<RequestInput<ProduceRequest>> {
     request(partitions, Ack::Leader, LONG)
 }
 
 /// The service that the broker runs for Produce, over `storage`, with the process-wide budget.
-fn service(
+pub(super) fn service(
     storage: &CountingStorage,
 ) -> impl Service<RequestInput<ProduceRequest>, Output = ProduceResponse, Error = Error> {
     ProduceService::new(storage.clone()).with_validation()
@@ -113,7 +113,7 @@ fn service(
 
 /// Serves `request` and returns the responses of its partitions, in order. It fails the test when
 /// the request has not answered by the time that a client with default settings gives up.
-async fn serve(
+pub(super) async fn serve(
     service: &impl Service<RequestInput<ProduceRequest>, Output = ProduceResponse, Error = Error>,
     request: RequestInput<ProduceRequest>,
 ) -> Result<Vec<PartitionProduceResponse>> {
@@ -127,7 +127,7 @@ async fn serve(
         .unwrap_or_default())
 }
 
-fn codes(responses: &[PartitionProduceResponse]) -> Result<Vec<ErrorCode>> {
+pub(super) fn codes(responses: &[PartitionProduceResponse]) -> Result<Vec<ErrorCode>> {
     responses
         .iter()
         .map(|response| ErrorCode::try_from(response.error_code).map_err(Into::into))
@@ -135,7 +135,7 @@ fn codes(responses: &[PartitionProduceResponse]) -> Result<Vec<ErrorCode>> {
 }
 
 /// A storage whose produce waits for a permit of the returned gate.
-fn stalled() -> (CountingStorage, Arc<Semaphore>) {
+pub(super) fn stalled() -> (CountingStorage, Arc<Semaphore>) {
     let gate = Arc::new(Semaphore::new(0));
 
     (

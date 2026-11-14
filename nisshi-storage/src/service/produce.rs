@@ -44,6 +44,7 @@ pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
     admission::Admission,
     batch_validation::{BatchValidationLayer, BatchValidationService},
+    detached::wait_for_detached_writes,
     partition::PartitionProduce,
     request_validation::{
         ProduceRequestValidationLayer, ProduceRequestValidationService, ValidatedProduceRequest,
