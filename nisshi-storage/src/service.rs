@@ -115,11 +115,12 @@ use opentelemetry::{
 };
 pub use produce::{
     AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
-    PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
-    ProduceService, ProduceTopicService, SchemaValidationLayer, SchemaValidationService,
-    StillRunning, StorePartitionService, StoredPartitions, TimestampLayer, TimestampService,
-    TopicConfiguration, UnknownPartitionLayer, UnknownPartitionService, ValidatedProduceRequest,
-    ValidatedTopic, inflate_produced, wait_for_detached_writes,
+    PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopicService, SchemaValidationLayer,
+    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions,
+    TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,
+    UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic, inflate_produced,
+    wait_for_detached_writes,
 };
 use rama::{Layer, Service};
 use tokio::{
@@ -752,6 +753,11 @@ impl Storage for RequestChannelService {
     /// not make before the deadline check.
     fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
         DeleteRecordsConcurrency::serial()
+    }
+
+    /// One write at a time, for the reason [`Storage::delete_records_concurrency`] gives above.
+    fn produce_concurrency(&self) -> usize {
+        1
     }
 
     #[instrument(skip_all)]

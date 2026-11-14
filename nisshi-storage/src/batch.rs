@@ -897,6 +897,10 @@ where
         self.storage.delete_records_concurrency()
     }
 
+    fn produce_concurrency(&self) -> usize {
+        self.storage.produce_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.storage.delete_topic(topic).await
     }

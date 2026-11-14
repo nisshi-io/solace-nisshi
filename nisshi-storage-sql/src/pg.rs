@@ -73,10 +73,10 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, Result,
-    ScramCredential, Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, PRODUCE_CONCURRENCY, ProduceEpoch,
+    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs,
+    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
     parse_storage_option, producer_claim,
@@ -4217,6 +4217,14 @@ impl Storage for Postgres {
             self.delete_records_per_request,
             Arc::clone(&self.delete_records_writes),
         )
+    }
+
+    /// Each write holds a pooled connection, so a request writes at most as many partitions at
+    /// once as the pool has connections, so that the writes of one request never wait for each
+    /// other's connection past the request's deadline. The writes of other requests still queue
+    /// on the pool.
+    fn produce_concurrency(&self) -> usize {
+        PRODUCE_CONCURRENCY.min(self.pool.status().max_size)
     }
 
     #[instrument(skip_all)]

@@ -273,8 +273,10 @@ async fn a_slow_earlier_partition_does_not_use_up_the_wait_of_a_later_one() -> R
     // One compressed batch at a time: a reservation is the 100 MiB maximum, clamped to the budget.
     let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
     let gate = Arc::new(Semaphore::new(0));
-    let storage =
-        CountingStorage::new(Listing::Topics, &[TOPIC]).with_produce_gate(Arc::clone(&gate));
+    // One write at a time, so that the second partition starts after the first one ended.
+    let storage = CountingStorage::new(Listing::Topics, &[TOPIC])
+        .with_produce_gate(Arc::clone(&gate))
+        .with_produce_concurrency(1);
 
     let request = tokio::spawn({
         let (storage, budget) = (storage.clone(), Arc::clone(&budget));

@@ -36,8 +36,10 @@ pub(super) const BUDGET_SPENT: &str =
 /// The partitions of a request share one `Admission`, and a partition takes from its remaining
 /// wait only the time that it spends waiting for the budget. The time that an earlier partition
 /// spends decoding or in the storage engine does not count, so a slow storage engine does not
-/// make a later partition answer `REQUEST_TIMED_OUT` while the budget is free. A request serves
-/// its partitions one after another, so the remaining wait needs no further synchronisation.
+/// make a later partition answer `REQUEST_TIMED_OUT` while the budget is free. A request writes
+/// several partitions at once, and each of them starts its wait from the remaining wait as it was
+/// when the wait started, so the waits of a request add up to about the wait, not exactly to it.
+/// The request's deadline bounds every wait.
 #[derive(Clone)]
 pub struct Admission {
     budget: Arc<DecodedBytesBudget>,
@@ -77,10 +79,13 @@ impl Admission {
         let started = Instant::now();
         let reserved = self.budget.reserve(bytes, started + remaining).await;
 
-        *self
+        // A wait only ever shortens the remaining wait. Another partition's wait can end first and
+        // lower it more than this one does, so this one keeps the smaller value.
+        let mut current = self
             .remaining
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = remaining.saturating_sub(started.elapsed());
+            .unwrap_or_else(PoisonError::into_inner);
+        *current = (*current).min(remaining.saturating_sub(started.elapsed()));
 
         reserved
     }
@@ -112,5 +117,65 @@ pub(super) fn decoded_upper_bound(batch: &deflated::Batch) -> usize {
             )
             .min(MAX_DECODED_BATCH_BYTES),
         _ => MAX_DECODED_BATCH_BYTES,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One unit of the budget, the least that a reservation takes.
+    const UNIT: usize = 1024;
+
+    /// Two partitions wait for the budget at once. The one that started later waited less, and
+    /// ends last. It does not give the request back the time that the other one took: the
+    /// remaining wait stays the smaller one.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_took_less_never_raises_the_remaining_wait() {
+        let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
+        let admission = Admission::new(Arc::clone(&budget), Duration::from_secs(10));
+
+        // All but one unit is held for the whole test, and the last unit is what the waits get,
+        // one at a time.
+        let _held = budget
+            .reserve(MAX_DECODED_BATCH_BYTES - UNIT, Instant::now())
+            .await
+            .expect("the budget is free");
+        let last_unit = budget
+            .reserve(UNIT, Instant::now())
+            .await
+            .expect("one unit is free");
+
+        let first = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.reserve(UNIT).await }
+        });
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // The second wait starts while the first one runs, so it starts from the same 10 s.
+        let second = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.reserve(UNIT).await }
+        });
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // The unit frees up, and the budget hands it to the first wait, which queued first. It
+        // took 8 s and leaves 2 s. The second wait gets the unit once the first one lets go of
+        // it. It took 4 s and would leave 6 s.
+        drop(last_unit);
+        drop(first.await.expect("the first wait ran"));
+        drop(second.await.expect("the second wait ran"));
+
+        // A third wait on a spent budget gets the 2 s that the first wait left, not the 6 s of
+        // the second.
+        let _last_unit = budget
+            .reserve(UNIT, Instant::now())
+            .await
+            .expect("the unit is free again");
+        let started = Instant::now();
+
+        assert!(admission.reserve(UNIT).await.is_err());
+
+        assert_eq!(Duration::from_secs(2), started.elapsed());
     }
 }

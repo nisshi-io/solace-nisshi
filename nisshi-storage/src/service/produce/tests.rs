@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod concurrent_partitions;
 mod fan_out;
 mod inflate_produced;
 mod request_deadline;

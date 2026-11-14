@@ -1423,6 +1423,11 @@ impl Storage for Engine {
         DeleteRecordsConcurrency::serial()
     }
 
+    /// One write at a time, for the reason [`Storage::delete_records_concurrency`] gives above.
+    fn produce_concurrency(&self) -> usize {
+        1
+    }
+
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
         debug!(?broker_registration);
 

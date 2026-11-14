@@ -43,7 +43,7 @@ use crate::METER;
 pub(super) const PRODUCE_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The message of a partition that the deadline stopped before its write started.
-const NOT_STARTED: &str =
+pub(super) const NOT_STARTED: &str =
     "the request's deadline passed before the broker started this partition's write, retry it";
 
 /// The message of a partition that the deadline stopped while it waited for the decoded-batch
@@ -52,8 +52,8 @@ const BUDGET_WAIT: &str = "the request's deadline passed while this partition wa
                            broker's decoded-batch budget, retry it";
 
 /// The message of a partition whose write the deadline left running.
-const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the \
-                       write may still complete, retry it";
+pub(super) const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the write may still \
+     complete, retry it";
 
 /// The message of a partition that the broker did not start because an earlier write to it runs.
 const IN_FLIGHT: &str = "the broker still runs an earlier write from this producer to this partition, retry the request";

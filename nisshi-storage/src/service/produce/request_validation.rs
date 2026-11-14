@@ -21,7 +21,9 @@ use nisshi_sans_io::{
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::{admission::Admission, deadline::Deadline, response};
+use super::{
+    PRODUCE_CONCURRENCY, admission::Admission, deadline::Deadline, response, slots::Slots,
+};
 use crate::{Error, Result};
 
 /// A [`ProduceRequest`] whose `acks` is valid.
@@ -44,6 +46,7 @@ pub struct ValidatedTopic {
     pub(super) partitions: Vec<PartitionProduceData>,
     pub(super) admission: Admission,
     pub(super) deadline: Deadline,
+    pub(super) slots: Slots,
 }
 
 /// A [`Layer`] that gives its inner [`Service`] a [`ValidatedProduceRequest`], and answers a
@@ -131,6 +134,7 @@ where
                         partitions: topic.partition_data.unwrap_or_default(),
                         admission: Admission::default(),
                         deadline,
+                        slots: Slots::new(PRODUCE_CONCURRENCY),
                     })
                     .collect(),
             })

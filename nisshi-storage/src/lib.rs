@@ -276,15 +276,16 @@ pub use service::{
     FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
-    MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
-    ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService, StillRunning,
-    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
-    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response, wait_for_detached_writes,
+    MetadataService, OutcomeSender, PRODUCE_CONCURRENCY, PartitionProduce,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
+    ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
+    RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
+    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions,
+    TimestampLayer, TimestampService, TopicConfiguration, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer,
+    UnknownPartitionService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
+    ValidatedProduceRequest, ValidatedTopic, bounded_channel, describe_groups_response,
+    inflate_produced, list_groups_response, wait_for_detached_writes,
 };
 
 #[cfg(feature = "dynostore")]
@@ -2255,6 +2256,19 @@ pub trait Storage: Debug + Send + Sync + 'static {
         ProduceEntry::produce_each(self, transaction_id, entries).await
     }
 
+    /// Returns how many partitions of one Produce request the [`ProduceService`] writes at once.
+    ///
+    /// The service makes one produce call for each partition of a request. At the request's
+    /// deadline it answers each partition that it has not started with `REQUEST_TIMED_OUT`, and
+    /// writes nothing for it. The default is [`PRODUCE_CONCURRENCY`]. A storage that runs its
+    /// writes one at a time answers 1, so that a second call never queues inside the engine,
+    /// where the deadline leaves it running after the request answered. A storage that wraps
+    /// another answers what the storage it wraps answers, unless the wrapper changes how the
+    /// calls run.
+    fn produce_concurrency(&self) -> usize {
+        PRODUCE_CONCURRENCY
+    }
+
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
     /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
@@ -2572,6 +2586,10 @@ where
         self.as_ref().delete_records_concurrency()
     }
 
+    fn produce_concurrency(&self) -> usize {
+        self.as_ref().produce_concurrency()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2886,6 +2904,10 @@ where
 
     fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
         self.as_ref().delete_records_concurrency()
+    }
+
+    fn produce_concurrency(&self) -> usize {
+        self.as_ref().produce_concurrency()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {

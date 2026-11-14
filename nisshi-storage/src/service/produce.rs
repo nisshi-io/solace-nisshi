@@ -17,11 +17,13 @@ mod admission;
 mod batch_validation;
 mod deadline;
 mod detached;
+mod grouping;
 mod partition;
 mod rejection;
 mod request_validation;
 mod response;
 mod schema;
+mod slots;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -32,6 +34,7 @@ mod unknown_partition;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use futures::{StreamExt as _, stream};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, ProduceRequest, ProduceResponse, produce_response::TopicProduceResponse,
     record::inflated,
@@ -40,7 +43,6 @@ use nisshi_schema::Registry;
 use rama::{Layer as _, Service};
 use tracing::{debug, instrument};
 
-use self::detached::Detached;
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
     admission::Admission,
@@ -58,10 +60,28 @@ pub use self::{
     topic_configuration::TopicConfiguration,
     unknown_partition::{UnknownPartitionLayer, UnknownPartitionService},
 };
+use self::{detached::Detached, slots::Slots};
 use crate::{
     Error, Result, Storage,
     decoded_budget::{self, DecodedBytesBudget},
 };
+
+/// How many partitions of one Produce request are written at once on a storage engine that does
+/// not set its own limit, see [`Storage::produce_concurrency`].
+///
+/// If a request writes its partitions one after another, a request for many partitions passes
+/// its deadline, and answers the partitions it did not reach with `REQUEST_TIMED_OUT`, however
+/// healthy each write is. Writing 4 at once takes a request for 100 partitions of 250 ms each
+/// from 25 s to about 6 s. The value is the one of `LIST_OFFSETS_CONCURRENCY`, for the same
+/// reasons. An engine with a connection pool bounds the calls of all requests itself, and the
+/// object store engine advances an idempotent producer's sequence with a compare-and-swap on one
+/// object, so each concurrent write to it costs conflict retries.
+///
+/// The decoded-byte budget counts each partition's batch while it is written, so a request holds
+/// up to this many batches of the budget at once, instead of one. The process-wide budget still
+/// caps the total. A partition that waits for the budget holds its slot, so the request makes no
+/// other storage call in that slot meanwhile.
+pub const PRODUCE_CONCURRENCY: usize = 4;
 
 /// Inflate a batch that a client sent in a Produce request, mapping a
 /// decode failure to `INVALID_RECORD`.
@@ -114,8 +134,9 @@ where
     })
 }
 
-/// A [`Service`] taking [`ValidatedProduceRequest`] returning [`ProduceResponse`], that serves each
-/// topic of the request, in order, with `topics`.
+/// A [`Service`] taking [`ValidatedProduceRequest`] returning [`ProduceResponse`], that serves the
+/// topics of the request with `topics`, up to `concurrency` storage calls at once, and answers them
+/// in the order of the request.
 ///
 /// [`ProduceService::new`] gives it a [`ProduceTopicService`] that uses a [`Storage`]. Call
 /// [`ProduceService::with_validation`] to get a service that takes a [`ProduceRequest`].
@@ -222,6 +243,7 @@ pub struct ProduceService<S> {
     topics: S,
     budget: Arc<DecodedBytesBudget>,
     wait: Duration,
+    concurrency: usize,
 }
 
 impl<S> ApiKey for ProduceService<S> {
@@ -268,7 +290,12 @@ where
                 detached,
             ));
 
-        Self::from_topics(ProduceTopicService::new(storage, partitions))
+        let concurrency = storage.produce_concurrency();
+
+        Self {
+            concurrency,
+            ..Self::from_topics(ProduceTopicService::new(storage, partitions))
+        }
     }
 
     /// Returns a service like [`ProduceService::new`] over `detached`, a set of its own.
@@ -279,14 +306,15 @@ where
 }
 
 impl<S> ProduceService<S> {
-    /// Returns a service that serves each topic with `topics`, and holds the decoded batches of a
-    /// request against the process-wide budget, for which a request waits at most
-    /// [`decoded_budget::WAIT_TIMEOUT`].
+    /// Returns a service that serves each topic with `topics`, up to [`PRODUCE_CONCURRENCY`]
+    /// storage calls at once, and holds the decoded batches of a request against the process-wide
+    /// budget, for which a request waits at most [`decoded_budget::WAIT_TIMEOUT`].
     fn from_topics(topics: S) -> Self {
         Self {
             topics,
             budget: decoded_budget::produce(),
             wait: decoded_budget::WAIT_TIMEOUT,
+            concurrency: PRODUCE_CONCURRENCY,
         }
     }
 
@@ -329,22 +357,47 @@ where
 
     #[instrument(skip(self, request))]
     async fn serve(&self, request: ValidatedProduceRequest) -> Result<Self::Output, Self::Error> {
-        let mut responses = Vec::with_capacity(request.topics.len());
-
         // One wait for the whole request, so that a request with many partitions does not wait
         // the full time for each one.
         let admission = Admission::new(Arc::clone(&self.budget), self.wait);
 
-        for topic in request.topics {
-            let topic = ValidatedTopic {
-                admission: admission.clone(),
-                ..topic
-            };
+        // One set of slots for the whole request, so that its topics together never make more
+        // than `concurrency` storage calls at once.
+        let slots = Slots::new(self.concurrency);
 
-            let Ok(response) = self.topics.serve(topic).await;
-            responses.push(response);
-        }
+        // If a request names a topic twice, the entries of that name are one group, and a group
+        // is served one entry after another, so the writes to a partition keep the request's
+        // order.
+        let groups = grouping::by_key(request.topics, |topic| topic.name.clone())
+            .into_iter()
+            .map(|group| async {
+                let mut answered = Vec::with_capacity(group.len());
 
-        Ok(response::produce_response(responses))
+                for (position, topic) in group {
+                    let topic = ValidatedTopic {
+                        admission: admission.clone(),
+                        slots: slots.clone(),
+                        ..topic
+                    };
+
+                    let Ok(response) = self.topics.serve(topic).await;
+                    answered.push((position, response));
+                }
+
+                answered
+            })
+            .collect::<Vec<_>>();
+
+        // Unordered, because an ordered buffer keeps a finished group's answer behind an
+        // unfinished earlier one and counts it against the window, so one slow topic would hold
+        // the later ones back. The slots bound the storage calls.
+        let answered = stream::iter(groups)
+            .buffer_unordered(self.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(response::produce_response(grouping::in_request_order(
+            answered,
+        )))
     }
 }
