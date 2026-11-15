@@ -17,8 +17,8 @@ use std::collections::BTreeSet;
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
     RequestInput, create_topics_request::CreatableTopic,
-    create_topics_response::CreatableTopicResult, metadata_response::MetadataResponseTopic,
-    topic::is_valid_topic_name,
+    create_topics_response::CreatableTopicResult, metadata_request::MetadataRequestTopic,
+    metadata_response::MetadataResponseTopic, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
@@ -184,10 +184,7 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let topics = input
-            .request
-            .topics
-            .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
+        let topics = input.request.topics.as_deref().map(requested_topics);
 
         // An empty list asks for no topics, and null for all of them
         // ([`MetadataRequest.isAllTopics`]). The v0 rule, where an empty list means all of them,
@@ -299,47 +296,54 @@ where
         let brokers = Some(response.brokers().to_owned());
         let cluster_id = response.cluster().map(|s| s.into());
         let controller_id = response.controller();
-        let topics = Some(
-            response
-                .topics()
-                .iter()
-                .filter(|_| !no_topics)
-                .map(|topic| {
-                    let topic = if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
-                        && topic
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| !is_valid_topic_name(name))
-                    {
-                        topic
-                            .clone()
-                            .error_code(ErrorCode::InvalidTopicException.into())
-                    } else if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
-                        && topic.name.is_none()
-                        && topic
-                            .topic_id
-                            .is_some_and(|topic_id| requested_ids.contains(&topic_id))
-                    {
-                        // Kafka picks the code in `KafkaApis` from whether the ID resolved to
-                        // a name, so the choice sits here and not in each storage engine,
-                        // which answers a miss the same for an ID and a name. The row's shape
-                        // alone does not say how the topic was asked for, so the request does.
-                        //
-                        // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1336-L1340
-                        topic.clone().error_code(ErrorCode::UnknownTopicId.into())
-                    } else {
-                        topic.clone()
-                    };
+        let mut topics = response
+            .topics()
+            .iter()
+            .filter(|_| !no_topics)
+            .map(|topic| {
+                let topic = if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    && topic
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !is_valid_topic_name(name))
+                {
+                    topic
+                        .clone()
+                        .error_code(ErrorCode::InvalidTopicException.into())
+                } else if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    && topic.name.is_none()
+                    && topic
+                        .topic_id
+                        .is_some_and(|topic_id| requested_ids.contains(&topic_id))
+                {
+                    // Kafka picks the code in `KafkaApis` from whether the ID resolved to
+                    // a name, so the choice sits here and not in each storage engine,
+                    // which answers a miss the same for an ID and a name. The row's shape
+                    // alone does not say how the topic was asked for, so the request does.
+                    //
+                    // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1336-L1340
+                    topic.clone().error_code(ErrorCode::UnknownTopicId.into())
+                } else {
+                    topic.clone()
+                };
 
-                    let operations = authorized_operations::topic(
-                        input.request.include_topic_authorized_operations,
-                        topic.name.as_deref(),
-                    );
+                let operations = authorized_operations::topic(
+                    input.request.include_topic_authorized_operations,
+                    topic.name.as_deref(),
+                );
 
-                    topic.topic_authorized_operations(Some(operations))
-                })
-                .collect::<Vec<_>>(),
-        );
+                topic.topic_authorized_operations(Some(operations))
+            })
+            .collect::<Vec<_>>();
+
+        // Kafka answers the unknown IDs before the other topics
+        // ([`KafkaApis.handleTopicMetadataRequest`]). The sort is stable, so the other topics
+        // keep the order that the storage answered them in.
+        //
+        // [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1419-L1420
+        topics.sort_by_key(|topic| topic.error_code != i16::from(ErrorCode::UnknownTopicId));
+
+        let topics = Some(topics);
         let cluster_authorized_operations = Some(authorized_operations::cluster(
             input.request.include_cluster_authorized_operations,
         ));
@@ -353,6 +357,37 @@ where
             .controller_id(controller_id)
             .topics(topics)
             .cluster_authorized_operations(cluster_authorized_operations))
+    }
+}
+
+/// The topics that a Metadata request for `topics` asks the storage for.
+///
+/// When an entry carries a topic ID other than the zero one, the request asks only by its IDs,
+/// each once, and its names are dropped, also the name of an entry that carries an ID, as Kafka
+/// reads it ([`KafkaApis.handleTopicMetadataRequest`]). Otherwise each entry asks by its name,
+/// and a name asked for twice is asked for once.
+///
+/// [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1331-L1347
+fn requested_topics(topics: &[MetadataRequestTopic]) -> Vec<TopicId> {
+    let mut seen = BTreeSet::new();
+
+    let ids = topics
+        .iter()
+        .filter_map(|topic| topic.topic_id)
+        .filter(|id| *id != NULL_TOPIC_ID && seen.insert(*id))
+        .map(TopicId::from)
+        .collect::<Vec<_>>();
+
+    if ids.is_empty() {
+        let mut asked = BTreeSet::new();
+
+        topics
+            .iter()
+            .map(TopicId::from)
+            .filter(|topic| asked.insert(topic.clone()))
+            .collect()
+    } else {
+        ids
     }
 }
 
