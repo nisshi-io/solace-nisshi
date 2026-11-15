@@ -14,7 +14,7 @@
 
 //! The clap value parser for [`EnvVarExp`].
 
-use std::{ffi::OsStr, marker::PhantomData, str::FromStr};
+use std::{ffi::OsStr, str::FromStr};
 
 use clap::{
     Arg, Command,
@@ -26,23 +26,20 @@ use url::Url;
 
 use crate::{EnvVarExp, Error};
 
-/// Parses an option value as [`EnvVarExp`], and reports a failure without the value. The reason
-/// is the `Display` of `T`'s parse error, so `T` must not put its input in that error. `Url`'s
-/// error does not.
+/// Parses an option value as [`EnvVarExp`]`<`[`Url`]`>`, and reports a failure without the value.
+/// The reason is the `Display` of the URL parse error, which does not put its input in the
+/// message. The parser is for `Url` only, so a type whose error might echo its input gets
+/// clap's own parser until someone checks it and adds it here.
 ///
 /// clap's own `FromStr` parser prints `invalid value '<raw value>' for '<option>'`. A URL option
 /// can hold a password, and that message goes to stderr and on to the container log, and
 /// `hide_env_values` hides a value only in `--help`. This parser names the option and the reason
 /// and leaves the value out.
-#[derive(Clone, Debug)]
-pub struct EnvVarExpParser<T>(PhantomData<fn() -> T>);
+#[derive(Clone, Copy, Debug)]
+pub struct EnvVarExpParser;
 
-impl<T> TypedValueParser for EnvVarExpParser<T>
-where
-    T: FromStr + Clone + Send + Sync + 'static,
-    Error: From<<T as FromStr>::Err>,
-{
-    type Value = EnvVarExp<T>;
+impl TypedValueParser for EnvVarExpParser {
+    type Value = EnvVarExp<Url>;
 
     fn parse_ref(
         &self,
@@ -50,7 +47,7 @@ where
         arg: Option<&Arg>,
         value: &OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        match value.to_str().map(EnvVarExp::<T>::from_str) {
+        match value.to_str().map(EnvVarExp::<Url>::from_str) {
             Some(Ok(parsed)) => Ok(parsed),
             Some(Err(err)) => Err(rejection(cmd, arg, &err.to_string())),
             None => Err(rejection(cmd, arg, NOT_UNICODE)),
@@ -94,15 +91,11 @@ impl TypedValueParser for UrlParser {
     }
 }
 
-impl<T> ValueParserFactory for EnvVarExp<T>
-where
-    T: FromStr + Clone + Send + Sync + 'static,
-    Error: From<<T as FromStr>::Err>,
-{
-    type Parser = EnvVarExpParser<T>;
+impl ValueParserFactory for EnvVarExp<Url> {
+    type Parser = EnvVarExpParser;
 
     fn value_parser() -> Self::Parser {
-        EnvVarExpParser(PhantomData)
+        EnvVarExpParser
     }
 }
 
