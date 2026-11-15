@@ -42,8 +42,11 @@ use tokio::{
 
 use crate::{
     Error, ProduceService, Result,
-    decoded_budget::DecodedBytesBudget,
-    service::counting_storage::{CountingStorage, Listing},
+    decoded_budget::{self, DecodedBytesBudget},
+    service::{
+        counting_storage::{CountingStorage, Listing},
+        produce::detached::Detached,
+    },
 };
 
 const TOPIC: &str = "abc";
@@ -104,11 +107,30 @@ fn acked(partitions: &[i32]) -> Result<RequestInput<ProduceRequest>> {
     request(partitions, Ack::Leader, LONG)
 }
 
-/// The service that the broker runs for Produce, over `storage`, with the process-wide budget.
+/// The service that the broker runs for Produce, over `storage`, with a decoded-bytes budget and a
+/// set of in-flight writes of its own.
 fn service(
     storage: &CountingStorage,
 ) -> impl Service<RequestInput<ProduceRequest>, Output = ProduceResponse, Error = Error> {
-    ProduceService::new(storage.clone()).with_validation()
+    service_sharing(storage, Detached::default())
+}
+
+/// A service like [`service`] that tracks its in-flight writes in `detached`. The broker builds
+/// one service for each connection over the set of the process, so services that share a set
+/// stand for connections of one broker.
+fn service_sharing(
+    storage: &CountingStorage,
+    detached: Detached,
+) -> impl Service<RequestInput<ProduceRequest>, Output = ProduceResponse, Error = Error> {
+    // A budget of its own as well, because a write that another test leaves running holds
+    // bytes of the process's budget, and the tests that run in one process would then wait for
+    // each other.
+    ProduceService::new_sharing(storage.clone(), detached)
+        .with_decoded_budget(
+            Arc::new(DecodedBytesBudget::new(4 * MAX_DECODED_BATCH_BYTES)),
+            decoded_budget::WAIT_TIMEOUT,
+        )
+        .with_validation()
 }
 
 /// Serves `request` and returns the responses of its partitions, in order. It fails the test when
@@ -241,8 +263,9 @@ async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()
 #[tokio::test(start_paused = true)]
 async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() -> Result<()> {
     let (storage, gate) = stalled();
-    let connection = service(&storage);
-    let other_connection = service(&storage);
+    let detached = Detached::default();
+    let connection = service_sharing(&storage, detached.clone());
+    let other_connection = service_sharing(&storage, detached.clone());
 
     let first = serve(&connection, acked(&[0])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&first)?);
@@ -283,23 +306,17 @@ fn produced_partitions(storage: &CountingStorage) -> Vec<i32> {
 /// deadline as it is.
 #[tokio::test(start_paused = true)]
 async fn the_request_timeout_shortens_the_deadline() -> Result<()> {
-    for (partition, (timeout_ms, expected)) in [
+    for (timeout_ms, expected) in [
         (3_000, Duration::from_secs(3)),
         (LONG, Duration::from_secs(20)),
         (0, Duration::from_secs(20)),
         (-1, Duration::from_secs(20)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        // A partition of its own for each round, because a write that an earlier round left
-        // running holds its partition for every service of the process.
-        let partition = i32::try_from(partition)?;
+    ] {
         let (storage, _gate) = stalled();
         let service = service(&storage);
         let started_at = Instant::now();
 
-        let responses = serve(&service, request(&[partition], Ack::Leader, timeout_ms)?).await?;
+        let responses = serve(&service, request(&[0], Ack::Leader, timeout_ms)?).await?;
 
         assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&responses)?);
         assert_eq!(expected, started_at.elapsed(), "timeout_ms {timeout_ms}");
@@ -357,6 +374,53 @@ async fn the_wait_for_the_budget_ends_at_the_deadline() -> Result<()> {
     assert_eq!(Duration::from_secs(3), started_at.elapsed());
     assert!(storage.produced().is_empty());
 
+    // The partition that waited names the budget, so that it does not read as a plain deadline.
+    // The one after it was never started, because the wait used up the time.
+    let messages = responses
+        .iter()
+        .map(|response| response.error_message.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(messages[0].contains("decoded-batch budget"), "{messages:?}");
+    assert!(
+        messages[1].contains("before the broker started"),
+        "{messages:?}"
+    );
+
+    Ok(())
+}
+
+/// A request whose read of the topic's configuration does not end answers at the deadline, with
+/// every partition not started, and storage is not asked to write.
+#[tokio::test(start_paused = true)]
+async fn the_read_of_the_topic_configuration_ends_at_the_deadline() -> Result<()> {
+    let config_gate = Arc::new(Semaphore::new(0));
+    let (storage, _gate) = stalled();
+    let storage = storage.with_config_gate(config_gate);
+    let service = service(&storage);
+    let started_at = Instant::now();
+
+    let responses = serve(&service, request(&[0, 1, 2], Ack::Leader, 3_000)?).await?;
+
+    assert_eq!(Duration::from_secs(3), started_at.elapsed());
+    assert_eq!(
+        vec![ErrorCode::RequestTimedOut; 3],
+        codes(&responses)?,
+        "{responses:?}"
+    );
+
+    for response in &responses {
+        assert!(
+            response
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("before the broker started")),
+            "{response:?}"
+        );
+    }
+
+    assert_eq!(0, storage.parked());
+    assert!(storage.produced().is_empty());
+
     Ok(())
 }
 
@@ -402,8 +466,8 @@ async fn a_request_that_finishes_in_time_answers_as_before() -> Result<()> {
 }
 
 /// Installs an in-memory exporter as the global meter provider. A test calls this before the code
-/// creates its first instrument. nextest runs each test in a process of its own, so the
-/// instruments are created after this in every test that calls it.
+/// creates its first instrument. The instruments are process-wide, so only the tests that call
+/// this need nextest's process for each test. The other tests share no state.
 fn install_exporter() -> (SdkMeterProvider, InMemoryMetricExporter) {
     let exporter = InMemoryMetricExporter::default();
     let provider = SdkMeterProvider::builder()

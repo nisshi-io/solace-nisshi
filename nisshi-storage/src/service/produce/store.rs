@@ -66,10 +66,14 @@ where
     G: Storage,
 {
     pub fn new(storage: G) -> Self {
-        Self {
-            storage,
-            detached: Detached::process(),
-        }
+        Self::with_detached(storage, Detached::process())
+    }
+
+    /// Returns a service that tracks the writes that its requests leave running in `detached`,
+    /// not in the set of the process. A test uses this so that it does not share state with the
+    /// others that run in its process.
+    pub(super) fn with_detached(storage: G, detached: Detached) -> Self {
+        Self { storage, detached }
     }
 }
 

@@ -46,6 +46,11 @@ pub(super) const PRODUCE_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 const NOT_STARTED: &str =
     "the request's deadline passed before the broker started this partition's write, retry it";
 
+/// The message of a partition that the deadline stopped while it waited for the decoded-batch
+/// budget.
+const BUDGET_WAIT: &str = "the request's deadline passed while this partition waited for the \
+                           broker's decoded-batch budget, retry it";
+
 /// The message of a partition whose write the deadline left running.
 const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the \
                        write may still complete, retry it";
@@ -68,6 +73,9 @@ static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(super) enum Stage {
     /// No storage write had started for the partition.
     NotStarted,
+    /// The partition waited for the decoded-batch budget, and the deadline ended the wait before
+    /// the budget's own wait did. No storage write had started.
+    BudgetWait,
     /// The storage write had started, and the broker answered without its result.
     Writing,
     /// The broker did not start a write, because an earlier write to the partition that its
@@ -79,6 +87,7 @@ impl Stage {
     fn as_str(self) -> &'static str {
         match self {
             Self::NotStarted => "not_started",
+            Self::BudgetWait => "budget_wait",
             Self::Writing => "writing",
             Self::InFlight => "in_flight",
         }
@@ -87,6 +96,7 @@ impl Stage {
     fn message(self) -> &'static str {
         match self {
             Self::NotStarted => NOT_STARTED,
+            Self::BudgetWait => BUDGET_WAIT,
             Self::Writing => WRITING,
             Self::InFlight => IN_FLIGHT,
         }

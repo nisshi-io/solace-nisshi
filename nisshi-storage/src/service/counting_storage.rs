@@ -112,6 +112,7 @@ pub(crate) struct CountingStorage {
     produce_gate: Option<Arc<Semaphore>>,
     produce_all_calls: Arc<AtomicUsize>,
     gated_partitions: Option<BTreeSet<i32>>,
+    config_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -203,6 +204,15 @@ impl CountingStorage {
     /// `produce_all` calls `produce` on this storage instead, and leaves this count unchanged.
     pub(crate) fn produce_all_calls(&self) -> usize {
         self.produce_all_calls.load(Ordering::SeqCst)
+    }
+
+    /// Returns this storage, with each read of a topic's configuration waiting for a permit of
+    /// `gate` before it answers, as a read waits for an engine connection.
+    pub(crate) fn with_config_gate(self, gate: Arc<Semaphore>) -> Self {
+        Self {
+            config_gate: Some(gate),
+            ..self
+        }
     }
 
     /// The number of produces now waiting for the gate.
@@ -494,6 +504,12 @@ impl Storage for CountingStorage {
         resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
+        if matches!(resource, ConfigResource::Topic)
+            && let Some(gate) = &self.config_gate
+        {
+            gate.acquire().await?.forget();
+        }
+
         let holds_topic = !matches!(resource, ConfigResource::Topic)
             || self
                 .topics

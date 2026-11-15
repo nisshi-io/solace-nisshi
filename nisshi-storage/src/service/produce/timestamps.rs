@@ -392,7 +392,8 @@ where
         // partition that waits here holds only its compressed batch.
         //
         // The wait ends at the request's deadline if that comes first. Nothing was written, so
-        // the partition answers as one that was not started.
+        // the partition answers as one that was not started, with a stage of its own and the
+        // warning of the exhausted path, so that an operator sees budget back-pressure.
         let compression = Compression::try_from(batch.attributes).unwrap_or_default();
         let reserved = request
             .deadline
@@ -401,7 +402,14 @@ where
 
         let mut reservation = match reserved {
             Err(_) => {
-                return Ok(Deadline::timed_out(Stage::NotStarted, request.index));
+                warn!(
+                    topic = request.topic,
+                    partition = request.index,
+                    "the request's deadline ended the wait for the decoded-batch budget, \
+                     answering REQUEST_TIMED_OUT"
+                );
+
+                return Ok(Deadline::timed_out(Stage::BudgetWait, request.index));
             }
             Ok(Ok(reservation)) => reservation,
             Ok(Err(Exhausted { requested, waited })) => {
