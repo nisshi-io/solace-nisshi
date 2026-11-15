@@ -17,9 +17,9 @@ use nisshi_sans_io::{
     describe_cluster_response::DescribeClusterBroker,
 };
 use rama::Service;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, StorageOperation, service::fetch::storage_failure_warns_now};
 
 /// A [`Service`] using its [`Storage`] taking [`DescribeClusterRequest`] returning [`DescribeClusterResponse`].
 /// ```no_run
@@ -89,9 +89,10 @@ where
                 .cluster_id(cluster_id)
                 .brokers(Some(brokers)),
 
-            Err(error) => {
-                error!(?error, "describing the cluster failed in storage");
-                storage_error_response(&error)
+            Err((operation, error)) => {
+                let response = storage_error_response(&error);
+                log_storage_failure(operation, &error, &response);
+                response
             }
         };
 
@@ -106,14 +107,48 @@ impl<G> DescribeClusterService<G>
 where
     G: Storage,
 {
-    /// Reads the brokers and the cluster id from storage.
-    async fn brokers_and_cluster_id(&self) -> Result<(Vec<DescribeClusterBroker>, String)> {
-        let brokers = self.storage.brokers().await?;
+    /// Reads the brokers and the cluster id from storage. A failure comes with the operation that
+    /// failed.
+    async fn brokers_and_cluster_id(
+        &self,
+    ) -> std::result::Result<(Vec<DescribeClusterBroker>, String), (StorageOperation, Error)> {
+        let brokers = self
+            .storage
+            .brokers()
+            .await
+            .map_err(|error| (StorageOperation::Brokers, error))?;
         debug!(?brokers);
 
-        let cluster_id = self.storage.cluster_id().await?;
+        let cluster_id = self
+            .storage
+            .cluster_id()
+            .await
+            .map_err(|error| (StorageOperation::ClusterId, error))?;
 
         Ok((brokers, cluster_id))
+    }
+}
+
+/// Logs a describe that failed in `operation` with `error` and was answered with `response`.
+///
+/// `KAFKA_STORAGE_ERROR` answers a failure that a retry may clear, which a client retries as
+/// often as it likes. That answer logs at `warn` at most once in each interval for each
+/// operation, and at debug after that. Any other code is a failure that a retry does not fix, so
+/// it logs at error each time.
+fn log_storage_failure(
+    operation: StorageOperation,
+    error: &Error,
+    response: &DescribeClusterResponse,
+) {
+    let error_code =
+        ErrorCode::try_from(response.error_code).unwrap_or(ErrorCode::UnknownServerError);
+
+    if error_code != ErrorCode::KafkaStorageError {
+        error!(%operation, ?error, ?error_code, "describing the cluster failed in storage");
+    } else if storage_failure_warns_now(operation) {
+        warn!(%operation, ?error, "describing the cluster failed in storage");
+    } else {
+        debug!(%operation, ?error, "describing the cluster failed in storage");
     }
 }
 
@@ -157,12 +192,36 @@ mod tests {
     use nisshi_sans_io::{Frame, Header};
     use rama::extensions::Extensions;
 
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
     use super::*;
-    use crate::service::counting_storage::{BrokerCall, CountingStorage, NODE_ID};
+    use crate::service::{
+        counting_storage::{BrokerCall, CountingStorage, NODE_ID},
+        fetch::STORAGE_FAILURE_WARN_INTERVAL,
+    };
+
+    /// Collects what the `tracing` subscriber of a test writes.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// An error that a retry may clear.
     fn transient() -> Error {
-        Error::from(std::io::Error::other("connection reset"))
+        Error::from(io::Error::other("connection reset"))
     }
 
     /// An error that a retry can't clear, with text that must not reach a client.
@@ -273,6 +332,58 @@ mod tests {
                 .map(|broker| broker.broker_id)
                 .collect::<Vec<_>>()
         );
+
+        Ok(())
+    }
+
+    /// A failure that a retry may clear logs at `warn` once in each interval for each operation
+    /// and at debug after that. A failure that a retry can't clear logs at error each time.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_warns_once_in_each_interval() -> Result<()> {
+        // Another test in this process may have used up the interval.
+        tokio::time::advance(STORAGE_FAILURE_WARN_INTERVAL).await;
+
+        let log = Log::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        for _ in 0..3 {
+            _ = serve(CountingStorage::failing_broker_call(
+                BrokerCall::ClusterId,
+                transient(),
+            ))
+            .await?;
+        }
+
+        for _ in 0..2 {
+            _ = serve(CountingStorage::failing_broker_call(
+                BrokerCall::Brokers,
+                permanent(),
+            ))
+            .await?;
+        }
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf8");
+        let count = |level: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.contains(" describing the cluster failed in storage")
+                        && line.split_whitespace().nth(1) == Some(level)
+                })
+                .count()
+        };
+
+        assert_eq!(1, count("WARN"), "{text}");
+        assert_eq!(2, count("DEBUG"), "{text}");
+        assert_eq!(2, count("ERROR"), "{text}");
 
         Ok(())
     }

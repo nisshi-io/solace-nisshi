@@ -17,10 +17,10 @@ use nisshi_sans_io::{
     find_coordinator_response::Coordinator,
 };
 use rama::Service;
-use tracing::{error, instrument};
+use tracing::{debug, error, instrument, warn};
 use url::Url;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, StorageOperation, service::fetch::storage_failure_warns_now};
 
 /// A [`Service`] using its [`Storage`] taking [`FindCoordinatorRequest`] returning [`FindCoordinatorResponse`].
 /// ```no_run
@@ -93,9 +93,10 @@ where
         let answer = match self.node_and_listener().await {
             Ok((node_id, listener)) => CoordinatorAnswer::this_broker(node_id, &listener),
 
-            Err(error) => {
-                error!(?error, "finding the coordinator failed in storage");
-                CoordinatorAnswer::storage_error(&error)
+            Err((operation, error)) => {
+                let answer = CoordinatorAnswer::storage_error(&error);
+                log_storage_failure(operation, &error, answer.error_code);
+                answer
             }
         };
 
@@ -135,12 +136,39 @@ impl<G> FindCoordinatorService<G>
 where
     G: Storage,
 {
-    /// Reads this broker's node id and advertised listener from storage.
-    async fn node_and_listener(&self) -> Result<(i32, Url)> {
-        let node_id = self.storage.node().await?;
-        let listener = self.storage.advertised_listener().await?;
+    /// Reads this broker's node id and advertised listener from storage. A failure comes with the
+    /// operation that failed.
+    async fn node_and_listener(
+        &self,
+    ) -> std::result::Result<(i32, Url), (StorageOperation, Error)> {
+        let node_id = self
+            .storage
+            .node()
+            .await
+            .map_err(|error| (StorageOperation::Node, error))?;
+        let listener = self
+            .storage
+            .advertised_listener()
+            .await
+            .map_err(|error| (StorageOperation::AdvertisedListener, error))?;
 
         Ok((node_id, listener))
+    }
+}
+
+/// Logs a lookup that failed in `operation` with `error` and was answered with `error_code`.
+///
+/// `COORDINATOR_NOT_AVAILABLE` answers a failure that a retry may clear, which every client
+/// retries as often as it likes, for each group. That answer logs at `warn` at most once in each
+/// interval for each operation, and at debug after that. Any other code is a failure that a retry
+/// does not fix, so it logs at error each time.
+fn log_storage_failure(operation: StorageOperation, error: &Error, error_code: ErrorCode) {
+    if error_code != ErrorCode::CoordinatorNotAvailable {
+        error!(%operation, ?error, ?error_code, "finding the coordinator failed in storage");
+    } else if storage_failure_warns_now(operation) {
+        warn!(%operation, ?error, "finding the coordinator failed in storage");
+    } else {
+        debug!(%operation, ?error, "finding the coordinator failed in storage");
     }
 }
 
@@ -212,12 +240,36 @@ mod tests {
     use nisshi_sans_io::{Frame, Header};
     use rama::extensions::Extensions;
 
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
     use super::*;
-    use crate::service::counting_storage::{BrokerCall, CountingStorage, HOST, NODE_ID, PORT};
+    use crate::service::{
+        counting_storage::{BrokerCall, CountingStorage, HOST, NODE_ID, PORT},
+        fetch::STORAGE_FAILURE_WARN_INTERVAL,
+    };
+
+    /// Collects what the `tracing` subscriber of a test writes.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Log {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// An error that a retry may clear.
     fn transient() -> Error {
-        Error::from(std::io::Error::other("connection reset"))
+        Error::from(io::Error::other("connection reset"))
     }
 
     /// An error that a retry can't clear, with text that must not reach a client.
@@ -370,6 +422,59 @@ mod tests {
             assert_eq!(HOST, coordinator.host);
             assert_eq!(PORT, coordinator.port);
         }
+
+        Ok(())
+    }
+
+    /// A failure that a retry may clear logs at `warn` once in each interval and at debug after
+    /// that, so clients that retry `COORDINATOR_NOT_AVAILABLE` do not flood the log. A failure
+    /// that a retry can't clear logs at error each time.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_warns_once_in_each_interval() -> Result<()> {
+        // Another test in this process may have used up the interval.
+        tokio::time::advance(STORAGE_FAILURE_WARN_INTERVAL).await;
+
+        let log = Log::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        for _ in 0..3 {
+            _ = serve(CountingStorage::failing_broker_call(
+                BrokerCall::Node,
+                transient(),
+            ))
+            .await?;
+        }
+
+        for _ in 0..2 {
+            _ = serve(CountingStorage::failing_broker_call(
+                BrokerCall::AdvertisedListener,
+                permanent(),
+            ))
+            .await?;
+        }
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf8");
+        let count = |level: &str| {
+            text.lines()
+                .filter(|line| {
+                    line.contains(" finding the coordinator failed in storage")
+                        && line.split_whitespace().nth(1) == Some(level)
+                })
+                .count()
+        };
+
+        assert_eq!(1, count("WARN"), "{text}");
+        assert_eq!(2, count("DEBUG"), "{text}");
+        assert_eq!(2, count("ERROR"), "{text}");
 
         Ok(())
     }

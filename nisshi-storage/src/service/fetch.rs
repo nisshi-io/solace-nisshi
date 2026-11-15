@@ -83,7 +83,7 @@ const UNRESOLVED_TOPIC: &str = "unresolved";
 
 /// The shortest time between two `warn` lines for failures of one storage operation that a retry
 /// may clear.
-const STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+pub(super) const STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// When each storage operation last logged a `warn` line for a failure that a retry may clear.
 static STORAGE_FAILURE_LAST_WARNED: LazyLock<Mutex<HashMap<StorageOperation, Instant>>> =
