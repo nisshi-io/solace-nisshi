@@ -65,9 +65,9 @@ pub(super) struct Detached {
 pub struct StillRunning {
     /// How many writes still run, whether or not their request still waits for them.
     pub writes: usize,
-    /// The partitions with a write that its request has answered. A write whose request still
-    /// waits for it, such as one that started during the wait, is in `writes` and not here, so
-    /// this can name fewer partitions than `writes` counts.
+    /// The partitions with a write whose request already answered at its deadline. A write whose
+    /// request was aborted by the shutdown, or that started during the wait, is in `writes` and
+    /// not here, so this can name fewer partitions than `writes` counts, or none.
     pub detached_partitions: Vec<Topition>,
 }
 

@@ -547,12 +547,14 @@ where
 
                 if still_running.writes > 0 {
                     // `writes` counts every running write. `detached_partitions` names only the
-                    // partitions of writes whose request already answered, so a write that its
-                    // request still waits for is in the count and not in the list.
+                    // partitions of writes whose request already answered at its deadline. Every
+                    // connection has drained or been aborted by now, so a write outside the list
+                    // is one whose request the shutdown aborted, or one that started during the
+                    // wait. The common shutdown case is a count with an empty list.
                     warn!(
                         writes = still_running.writes,
                         detached_partitions = ?still_running.detached_partitions,
-                        "the shutdown grace ended with produce writes still running"
+                        "the shutdown grace ended with produce writes still running; detached_partitions lists only writes whose request already answered"
                     );
                 }
 
