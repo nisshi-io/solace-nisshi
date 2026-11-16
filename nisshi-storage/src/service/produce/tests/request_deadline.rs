@@ -363,7 +363,7 @@ async fn the_wait_for_the_budget_ends_at_the_deadline() -> Result<()> {
         )
         .await;
 
-    let service = ProduceService::new(storage.clone())
+    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
         .with_decoded_budget(budget, Duration::from_secs(60))
         .with_validation();
     let started_at = Instant::now();
@@ -430,7 +430,7 @@ async fn the_read_of_the_topic_configuration_ends_at_the_deadline() -> Result<()
 async fn a_detached_write_holds_its_budget_until_it_ends() -> Result<()> {
     let (storage, gate) = stalled();
     let budget = Arc::new(DecodedBytesBudget::new(4 * MAX_DECODED_BATCH_BYTES));
-    let service = ProduceService::new(storage.clone())
+    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
         .with_decoded_budget(Arc::clone(&budget), Duration::from_secs(60))
         .with_validation();
 
@@ -513,6 +513,33 @@ fn recorded(
         .collect()
 }
 
+/// Returns the count and the sum of each data point of the histogram `name`, as the last export
+/// holds them.
+fn histogram(
+    provider: &SdkMeterProvider,
+    exporter: &InMemoryMetricExporter,
+    name: &str,
+) -> Vec<(u64, u64)> {
+    provider.force_flush().expect("flush");
+
+    exporter
+        .get_finished_metrics()
+        .expect("finished metrics")
+        .last()
+        .into_iter()
+        .flat_map(ResourceMetrics::scope_metrics)
+        .flat_map(ScopeMetrics::metrics)
+        .filter(|metric| metric.name() == name)
+        .flat_map(|metric| match metric.data() {
+            AggregatedMetrics::U64(MetricData::Histogram(histogram)) => histogram
+                .data_points()
+                .map(|point| (point.count(), point.sum()))
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect()
+}
+
 fn sorted<'a>(attributes: impl Iterator<Item = &'a KeyValue>) -> Vec<(String, String)> {
     let mut sorted = attributes
         .map(|attribute| (attribute.key.to_string(), attribute.value.to_string()))
@@ -561,6 +588,53 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     assert_matches!(
         recorded(&provider, &exporter, "nisshi_produce_detached_writes").as_slice(),
         [(_, 0)]
+    );
+
+    Ok(())
+}
+
+/// A partition that the deadline stops while it waits for the decoded-batch budget counts at the
+/// `budget_wait` stage, and does not count as an exhausted budget, which is the budget's own
+/// timeout. The wait is recorded, although the deadline drops it before it returns.
+#[tokio::test(start_paused = true)]
+async fn the_deadline_counts_a_partition_that_waited_for_the_budget() -> Result<()> {
+    let (provider, exporter) = install_exporter();
+    let storage = CountingStorage::new(Listing::Topics, &[TOPIC]);
+    let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
+    let _held = budget
+        .reserve(
+            MAX_DECODED_BATCH_BYTES,
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    let service = ProduceService::new_sharing(storage, Detached::default())
+        .with_decoded_budget(budget, Duration::from_secs(60))
+        .with_validation();
+
+    let responses = serve(&service, request(&[0], Ack::Leader, 3_000)?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&responses)?);
+
+    assert_eq!(
+        vec![(stage("budget_wait"), 1)],
+        recorded(&provider, &exporter, "nisshi_produce_deadline_exceeded")
+    );
+    assert!(
+        recorded(
+            &provider,
+            &exporter,
+            "nisshi_produce_decoded_budget_exhausted"
+        )
+        .is_empty()
+    );
+    // Two waits: the setup's reservation, which took no time, and the request's, which took the
+    // 3 s that the deadline allowed.
+    assert_eq!(
+        vec![(2, 3_000)],
+        histogram(
+            &provider,
+            &exporter,
+            "nisshi_produce_decoded_budget_wait_duration"
+        )
     );
 
     Ok(())

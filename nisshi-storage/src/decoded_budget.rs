@@ -93,6 +93,13 @@ static EXHAUSTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Records the time that a request waited for the budget. [`DecodedBytesBudget::reserve`] calls
+/// this when it returns. A caller that drops the `reserve` future at its own deadline records the
+/// time itself, because the dropped future never reaches that call.
+pub(crate) fn record_wait(waited: Duration) {
+    WAIT_DURATION.record(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX), &[]);
+}
+
 /// A request that waited until its deadline without getting its bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Exhausted {
@@ -172,7 +179,7 @@ impl DecodedBytesBudget {
 
         let acquired = timeout_at(deadline, self.inner.semaphore.acquire_many(units)).await;
         let waited = waiting.elapsed();
-        WAIT_DURATION.record(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX), &[]);
+        record_wait(waited);
 
         match acquired {
             Ok(Ok(permit)) => {
