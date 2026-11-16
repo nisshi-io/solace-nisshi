@@ -66,6 +66,33 @@ Result JSON lands in `results/`.
   not as a durable setup. On macOS only `fsync_writethrough` flushes the drive cache, and it is too slow
   to run at 50k msg/s, so the default WAL is not flushed to the media either.
 
+## Connections per client
+
+The broker logs one `nisshi::connection` event when it accepts a connection and one when the connection
+closes, and `broker` turns them on (`RUST_LOG=warn,nisshi::connection=info`) and asks for a snapshot of every
+open connection each `CONNECTION_SNAPSHOT_INTERVAL` (default `10s`). A close event carries the connection's
+`client_id`, its age, the requests it sent by API, and the topic-partitions it produced to (with the records
+and bytes) and fetched from. If you set `RUST_LOG` yourself, keep `nisshi::connection=info` in it.
+
+```shell
+./run.sh run workloads/16-partitions-3min.yaml
+./run.sh connections                                          # clients, their connections and requests
+./run.sh connections --connections --csv results/connections.csv   # every connection, and a CSV of them
+```
+
+`connections` runs the `connections` binary of `nisshi-broker` on `broker.log`, so it covers everything since
+`./run.sh broker`. The first run builds the binary in release mode, which took about a minute on a laptop. It groups the connections
+by `client_id`, and by client kind, which is the id without its trailing number (`producer-3` is a
+`producer`). A connection that closed before it sent a request has no `client_id` and is reported as
+`(no request)`. A connection still open when the log ends is taken from its latest snapshot.
+
+`run` also samples the established sockets on port 9092 with `lsof` every `SOCKET_SAMPLE_INTERVAL` seconds
+(default 5, 0 turns it off) into `results/sockets-*.csv`, and prints the peak when the run ends. The
+`broker_established` column is the sockets the broker holds, and `benchmark_established` is the sockets the
+benchmark JVM holds to the broker. Each connection has one of each, so the columns agree except while a
+connection opens or closes, and `broker_established` should reach the broker's `open at the peak` figure
+from `connections`. `./run.sh sockets 1` samples every second without a run, for another client.
+
 ## Checking queries against large volumes
 
 `seed.sql` fills a topic with generated records straight in postgres, far faster than producing

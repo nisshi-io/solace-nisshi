@@ -18,6 +18,7 @@
 
 use std::{
     io,
+    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -335,6 +336,87 @@ async fn snapshots_report_an_open_connection_and_then_count_it_out() -> Result<(
 
         let open = wait_for("open=0", after_close).await?;
         assert!(open.contains("connections open"), "{open}");
+
+        Ok(())
+    })
+    .await?
+}
+
+/// The `connections` binary reads the events that the broker logs: it reports the client, the
+/// connection it used, and the partition it produced to and fetched from.
+#[tokio::test]
+async fn the_connections_report_reads_the_events_the_broker_logs() -> Result<()> {
+    let capture = Capture::default();
+    let writer = capture.clone();
+
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_env_filter("nisshi::connection=info")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(None).await?;
+        let topic = alphanumeric_string(15);
+
+        let mut stream = TcpStream::connect(broker.addr).await?;
+        create_topic(&mut stream, &topic, 2).await?;
+        produce(&mut stream, &topic, 1).await?;
+        produce(&mut stream, &topic, 1).await?;
+        fetch(&mut stream, &topic, 1).await?;
+        drop(stream);
+
+        _ = closed_connection_that_produced(&capture).await?;
+
+        let directory = tempfile::tempdir()?;
+        let log = directory.path().join("broker.log");
+        std::fs::write(&log, capture.text())?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_connections"))
+            .arg("--filename")
+            .arg(&log)
+            .output()?;
+
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{report}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The report names the client once, with its one connection, two produced records in
+        // one partition, and one fetched partition. The probe connection has no client.
+        let (_, per_client) = report
+            .split_once("## Per client")
+            .ok_or_else(|| anyhow!("no per-client table:\n{report}"))?;
+
+        let client = per_client
+            .lines()
+            .find(|line| line.starts_with("| nisshi-broker "))
+            .ok_or_else(|| anyhow!("no row for the client:\n{report}"))?;
+
+        let cells = client
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            [
+                "nisshi-broker",
+                "1",
+                "CreateTopics=1 Fetch=1 Produce=2",
+                "1",
+                "2",
+                "1",
+                ""
+            ],
+            cells[..]
+        );
+        assert!(report.contains("| (no request) "), "{report}");
 
         Ok(())
     })

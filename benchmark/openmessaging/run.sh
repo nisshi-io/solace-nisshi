@@ -11,6 +11,12 @@
 #   run.sh seed [var=value]   fill postgres with generated records, see seed.sql for the variables
 #   run.sh explain [topic [partition [offset]]]
 #                             EXPLAIN ANALYZE the fetch queries against the seeded topic
+#   run.sh connections [args] report the connections each client opened, from the broker log:
+#                             the clients, the requests they sent and the topic-partitions they
+#                             produced to and fetched from. Args go to the connections binary
+#                             (nisshi-broker/src/bin/connections), for example --connections or
+#                             --csv results/connections.csv
+#   run.sh sockets [seconds]  sample the sockets on the broker's port with lsof until interrupted
 #   run.sh stop               stop the broker and postgres
 #
 # By default postgres is a Homebrew postgres on 127.0.0.1, with all its files in .pg/ beside this
@@ -31,6 +37,13 @@
 # POSTGRES_ARGS adds arguments to the postgres server, for example
 # "-c shared_preload_libraries=auto_explain"
 #
+# The broker logs one `nisshi::connection` event per connection opened and closed, and every
+# CONNECTION_SNAPSHOT_INTERVAL (default 10s) the state of each open connection, which
+# `connections` reads. RUST_LOG replaces the default filter, so keep nisshi::connection=info in it
+# to keep those events. `run` also samples the established sockets on the broker's port with lsof
+# every SOCKET_SAMPLE_INTERVAL seconds (default 5, 0 turns it off) into results/sockets-*.csv:
+# the count the broker holds, and the count the benchmark JVM holds to it, as a check on the log.
+#
 # DRIVER is the benchmark driver file `run` uses, driver-nisshi.yaml by default. Copy that file to
 # change the producer or consumer settings, for example consumerConfig's fetch.max.wait.ms.
 set -euo pipefail
@@ -45,6 +58,7 @@ postgres=${POSTGRES:-local}
 pg_bin=${PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}
 pg_dir="$here/.pg"
 pg_port=${POSTGRES_PORT:-5432}
+broker_port=9092
 
 # The upstream commit that the patch and the build flags below were made for. Set OMB_COMMIT to
 # try another.
@@ -140,12 +154,68 @@ broker() {
     storage=$storage${STORAGE_QUERY:+?$STORAGE_QUERY}
     cargo build --release --bin nisshi --no-default-features --features postgres
     pkill -f 'target/release/nisshi broker' 2>/dev/null || true
-    RUST_LOG=${RUST_LOG:-warn} nohup target/release/nisshi broker \
+    RUST_LOG=${RUST_LOG:-warn,nisshi::connection=info} \
+        CONNECTION_SNAPSHOT_INTERVAL=${CONNECTION_SNAPSHOT_INTERVAL:-10s} \
+        nohup target/release/nisshi broker \
         --storage-engine="$storage" \
-        --advertised-listener-url=tcp://localhost:9092 \
+        --advertised-listener-url=tcp://localhost:$broker_port \
         >"$here/broker.log" 2>&1 &
     echo $! >"$here/broker.pid"
     echo "broker pid $(cat "$here/broker.pid"), log $here/broker.log"
+}
+
+# Prints how many ESTABLISHED TCP sockets of process $1 have a name that matches the extended
+# regular expression $2, or 0 when there is no such process. lsof's -F n output has one line
+# per socket: n<local address>-><remote address>.
+established() {
+    local pid=$1 pattern=$2
+    [[ -n $pid ]] || { echo 0; return; }
+    { lsof -nP -a -p "$pid" -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null || true; } | grep -c -E "$pattern" || true
+}
+
+# Appends a line to the CSV $1 every $2 seconds, until killed: the sockets the broker holds on its
+# port, and the sockets the benchmark JVM holds to that port. Each connection has one of each,
+# so the two columns agree except while a connection opens or closes, or when a client outside
+# the benchmark is connected.
+sample_sockets() {
+    local file=$1 interval=$2 broker_pid jvm_pid
+    echo "time,broker_established,benchmark_established" >"$file"
+    while true; do
+        broker_pid=$(cat "$here/broker.pid" 2>/dev/null || true)
+        jvm_pid=$(pgrep -n -f io.openmessaging.benchmark.Benchmark || true)
+        echo "$(date +%Y-%m-%dT%H:%M:%S),$(established "$broker_pid" ":$broker_port->"),$(established "$jvm_pid" "->.*:$broker_port\$")" >>"$file"
+        sleep "$interval"
+    done
+}
+
+# Prints the most sockets that a sample file in $1 holds at once, for each column
+peak_sockets() {
+    awk -F, 'NR > 1 { if ($2 > b) b = $2; if ($3 > j) j = $3 } END { printf "peak sockets: broker %d, benchmark %d\n", b, j }' "$1"
+}
+
+sampler_pid=
+stop_sampler() {
+    if [[ -n $sampler_pid ]]; then
+        kill "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+        sampler_pid=
+    fi
+}
+
+sockets() {
+    local interval=${1:-${SOCKET_SAMPLE_INTERVAL:-5}}
+    mkdir -p "$results"
+    local file
+    file="$results/sockets-$(date +%Y%m%d-%H%M%S).csv"
+    echo "sampling every ${interval}s into $file, interrupt to stop" >&2
+    sample_sockets "$file" "$interval"
+}
+
+connections() {
+    [[ -f "$here/broker.log" ]] || { echo "run.sh: no broker.log, run.sh broker first" >&2; exit 1; }
+    cargo run --quiet --release --manifest-path "$root/Cargo.toml" -p nisshi-broker \
+        --no-default-features --features postgres --bin connections -- \
+        --filename "$here/broker.log" "$@"
 }
 
 run() {
@@ -156,9 +226,19 @@ run() {
     # bin/benchmark resolves its classpath and the payload files relative to the working
     # directory, and writes result JSON there, so run in the distribution and move the results
     # out afterwards. Without HEAP_OPTS, bin/benchmark uses a 4 GB heap.
-    local status=0
+    local status=0 interval=${SOCKET_SAMPLE_INTERVAL:-5} sockets_file=
+    if [[ $interval != 0 ]]; then
+        sockets_file="$results/sockets-$(date +%Y%m%d-%H%M%S).csv"
+        sample_sockets "$sockets_file" "$interval" &
+        sampler_pid=$!
+        trap stop_sampler EXIT
+    fi
     (cd "$dist" && bin/benchmark --drivers "${DRIVER:-$here/driver-nisshi.yaml}" "$workload") || status=$?
+    stop_sampler
     mv -f "$dist"/*.json "$results/" 2>/dev/null || true
+    if [[ -n $sockets_file ]]; then
+        echo "socket samples: $sockets_file, $(peak_sockets "$sockets_file")"
+    fi
     return "$status"
 }
 
@@ -209,6 +289,8 @@ case "${1:-}" in
     run) shift; run "$@" ;;
     seed) shift; seed "$@" ;;
     explain) shift; explain "$@" ;;
+    connections) shift; connections "$@" ;;
+    sockets) shift; sockets "$@" ;;
     stop) stop ;;
-    *) sed -n '2,25p' "$0"; exit 1 ;;
+    *) sed -n '2,29p' "$0"; exit 1 ;;
 esac
