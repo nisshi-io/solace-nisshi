@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use rama::{Service, extensions::Extensions, service::BoxService};
 use tracing::warn;
 
-use crate::Error;
+use crate::{ConnectionStats, Error};
 
 /// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from
 /// [`RootMessageMeta`], narrowed by `capped` for a route registered through
@@ -240,6 +240,10 @@ where
         let api_version = req.frame.api_version()?;
 
         if is_within_protocol_range(api_key, api_version) {
+            if let Some(stats) = req.extensions.get_ref::<ConnectionStats>() {
+                stats.record_request(api_key, req.frame.client_id().ok().flatten());
+            }
+
             return service.serve(req).await;
         }
 

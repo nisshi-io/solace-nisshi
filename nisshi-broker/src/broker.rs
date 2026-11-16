@@ -15,11 +15,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod connections;
 pub mod group;
 mod maintenance;
 mod sweep_failures;
 
-use self::sweep_failures::SweepFailures;
+use self::{
+    connections::{ConnectionRegistry, log_summary},
+    sweep_failures::SweepFailures,
+};
 use crate::{
     CancelKind, Error, Result,
     coordinator::group::{
@@ -37,7 +41,9 @@ use nisshi_schema::{
     lake::{House, LakeHouseType},
     redact_url,
 };
-use nisshi_service::{PeerAddressExtension, ProgressBarExtension, ShutdownExtension};
+use nisshi_service::{
+    ConnectionStats, PeerAddressExtension, ProgressBarExtension, ShutdownExtension,
+};
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
     TopicCreationConfig,
@@ -299,6 +305,10 @@ pub struct Broker<G, S> {
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
+    /// How often the broker logs the state of each open connection, when it does.
+    connection_snapshot_interval: Option<Duration>,
+    connections: ConnectionRegistry,
+
     /// The scheme of the storage URL, which names the engine in a maintenance failure.
     storage_engine: String,
 
@@ -359,6 +369,8 @@ where
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
+            connection_snapshot_interval: None,
+            connections: ConnectionRegistry::default(),
             storage_engine: String::from("unknown"),
 
             cancellation: CancellationToken::new(),
@@ -622,6 +634,14 @@ where
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         txn_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
+        // Absent unless the operator asks for connection snapshots. The first one comes a whole
+        // period after startup, when there is something to report.
+        let mut snapshot_interval = self.connection_snapshot_interval.map(|period| {
+            let mut interval = time::interval_at(Instant::now() + period, period);
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            interval
+        });
+
         // Track the in-flight sweep per interval so a sweep slower than its
         // interval can't overlap itself or pile up: skip the tick while the
         // previous sweep is still running.
@@ -670,6 +690,10 @@ where
         }
 
         let mut connections = 0;
+
+        // Numbers the connections that were accepted, for the `nisshi::connection` events. Unlike
+        // `connections`, which counts every pass of the loop, it moves only on an accept.
+        let mut connection_id: u64 = 0;
 
         // Backs off after a run of consecutive accept()-arm errors that look like
         // resource exhaustion (e.g. EMFILE/ENFILE), so a persistent failure doesn't
@@ -721,6 +745,15 @@ where
                     let extensions = Extensions::default();
                     _ = extensions.insert(PeerAddressExtension::new(addr));
                     _ = extensions.insert(ShutdownExtension::new(self.cancellation.clone()));
+
+                    connection_id += 1;
+                    let id = connection_id;
+                    let stats = ConnectionStats::new();
+                    _ = extensions.insert(stats.clone());
+
+                    let guard = self.connections.register(id, addr, stats.clone());
+
+                    log_summary("connection opened", id, addr, &stats);
 
                     let pb = if self.silent {
                         None
@@ -824,6 +857,10 @@ where
                             }
                         }
 
+                        log_summary("connection closed", id, addr, &stats);
+
+                        drop(guard);
+
                         if let Some(ref pb) = pb {
                             pb.finish_and_clear();
                         }
@@ -856,6 +893,10 @@ where
                         debug!(?handle);
                         maintenance_sweep = Some(handle);
                     }
+                }
+
+                () = next_snapshot(&mut snapshot_interval) => {
+                    self.connections.log_snapshot();
                 }
 
                 _ = txn_interval.tick() => {
@@ -929,6 +970,14 @@ where
     }
 }
 
+/// Waits for the next connection snapshot, or forever when snapshots are off.
+async fn next_snapshot(interval: &mut Option<time::Interval>) {
+    match interval {
+        Some(interval) => _ = interval.tick().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Builder<N, C, I, A, S, L> {
     node_id: N,
@@ -946,6 +995,7 @@ pub struct Builder<N, C, I, A, S, L> {
     banner: Option<String>,
     group_coordinator: GroupCoordinatorConfig,
     topic_creation: TopicCreationConfig,
+    connection_snapshot_interval: Option<Duration>,
 
     cancellation: CancellationToken,
 }
@@ -977,6 +1027,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
             cancellation: self.cancellation,
         }
     }
@@ -998,6 +1049,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
 
             cancellation: self.cancellation,
         }
@@ -1020,6 +1072,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
 
             cancellation: self.cancellation,
         }
@@ -1045,6 +1098,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
 
             cancellation: self.cancellation,
         }
@@ -1069,6 +1123,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
 
             cancellation: self.cancellation,
         }
@@ -1093,6 +1148,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            connection_snapshot_interval: self.connection_snapshot_interval,
 
             cancellation: self.cancellation,
         }
@@ -1153,6 +1209,18 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn topic_creation(self, topic_creation: TopicCreationConfig) -> Self {
         Self {
             topic_creation,
+            ..self
+        }
+    }
+
+    /// How often the broker logs the state of each open connection at the `nisshi::connection`
+    /// target, or `None`, the default, for not at all.
+    pub fn connection_snapshot_interval(
+        self,
+        connection_snapshot_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            connection_snapshot_interval,
             ..self
         }
     }
@@ -1247,6 +1315,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             banner: self.banner,
             maintenance_interval: intervals.maintenance,
             transaction_maintenance_interval: intervals.transaction_maintenance,
+            connection_snapshot_interval: self.connection_snapshot_interval,
+            connections: ConnectionRegistry::default(),
             storage_engine,
             cancellation: self.cancellation,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,

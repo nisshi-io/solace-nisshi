@@ -251,6 +251,7 @@ use url::Url;
 
 mod api;
 mod channel;
+mod connection_stats;
 mod consumer;
 mod frame;
 mod input;
@@ -281,6 +282,12 @@ pub use transaction_abortable::{
 pub use channel::{
     ChannelFrameLayer, ChannelFrameService, FrameChannelService, FrameReceiver, FrameSender,
     bounded_channel,
+};
+
+pub use connection_stats::{
+    CONNECTION_TARGET, ConnectionStats, ConnectionSummary, FetchStatsLayer, FetchStatsService,
+    MAX_TRACKED_PARTITIONS, ProduceStatsLayer, ProduceStatsService, ProducedTraffic,
+    TopicPartition,
 };
 
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};

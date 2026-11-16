@@ -79,13 +79,28 @@ pub(crate) async fn spawn_broker_with_authentication(
         Url::parse("memory://")?
     };
 
-    spawn(tls, authentication, storage, None).await
+    spawn(tls, authentication, storage, None, None).await
 }
 
 /// Like [`spawn_broker`], with `schemas` as the registry that the broker validates produced
 /// records against.
 pub(crate) async fn spawn_broker_with_schemas(schemas: Option<Registry>) -> Result<RunningBroker> {
-    spawn(None, false, Url::parse("memory://")?, schemas).await
+    spawn(None, false, Url::parse("memory://")?, schemas, None).await
+}
+
+/// Like [`spawn_broker`], with the broker logging the state of its open connections every
+/// `snapshot_interval`.
+pub(crate) async fn spawn_broker_with_connection_snapshots(
+    snapshot_interval: Duration,
+) -> Result<RunningBroker> {
+    spawn(
+        None,
+        false,
+        Url::parse("memory://")?,
+        None,
+        Some(snapshot_interval),
+    )
+    .await
 }
 
 /// Like [`spawn_broker_with_authentication`], on the storage at `storage`.
@@ -94,7 +109,7 @@ pub(crate) async fn spawn_broker_on(
     authentication: bool,
     storage: Url,
 ) -> Result<RunningBroker> {
-    spawn(tls, authentication, storage, None).await
+    spawn(tls, authentication, storage, None, None).await
 }
 
 async fn spawn(
@@ -102,6 +117,7 @@ async fn spawn(
     authentication: bool,
     storage: Url,
     schemas: Option<Registry>,
+    snapshot_interval: Option<Duration>,
 ) -> Result<RunningBroker> {
     let port = free_port().await?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -117,6 +133,7 @@ async fn spawn(
         .tls_server_config(tls)
         .authentication(authentication)
         .schema_registry(schemas)
+        .connection_snapshot_interval(snapshot_interval)
         .silent(true)
         .build()
         .await?;
