@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ mod common;
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
 pub mod ch;
 pub mod close_after_response;
+pub mod drain;
 pub mod route;
 pub mod tcp;
 pub mod version_gate;

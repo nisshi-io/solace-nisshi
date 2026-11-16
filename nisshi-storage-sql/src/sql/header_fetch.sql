@@ -1,5 +1,8 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
+--
+-- Contributors outside Solace:
+--   Or Hayat
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -13,7 +16,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select h.k, h.v
+select h.k as key, h.v as value
 from header h
 join record r on h.topition = r.topition and h.offset_id = r.offset_id
 join topition tp on tp.id = r.topition

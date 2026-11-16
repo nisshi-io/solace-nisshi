@@ -98,7 +98,11 @@ the first whose scheme matches the `--storage-engine` URL. Cargo features choose
 compiled in; [Storage options](docs/storage.md) lists them.
 
 The handlers for most Kafka APIs live in `nisshi-storage/src/service/`, one file per API, and
-call the `Storage` trait. Consumer group handlers live in `nisshi-broker/src/broker/group/` and call
+call the `Storage` trait. The Produce handler, in `service/produce.rs` and `service/produce/`, is
+a stack of services. One layer checks `acks`, and `ProduceService` serves each topic of the request
+with `ProduceTopicService`, which reads the topic's configuration. For each partition, the services
+check the batch, validate its timestamps, validate its records against the schema, and then write
+the batch with `StorePartitionService`. Each step is public, so another service can compose them. Consumer group handlers live in `nisshi-broker/src/broker/group/` and call
 the group coordinator in `nisshi-broker/src/coordinator/group/`, which keeps group state in
 storage too.
 
@@ -117,8 +121,9 @@ data in the broker's own memory, so no other broker can see it.
 
 The `--schema-registry` URL points at a directory or bucket holding a schema per topic
 (`topic.avsc`, `topic.json` or `topic.proto`). The broker hands the registry, and the lake writer
-if one is configured, to the storage engine when it builds it. On produce, the engine validates
-each record against the topic's schema and rejects one that doesn't match. With a lake writer
+if one is configured, to the storage engine when it builds it. The broker also hands the registry to
+the Produce handler, which validates each record against the topic's schema before it calls the
+storage engine, and rejects a batch that doesn't match. With a lake writer
 (`broker parquet`, `broker iceberg` or `broker delta`, behind the `parquet`, `iceberg` and `delta`
 features), it also writes each record to the topic's table. [Schema registry](docs/schema-registry.md)
 describes the schema files. The lake writer only adds records: DeleteRecords, retention and

@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -118,7 +121,7 @@ impl Schema {
             AvroSchema::Float => Ok(DataType::Float32),
             AvroSchema::Double => Ok(DataType::Float64),
             AvroSchema::Bytes => Ok(DataType::LargeBinary),
-            AvroSchema::String | AvroSchema::Uuid | AvroSchema::Enum(_) => Ok(DataType::Utf8),
+            AvroSchema::String | AvroSchema::Uuid(_) | AvroSchema::Enum(_) => Ok(DataType::Utf8),
 
             AvroSchema::Array(schema) => self
                 .schema_data_type(path, &schema.items)
@@ -240,7 +243,7 @@ impl Schema {
 
             AvroSchema::LocalTimestampNanos => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
 
-            AvroSchema::Duration => Ok(DataType::Struct(Fields::from_iter([
+            AvroSchema::Duration(_) => Ok(DataType::Struct(Fields::from_iter([
                 Field::new("month", DataType::UInt32, NULLABLE),
                 Field::new("days", DataType::UInt32, NULLABLE),
                 Field::new("milliseconds", DataType::UInt32, NULLABLE),
@@ -267,7 +270,7 @@ impl Schema {
             AvroSchema::Float => Ok(Box::new(Float32Builder::new())),
             AvroSchema::Double => Ok(Box::new(Float64Builder::new())),
             AvroSchema::Bytes => Ok(Box::new(LargeBinaryBuilder::new())),
-            AvroSchema::String | AvroSchema::Uuid | AvroSchema::Enum(_) => {
+            AvroSchema::String | AvroSchema::Uuid(_) | AvroSchema::Enum(_) => {
                 Ok(Box::new(StringBuilder::new()))
             }
 
@@ -368,7 +371,7 @@ impl Schema {
             AvroSchema::LocalTimestampMicros => Ok(Box::new(Time64MicrosecondBuilder::new())),
             AvroSchema::LocalTimestampNanos => Ok(Box::new(Time64NanosecondBuilder::new())),
 
-            AvroSchema::Duration => Ok(Box::new(StructBuilder::new(
+            AvroSchema::Duration(_) => Ok(Box::new(StructBuilder::new(
                 vec![
                     Field::new("month", DataType::UInt32, NULLABLE),
                     Field::new("days", DataType::UInt32, NULLABLE),
@@ -542,7 +545,7 @@ fn append_list_builder(
                     })
             })?,
 
-        AvroSchema::String | AvroSchema::Uuid => builder
+        AvroSchema::String | AvroSchema::Uuid(_) => builder
             .values()
             .as_any_mut()
             .downcast_mut::<StringBuilder>()
@@ -649,7 +652,7 @@ fn append_list_builder(
         AvroSchema::LocalTimestampMillis => todo!(),
         AvroSchema::LocalTimestampMicros => todo!(),
         AvroSchema::LocalTimestampNanos => todo!(),
-        AvroSchema::Duration => todo!(),
+        AvroSchema::Duration(_) => todo!(),
         AvroSchema::Ref { name } => {
             let _ = name;
             todo!()
@@ -751,7 +754,7 @@ fn append_struct_builder(
             (AvroSchema::Decimal(_decimal_schema), _) => todo!(),
             (AvroSchema::BigDecimal, _) => todo!(),
 
-            (AvroSchema::Uuid, Value::Uuid(value)) => builder
+            (AvroSchema::Uuid(_), Value::Uuid(value)) => builder
                 .field_builder::<StringBuilder>(index)
                 .ok_or(Error::BadDowncast { field: name })
                 .map(|values| values.append_value(value.to_string()))?,
@@ -789,7 +792,7 @@ fn append_struct_builder(
             (AvroSchema::LocalTimestampMillis, _) => todo!(),
             (AvroSchema::LocalTimestampMicros, _) => todo!(),
             (AvroSchema::LocalTimestampNanos, _) => todo!(),
-            (AvroSchema::Duration, _) => todo!(),
+            (AvroSchema::Duration(_), _) => todo!(),
             (AvroSchema::Ref { name }, _) => {
                 let _ = name;
                 todo!();
@@ -917,7 +920,7 @@ fn append_value(
             .ok_or(Error::Downcast)
             .map(|builder| builder.append_null()),
 
-        (Some(AvroSchema::Uuid), Value::Null) => column
+        (Some(AvroSchema::Uuid(_)), Value::Null) => column
             .as_any_mut()
             .downcast_mut::<StringBuilder>()
             .ok_or(Error::Downcast)
@@ -1090,7 +1093,9 @@ where
                         // refuse every codec except `null` before the reader reads a block.
                         container::require_null_codec(&encoded)?;
 
-                        Reader::with_schema(schema, &encoded[..])
+                        Reader::builder(&encoded[..])
+                            .reader_schema(schema)
+                            .build()
                             .and_then(|mut reader| reader.next().transpose())
                             .map_err(|_| Error::AvroRecord)
                     })
@@ -1360,7 +1365,7 @@ mod tests {
     async fn record_of_primitive_data_types() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
                   "name": "Message",
                   "type": "record",
                   "fields": [
@@ -1382,7 +1387,7 @@ mod tests {
                     }
                   ]
                 }
-        ));
+        ))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1446,7 +1451,7 @@ mod tests {
     async fn record_of_with_list_of_primitive_data_types() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
                   "type": "record",
                   "name": "Message",
                   "fields": [
@@ -1468,7 +1473,7 @@ mod tests {
                     }
                   ]
                 }
-        ));
+        ))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1546,11 +1551,11 @@ mod tests {
     async fn union() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "union",
             "fields": [{"name": "value", "type": ["null", "float"]}]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1610,7 +1615,7 @@ mod tests {
     async fn enumeration() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "Suit",
             "fields": [
@@ -1620,12 +1625,15 @@ mod tests {
                     "symbols": ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]
                 }
             ]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
 
-            let values = [Value::from(json!("CLUBS")), Value::from(json!("HEARTS"))];
+            let values = [
+                Value::try_from(json!("CLUBS"))?,
+                Value::try_from(json!("HEARTS"))?,
+            ];
 
             for value in values {
                 batch = batch.record(
@@ -1675,7 +1683,7 @@ mod tests {
     async fn observation_enumeration() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
           "type": "record",
           "name": "observation",
           "fields": [
@@ -1693,7 +1701,7 @@ mod tests {
               }
             }
           ]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1752,18 +1760,18 @@ mod tests {
     async fn map() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "Long",
             "fields": [
                 {"name": "value", "type": "map", "values": "long", "default": {}},
             ],
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
 
-            let values = [Value::from(json!({"a": 1, "b": 3, "c": 5}))];
+            let values = [Value::try_from(json!({"a": 1, "b": 3, "c": 5}))?];
 
             for value in values {
                 batch = batch.record(
@@ -1822,13 +1830,13 @@ mod tests {
     async fn simple_integer_key_as_arrow() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [
                 {"name": "key", "type": "int"}
             ]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1884,7 +1892,7 @@ mod tests {
     async fn simple_record_value_as_arrow() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
                   "type": "record",
                   "name": "Person",
                   "fields": [
@@ -1902,7 +1910,7 @@ mod tests {
                     }
                   ]
                 }
-        ));
+        ))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -1972,7 +1980,7 @@ mod tests {
     async fn array_bool_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -1981,7 +1989,7 @@ mod tests {
                 "items": "boolean",
                 "default": []
             }]
-        }));
+        }))?;
 
         let values = [[true, true], [false, true], [true, false], [false, false]]
             .into_iter()
@@ -2045,7 +2053,7 @@ mod tests {
     async fn array_int_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2054,7 +2062,7 @@ mod tests {
                 "items": "int",
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2116,7 +2124,7 @@ mod tests {
     async fn array_long_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2125,7 +2133,7 @@ mod tests {
                 "items": "long",
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2187,7 +2195,7 @@ mod tests {
     async fn array_float_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "name": "test",
             "type": "record",
             "fields": [{
@@ -2196,7 +2204,7 @@ mod tests {
                 "items": "float",
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2261,7 +2269,7 @@ mod tests {
     async fn array_double_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2270,7 +2278,7 @@ mod tests {
                 "items": "double",
                 "default": []
             }],
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2335,7 +2343,7 @@ mod tests {
     async fn array_string_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2344,7 +2352,7 @@ mod tests {
                 "items": "string",
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2410,7 +2418,7 @@ mod tests {
     async fn array_record_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2430,7 +2438,7 @@ mod tests {
                 ]},
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -2503,7 +2511,7 @@ mod tests {
     async fn array_bytes_value() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2512,7 +2520,7 @@ mod tests {
                 "items": "bytes",
                 "default": []
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2577,7 +2585,7 @@ mod tests {
     async fn uuid_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2585,7 +2593,7 @@ mod tests {
                 "type": "string",
                 "logicalType": "uuid"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2654,7 +2662,7 @@ mod tests {
     async fn time_millis_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2662,7 +2670,7 @@ mod tests {
                 "type": "int",
                 "logicalType": "time-millis"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -2726,7 +2734,7 @@ mod tests {
     async fn time_micros_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2734,7 +2742,7 @@ mod tests {
                 "type": "long",
                 "logicalType": "time-micros"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2799,7 +2807,7 @@ mod tests {
     async fn timestamp_millis_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2807,7 +2815,7 @@ mod tests {
                 "type": "long",
                 "logicalType": "timestamp-millis"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -2871,7 +2879,7 @@ mod tests {
     async fn timestamp_micros_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -2879,7 +2887,7 @@ mod tests {
                 "type": "long",
                 "logicalType": "timestamp-micros"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -2944,7 +2952,7 @@ mod tests {
     async fn local_timestamp_millis_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
                 "fields": [{
@@ -2952,7 +2960,7 @@ mod tests {
                     "type": "long",
                     "logicalType": "local-timestamp-millis"
                 }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -3017,7 +3025,7 @@ mod tests {
     async fn local_timestamp_micros_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -3025,7 +3033,7 @@ mod tests {
                 "type": "long",
                 "logicalType": "local-timestamp-micros"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -3089,7 +3097,7 @@ mod tests {
     async fn date_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -3097,7 +3105,7 @@ mod tests {
                 "type": "int",
                 "logicalType": "date"
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
@@ -3165,7 +3173,7 @@ mod tests {
     async fn decimal_fixed_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -3179,7 +3187,7 @@ mod tests {
                 "precision": 8,
                 "scale": 2,
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -3245,7 +3253,7 @@ mod tests {
     async fn decimal_variable_logical_type() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [{
@@ -3255,7 +3263,7 @@ mod tests {
                 "precision": 8,
                 "scale": 2,
             }]
-        }));
+        }))?;
 
         let batch = {
             let mut batch = Batch::builder();
@@ -3320,7 +3328,7 @@ mod tests {
     async fn string_key_with_record_as_arrow() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
                   "type": "record",
                   "name": "test",
                   "fields": [
@@ -3347,7 +3355,7 @@ mod tests {
                     }
                   ]
                 }
-        ));
+        ))?;
 
         // https://people.math.sc.edu/Burkardt/datasets/csv/csv.html
         let grades = [
@@ -3605,21 +3613,21 @@ mod tests {
     async fn deflate_key_as_arrow_is_invalid_record() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::from(json!({
+        let schema = Schema::try_from(json!({
             "type": "record",
             "name": "test",
             "fields": [
                 {"name": "key", "type": "int"}
             ]
-        }));
+        }))?;
 
         let key = {
             let mut writer = apache_avro::Writer::with_codec(
                 schema.key.as_ref().unwrap(),
                 vec![],
                 apache_avro::Codec::Deflate(apache_avro::DeflateSettings::default()),
-            );
-            _ = writer.append(Value::Int(32123))?;
+            )?;
+            _ = writer.append_value(Value::Int(32123))?;
             writer.into_inner().map(Bytes::from)?
         };
 

@@ -1,5 +1,8 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
+--
+-- Contributors outside Solace:
+--   Or Hayat
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -16,7 +19,7 @@
 -- prepare txn_detail_select_timed_out (text, timestamptz) as
 -- Returns transactions still in BEGIN past their timeout, for the abort sweep.
 
-select txn.name, p.id, pe.epoch
+select txn.name, p.id as producer_id, pe.epoch as producer_epoch
 
 from
 

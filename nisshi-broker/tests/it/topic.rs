@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,6 +65,7 @@ pub async fn create_describe_topic_partitions_by_id<G>(
     cluster_id: impl Into<String>,
     broker_id: i32,
     sc: G,
+    expected_leader_epoch: i32,
 ) -> Result<()>
 where
     G: Storage + Clone,
@@ -116,7 +120,7 @@ where
     for partition in responses[0].partitions.as_deref().unwrap_or_default() {
         assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
         assert_eq!(broker_id, partition.leader_id);
-        assert_eq!(0, partition.leader_epoch);
+        assert_eq!(expected_leader_epoch, partition.leader_epoch);
         assert_eq!(
             Some(vec![broker_id; replication_factor as usize]),
             partition.replica_nodes
@@ -137,6 +141,7 @@ pub async fn create_describe_topic_partitions_by_name<G>(
     cluster_id: impl Into<String>,
     broker_id: i32,
     sc: G,
+    expected_leader_epoch: i32,
 ) -> Result<()>
 where
     G: Storage + Clone,
@@ -190,7 +195,7 @@ where
     for partition in responses[0].partitions.as_deref().unwrap_or_default() {
         assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
         assert_eq!(broker_id, partition.leader_id);
-        assert_eq!(0, partition.leader_epoch);
+        assert_eq!(expected_leader_epoch, partition.leader_epoch);
         assert_eq!(
             Some(vec![broker_id; replication_factor as usize]),
             partition.replica_nodes
@@ -324,6 +329,7 @@ mod pg {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -339,6 +345,7 @@ mod pg {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -438,6 +445,7 @@ mod in_memory {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -453,6 +461,7 @@ mod in_memory {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -522,6 +531,7 @@ mod lite {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -537,6 +547,7 @@ mod lite {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -621,6 +632,7 @@ mod slatedb {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -636,6 +648,7 @@ mod slatedb {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            0,
         )
         .await
     }
@@ -709,7 +722,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_id() -> Result<()> {
         let _guard = init_tracing()?;
@@ -721,11 +733,11 @@ mod turso {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            -1,
         )
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_describe_topic_partitions_by_name() -> Result<()> {
         let _guard = init_tracing()?;
@@ -737,6 +749,7 @@ mod turso {
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
+            -1,
         )
         .await
     }
@@ -756,7 +769,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_delete() -> Result<()> {
         let _guard = init_tracing()?;
@@ -772,7 +784,6 @@ mod turso {
         .await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table and answers a partition leader epoch of -1"]
     #[tokio::test]
     async fn create_with_config_delete() -> Result<()> {
         let _guard = init_tracing()?;

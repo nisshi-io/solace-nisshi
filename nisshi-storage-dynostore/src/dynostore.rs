@@ -1,4 +1,10 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   David Flanagan
+//   Enwei Jiao
+//   Or Hayat
+//   Shane Kennedy
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -68,10 +74,11 @@ use nisshi_storage::{
     BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
     FetchedDataSender, FetchedSender, FirstSequence, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage,
-    ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, epoch_is_exhausted,
-    inflate_produced, max_message_bytes, offload, producer_claim,
+    ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    delete_records_cutoff, epoch_is_exhausted, inflate_produced, lake_skip, max_message_bytes,
+    offload, producer_claim,
 };
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
@@ -3375,7 +3382,7 @@ impl DynoStore {
             .map_err(unretriable_after_write)
     }
 
-    /// Returns `inflated` when the schema registry or the lake reads it, and drops it otherwise.
+    /// Returns `inflated` when the lake reads it, and drops it otherwise.
     ///
     /// [`Self::produce_with`] first reads the partition from the object store. The produce drops a
     /// decoded batch that nothing reads only after that request, so a batch kept until then is
@@ -3384,7 +3391,7 @@ impl DynoStore {
     ///
     /// [`MAX_DECODED_BATCH_BYTES`]: nisshi_sans_io::record::MAX_DECODED_BATCH_BYTES
     fn inflated_if_read(&self, inflated: inflated::Batch) -> Option<inflated::Batch> {
-        (self.schemas.is_some() || self.lake.is_some()).then_some(inflated)
+        self.lake.is_some().then_some(inflated)
     }
 
     /// Returns `inflated`, or decodes `deflated` on the blocking pool when the caller passed none.
@@ -3503,9 +3510,9 @@ impl DynoStore {
             self.ensure_partition_in_transaction(transaction_id, topition, &deflated)
                 .await?;
 
-            // Decode and validate before the high watermark moves, so that a
-            // batch rejected here leaves no state behind.
-            let inflated = if let Some(ref registry) = self.schemas {
+            // Decode before the high watermark moves, so that a batch that does
+            // not decode leaves no state behind.
+            let inflated = if self.schemas.is_some() {
                 let batch_attribute = BatchAttribute::try_from(deflated.attributes)
                     .inspect(|batch_attribute| debug!(?batch_attribute))
                     .inspect_err(|err| debug!(?err))?;
@@ -3517,12 +3524,6 @@ impl DynoStore {
                     let inflated = Self::decoded(inflated, &deflated)
                         .await
                         .inspect(|inflated| debug!(?inflated))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
                         .inspect_err(|err| debug!(?err))?;
 
                     Some(inflated)
@@ -3623,29 +3624,29 @@ impl DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            // Decode and validate before the producer's sequence or the high
-            // watermark moves, so that a batch rejected here leaves no state
+            // Decode before the producer's sequence or the high watermark
+            // moves, so that a batch that does not decode leaves no state
             // behind. A producer can reuse a rejected batch's sequence for its
             // next batch. If the stored sequence had moved, that batch would
             // get DUPLICATE_SEQUENCE_NUMBER, which a client reports as success
             // although nothing was stored.
-            let inflated = if !attributes.control && (self.schemas.is_some() || self.lake.is_some())
-            {
+            //
+            // A topic that the produce service does not validate does not reach the lake. The
+            // lake converts each record through the schema, and a record that breaks the schema
+            // fails that conversion after the offsets below are reserved.
+            let validates_schema =
+                TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema();
+
+            if !attributes.control && self.lake.is_some() && !validates_schema {
+                lake_skip::warn_once(topition.topic());
+            }
+
+            let inflated = if !attributes.control && self.lake.is_some() && validates_schema {
                 let inflated = Self::decoded(inflated, &deflated)
                     .await
                     .inspect_err(|err| debug!(?err))?;
 
-                if let Some(ref registry) = self.schemas {
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
-
-                // Only the lake reads the decoded batch after this point.
-                // Dropping it here, rather than at the end of the function,
-                // frees its memory before the object store writes.
-                self.lake.is_some().then_some(inflated)
+                Some(inflated)
             } else {
                 // Not decoded here, so a batch that the caller decoded is not held across the
                 // writes below.
@@ -4763,16 +4764,19 @@ impl Storage for DynoStore {
         ];
 
         let responses = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 let mut responses = vec![];
 
                 for topic in topics {
+                    // A failed read is an error of the whole call, as it is for the listing of
+                    // all topics below. A topic-level code would let a caller take a failed
+                    // read for a topic that does not exist.
                     let response = match self
                         .topic_metadata(topic)
                         .await
-                        .inspect_err(|error| error!(?error))
+                        .inspect_err(|error| debug!(?error))?
                     {
-                        Ok(Some(topic_metadata)) => {
+                        Some(topic_metadata) => {
                             let name = Some(topic_metadata.topic.name.to_owned());
                             let error_code = ErrorCode::None.into();
                             let topic_id = Some(topic_metadata.id.into_bytes());
@@ -4811,25 +4815,11 @@ impl Storage for DynoStore {
                                 .topic_authorized_operations(Some(-2147483648))
                         }
 
-                        Ok(None) => MetadataResponseTopic::default()
+                        None => MetadataResponseTopic::default()
                             .error_code(ErrorCode::UnknownTopicOrPartition.into())
                             .name(match topic {
                                 TopicId::Name(name) => Some(name.into()),
                                 TopicId::Id(_) => None,
-                            })
-                            .topic_id(Some(match topic {
-                                TopicId::Name(_) => NULL_TOPIC_ID,
-                                TopicId::Id(id) => id.into_bytes(),
-                            }))
-                            .is_internal(Some(false))
-                            .partitions(Some([].into()))
-                            .topic_authorized_operations(Some(-2147483648)),
-
-                        Err(_) => MetadataResponseTopic::default()
-                            .error_code(ErrorCode::UnknownServerError.into())
-                            .name(match topic {
-                                TopicId::Name(name) => Some(name.into()),
-                                TopicId::Id(_) => Some("".into()),
                             })
                             .topic_id(Some(match topic {
                                 TopicId::Name(_) => NULL_TOPIC_ID,
@@ -4846,7 +4836,7 @@ impl Storage for DynoStore {
                 responses
             }
 
-            _ => {
+            None => {
                 self.meta
                     .with(&self.object_store, |meta| {
                         let mut responses = vec![];
@@ -5000,9 +4990,15 @@ impl Storage for DynoStore {
                         .topic_authorized_operations(-2147483648),
                 ),
 
-                Err(_) => responses.push(
+                Err(error) => responses.push(
                     DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::UnknownServerError.into())
+                        .error_code(
+                            match topic {
+                                TopicId::Id(_) => nisshi_storage::topic_id_query_error_code(&error),
+                                TopicId::Name(_) => ErrorCode::UnknownServerError,
+                            }
+                            .into(),
+                        )
                         .name(match topic {
                             TopicId::Name(name) => Some(name.into()),
                             TopicId::Id(_) => None,

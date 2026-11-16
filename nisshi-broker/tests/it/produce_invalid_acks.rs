@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -112,19 +112,18 @@ async fn produce(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let response = ProduceService {
-        storage: storage.clone(),
-    }
-    .serve(RequestInput {
-        request: ProduceRequest::default().acks(acks).topic_data(Some(
-            [TopicProduceData::default()
-                .name(name.into())
-                .partition_data(Some(partition_data))]
-            .into(),
-        )),
-        extensions: Extensions::default(),
-    })
-    .await?;
+    let response = ProduceService::new(storage.clone())
+        .with_validation()
+        .serve(RequestInput {
+            request: ProduceRequest::default().acks(acks).topic_data(Some(
+                [TopicProduceData::default()
+                    .name(name.into())
+                    .partition_data(Some(partition_data))]
+                .into(),
+            )),
+            extensions: Extensions::default(),
+        })
+        .await?;
 
     let topics = response.responses.unwrap_or_default();
     assert_eq!(1, topics.len());

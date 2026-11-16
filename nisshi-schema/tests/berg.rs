@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1529,7 +1532,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -1634,7 +1637,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -1739,7 +1742,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -1826,7 +1829,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -1834,8 +1837,8 @@ mod avro {
             let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
 
             let values = [
-                AvroValue::from(json!("CLUBS")),
-                AvroValue::from(json!("HEARTS")),
+                AvroValue::try_from(json!("CLUBS"))?,
+                AvroValue::try_from(json!("HEARTS"))?,
             ];
 
             for value in values {
@@ -1918,7 +1921,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -1999,14 +2002,14 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
         let record_batch = {
             let mut batch = Batch::builder();
 
-            let values = [AvroValue::from(json!({"a": 1, "b": 3, "c": 5}))];
+            let values = [AvroValue::try_from(json!({"a": 1, "b": 3, "c": 5}))?];
 
             for value in values {
                 batch = batch.record(
@@ -2077,7 +2080,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2169,7 +2172,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2269,7 +2272,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let values = [[true, true], [false, true], [true, false], [false, false]]
             .into_iter()
@@ -2358,7 +2361,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2445,7 +2448,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2532,7 +2535,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2622,7 +2625,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2712,7 +2715,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2814,7 +2817,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -2913,7 +2916,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -3002,7 +3005,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -3098,7 +3101,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -3185,7 +3188,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -3273,7 +3276,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 
@@ -3360,7 +3363,7 @@ mod avro {
             Registry::new(object_store)
         };
 
-        let schema = Schema::from(avro);
+        let schema = Schema::try_from(avro)?;
 
         let partition = 32123;
 

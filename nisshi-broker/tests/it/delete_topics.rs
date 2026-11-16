@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -76,7 +76,7 @@ async fn delete_unknown_by_uuid(storage: impl Storage + Clone) -> Result<(), Err
 
     let topic = Uuid::new_v4();
 
-    let error_code = ErrorCode::UnknownTopicOrPartition;
+    let error_code = ErrorCode::UnknownTopicId;
 
     assert_eq!(
         DeleteTopicsResponse::default()
@@ -311,7 +311,7 @@ async fn invalid_topic_name_mixed_list(storage: impl Storage + Clone) -> Result<
         (by_id(empty_id), ErrorCode::None),
         (by_name(), ErrorCode::None),
         // Every topic is gone: a second delete finds nothing.
-        (by_id(empty_id), ErrorCode::UnknownTopicOrPartition),
+        (by_id(empty_id), ErrorCode::UnknownTopicId),
         (by_name(), ErrorCode::UnknownTopicOrPartition),
     ] {
         let response = delete_topics

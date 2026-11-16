@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -18,4 +18,4 @@ insert into topic
 select c.id, $2, $3, $4, $5, false
 from cluster c
 where c.name = $1
-returning topic.uuid
+returning topic.uuid as uuid

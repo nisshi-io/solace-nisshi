@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -256,6 +256,7 @@ mod frame;
 mod input;
 mod metadata_topic_ids;
 mod peer_address;
+mod shutdown;
 mod stream;
 mod transaction_abortable;
 mod version_gate;
@@ -269,7 +270,9 @@ pub use version_gate::{
 
 pub use input::TcpListenerInput;
 
-pub use metadata_topic_ids::{MetadataTopicIdLayer, MetadataTopicIdService, refuse_topic_ids};
+pub use metadata_topic_ids::{
+    MetadataTopicIdLayer, MetadataTopicIdService, all_topics_at_v0, refuse_topic_ids,
+};
 
 pub use transaction_abortable::{
     TransactionAbortableDowngradeLayer, TransactionAbortableDowngradeService,
@@ -283,6 +286,8 @@ pub use channel::{
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
 
 pub use peer_address::PeerAddressExtension;
+
+pub use shutdown::ShutdownExtension;
 
 pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,

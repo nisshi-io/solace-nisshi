@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,5 +53,5 @@ pub use pg::factory::PostgresFactory as PostgresEngineFactory;
 #[cfg(all(feature = "test-support", feature = "postgres"))]
 #[doc(hidden)]
 pub fn watermark_select_for_write() -> nisshi_storage::Result<&'static str> {
-    sql::SQL.get(sql::watermark_select_for_write::QUERY)
+    sql::SQL.get(sql::watermark_select_for_write::QUERY.key())
 }

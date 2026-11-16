@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,9 @@ use nisshi_sans_io::{
     ConfigResource, ErrorCode,
     record::{Record, deflated, inflated},
 };
-use nisshi_storage::{Error, Storage as _, Topition};
+use nisshi_storage::{Error, Storage as _, TopicId, Topition};
 use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
+use uuid::Uuid;
 
 use crate::dynostore::{
     DynoStore,
@@ -74,6 +75,31 @@ async fn failed_read_answers_kafka_storage_error_to_produce() -> Result<(), Erro
     Ok(())
 }
 
+/// A metadata read that fails transiently returns the error to the caller, which answers
+/// `KAFKA_STORAGE_ERROR`, because an unknown topic ID tells a client that the topic is gone.
+#[tokio::test]
+async fn failed_read_returns_a_transient_error_from_metadata() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(
+        "nisshi",
+        111,
+        FailingObjectStore::failing_get(InMemory::new()),
+    )?;
+
+    let error = storage
+        .metadata(Some(&[TopicId::from(Uuid::now_v7()), TopicId::from("abc")]))
+        .await
+        .expect_err("a failed read is an error of the whole call");
+
+    assert_eq!(
+        ErrorCode::KafkaStorageError,
+        nisshi_storage::topic_id_query_error_code(&error)
+    );
+
+    Ok(())
+}
+
 /// A retry does not fix metadata that can't be decoded, so its error keeps its type.
 #[tokio::test]
 async fn undecodable_metadata_is_not_a_kafka_storage_error() -> Result<(), Error> {
@@ -98,6 +124,35 @@ async fn undecodable_metadata_is_not_a_kafka_storage_error() -> Result<(), Error
         described,
         Err(Error::Api(ErrorCode::KafkaStorageError))
     ));
+
+    Ok(())
+}
+
+/// A retry does not fix metadata that can't be decoded, so the error that a metadata read returns
+/// for it answers `UNKNOWN_SERVER_ERROR` and not the retriable `KAFKA_STORAGE_ERROR`.
+#[tokio::test]
+async fn undecodable_metadata_returns_a_permanent_error_from_metadata() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let object_store = InMemory::new();
+    let storage = DynoStore::new("nisshi", 111, object_store.clone())?;
+
+    _ = object_store
+        .put(
+            &Path::from("clusters/nisshi/meta.json"),
+            PutPayload::from_static(b"not json"),
+        )
+        .await?;
+
+    let error = storage
+        .metadata(Some(&[TopicId::from(Uuid::now_v7()), TopicId::from("abc")]))
+        .await
+        .expect_err("an undecodable read is an error of the whole call");
+
+    assert_eq!(
+        ErrorCode::UnknownServerError,
+        nisshi_storage::topic_id_query_error_code(&error)
+    );
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,10 @@
 //! A topic's `max.message.bytes`: the size in bytes of the largest record batch that a produce
 //! stores for the topic.
 //!
-//! Each storage engine checks a produced batch against the limit in its own produce. A check in
-//! [`ProduceService`](crate::ProduceService) would need one more read of the topic's configuration
-//! for every produce. The engine instead reads the limit with a query that its produce already runs.
+//! [`BatchValidationService`](crate::BatchValidationService) checks a produced batch against the
+//! limit before it validates the records of the batch, as Kafka does. Each storage engine checks
+//! the batch again in its own produce, so a caller of [`Storage::produce`](crate::Storage::produce)
+//! gets the same answer.
 
 use nisshi_sans_io::{ByteSize as _, record::deflated};
 use tracing::debug;

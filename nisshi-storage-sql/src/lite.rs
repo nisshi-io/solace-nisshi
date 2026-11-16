@@ -1,4 +1,8 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Or Hayat
+//   Shane Kennedy
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +20,25 @@ use crate::{
     database_file,
     schema::{RecordedSchema, should_create_schema},
     sql::{
-        Cache, consumer_group_select, consumer_offset_select, consumer_offset_select_by_group,
-        default_hash, idempotent_epoch_check, idempotent_sequence_check, producer_epochs_select,
-        remove_comments, result_columns::ResultColumns, txn_offset_commit_tp_select_pending,
-        txn_produce_partition_check, txn_produce_partition_select, watermark_select_for_write,
+        self, Cache, ColumnErrorCount, Query, QueryRow, QueryRowCursor, ROWS_PER_FETCH,
+        consumer_group_select, default_hash, driver::KafkaTimestamp, driver::sqlite::StoredTime,
+        header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
+        producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
+        producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
+        topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
+        topic_insert, topic_select_name, topic_select_uuid, topition_insert,
+        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
+        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
+        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
+        virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::NaiveDateTime;
 use deadpool::managed;
 use libsql::{
-    Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior, Value,
+    Connection, Database, Row, Rows, Statement, Transaction, TransactionBehavior,
     ffi::SQLITE_CONSTRAINT_UNIQUE,
     params::{IntoParams, Params},
 };
@@ -52,7 +63,7 @@ use nisshi_sans_io::{
     incremental_alter_configs_response::AlterConfigsResourceResponse,
     metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
     record::{Header, Record, deflated, inflated},
-    to_system_time, to_timestamp,
+    to_timestamp,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_schema::{
@@ -66,12 +77,12 @@ use nisshi_storage::{
     FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
     RequestStorageService, RequestTimer, Result, ScramCredential, SemaphoreProxy, StartupFailure,
-    Storage, StorageOperation, StoredEpochs, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    bounded_channel, check_claim,
+    Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
-    delete_records_cutoff, epoch_is_exhausted, inflate, max_message_bytes, parse_storage_option,
-    producer_claim,
+    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
+    parse_storage_option, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -86,7 +97,6 @@ use std::{
     env,
     fmt::Debug,
     marker::PhantomData,
-    ops::Deref,
     path::PathBuf,
     result,
     str::FromStr,
@@ -203,17 +213,18 @@ struct Txn {
     status: TxnState,
 }
 
-impl TryFrom<Row> for Txn {
+impl TryFrom<txn_produce_offset_select_overlapping_txn::Row> for Txn {
     type Error = Error;
 
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let name = row.get::<String>(0).inspect_err(|err| error!(?err))?;
-        let producer_id = row.get::<i64>(1).inspect_err(|err| error!(?err))?;
-        let producer_epoch = i16::try_from(row.get::<i32>(2).inspect_err(|err| error!(?err))?)?;
-        let status = row
-            .get::<Option<String>>(3)
-            .map_err(Into::into)
-            .and_then(|status| status.map_or(Ok(TxnState::Begin), TxnState::try_from))
+    fn try_from(row: txn_produce_offset_select_overlapping_txn::Row) -> Result<Self, Self::Error> {
+        let txn_produce_offset_select_overlapping_txn::Row {
+            name,
+            producer_id,
+            producer_epoch,
+            status,
+        } = row;
+        let status = status
+            .map_or(Ok(TxnState::Begin), TxnState::try_from)
             .inspect_err(|err| error!(?err))?;
 
         Ok(Self {
@@ -504,6 +515,108 @@ impl PoolConnection {
             })
     }
 
+    /// Runs `query`, and returns its rows, each read as `T` when the caller reaches it.
+    async fn query_rows<T: QueryRow>(
+        &self,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<QueryRowCursor<Rows, T>> {
+        let query = query.key();
+        let rows = self.query(query, params).await?;
+        QueryRowCursor::new(
+            ResultColumns::new(query, &rows),
+            rows,
+            self.column_error_count(query),
+        )
+    }
+
+    /// Returns the count of `query`'s column errors in `SQL_ERROR`, with the labels that
+    /// [`Self::attributes_for_error`] gives the query.
+    fn column_error_count(&self, query: &str) -> ColumnErrorCount {
+        ColumnErrorCount::new(&SQL_ERROR, vec![KeyValue::new("key", query.to_owned())])
+    }
+
+    /// Runs `query`, and returns the first row of its result as `T`, or `None` when the result
+    /// has no rows.
+    ///
+    /// The function drops the result before it returns, because SQLite can't commit while a
+    /// `returning` statement is still open.
+    async fn query_first<T: QueryRow>(
+        &self,
+        query: Query<T>,
+        params: impl IntoParams,
+    ) -> Result<Option<T>> {
+        let mut rows = self.query_leading_rows(query, params, 1).await?;
+        Ok(rows.pop())
+    }
+
+    /// Runs `query`, and returns at most `limit` of its rows, in order, each read as `T`. It
+    /// records the query's SQL metrics, and drops the result before it returns.
+    #[instrument(skip_all)]
+    async fn query_leading_rows<T: QueryRow>(
+        &self,
+        query: Query<T>,
+        params: impl IntoParams,
+        limit: usize,
+    ) -> Result<Vec<T>> {
+        let query = query.key();
+
+        // The params hold record data and SCRAM credentials, so we log only the SQL.
+        debug!(sql = query);
+
+        let start = SystemTime::now();
+
+        let statement = self.prepared_statement(query).await?;
+
+        let mut rows = statement
+            .query(params)
+            .await
+            .inspect(|rows| debug!(?rows))
+            .inspect_err(|err| self.record_query_error(query, start, err))?;
+
+        let reader = T::reader(&ResultColumns::new(query, &rows))
+            .inspect_err(|err| self.column_error_count(query).record(err))?;
+
+        let mut leading = Vec::with_capacity(limit);
+
+        // libSQL reports an error of the statement's first step from the first `next`, not from
+        // `query`.
+        while leading.len() < limit
+            && let Some(row) = rows
+                .next()
+                .await
+                .inspect(|row| debug!(?row))
+                .inspect_err(|err| self.record_query_error(query, start, err))?
+        {
+            // A libSQL `Row` reads its values from the statement's current row, and the next
+            // step replaces them, so the loop reads each row before it steps again.
+            leading.push(
+                T::read(&reader, &row)
+                    .inspect_err(|err| self.column_error_count(query).record(err))?,
+            );
+        }
+
+        let attributes = [KeyValue::new("sql", query.to_owned())];
+
+        SQL_DURATION.record(elapsed_millis(start), &attributes);
+        SQL_REQUESTS.add(1, &attributes);
+
+        Ok(leading)
+    }
+
+    /// Logs `err` from `query`, started at `start`, and counts it in `SQL_ERROR`.
+    ///
+    /// A unique-constraint violation is logged at debug level and not counted, because some
+    /// callers expect one, as a topic insert does for an existing topic.
+    fn record_query_error(&self, query: &str, start: SystemTime, err: &libsql::Error) {
+        if is_unique_constraint(err) {
+            debug!(?err);
+        } else {
+            error!(?err, query, elapsed_millis = elapsed_millis(start));
+            SQL_ERROR.add(1, &self.attributes_for_error(Some(query), err)[..]);
+        }
+    }
+
     #[instrument(skip_all)]
     async fn execute<P>(&self, sql: &str, params: P) -> result::Result<usize, libsql::Error>
     where
@@ -578,54 +691,52 @@ impl PoolConnection {
         Ok(row)
     }
 
-    #[instrument(skip_all)]
-    async fn query_one<P>(&self, sql: &str, params: P) -> result::Result<Row, libsql::Error>
-    where
-        P: IntoParams,
-    {
-        // The params hold record data and SCRAM credentials, so we log only the SQL.
-        debug!(sql);
+    /// Runs `query`, and returns the first row of its result as `T`.
+    ///
+    /// Returns a libSQL `Misuse` error when the result has no rows.
+    async fn query_one<T: QueryRow>(&self, query: Query<T>, params: impl IntoParams) -> Result<T> {
+        self.query_first(query, params)
+            .await?
+            .ok_or_else(|| libsql::Error::Misuse(format!("sql={key}", key = query.key())).into())
+    }
 
-        let start = SystemTime::now();
+    /// Returns the newest epoch of `producer` in `cluster`, or `None` when the producer does not
+    /// exist or has no epoch.
+    async fn producer_epoch_current(&self, cluster: &str, producer: i64) -> Result<Option<i16>> {
+        self.query_first(
+            producer_epoch_current_for_producer::QUERY,
+            (cluster, producer),
+        )
+        .await
+        .map(|row| row.map(|row| row.epoch))
+    }
 
-        let statement = self.prepared_statement(sql).await?;
+    /// Returns the producer that owns `transaction_id` in `cluster`, the newest of its epochs
+    /// with a transaction, and that transaction's status, or `None` when there is no such epoch.
+    async fn producer_epoch_for_current_txn(
+        &self,
+        cluster: &str,
+        transaction_id: &str,
+    ) -> Result<Option<producer_epoch_for_current_txn::Row>> {
+        self.query_first(
+            producer_epoch_for_current_txn::QUERY,
+            (cluster, transaction_id),
+        )
+        .await
+    }
 
-        let mut rows = statement
-            .query(params)
+    /// Adds a producer to `cluster`, and returns its ID.
+    async fn producer_insert(&self, cluster: &str) -> Result<i64> {
+        self.query_one(producer_insert::QUERY, &[cluster])
             .await
-            .inspect(|rows| debug!(?rows))
-            .inspect_err(|err| {
-                if is_unique_constraint(err) {
-                    debug!(?err);
-                } else {
-                    error!(?err, elapsed_millis = elapsed_millis(start));
-                    SQL_ERROR.add(1, &self.attributes_for_error(Some(sql), err)[..]);
-                }
-            })?;
+            .map(|row| row.id)
+    }
 
-        if let Some(row) = rows
-            .next()
+    /// Adds the next epoch to `producer` in `cluster`, and returns it.
+    async fn producer_epoch_insert(&self, cluster: &str, producer: i64) -> Result<i16> {
+        self.query_one(producer_epoch_insert::QUERY, (cluster, producer))
             .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| {
-                if is_unique_constraint(err) {
-                    debug!(?err);
-                } else {
-                    error!(?err, elapsed_millis = elapsed_millis(start));
-                    SQL_ERROR.add(1, &self.attributes_for_error(Some(sql), err)[..]);
-                }
-            })?
-        {
-            let attributes = [KeyValue::new("sql", sql.to_owned())];
-
-            SQL_DURATION.record(elapsed_millis(start), &attributes);
-
-            SQL_REQUESTS.add(1, &attributes);
-
-            Ok(row).inspect(|row| debug!(?row))
-        } else {
-            Err(libsql::Error::Misuse(format!("sql={sql}")))
-        }
+            .map(|row| row.epoch)
     }
 }
 
@@ -683,9 +794,12 @@ impl Delegate {
 
         let topic = resource.resource_name.as_str();
 
-        if c.query_opt("topic_select_name.sql", (self.cluster.as_str(), topic))
-            .await?
-            .is_none()
+        if c.query_opt(
+            topic_select_name::QUERY.key(),
+            (self.cluster.as_str(), topic),
+        )
+        .await?
+        .is_none()
         {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
         }
@@ -695,14 +809,12 @@ impl Delegate {
             let name = config.name.as_str();
 
             let current = if matches!(op, OpType::Append | OpType::Subtract) {
-                c.query_opt(
-                    "topic_configuration_select_name.sql",
+                c.query_first(
+                    topic_configuration_select_name::QUERY,
                     (self.cluster.as_str(), topic, name),
                 )
                 .await?
-                .map(|row| row.get::<Option<String>>(0))
-                .transpose()?
-                .flatten()
+                .and_then(|row| row.value)
             } else {
                 None
             };
@@ -717,7 +829,7 @@ impl Delegate {
                 Some(value) => {
                     _ = c
                         .query_opt(
-                            "topic_configuration_upsert.sql",
+                            topic_configuration_upsert::QUERY.key(),
                             (self.cluster.as_str(), topic, name, value.as_str()),
                         )
                         .await?;
@@ -726,7 +838,7 @@ impl Delegate {
                 None => {
                     _ = c
                         .query_opt(
-                            "topic_configuration_delete.sql",
+                            sql::TOPIC_CONFIGURATION_DELETE,
                             (self.cluster.as_str(), topic, name),
                         )
                         .await?;
@@ -757,8 +869,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let mut rows = connection
-            .query(
+        let epochs = connection
+            .query_first(
                 producer_epochs_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -767,34 +879,16 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-        let columns = ResultColumns::libsql(producer_epochs_select::QUERY, &rows);
-        let newest_epoch = columns.index(producer_epochs_select::NEWEST_EPOCH)? as i32;
-        let partition_epoch = columns.index(producer_epochs_select::PARTITION_EPOCH)? as i32;
-        let transactional = columns.index(producer_epochs_select::TRANSACTIONAL)? as i32;
-
-        if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-            let stored = StoredEpochs {
-                transactional: row
-                    .get::<i32>(transactional)
-                    .inspect_err(|err| error!(?err))?
-                    != 0,
-                newest: i16::try_from(
-                    row.get::<i32>(newest_epoch)
-                        .inspect_err(|err| error!(?err))?,
-                )?,
-                partition: row
-                    .get::<Option<i32>>(partition_epoch)
-                    .inspect_err(|err| error!(?err))?
-                    .map(i16::try_from)
-                    .transpose()?,
-            };
+        if let Some(epochs) = epochs {
+            let stored = StoredEpochs::from(epochs);
 
             if idempotent_epoch_check(transaction_id, stored, deflated)? == ProduceEpoch::Start {
                 _ = connection
                     .execute(
-                        "producer_epoch_insert_given.sql",
+                        sql::PRODUCER_EPOCH_INSERT_GIVEN,
                         (
                             self.cluster.as_str(),
                             deflated.producer_id,
@@ -805,9 +899,9 @@ impl Delegate {
                     .inspect_err(|err| error!(?err))?;
             }
 
-            let row = connection
+            let producer_select_for_update::Row { sequence } = connection
                 .query_one(
-                    "producer_select_for_update.sql",
+                    producer_select_for_update::QUERY,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -827,8 +921,6 @@ impl Delegate {
                     )
                 })?;
 
-            let sequence = row.get::<i32>(0).inspect_err(|err| error!(?err))?;
-
             debug!(
                 self.cluster,
                 ?topition,
@@ -846,7 +938,7 @@ impl Delegate {
                 1,
                 connection
                     .execute(
-                        "producer_detail_insert.sql",
+                        sql::PRODUCER_DETAIL_INSERT,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -876,8 +968,8 @@ impl Delegate {
     ) -> Result<watermark_select_for_write::Row> {
         debug!(?topition);
 
-        let mut rows = connection
-            .query(
+        connection
+            .query_first(
                 watermark_select_for_write::LITE_QUERY,
                 (
                     self.cluster.as_str(),
@@ -885,27 +977,9 @@ impl Delegate {
                     topition.partition(),
                 ),
             )
-            .await?;
-
-        let columns = ResultColumns::libsql(watermark_select_for_write::LITE_QUERY, &rows);
-        let low = columns.index(watermark_select_for_write::LOW)? as i32;
-        let high = columns.index(watermark_select_for_write::HIGH)? as i32;
-        let max_message_bytes =
-            columns.index(watermark_select_for_write::MAX_MESSAGE_BYTES)? as i32;
-
-        let Some(row) = rows
-            .next()
             .await
             .inspect_err(|err| error!(?err, cluster = ?self.cluster, ?topition))?
-        else {
-            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
-        };
-
-        Ok(watermark_select_for_write::Row {
-            low: row.get(low).inspect_err(|err| error!(?err))?,
-            high: row.get(high).inspect_err(|err| error!(?err))?,
-            max_message_bytes: row.get(max_message_bytes).inspect_err(|err| error!(?err))?,
-        })
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))
     }
 
     /// Refuses a client's transactional batch for a partition that is not in its producer's
@@ -918,8 +992,8 @@ impl Delegate {
         deflated: &deflated::Batch,
         connection: &PoolConnection,
     ) -> Result<()> {
-        let mut rows = connection
-            .query(
+        let row = connection
+            .query_first(
                 txn_produce_partition_select::QUERY,
                 (
                     self.cluster.as_str(),
@@ -932,19 +1006,6 @@ impl Delegate {
             )
             .await
             .inspect_err(|err| error!(?err))?;
-
-        let columns = ResultColumns::libsql(txn_produce_partition_select::QUERY, &rows);
-        let producer = columns.index(txn_produce_partition_select::PRODUCER)? as i32;
-        let added = columns.index(txn_produce_partition_select::ADDED)? as i32;
-
-        let row = match rows.next().await.inspect_err(|err| error!(?err))? {
-            Some(row) => Some((
-                row.get::<Option<i64>>(producer)
-                    .inspect_err(|err| error!(?err))?,
-                row.get::<i32>(added).inspect_err(|err| error!(?err))?,
-            )),
-            None => None,
-        };
 
         txn_produce_partition_check(row, deflated.producer_id)
             .inspect_err(|err| debug!(transaction_id, ?topition, deflated.producer_id, ?err))
@@ -1005,31 +1066,6 @@ impl Delegate {
 
         debug!(after_attributes = elapsed_millis(start));
 
-        if !attributes.control
-            && let Some(ref schemas) = self.schemas
-            && self
-                .describe_config(topic, ConfigResource::Topic, None)
-                .await
-                .map(|resources| {
-                    resources
-                        .configs
-                        .as_ref()
-                        .and_then(|configs| {
-                            topic_config::lookup(
-                                configs.iter().inspect(|config| debug!(?config)).filter_map(
-                                    |config| Some((config.name.as_str(), config.value.as_deref()?)),
-                                ),
-                                topic_config::SCHEMA_VALIDATION,
-                            )
-                            .and_then(|value| bool::from_str(value).ok())
-                        })
-                        .unwrap_or(true)
-                })
-                .inspect(|schema_validation| debug!(schema_validation))?
-        {
-            schemas.validate(topition.topic(), &inflated).await?;
-        }
-
         debug!(after_validation = elapsed_millis(start));
 
         let last_offset_delta = i64::from(inflated.last_offset_delta);
@@ -1072,7 +1108,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "record_insert.sql",
+                        sql::RECORD_INSERT,
                         (
                             self.cluster.as_str(),
                             topic,
@@ -1107,7 +1143,7 @@ impl Delegate {
 
                     _ = connection
                         .execute(
-                            "header_insert.sql",
+                            sql::HEADER_INSERT,
                             (
                                 self.cluster.as_str(),
                                 topic,
@@ -1137,7 +1173,7 @@ impl Delegate {
 
                 _ = connection
                         .execute(
-                            "txn_produce_offset_insert.sql",
+                            sql::TXN_PRODUCE_OFFSET_INSERT,
                             (
                                 self.cluster.as_str(),
                                 transaction_id,
@@ -1159,7 +1195,7 @@ impl Delegate {
 
         _ = connection
             .execute(
-                "watermark_update.sql",
+                sql::WATERMARK_UPDATE,
                 (
                     self.cluster.as_str(),
                     topic,
@@ -1180,15 +1216,19 @@ impl Delegate {
                 .await
                 .inspect_err(|err| error!(?err))?;
 
-            lake.store(
-                topition.topic(),
-                topition.partition(),
-                high.unwrap_or_default(),
-                &inflated,
-                config,
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
+            if TopicConfiguration::described(topition.topic(), config.clone())?.validates_schema() {
+                lake.store(
+                    topition.topic(),
+                    topition.partition(),
+                    high.unwrap_or_default(),
+                    &inflated,
+                    config,
+                )
+                .await
+                .inspect_err(|err| error!(?err))?;
+            } else {
+                lake_skip::warn_once(topition.topic());
+            }
         }
 
         debug!(after_all_done = elapsed_millis(start));
@@ -1214,8 +1254,8 @@ impl Delegate {
         let mut overlaps = vec![];
 
         let mut rows = connection
-            .query(
-                "txn_select_produced_topitions.sql",
+            .query_rows(
+                txn_select_produced_topitions::QUERY,
                 (
                     self.cluster.as_str(),
                     transaction_id,
@@ -1225,10 +1265,9 @@ impl Delegate {
             )
             .await?;
 
-        while let Some(row) = rows.next().await? {
-            let topic = row.get::<String>(0)?;
-            let partition = row.get::<i32>(1)?;
-
+        while let Some(txn_select_produced_topitions::Row { topic, partition }) =
+            rows.next().await?
+        {
             let topition = Topition::new(topic.clone(), partition);
 
             debug!(?topition);
@@ -1270,9 +1309,9 @@ impl Delegate {
 
             debug!(offset, ?topition);
 
-            let mut rows = connection
-                .query(
-                    "txn_produce_offset_select_offset_range.sql",
+            let row = connection
+                .query_first(
+                    txn_produce_offset_select_offset_range::QUERY,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1284,14 +1323,16 @@ impl Delegate {
                 )
                 .await?;
 
-            if let Some(row) = rows.next().await? {
-                let offset_start = row.get::<i64>(0)?;
-                let offset_end = row.get::<i64>(1)?;
+            if let Some(txn_produce_offset_select_offset_range::Row {
+                offset_start,
+                offset_end,
+            }) = row
+            {
                 debug!(offset_start, offset_end);
 
                 let mut rows = connection
-                    .query(
-                        "txn_produce_offset_select_overlapping_txn.sql",
+                    .query_rows(
+                        txn_produce_offset_select_overlapping_txn::QUERY,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -1337,7 +1378,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_produce_offset_delete_by_txn.sql",
+                        sql::TXN_PRODUCE_OFFSET_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1349,7 +1390,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_topition_delete_by_txn.sql",
+                        sql::TXN_TOPITION_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1362,7 +1403,7 @@ impl Delegate {
                 if txn.status == TxnState::PrepareCommit {
                     _ = connection
                         .execute(
-                            "consumer_offset_insert_from_txn.sql",
+                            sql::CONSUMER_OFFSET_INSERT_FROM_TXN,
                             (
                                 self.cluster.as_str(),
                                 txn.name.as_str(),
@@ -1375,7 +1416,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_offset_commit_tp_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1387,7 +1428,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_offset_commit_delete_by_txn.sql",
+                        sql::TXN_OFFSET_COMMIT_DELETE_BY_TXN,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1407,7 +1448,7 @@ impl Delegate {
 
                 _ = connection
                     .execute(
-                        "txn_status_update.sql",
+                        sql::TXN_STATUS_UPDATE,
                         (
                             self.cluster.as_str(),
                             txn.name.as_str(),
@@ -1429,7 +1470,7 @@ impl Delegate {
 
             _ = connection
                 .execute(
-                    "txn_status_update.sql",
+                    sql::TXN_STATUS_UPDATE,
                     (
                         self.cluster.as_str(),
                         transaction_id,
@@ -1454,7 +1495,7 @@ impl Delegate {
     async fn policy_compact_delete(&self, topition: i64, offset_id: i64) -> Result<u64> {
         let pc = self.connection().await?;
 
-        pc.execute("lite/policy_compact_delete.sql", (topition, offset_id))
+        pc.execute(sql::LITE_POLICY_COMPACT_DELETE, (topition, offset_id))
             .await
             .map(|rows| rows as u64)
             .inspect(|rows| debug!(rows))
@@ -1471,16 +1512,17 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query(
-                "lite/policy_compact_compaction.sql",
+            .query_rows(
+                sql::lite_policy_compact_compaction::QUERY,
                 (topition, key, max_offset_id),
             )
             .await?;
 
         let mut offsets = Vec::new();
 
-        while let Some(row) = rows.next().await? {
-            let offset = row.get::<i64>(0)?;
+        while let Some(sql::lite_policy_compact_compaction::Row { offset_id: offset }) =
+            rows.next().await?
+        {
             offsets.push(offset);
         }
 
@@ -1491,15 +1533,16 @@ impl Delegate {
     async fn policy_compact_max_offset_id(&self, topition: i64, key: &[u8]) -> Result<Option<i64>> {
         let pc = self.connection().await?;
 
-        if let Some(row) = pc
-            .query_opt("lite/policy_compact_max_offset_id.sql", (topition, key))
-            .await?
-        {
-            row.get::<i64>(0).map(Some).map_err(Into::into)
-        } else {
-            Ok(None)
-        }
-        .inspect(|max_offset| debug!(max_offset))
+        let row = pc
+            .query_first(
+                sql::lite_policy_compact_max_offset_id::QUERY,
+                (topition, key),
+            )
+            .await?;
+
+        let max_offset = row.map(|row| row.max_offset_id);
+        debug!(max_offset);
+        Ok(max_offset)
     }
 
     #[instrument(skip(self))]
@@ -1507,14 +1550,14 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query("lite/policy_compact_distinct_k.sql", [topition])
+            .query_rows(sql::lite_policy_compact_distinct_k::QUERY, [topition])
             .await?;
 
         let mut keys = BTreeSet::new();
 
         while let Some(row) = rows.next().await? {
-            if let Some(key) = row.get::<Option<Vec<u8>>>(0)? {
-                _ = keys.insert(key);
+            if let Some(key) = row.key {
+                _ = keys.insert(Vec::from(key));
             }
         }
 
@@ -1528,13 +1571,15 @@ impl Delegate {
         let pc = self.connection().await?;
 
         let mut rows = pc
-            .query("lite/policy_compact_topitions.sql", [self.cluster.as_str()])
+            .query_rows(
+                sql::lite_policy_compact_topitions::QUERY,
+                [self.cluster.as_str()],
+            )
             .await?;
 
         let mut topitions = BTreeSet::new();
 
-        while let Some(row) = rows.next().await? {
-            let topition = row.get::<i64>(0)?;
+        while let Some(sql::lite_policy_compact_topitions::Row { topition }) = rows.next().await? {
             _ = topitions.insert(topition);
         }
 
@@ -1549,7 +1594,7 @@ impl Delegate {
             CompactionMode::Single => {
                 let pc = self.connection().await?;
 
-                pc.execute("policy_compact.sql", [self.cluster.as_str()])
+                pc.execute(sql::POLICY_COMPACT, [self.cluster.as_str()])
                     .await
                     .map(|compacted| compacted as u64)
                     .inspect(|_| {
@@ -1611,7 +1656,7 @@ impl Delegate {
                 if let Some(vacuum_temporary) = temporary.to_str() {
                     let pc = self.connection().await?;
                     let rows = pc
-                        .execute("lite/vacuum_into.sql", [vacuum_temporary])
+                        .execute(sql::LITE_VACUUM_INTO, [vacuum_temporary])
                         .await? as u64;
 
                     rename(temporary, vacuum_into).await?;
@@ -1634,12 +1679,12 @@ impl Delegate {
 
         let by_age = pc
             .execute(
-                "lite/policy_delete.sql",
+                sql::LITE_POLICY_DELETE,
                 (self.cluster.as_str(), now, retention_ms),
             )
             .await?;
 
-        pc.execute("lite/policy_delete_bytes.sql", [self.cluster.as_str()])
+        pc.execute(sql::LITE_POLICY_DELETE_BYTES, [self.cluster.as_str()])
             .await
             .map(|by_bytes| (by_age + by_bytes) as u64)
             .map_err(Into::into)
@@ -1692,17 +1737,13 @@ impl Delegate {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let row = c
-            .query_one(
-                "virtual_topic_upsert.sql",
-                (self.cluster.as_str(), topic, key, uuid.to_string()),
-            )
-            .await?;
-
-        row.get_str(0)
-            .map_err(Error::from)
-            .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-            .inspect(|vt| debug!(%vt))
+        c.query_one(
+            virtual_topic_upsert::QUERY,
+            (self.cluster.as_str(), topic, key, uuid.to_string()),
+        )
+        .await
+        .map(|row| row.uuid)
+        .inspect(|vt| debug!(%vt))
     }
 }
 
@@ -1884,19 +1925,28 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
         .await?;
 
     _ = tx
-        .execute(SQL.get("nisshi_schema_version_create.sql")?, ())
+        .execute(SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?, ())
         .await?;
 
-    let recorded = match tx
-        .query(SQL.get("nisshi_schema_version_select.sql")?, ())
-        .await?
-        .next()
-        .await?
-    {
-        Some(row) => Some(RecordedSchema {
-            version: row.get(0)?,
-            oldest_compatible_version: row.get(1)?,
-        }),
+    let mut rows = tx
+        .query(SQL.get(sql::nisshi_schema_version_select::QUERY.key())?, ())
+        .await?;
+    let reader = sql::nisshi_schema_version_select::RowReader::new(&ResultColumns::new(
+        sql::nisshi_schema_version_select::QUERY.key(),
+        &rows,
+    ))?;
+    let recorded = match rows.next().await? {
+        Some(row) => {
+            let sql::nisshi_schema_version_select::Row {
+                version,
+                oldest_compatible_version,
+            } = reader.read_row(&row)?;
+
+            Some(RecordedSchema {
+                version,
+                oldest_compatible_version,
+            })
+        }
         None => None,
     };
     debug!(?recorded);
@@ -1925,7 +1975,7 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
 
     _ = tx
         .execute(
-            SQL.get("nisshi_schema_version_insert.sql")?,
+            SQL.get(sql::NISSHI_SCHEMA_VERSION_INSERT)?,
             [SCHEMA_VERSION, OLDEST_COMPATIBLE_SCHEMA_VERSION],
         )
         .await?;
@@ -1946,7 +1996,7 @@ async fn ensure_schema(db: &Database, busy_timeout: Duration) -> Result<()> {
 
 pub(crate) static SQL: LazyLock<Cache> = LazyLock::new(|| {
     Cache::new(
-        crate::sql::SQL
+        sql::SQL
             .iter()
             .map(|(name, sql)| fix_parameters(sql).map(|sql| (*name, sql)))
             .collect::<Result<BTreeMap<_, _>>>()
@@ -2832,41 +2882,35 @@ impl Builder<String, i32, Url, Url> {
     }
 }
 
-fn unique_constraint(error_code: ErrorCode) -> impl Fn(libsql::Error) -> Error {
-    move |err| {
-        if let libsql::Error::SqliteFailure(code, ref reason) = err {
-            debug!(code, reason);
-
-            if code == SQLITE_CONSTRAINT_UNIQUE {
-                Error::Api(error_code)
-            } else {
-                err.into()
-            }
-        } else {
-            err.into()
+/// Returns a function that maps a unique-constraint violation to [`Error::Api`] with
+/// `error_code`, and returns every other error as it is.
+fn unique_constraint<E: Into<Error>>(error_code: ErrorCode) -> impl Fn(E) -> Error {
+    move |err| match err.into() {
+        Error::LibSql(err) if is_unique_constraint(&err) => {
+            debug!(?err);
+            Error::Api(error_code)
         }
+
+        err => err,
     }
 }
 
 /// Reads a `consumer_group_detail.sql` row as the stored group and the version that
 /// `update_group` compares against.
-fn group_detail_with_version(row: &Row) -> Result<(GroupDetail, Version)> {
-    let version = row
-        .get_str(0)
-        .map_err(Error::from)
-        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-        .inspect_err(|err| error!(?err))
-        .map(|uuid| Version {
-            e_tag: Some(uuid.to_string()),
-            version: None,
-        })
-        .inspect(|version| debug!(?version))?;
+fn group_detail_with_version(
+    row: sql::consumer_group_detail::Row,
+) -> Result<(GroupDetail, Version)> {
+    let version = Version {
+        e_tag: Some(row.e_tag.to_string()),
+        version: None,
+    };
+    debug!(?version);
 
     let current = row
-        .get_str(1)
+        .detail
         .map_err(Error::from)
         .inspect(|value| debug!(%value))
-        .and_then(|value| serde_json::from_str::<GroupDetail>(value).map_err(Into::into))
+        .and_then(|value| serde_json::from_value::<GroupDetail>(value).map_err(Into::into))
         .inspect(|current| debug!(?current))
         .inspect_err(|err| error!(?err))?;
 
@@ -2949,7 +2993,7 @@ impl Storage for Delegate {
 
         connection
             .execute(
-                "register_broker.sql",
+                sql::REGISTER_BROKER,
                 &[broker_registration.cluster_id.as_str()],
             )
             .await
@@ -3011,23 +3055,11 @@ impl Storage for Delegate {
                 (topic.replication_factor as i32),
             );
 
-            pc.query_one("topic_insert.sql", parameters.clone())
+            pc.query_one(topic_insert::QUERY, parameters.clone())
                 .await
-                .inspect_err(|err| {
-                    if is_unique_constraint(err) {
-                        debug!(?err);
-                    } else {
-                        error!(?err)
-                    }
-                })
                 .map_err(unique_constraint(ErrorCode::TopicAlreadyExists))
                 .inspect(|row| debug!(?parameters, ?row))
-                .and_then(|row| {
-                    row.get::<String>(0)
-                        .inspect_err(|err| error!(?err))
-                        .map_err(Into::into)
-                })
-                .and_then(|id| Uuid::parse_str(id.as_str()).map_err(Into::into))
+                .map(|row| row.uuid)
         }
         .inspect(|uuid| debug!(?uuid))
         .inspect_err(|err| error!(?err))?;
@@ -3035,17 +3067,11 @@ impl Storage for Delegate {
         for partition in 0..topic.num_partitions {
             let params = (self.cluster.as_str(), topic.name.as_str(), partition);
 
-            _ = pc
-                .query_opt("topition_insert.sql", params)
-                .await
-                .map(|row| row.map(|row| row.get_value(0)).transpose())
-                .inspect(|topition| debug!(?topition))?;
+            let topition = pc.query_first(topition_insert::QUERY, params).await?;
+            debug!(?topition);
 
-            _ = pc
-                .query_opt("watermark_insert.sql", params)
-                .await
-                .map(|row| row.map(|row| row.get_value(0)).transpose())
-                .inspect(|watermark| debug!(?watermark))?;
+            let watermark = pc.query_first(watermark_insert::QUERY, params).await?;
+            debug!(?watermark);
         }
 
         if let Some(configs) = topic.configs {
@@ -3059,12 +3085,11 @@ impl Storage for Delegate {
                     config.value.as_deref(),
                 );
 
-                _ = pc
-                    .query_one("topic_configuration_upsert.sql", params)
+                let id = pc
+                    .query_one(topic_configuration_upsert::QUERY, params)
                     .await
-                    .map(|row| row.get_value(0))
-                    .inspect_err(|err| error!(?err, ?config))
-                    .inspect(|id| debug!(?id, ?config))?;
+                    .inspect_err(|err| error!(?err, ?config))?;
+                debug!(?id, ?config);
             }
         }
 
@@ -3127,7 +3152,7 @@ impl Storage for Delegate {
                                     if cutoff > stage.log_start {
                                         _ = pc
                                             .execute(
-                                                "record_delete_by_offset.sql",
+                                                sql::RECORD_DELETE_BY_OFFSET,
                                                 (
                                                     self.cluster.as_str(),
                                                     topic.name.as_str(),
@@ -3141,7 +3166,7 @@ impl Storage for Delegate {
 
                                     _ = pc
                                         .execute(
-                                            "watermark_update.sql",
+                                            sql::WATERMARK_UPDATE,
                                             (
                                                 self.cluster.as_str(),
                                                 topic.name.as_str(),
@@ -3187,41 +3212,41 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
         let tx = pc.transaction().await?;
 
-        let mut rows = match topic {
-            TopicId::Id(id) => {
-                pc.query(
-                    "topic_select_uuid.sql",
+        let topic_name = match topic {
+            TopicId::Id(id) => pc
+                .query_first(
+                    topic_select_uuid::NAME_QUERY,
                     (self.cluster.as_str(), id.to_string().as_str()),
                 )
                 .await?
-            }
+                .map(|row| row.name),
 
-            TopicId::Name(name) => {
-                pc.query(
-                    "topic_select_name.sql",
+            TopicId::Name(name) => pc
+                .query_first(
+                    topic_select_name::NAME_QUERY,
                     (self.cluster.as_str(), name.as_str()),
                 )
                 .await?
-            }
+                .map(|row| row.name),
         };
 
-        let Some(row) = rows.next().await? else {
+        let Some(topic_name) = topic_name else {
             return Ok(ErrorCode::UnknownTopicOrPartition);
         };
 
-        let topic_name = row.get_str(1)?;
+        let topic_name = topic_name.as_str();
 
         for sql in [
-            "consumer_offset_delete_by_topic.sql",
-            "topic_configuration_delete_by_topic.sql",
-            "watermark_delete_by_topic.sql",
-            "header_delete_by_topic.sql",
-            "record_delete_by_topic.sql",
-            "txn_offset_commit_tp_delete_by_topic.sql",
-            "txn_produce_offset_delete_by_topic.sql",
-            "txn_topition_delete_by_topic.sql",
-            "producer_detail_delete_by_topic.sql",
-            "topition_delete_by_topic.sql",
+            sql::CONSUMER_OFFSET_DELETE_BY_TOPIC,
+            sql::TOPIC_CONFIGURATION_DELETE_BY_TOPIC,
+            sql::WATERMARK_DELETE_BY_TOPIC,
+            sql::HEADER_DELETE_BY_TOPIC,
+            sql::RECORD_DELETE_BY_TOPIC,
+            sql::TXN_OFFSET_COMMIT_TP_DELETE_BY_TOPIC,
+            sql::TXN_PRODUCE_OFFSET_DELETE_BY_TOPIC,
+            sql::TXN_TOPITION_DELETE_BY_TOPIC,
+            sql::PRODUCER_DETAIL_DELETE_BY_TOPIC,
+            sql::TOPITION_DELETE_BY_TOPIC,
         ] {
             let rows = pc.execute(sql, (self.cluster.as_str(), topic_name)).await?;
 
@@ -3229,7 +3254,7 @@ impl Storage for Delegate {
         }
 
         _ = pc
-            .execute("topic_delete_by.sql", (self.cluster.as_str(), topic_name))
+            .execute(sql::TOPIC_DELETE_BY, (self.cluster.as_str(), topic_name))
             .await?;
 
         pc.commit(tx).await.and(Ok(ErrorCode::None)).inspect(|_| {
@@ -3361,8 +3386,8 @@ impl Storage for Delegate {
 
             let mut records = if let Some(key) = key_filter {
                 let key_bytes = key.as_bytes().to_vec();
-                c.query(
-                    "record_fetch_keyed.sql",
+                c.query_rows(
+                    record_fetch::KEYED_QUERY,
                     (
                         self.cluster.as_str(),
                         base_topic,
@@ -3371,12 +3396,13 @@ impl Storage for Delegate {
                         (max_bytes as i64),
                         high_watermark,
                         key_bytes,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
             } else {
-                c.query(
-                    "record_fetch.sql",
+                c.query_rows(
+                    record_fetch::QUERY,
                     (
                         self.cluster.as_str(),
                         topition.topic(),
@@ -3384,6 +3410,7 @@ impl Storage for Delegate {
                         offset,
                         (max_bytes as i64),
                         high_watermark,
+                        ROWS_PER_FETCH,
                     ),
                 )
                 .await
@@ -3402,17 +3429,25 @@ impl Storage for Delegate {
             // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
             // configured instead of shrinking to the time left, because it applies to each wait and
             // is shared with every later user of the pooled connection.
-            while let Some(row) = records.next().await? {
-                let offset = row
-                    .get::<i64>(0)
-                    .inspect(|offset| debug!(offset))
-                    .inspect_err(|err| error!(?err))?;
+            while let Some(record_fetch::Row {
+                offset_id: offset,
+                attributes,
+                timestamp,
+                key,
+                value,
+                producer_id,
+                producer_epoch,
+            }) = records.next().await?
+            {
+                debug!(offset, ?timestamp);
+                debug!(key_len = ?key.as_ref().map(Bytes::len));
+                debug!(value_len = ?value.as_ref().map(Bytes::len));
 
                 let mut headers = vec![];
 
                 let mut header_rows = c
-                    .query(
-                        "header_fetch.sql",
+                    .query_rows(
+                        header_fetch::QUERY,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
@@ -3422,57 +3457,18 @@ impl Storage for Delegate {
                     )
                     .await?;
 
-                while let Some(header) = header_rows.next().await? {
-                    let mut header_builder = Header::builder();
-
-                    if let Some(k) = header
-                        .get::<Option<Vec<u8>>>(0)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.key(Bytes::from(k));
-                    }
-
-                    if let Some(v) = header
-                        .get::<Option<Vec<u8>>>(1)
-                        .inspect_err(|err| error!(?err))?
-                    {
-                        header_builder = header_builder.value(Bytes::from(v));
-                    }
-
-                    headers.push(header_builder);
+                while let Some(header_fetch::Row { key, value }) = header_rows.next().await? {
+                    headers.push(Header { key, value }.into());
                 }
 
                 data.send_record(FetchedRecord {
                     offset,
-                    timestamp: row
-                        .get_value(2)
-                        .map_err(Error::from)
-                        .and_then(LiteTimestamp::millis)
-                        .inspect(|timestamp| debug!(?timestamp))
-                        .inspect_err(|err| error!(?err))?,
-                    attributes: row
-                        .get::<Option<i32>>(1)
-                        .map(|attributes| attributes.unwrap_or(0))
-                        .inspect_err(|err| error!(?err))? as i16,
-                    producer_id: row
-                        .get::<Option<i64>>(6)
-                        .map(|producer_id| producer_id.unwrap_or(-1))
-                        .inspect_err(|err| error!(?err))?,
-                    producer_epoch: i16::try_from(
-                        row.get::<Option<i32>>(7)
-                            .map(|producer_epoch| producer_epoch.unwrap_or(-1))
-                            .inspect_err(|err| error!(?err))?,
-                    )?,
-                    key: row
-                        .get::<Option<Vec<u8>>>(3)
-                        .map(|o| o.map(Bytes::from))
-                        .inspect(|k| debug!(key_len = ?k.as_ref().map(Bytes::len)))
-                        .inspect_err(|err| error!(?err))?,
-                    value: row
-                        .get::<Option<Vec<u8>>>(4)
-                        .map(|o| o.map(Bytes::from))
-                        .inspect(|v| debug!(value_len = ?v.as_ref().map(Bytes::len)))
-                        .inspect_err(|err| error!(?err))?,
+                    timestamp,
+                    attributes: attributes.unwrap_or(0),
+                    producer_id: producer_id.unwrap_or(-1),
+                    producer_epoch: producer_epoch.unwrap_or(-1),
+                    key,
+                    value,
                     headers,
                 })
                 .await?;
@@ -3494,9 +3490,9 @@ impl Storage for Delegate {
 
         let c = self.connection().await?;
 
-        let row = c
+        let watermark_select::Row { low, high, stable } = c
             .query_one(
-                "watermark_select.sql",
+                watermark_select::QUERY,
                 (
                     self.cluster.as_str(),
                     self.base_topic(topition.topic()).await?,
@@ -3506,20 +3502,9 @@ impl Storage for Delegate {
             .await
             .inspect_err(|err| error!(?topition, ?err))?;
 
-        let log_start = row
-            .get::<Option<i64>>(0)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let high_watermark = row
-            .get::<Option<i64>>(1)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or_default();
-
-        let last_stable = row
-            .get::<Option<i64>>(2)
-            .inspect_err(|err| error!(?topition, ?err))?
-            .unwrap_or(high_watermark);
+        let log_start = low.unwrap_or_default();
+        let high_watermark = high.unwrap_or_default();
+        let last_stable = stable.unwrap_or(high_watermark);
 
         debug!(cluster = self.cluster, ?topition, log_start, high_watermark,);
 
@@ -3558,7 +3543,7 @@ impl Storage for Delegate {
 
             let mut rows = c
                 .query(
-                    "topition_select.sql",
+                    sql::TOPITION_SELECT,
                     (
                         self.cluster.as_str(),
                         self.base_topic(topition.topic()).await?,
@@ -3571,7 +3556,7 @@ impl Storage for Delegate {
             if rows.next().await.inspect_err(|err| error!(?err))?.is_some() {
                 if !cg_inserted {
                     let rows = c
-                        .execute("consumer_group_insert.sql", (self.cluster.as_str(), group))
+                        .execute(sql::CONSUMER_GROUP_INSERT, (self.cluster.as_str(), group))
                         .await?;
                     debug!(rows);
 
@@ -3580,7 +3565,7 @@ impl Storage for Delegate {
 
                 let rows = c
                     .execute(
-                        "consumer_offset_insert.sql",
+                        sql::CONSUMER_OFFSET_INSERT,
                         (
                             self.cluster.as_str(),
                             self.base_topic(topition.topic()).await?,
@@ -3588,7 +3573,7 @@ impl Storage for Delegate {
                             group,
                             offset.offset,
                             offset.leader_epoch,
-                            offset.timestamp.map(LiteTimestamp),
+                            offset.timestamp.map(StoredTime::from),
                             offset.metadata.as_deref(),
                         ),
                     )
@@ -3633,27 +3618,24 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query(
-                consumer_offset_select_by_group::QUERY,
+            .query_rows(
+                sql::consumer_offset_select_by_group::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
 
-        let columns = ResultColumns::libsql(consumer_offset_select_by_group::QUERY, &rows);
-        let topic = columns.index(consumer_offset_select_by_group::TOPIC)? as i32;
-        let partition = columns.index(consumer_offset_select_by_group::PARTITION)? as i32;
-        let committed_offset =
-            columns.index(consumer_offset_select_by_group::COMMITTED_OFFSET)? as i32;
-        let leader_epoch = columns.index(consumer_offset_select_by_group::LEADER_EPOCH)? as i32;
-        let metadata = columns.index(consumer_offset_select_by_group::METADATA)? as i32;
-
-        while let Some(row) = rows.next().await? {
-            let topic = row.get_str(topic)?;
-            let partition = row.get::<i32>(partition)?;
+        while let Some(sql::consumer_offset_select_by_group::Row {
+            topic,
+            partition,
+            committed_offset,
+            leader_epoch,
+            metadata,
+        }) = rows.next().await?
+        {
             let committed = CommittedOffset {
-                offset: row.get::<i64>(committed_offset)?,
-                leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
-                metadata: row.get::<Option<String>>(metadata)?,
+                offset: committed_offset,
+                leader_epoch,
+                metadata,
             };
 
             debug!(group_id, topic, partition, ?committed);
@@ -3680,24 +3662,19 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query(
+            .query_rows(
                 txn_offset_commit_tp_select_pending::QUERY,
                 (self.cluster.as_str(), group_id),
             )
             .await
             .inspect_err(|err| error!(?err, cluster = self.cluster, group_id))?;
 
-        let columns = ResultColumns::libsql(txn_offset_commit_tp_select_pending::QUERY, &rows);
-        let topic = columns.index(txn_offset_commit_tp_select_pending::TOPIC)? as i32;
-        let partition = columns.index(txn_offset_commit_tp_select_pending::PARTITION)? as i32;
-
         let mut pending = BTreeSet::new();
 
-        while let Some(row) = rows.next().await? {
-            _ = pending.insert(Topition::new(
-                row.get_str(topic)?,
-                row.get::<i32>(partition)?,
-            ));
+        while let Some(txn_offset_commit_tp_select_pending::Row { topic, partition }) =
+            rows.next().await?
+        {
+            _ = pending.insert(Topition::new(topic, partition));
         }
 
         debug!(cluster = self.cluster, group_id, ?pending);
@@ -3726,8 +3703,8 @@ impl Storage for Delegate {
 
         for topic in topics {
             let mut rows = c
-                .query(
-                    consumer_offset_select::QUERY,
+                .query_rows(
+                    sql::consumer_offset_select::QUERY,
                     (
                         self.cluster.as_str(),
                         group_id,
@@ -3746,21 +3723,14 @@ impl Storage for Delegate {
                     )
                 })?;
 
-            let columns = ResultColumns::libsql(consumer_offset_select::QUERY, &rows);
-            let committed_offset = columns.index(consumer_offset_select::COMMITTED_OFFSET)? as i32;
-            let leader_epoch = columns.index(consumer_offset_select::LEADER_EPOCH)? as i32;
-            let metadata = columns.index(consumer_offset_select::METADATA)? as i32;
-
             let committed = rows
                 .next()
                 .await
-                .and_then(|maybe| {
-                    maybe.map_or(Ok(CommittedOffset::uncommitted()), |row| {
-                        Ok(CommittedOffset {
-                            offset: row.get::<i64>(committed_offset)?,
-                            leader_epoch: row.get::<Option<i32>>(leader_epoch)?,
-                            metadata: row.get::<Option<String>>(metadata)?,
-                        })
+                .map(|row| {
+                    row.map_or(CommittedOffset::uncommitted(), |row| CommittedOffset {
+                        offset: row.committed_offset,
+                        leader_epoch: row.leader_epoch,
+                        metadata: row.metadata,
                     })
                 })
                 .inspect(|committed| {
@@ -3808,21 +3778,21 @@ impl Storage for Delegate {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                (ListOffset::Earliest, _) => list_offset::EARLIEST_QUERY,
                 (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
-                    "list_latest_offset_committed.sql"
+                    list_offset::LATEST_COMMITTED_QUERY
                 }
                 (ListOffset::Latest, IsolationLevel::ReadUncommitted) => {
-                    "list_latest_offset_uncommitted.sql"
+                    list_offset::LATEST_UNCOMMITTED_QUERY
                 }
-                (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+                (ListOffset::Timestamp(_), _) => list_offset::LATEST_TIMESTAMP_QUERY,
             };
 
             debug!(?query);
 
             let list_offset = match offset_type {
                 ListOffset::Earliest | ListOffset::Latest => c
-                    .query_opt(
+                    .query_first(
                         query,
                         (
                             self.cluster.as_str(),
@@ -3834,13 +3804,13 @@ impl Storage for Delegate {
                     .inspect_err(|err| error!(?err, cluster = self.cluster, ?topition)),
 
                 ListOffset::Timestamp(timestamp) => c
-                    .query_opt(
+                    .query_first(
                         query,
                         (
                             self.cluster.as_str(),
                             topition.topic(),
                             topition.partition(),
-                            LiteTimestamp::from(timestamp),
+                            StoredTime::from(*timestamp),
                         ),
                     )
                     .await
@@ -3869,41 +3839,37 @@ impl Storage for Delegate {
                         ..Default::default()
                     })
                 },
-                |row| {
-                    debug!(?row);
+                |list_offset::Row {
+                     offset_id,
+                     timestamp,
+                 }|
+                 -> Result<ListOffsetResponse> {
+                    let offset = Some(offset_id);
 
-                    row.get::<i64>(0)
-                        .map_err(Into::into)
-                        .map(Some)
-                        .and_then(|offset| {
-                            row.get_value(1)
-                                .map_err(Into::into)
-                                .and_then(|value| match value {
-                                    Value::Null => Ok(None),
-                                    // A record that was produced without a timestamp stores
-                                    // NO_TIMESTAMP, -1, and `SystemTime` cannot hold a negative
-                                    // millisecond count, so this answers no timestamp for it.
-                                    Value::Integer(timestamp) if timestamp < 0 => Ok(None),
-                                    value => LiteTimestamp::try_from(value)
-                                        .map(SystemTime::from)
-                                        .map(Some),
-                                })
-                                .map(|timestamp| {
-                                    debug!(
-                                        cluster = self.cluster,
-                                        ?topition,
-                                        ?offset_type,
-                                        offset,
-                                        ?timestamp
-                                    );
+                    // Only a Timestamp lookup converts the timestamp, because the service drops
+                    // it for Earliest and Latest. Converting it for those two would fail a
+                    // request on an instant that this platform's `SystemTime` cannot hold,
+                    // although the request never uses it.
+                    let timestamp = match offset_type {
+                        ListOffset::Timestamp(_) => {
+                            timestamp.map(KafkaTimestamp::system_time).transpose()?
+                        }
+                        ListOffset::Earliest | ListOffset::Latest => None,
+                    };
 
-                                    ListOffsetResponse {
-                                        timestamp,
-                                        offset,
-                                        ..Default::default()
-                                    }
-                                })
-                        })
+                    debug!(
+                        cluster = self.cluster,
+                        ?topition,
+                        ?offset_type,
+                        offset,
+                        ?timestamp
+                    );
+
+                    Ok(ListOffsetResponse {
+                        timestamp,
+                        offset,
+                        ..Default::default()
+                    })
                 },
             )?;
 
@@ -3942,7 +3908,7 @@ impl Storage for Delegate {
         debug!(?brokers);
 
         let responses = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 let mut responses = vec![];
 
                 for topic in topics {
@@ -3963,23 +3929,23 @@ impl Storage for Delegate {
                             }?;
 
                             let mut rows = c
-                                .query("topic_select_name.sql", (self.cluster.as_str(), base_topic))
+                                .query_rows(
+                                    topic_select_name::QUERY,
+                                    (self.cluster.as_str(), base_topic),
+                                )
                                 .await?;
 
-                            match rows.next().await.inspect_err(|err| error!(?err)) {
-                                Ok(Some(row)) => {
+                            match rows.next().await {
+                                Ok(Some(topic_select_name::Row {
+                                    uuid,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                    ..
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-
-                                    let topic_id = vtid.or(row
-                                        .get_str(0)
-                                        .map_err(Error::from)
-                                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                                        .map(|uuid| uuid.into_bytes())
-                                        .map(Some)?);
-
-                                    let is_internal = row.get::<bool>(2).map(Some)?;
-                                    let partitions = row.get::<i32>(3)?;
-                                    let replication_factor = row.get::<i32>(4)?;
+                                    let topic_id = vtid.or(Some(uuid.into_bytes()));
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -4020,8 +3986,11 @@ impl Storage for Delegate {
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
 
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    error!(?reason, ?topic);
                                     MetadataResponseTopic::default()
                                         .error_code(ErrorCode::UnknownTopicOrPartition.into())
                                         .name(Some(name.into()))
@@ -4036,25 +4005,24 @@ impl Storage for Delegate {
                             debug!(?id);
 
                             let mut rows = c
-                                .query(
-                                    "topic_select_uuid.sql",
+                                .query_rows(
+                                    topic_select_uuid::QUERY,
                                     (self.cluster.as_str(), id.to_string().as_str()),
                                 )
                                 .await?;
 
                             match rows.next().await {
-                                Ok(Some(row)) => {
+                                Ok(Some(topic_select_uuid::Row {
+                                    uuid,
+                                    name,
+                                    is_internal,
+                                    partitions,
+                                    replication_factor,
+                                })) => {
                                     let error_code = ErrorCode::None.into();
-                                    let topic_id = row
-                                        .get_str(0)
-                                        .map_err(Error::from)
-                                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                                        .map(|uuid| uuid.into_bytes())
-                                        .map(Some)?;
-                                    let name = row.get::<String>(1).map(Some)?;
-                                    let is_internal = row.get::<bool>(2).map(Some)?;
-                                    let partitions = row.get::<i32>(3)?;
-                                    let replication_factor = row.get::<i32>(4)?;
+                                    let topic_id = Some(uuid.into_bytes());
+                                    let name = Some(name);
+                                    let is_internal = Some(is_internal);
 
                                     debug!(
                                         ?error_code,
@@ -4093,10 +4061,16 @@ impl Storage for Delegate {
                                     .is_internal(Some(false))
                                     .partitions(Some([].into()))
                                     .topic_authorized_operations(Some(-2147483648)),
+                                // A row that can't be read fails the whole request, not only this topic.
+                                Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                                 Err(reason) => {
-                                    debug!(?reason);
+                                    error!(?reason, ?topic, topic_id = %id, "topic ID query failed, answering UNKNOWN_TOPIC_OR_PARTITION");
                                     MetadataResponseTopic::default()
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                        .error_code(
+                                            nisshi_storage::topic_id_query_error_code(&reason)
+                                                .into(),
+                                        )
                                         .name(None)
                                         .topic_id(Some(id.into_bytes()))
                                         .is_internal(Some(false))
@@ -4111,25 +4085,25 @@ impl Storage for Delegate {
                 responses
             }
 
-            _ => {
+            None => {
                 let mut responses = vec![];
 
                 let mut rows = c
-                    .query("topic_by_cluster.sql", &[self.cluster.as_str()])
+                    .query_rows(topic_by_cluster::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                while let Some(row) = rows.next().await? {
+                while let Some(topic_by_cluster::Row {
+                    uuid,
+                    name,
+                    is_internal,
+                    partitions,
+                    replication_factor,
+                }) = rows.next().await?
+                {
                     let error_code = ErrorCode::None.into();
-                    let topic_id = row
-                        .get_str(0)
-                        .map_err(Error::from)
-                        .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                        .map(|uuid| uuid.into_bytes())
-                        .map(Some)?;
-                    let name = row.get::<String>(1).map(Some)?;
-                    let is_internal = row.get::<bool>(2).map(Some)?;
-                    let partitions = row.get::<i32>(3)?;
-                    let replication_factor = row.get::<i32>(4)?;
+                    let topic_id = Some(uuid.into_bytes());
+                    let name = Some(name);
+                    let is_internal = Some(is_internal);
 
                     debug!(
                         ?error_code,
@@ -4195,31 +4169,24 @@ impl Storage for Delegate {
         let c = self.connection().await?;
 
         let mut rows = c
-            .query("topic_select.sql", (self.cluster.as_str(), name))
+            .query(sql::TOPIC_SELECT, (self.cluster.as_str(), name))
             .await?;
 
         if rows.next().await?.is_some() {
             let mut rows = c
-                .query(
-                    "topic_configuration_select.sql",
+                .query_rows(
+                    topic_configuration_select::QUERY,
                     (self.cluster.as_str(), name),
                 )
                 .await?;
 
             let mut configs = vec![];
 
-            while let Some(row) = rows.next().await? {
-                let name = row.get_str(0).inspect_err(|err| error!(?err))?;
-                let value = row
-                    .get::<Option<String>>(1)
-                    .map(|value| value.unwrap_or_default())
-                    .map(Some)
-                    .inspect_err(|err| error!(?err))?;
-
+            while let Some(topic_configuration_select::Row { name, value }) = rows.next().await? {
                 configs.push(
                     DescribeConfigsResourceResult::default()
-                        .name(name.to_owned())
-                        .value(value)
+                        .name(name)
+                        .value(Some(value.unwrap_or_default()))
                         .read_only(false)
                         .is_default(Some(false))
                         .config_source(Some(ConfigSource::DynamicTopicConfig.into()))
@@ -4280,24 +4247,24 @@ impl Storage for Delegate {
         for topic in topics.unwrap_or_default() {
             responses.push(match topic {
                 TopicId::Name(name) => {
-                    match c
-                        .query_opt(
-                            "topic_select_name.sql",
+                    let selected = c
+                        .query_first(
+                            topic_select_name::QUERY,
                             (self.cluster.as_str(), name.as_str()),
                         )
-                        .await
-                        .inspect_err(|err| error!(?err))
-                    {
-                        Ok(Some(row)) => {
-                            let topic_id = row
-                                .get_str(0)
-                                .map_err(Error::from)
-                                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                                .map(|uuid| uuid.into_bytes())?;
-                            let name = row.get::<String>(1).map(Some)?;
-                            let is_internal = row.get::<bool>(2).map(Some)?;
-                            let partitions = row.get::<i32>(3)?;
-                            let replication_factor = row.get::<i32>(4)?;
+                        .await;
+
+                    match selected {
+                        Ok(Some(topic_select_name::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -4355,8 +4322,11 @@ impl Storage for Delegate {
                             .partitions(Some([].into()))
                             .topic_authorized_operations(-2147483648),
 
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
-                            debug!(?reason);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
                                 .error_code(ErrorCode::UnknownServerError.into())
                                 .name(match topic {
@@ -4375,23 +4345,24 @@ impl Storage for Delegate {
                 }
                 TopicId::Id(id) => {
                     debug!(?id);
-                    match c
-                        .query_one(
-                            "topic_select_uuid.sql",
+                    let selected = c
+                        .query_first(
+                            topic_select_uuid::QUERY,
                             (self.cluster.as_str(), id.to_string().as_str()),
                         )
-                        .await
-                    {
-                        Ok(row) => {
-                            let topic_id = row
-                                .get_str(0)
-                                .map_err(Error::from)
-                                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                                .map(|uuid| uuid.into_bytes())?;
-                            let name = row.get::<String>(1).map(Some)?;
-                            let is_internal = row.get::<bool>(2).map(Some)?;
-                            let partitions = row.get::<i32>(3)?;
-                            let replication_factor = row.get::<i32>(4)?;
+                        .await;
+
+                    match selected {
+                        Ok(Some(topic_select_uuid::Row {
+                            uuid,
+                            name,
+                            is_internal,
+                            partitions,
+                            replication_factor,
+                        })) => {
+                            let topic_id = uuid.into_bytes();
+                            let name = Some(name);
+                            let is_internal = Some(is_internal);
 
                             debug!(
                                 ?topic_id,
@@ -4435,10 +4406,29 @@ impl Storage for Delegate {
                                 .topic_authorized_operations(-2147483648)
                         }
 
+                        Ok(None) => DescribeTopicPartitionsResponseTopic::default()
+                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .name(match topic {
+                                TopicId::Name(name) => Some(name.into()),
+                                TopicId::Id(_) => None,
+                            })
+                            .topic_id(match topic {
+                                TopicId::Name(_) => NULL_TOPIC_ID,
+                                TopicId::Id(id) => id.into_bytes(),
+                            })
+                            .is_internal(false)
+                            .partitions(Some([].into()))
+                            .topic_authorized_operations(-2147483648),
+
+                        // A row that can't be read fails the whole request, not only this topic.
+                        Err(reason) if sql::is_column_error(&reason) => return Err(reason),
+
                         Err(reason) => {
-                            debug!(?reason);
+                            error!(?reason, ?topic);
                             DescribeTopicPartitionsResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    nisshi_storage::topic_id_query_error_code(&reason).into(),
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,
@@ -4472,22 +4462,14 @@ impl Storage for Delegate {
         let mut listed_groups = vec![];
 
         let mut rows = c
-            .query(consumer_group_select::QUERY, &[self.cluster.as_str()])
+            .query_rows(consumer_group_select::QUERY, &[self.cluster.as_str()])
             .await?;
 
-        let columns = ResultColumns::libsql(consumer_group_select::QUERY, &rows);
-        let name = columns.index(consumer_group_select::NAME)? as i32;
-        let detail = columns.index(consumer_group_select::DETAIL)? as i32;
+        while let Some(consumer_group_select::Row { name, detail }) = rows.next().await? {
+            let stored =
+                detail.map(|detail| detail.and_then(serde_json::from_value::<GroupDetail>));
 
-        while let Some(row) = rows.next().await? {
-            let group_id = row.get_str(name)?.to_owned();
-
-            let stored = row
-                .get::<Option<String>>(detail)
-                .map_err(Error::from)?
-                .map(|detail| serde_json::from_str::<GroupDetail>(&detail));
-
-            listed_groups.push(NamedGroupDetail::decoded(group_id, stored));
+            listed_groups.push(NamedGroupDetail::decoded(name, stored));
         }
 
         Ok(listed_groups).inspect(|_| {
@@ -4514,7 +4496,7 @@ impl Storage for Delegate {
             for group_id in group_ids {
                 _ = c
                     .execute(
-                        "consumer_offset_delete_by_cg.sql",
+                        sql::CONSUMER_OFFSET_DELETE_BY_CG,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4522,7 +4504,7 @@ impl Storage for Delegate {
 
                 _ = c
                     .execute(
-                        "consumer_group_detail_delete_by_cg.sql",
+                        sql::CONSUMER_GROUP_DETAIL_DELETE_BY_CG,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4530,7 +4512,7 @@ impl Storage for Delegate {
 
                 let rows = c
                     .execute(
-                        "consumer_group_delete.sql",
+                        sql::CONSUMER_GROUP_DELETE,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4592,8 +4574,8 @@ impl Storage for Delegate {
                 };
 
                 match c
-                    .query_opt(
-                        "consumer_group_select_by_name.sql",
+                    .query_first(
+                        sql::consumer_group_select_by_name::QUERY,
                         (self.cluster.as_str(), group_id.as_str()),
                     )
                     .await
@@ -4603,17 +4585,12 @@ impl Storage for Delegate {
                         // A group row with no detail row (e.g. a group that only ever committed
                         // offsets, never a JoinGroup) joins to a NULL `detail` column here: that
                         // group exists and is empty, not an error.
-                        let stored = row
-                            .get::<Option<String>>(1)
-                            .map_err(Error::from)
-                            .transpose()
-                            .map(|stored| {
-                                stored.and_then(|detail| {
-                                    serde_json::from_str::<GroupDetail>(&detail)
-                                        .map_err(Error::from)
-                                        .inspect(|current| debug!(?current))
-                                })
-                            });
+                        let stored = row.detail.map(|detail| {
+                            detail
+                                .and_then(serde_json::from_value::<GroupDetail>)
+                                .map_err(Error::from)
+                                .inspect(|current| debug!(?current))
+                        });
 
                         results.push(NamedGroupDetail::decoded(group_id.into(), stored));
                     }
@@ -4625,7 +4602,7 @@ impl Storage for Delegate {
 
                     Err(err) => results.push(NamedGroupDetail::error_code(
                         group_id.into(),
-                        Error::from(err).error_code(ErrorCode::CoordinatorNotAvailable),
+                        err.error_code(ErrorCode::CoordinatorNotAvailable),
                     )),
                 }
             }
@@ -4646,14 +4623,12 @@ impl Storage for Delegate {
 
         let c = self.connection().await?;
 
-        c.query_opt(
-            "consumer_group_detail.sql",
+        c.query_first(
+            sql::consumer_group_detail::QUERY,
             (group_id, self.cluster.as_str()),
         )
         .await
-        .map_err(Error::from)
         .inspect_err(|err| error!(?err, group_id))?
-        .as_ref()
         .map(group_detail_with_version)
         .transpose()
         .inspect_err(|err| error!(?err, group_id, "the stored group can't be decoded"))
@@ -4680,7 +4655,7 @@ impl Storage for Delegate {
 
         _ = pc
             .execute(
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 (self.cluster.as_str(), group_id),
             )
             .await?;
@@ -4703,9 +4678,9 @@ impl Storage for Delegate {
 
         let detail = serde_json::to_value(detail).inspect(|detail| debug!(%detail))?;
 
-        let outcome = if let Some(row) = pc
-            .query_opt(
-                "consumer_group_detail_insert.sql",
+        let row = pc
+            .query_first(
+                sql::consumer_group_detail_insert::QUERY,
                 (
                     self.cluster.as_str(),
                     group_id,
@@ -4715,32 +4690,24 @@ impl Storage for Delegate {
                 ),
             )
             .await
-            .inspect(|row| debug!(?row))
-            .inspect_err(|err| error!(?err))?
-        {
-            row.get_str(2)
-                .map_err(Error::from)
-                .and_then(|str| Uuid::parse_str(str).map_err(Into::into))
-                .inspect_err(|err| error!(?err))
-                .map_err(Into::into)
-                .map(|uuid| uuid.to_string())
-                .map(Some)
-                .map(|e_tag| Version {
-                    e_tag,
-                    version: None,
-                })
-                .inspect(|version| debug!(?version))
+            .inspect_err(|err| error!(?err))?;
+
+        let outcome = if let Some(row) = row {
+            let version = Version {
+                e_tag: Some(row.e_tag.to_string()),
+                version: None,
+            };
+            debug!(?version);
+            Ok(version)
         } else {
-            let row = pc
+            let (current, version) = pc
                 .query_one(
-                    "consumer_group_detail.sql",
+                    sql::consumer_group_detail::QUERY,
                     (group_id, self.cluster.as_str()),
                 )
                 .await
-                .inspect(|row| debug!(?row))
-                .inspect_err(|err| error!(?err))?;
-
-            let (current, version) = group_detail_with_version(&row)?;
+                .inspect_err(|err| error!(?err))
+                .and_then(group_detail_with_version)?;
 
             Err(UpdateError::Outdated {
                 current: Box::new(current),
@@ -4793,23 +4760,18 @@ impl Storage for Delegate {
 
                 let mut rolled_back = false;
 
-                if let Some(row) = pc
-                    .query_opt(
-                        "producer_epoch_for_current_txn.sql",
-                        (self.cluster.as_str(), transaction_id),
-                    )
+                if let Some(producer_epoch_for_current_txn::Row {
+                    producer: id,
+                    epoch,
+                    status,
+                }) = pc
+                    .producer_epoch_for_current_txn(self.cluster.as_str(), transaction_id)
                     .await
-                    .inspect_err(|err| error!(?err))?
+                    .inspect_err(|err| error!(?err, transaction_id))?
                 {
-                    let id = row.get::<i64>(0).inspect_err(|err| error!(?err))?;
-                    let epoch = i16::try_from(row.get::<i32>(1).inspect_err(|err| error!(?err))?)
-                        .inspect_err(|err| error!(?err, transaction_id, id))?;
-                    let status = row
-                        .get::<Option<String>>(2)
-                        .inspect_err(|err| error!(?err))?
-                        .map_or(Ok(None), |status| {
-                            TxnState::from_str(status.as_str()).map(Some)
-                        })?;
+                    let status = status.map_or(Ok(None), |status| {
+                        TxnState::from_str(status.as_str()).map(Some)
+                    })?;
 
                     debug!(transaction_id, id, epoch, ?status, ?claim);
 
@@ -4854,49 +4816,32 @@ impl Storage for Delegate {
                     }
                 }
 
-                let (producer, epoch) = if let Some(row) = pc
-                    .query_opt(
-                        "txn_select_name.sql",
+                let txn_producer = pc
+                    .query_first(
+                        txn_select_name::QUERY,
                         (self.cluster.as_str(), transaction_id),
                     )
                     .await
                     .inspect_err(|err| error!(?err))?
-                {
-                    let producer: i64 = row
-                        .get(0)
-                        .inspect_err(|err| error!(?err))
-                        .inspect(|producer| debug!(producer))?;
+                    .map(|row| row.producer_id);
+
+                let (producer, epoch) = if let Some(producer) = txn_producer {
+                    debug!(producer);
 
                     // A bump gives the producer its newest epoch plus one, so the limit
                     // applies to that epoch, not to the newest epoch with a transaction.
                     let newest = pc
-                        .query_opt(
-                            "producer_epoch_current_for_producer.sql",
-                            (self.cluster.as_str(), producer),
-                        )
+                        .producer_epoch_current(self.cluster.as_str(), producer)
                         .await
-                        .inspect_err(|err| error!(?err))?
-                        .map(|row| {
-                            row.get::<i32>(0)
-                                .map_err(Error::from)
-                                .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
-                        })
-                        .transpose()
                         .inspect_err(|err| error!(?err, transaction_id, producer))?;
 
                     if newest.is_some_and(epoch_is_exhausted) {
                         // The status after the rollback above, if it ran.
                         let status = pc
-                            .query_opt(
-                                "producer_epoch_for_current_txn.sql",
-                                (self.cluster.as_str(), transaction_id),
-                            )
+                            .producer_epoch_for_current_txn(self.cluster.as_str(), transaction_id)
                             .await
                             .inspect_err(|err| error!(?err))?
-                            .map(|row| row.get::<Option<String>>(2))
-                            .transpose()
-                            .inspect_err(|err| error!(?err))?
-                            .flatten()
+                            .and_then(|row| row.status)
                             .map(|status| TxnState::from_str(status.as_str()))
                             .transpose()?;
 
@@ -4912,7 +4857,7 @@ impl Storage for Delegate {
                             if rolled_back {
                                 _ = pc
                                     .query_opt(
-                                        "producer_epoch_insert.sql",
+                                        producer_epoch_insert::QUERY.key(),
                                         (self.cluster.as_str(), producer),
                                     )
                                     .await
@@ -4936,21 +4881,14 @@ impl Storage for Delegate {
 
                         let previous = producer;
 
-                        let producer: i64 = pc
-                            .query_one("producer_insert.sql", &[self.cluster.as_str()])
+                        let producer = pc
+                            .producer_insert(self.cluster.as_str())
                             .await
-                            .and_then(|row| row.get(0))
                             .inspect_err(|err| error!(?err))?;
 
                         let epoch = pc
-                            .query_one(
-                                "producer_epoch_insert.sql",
-                                (self.cluster.as_str(), producer),
-                            )
+                            .producer_epoch_insert(self.cluster.as_str(), producer)
                             .await
-                            .and_then(|row| row.get::<i32>(0))
-                            .map_err(Error::from)
-                            .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
                             .inspect_err(|err| error!(self.cluster, producer, ?err))?;
 
                         // A produce with an epoch below the producer's newest is fenced, so
@@ -4958,7 +4896,7 @@ impl Storage for Delegate {
                         // i16::MAX gets no new epoch, and is fenced already.
                         _ = pc
                             .query_opt(
-                                "producer_epoch_insert.sql",
+                                producer_epoch_insert::QUERY.key(),
                                 (self.cluster.as_str(), previous),
                             )
                             .await
@@ -4966,7 +4904,7 @@ impl Storage for Delegate {
 
                         let updated = pc
                             .execute(
-                                "txn_update_producer.sql",
+                                sql::TXN_UPDATE_PRODUCER,
                                 (self.cluster.as_str(), transaction_id, producer),
                             )
                             .await
@@ -4988,44 +4926,29 @@ impl Storage for Delegate {
 
                         (producer, epoch)
                     } else {
-                        let row = pc
-                            .query_one(
-                                "producer_epoch_insert.sql",
-                                (self.cluster.as_str(), producer),
-                            )
+                        let epoch = pc
+                            .producer_epoch_insert(self.cluster.as_str(), producer)
                             .await
+                            .inspect(|epoch| debug!(epoch))
                             .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                        let epoch = i16::try_from(
-                            row.get::<i32>(0)
-                                .inspect(|epoch| debug!(epoch))
-                                .inspect_err(|err| error!(?err))?,
-                        )?;
 
                         (producer, epoch)
                     }
                 } else {
-                    let row = pc
-                        .query_one("producer_insert.sql", &[self.cluster.as_str()])
+                    let producer = pc
+                        .producer_insert(self.cluster.as_str())
                         .await
                         .inspect_err(|err| error!(?err))?;
 
-                    let producer: i64 = row.get(0).inspect_err(|err| error!(?err))?;
-
-                    let row = pc
-                        .query_one(
-                            "producer_epoch_insert.sql",
-                            (self.cluster.as_str(), producer),
-                        )
+                    let epoch = pc
+                        .producer_epoch_insert(self.cluster.as_str(), producer)
                         .await
                         .inspect_err(|err| error!(self.cluster, producer, ?err))?;
-
-                    let epoch = i16::try_from(row.get::<i32>(0)?)?;
 
                     assert_eq!(
                         1,
                         pc.execute(
-                            "txn_insert.sql",
+                            sql::TXN_INSERT,
                             (self.cluster.as_str(), transaction_id, producer),
                         )
                         .await
@@ -5045,7 +4968,7 @@ impl Storage for Delegate {
                 assert_eq!(
                     1,
                     pc.execute(
-                        "txn_detail_insert.sql",
+                        sql::TXN_DETAIL_INSERT,
                         (
                             self.cluster.as_str(),
                             transaction_id,
@@ -5090,29 +5013,25 @@ impl Storage for Delegate {
                 let tx = pc.transaction().await?;
 
                 let mut rows = pc
-                    .query("producer_insert.sql", &[self.cluster.as_str()])
+                    .query_rows(producer_insert::QUERY, &[self.cluster.as_str()])
                     .await?;
 
-                if let Some(row) = rows.next().await? {
-                    let producer = row.get::<i64>(0).inspect(|producer| debug!(producer))?;
+                if let Some(producer_insert::Row { id: producer }) = rows.next().await? {
+                    debug!(producer);
 
                     while let Some(row) = rows.next().await? {
                         debug!(?row)
                     }
 
                     let mut rows = pc
-                        .query(
-                            "producer_epoch_insert.sql",
+                        .query_rows(
+                            producer_epoch_insert::QUERY,
                             (self.cluster.as_str(), producer),
                         )
                         .await?;
 
-                    if let Some(row) = rows.next().await? {
-                        let epoch = row
-                            .get::<i32>(0)
-                            .map_err(Error::from)
-                            .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
-                            .inspect(|epoch| debug!(epoch))?;
+                    if let Some(producer_epoch_insert::Row { epoch }) = rows.next().await? {
+                        debug!(epoch);
 
                         while let Some(row) = rows.next().await? {
                             debug!(?row)
@@ -5221,7 +5140,7 @@ impl Storage for Delegate {
                     for partition_index in topic.partitions.unwrap_or(vec![]) {
                         _ = pc
                             .execute(
-                                "txn_topition_insert.sql",
+                                sql::TXN_TOPITION_INSERT,
                                 (
                                     self.cluster.as_str(),
                                     topic.name.as_str(),
@@ -5258,7 +5177,7 @@ impl Storage for Delegate {
 
                 _ = pc
                     .execute(
-                        "txn_detail_update_started_at.sql",
+                        sql::TXN_DETAIL_UPDATE_STARTED_AT,
                         (
                             self.cluster.as_str(),
                             transaction_id.as_str(),
@@ -5305,33 +5224,18 @@ impl Storage for Delegate {
         let tx = pc.transaction().await?;
 
         let (producer_id, producer_epoch) = if let Some(row) = pc
-            .query_opt(
-                "producer_epoch_for_current_txn.sql",
-                (self.cluster.as_str(), offsets.transaction_id.as_str()),
-            )
+            .producer_epoch_for_current_txn(self.cluster.as_str(), offsets.transaction_id.as_str())
             .await
             .inspect_err(|err| error!(?err))?
         {
-            let producer_id = row
-                .get::<i64>(0)
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
-
-            let epoch = row
-                .get::<i32>(1)
-                .map_err(Error::from)
-                .and_then(|epoch| i16::try_from(epoch).map_err(Error::from))
-                .map(Some)
-                .inspect_err(|err| error!(?err))?;
-
-            (producer_id, epoch)
+            (Some(row.producer), Some(row.epoch))
         } else {
             (None, None)
         };
 
         _ = pc
             .execute(
-                "consumer_group_insert.sql",
+                sql::CONSUMER_GROUP_INSERT,
                 (self.cluster.as_str(), offsets.group_id.as_str()),
             )
             .await?;
@@ -5340,7 +5244,7 @@ impl Storage for Delegate {
 
         _ = pc
             .execute(
-                "txn_offset_commit_insert.sql",
+                sql::TXN_OFFSET_COMMIT_INSERT,
                 (
                     self.cluster.as_str(),
                     offsets.transaction_id.as_str(),
@@ -5366,7 +5270,7 @@ impl Storage for Delegate {
                     {
                         _ = pc
                             .execute(
-                                "txn_offset_commit_tp_insert.sql",
+                                sql::TXN_OFFSET_COMMIT_TP_INSERT,
                                 (
                                     self.cluster.as_str(),
                                     offsets.transaction_id.as_str(),
@@ -5478,13 +5382,16 @@ impl Storage for Delegate {
         {
             let connection = self.pool.get().await?;
 
-            let mut rows = connection.query("maintain-vacuum.sql", ()).await?;
+            let mut rows = connection
+                .query_rows(sql::maintain_vacuum::QUERY, ())
+                .await?;
 
-            if let Some(row) = rows.next().await.inspect_err(|err| error!(?err))? {
-                debug!(
-                    freelist_count = row.get_str(0)?,
-                    page_size = row.get_str(1)?
-                );
+            if let Some(sql::maintain_vacuum::Row {
+                freelist_count,
+                page_size,
+            }) = rows.next().await.inspect_err(|err| error!(?err))?
+            {
+                debug!(freelist_count, page_size);
             }
         }
 
@@ -5536,7 +5443,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         pc.execute(
-            "scram_credential_delete.sql",
+            sql::SCRAM_CREDENTIAL_DELETE,
             (self.cluster.as_str(), user, i32::from(mechanism)),
         )
         .await
@@ -5562,7 +5469,7 @@ impl Storage for Delegate {
         let pc = self.connection().await?;
 
         pc.execute(
-            "scram_credential_insert.sql",
+            sql::SCRAM_CREDENTIAL_INSERT,
             (
                 self.cluster.as_str(),
                 user,
@@ -5594,30 +5501,27 @@ impl Storage for Delegate {
         let start = SystemTime::now();
         let pc = self.connection().await?;
 
-        pc.query_opt(
-            "scram_credential_select.sql",
-            (self.cluster.as_str(), user, i32::from(mechanism)),
-        )
-        .await
-        .inspect_err(|err| error!(?err))
-        .map_err(Into::into)
-        .and_then(|row| {
-            if let Some(row) = row {
-                let salt = row.get::<Vec<u8>>(0).map(Bytes::from)?;
-                let iterations = row.get::<i32>(1)?;
-                let stored_key = row.get::<Vec<u8>>(2).map(Bytes::from)?;
-                let server_key = row.get::<Vec<u8>>(3).map(Bytes::from)?;
+        let row = pc
+            .query_first(
+                sql::scram_credential_select::QUERY,
+                (self.cluster.as_str(), user, i32::from(mechanism)),
+            )
+            .await
+            .inspect_err(|err| error!(?err))?;
 
-                Ok(Some(ScramCredential {
-                    salt,
-                    iterations,
-                    stored_key,
-                    server_key,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
+        Ok(row.map(
+            |sql::scram_credential_select::Row {
+                 salt,
+                 iterations,
+                 stored_key,
+                 server_key,
+             }| ScramCredential {
+                salt,
+                iterations,
+                stored_key,
+                server_key,
+            },
+        ))
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(
                 elapsed_millis(start),
@@ -5630,82 +5534,10 @@ impl Storage for Delegate {
     async fn ping(&self) -> Result<()> {
         let start = SystemTime::now();
         let c = self.pool.get().await?;
-        let _ = c.query("ping.sql", ()).await?;
+        let _ = c.query(sql::PING, ()).await?;
         DELEGATE_REQUEST_DURATION
             .record(elapsed_millis(start), &[StorageOperation::Ping.attribute()]);
         Ok(())
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct LiteTimestamp(SystemTime);
-
-impl Deref for LiteTimestamp {
-    type Target = SystemTime;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<SystemTime> for LiteTimestamp {
-    fn from(value: SystemTime) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&SystemTime> for LiteTimestamp {
-    fn from(value: &SystemTime) -> Self {
-        Self(*value)
-    }
-}
-
-impl From<LiteTimestamp> for SystemTime {
-    fn from(value: LiteTimestamp) -> Self {
-        value.0
-    }
-}
-
-impl From<LiteTimestamp> for Value {
-    fn from(value: LiteTimestamp) -> Self {
-        Value::Integer(to_timestamp(&value.0).unwrap_or_default())
-    }
-}
-
-impl TryFrom<Value> for LiteTimestamp {
-    type Error = Error;
-
-    fn try_from(value: Value) -> result::Result<Self, Self::Error> {
-        match value {
-            Value::Integer(timestamp) => to_system_time(timestamp)
-                .map_err(Into::into)
-                .map(LiteTimestamp::from),
-
-            Value::Text(text) => NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f")
-                .map(|date_time| date_time.and_utc())
-                .inspect(|dt| debug!(?dt))
-                .map(SystemTime::from)
-                .map(LiteTimestamp::from)
-                .map_err(Into::into),
-
-            Value::Real(_) | Value::Null | Value::Blob(_) => {
-                Err(Error::UnexpectedLibSqlValue(value))
-            }
-        }
-    }
-}
-
-impl LiteTimestamp {
-    /// Returns the Kafka timestamp, in milliseconds since the epoch, that the stored `value` holds.
-    ///
-    /// A record that a producer sent without a timestamp stores NO_TIMESTAMP, -1. A [`SystemTime`]
-    /// cannot hold a negative millisecond count, so an integer is returned as stored.
-    fn millis(value: Value) -> Result<i64> {
-        match value {
-            Value::Integer(timestamp) => Ok(timestamp),
-            value => LiteTimestamp::try_from(value)
-                .and_then(|timestamp| to_timestamp(&timestamp.0).map_err(Into::into)),
-        }
     }
 }
 
@@ -5717,7 +5549,11 @@ mod tests {
     use std::assert_matches;
     use std::thread;
 
-    use nisshi_sans_io::Compression;
+    use nisshi_sans_io::{
+        Compression,
+        create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    };
+    use nisshi_schema::{Registry, lake::House};
     use nisshi_storage::{ArcDynStorage, StorageContainer, StorageFactory as _};
     use tempfile::{tempdir, tempdir_in};
     use tokio::{fs::remove_file, task::yield_now, time::Instant};
@@ -5726,22 +5562,6 @@ mod tests {
 
     use super::*;
     use nisshi_storage::fetched::FetchUntilDeadline as _;
-
-    #[test]
-    fn timestamp_from_null_is_an_error() {
-        assert_matches!(
-            LiteTimestamp::try_from(Value::Null),
-            Err(Error::UnexpectedLibSqlValue(Value::Null))
-        );
-    }
-
-    #[test]
-    fn stored_millis_keep_a_negative_no_timestamp() -> Result<()> {
-        assert_eq!(-1, LiteTimestamp::millis(Value::Integer(-1))?);
-        assert_eq!(1_234, LiteTimestamp::millis(Value::Integer(1_234))?);
-
-        Ok(())
-    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};
@@ -6054,7 +5874,8 @@ mod tests {
             .query("select last_updated from cluster where name = ?1", &[name])
             .await?;
         let row = rows.next().await?.unwrap();
-        let _timestamp = LiteTimestamp::try_from(row.get_value(0)?)?;
+        let last_updated = row.get::<String>(0)?;
+        _ = chrono::NaiveDateTime::parse_from_str(&last_updated, "%Y-%m-%d %H:%M:%S%.f")?;
 
         Ok(())
     }
@@ -6515,6 +6336,412 @@ mod tests {
             records > 0,
             "the fetch kept none of the records that it read before its deadline"
         );
+
+        Ok(())
+    }
+
+    /// Opens an engine on a database file in a temporary directory and creates a topic of one
+    /// partition on it, a virtual topic when `keyed`. Returns the engine, the partition that
+    /// records are produced to and the one that a fetch reads: a keyed fetch reads the records
+    /// with the key `k` of the virtual topic.
+    async fn fetch_engine_with_topic(
+        keyed: bool,
+    ) -> Result<(tempfile::TempDir, ArcDynStorage, Topition, Topition)> {
+        let current_dir = env::current_dir()?;
+        let temp_dir = tempdir_in(&current_dir)?;
+        let relative = temp_dir
+            .path()
+            .strip_prefix(&current_dir)
+            .map_err(|err| Error::Message(err.to_string()))?
+            .join("nisshi.db");
+
+        let cluster = "nisshi";
+        let node = 12321;
+        let topic = "test";
+
+        let engine = Engine::builder()
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092")?)
+            .cluster(cluster.to_owned())
+            .storage(Url::parse(&format!(
+                "file:///{}?mode=direct",
+                relative.display()
+            ))?)
+            .node(node)
+            .build()
+            .await?;
+
+        engine
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: node,
+                cluster_id: cluster.to_owned(),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.to_owned())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some(
+                        keyed
+                            .then(|| {
+                                CreatableTopicConfig::default()
+                                    .name(topic_config::VIRTUAL.to_owned())
+                                    .value(Some("true".into()))
+                            })
+                            .into_iter()
+                            .collect(),
+                    )),
+                false,
+            )
+            .await?;
+
+        let produced = Topition::new(topic, 0);
+        let fetched = if keyed {
+            Topition::new(format!("{topic}/k"), 0)
+        } else {
+            produced.clone()
+        };
+
+        Ok((temp_dir, engine, produced, fetched))
+    }
+
+    /// Stores `count` records, 1,000 to a batch because a batch of headers can exceed the
+    /// message size limit. Each has the key `k`, or the key `j` when `alternate_keys` and its
+    /// offset is odd. Each has the value `a`, and a 1 byte header key and a 99 byte header value
+    /// when `with_header`. A record then costs 111 bytes against a fetch's `max_bytes`: 7 for every
+    /// record, 1 for the key, 1 for the value, 2 for the header's framing and 100 for the header.
+    async fn produce_keyed_records(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        count: i64,
+        with_header: bool,
+        alternate_keys: bool,
+    ) -> Result<()> {
+        const RECORDS_PER_BATCH: i64 = 1_000;
+
+        for first in (0..count).step_by(usize::try_from(RECORDS_PER_BATCH)?) {
+            let in_batch = RECORDS_PER_BATCH.min(count - first);
+
+            let batch = (0..in_batch)
+                .fold(inflated::Batch::builder(), |builder, delta| {
+                    let key: &'static [u8] = if alternate_keys && (first + delta) % 2 == 1 {
+                        b"j"
+                    } else {
+                        b"k"
+                    };
+
+                    let record = Record::builder()
+                        .key(Some(Bytes::from_static(key)))
+                        .value(Some(Bytes::from_static(b"a")))
+                        .offset_delta(i32::try_from(delta).unwrap_or(i32::MAX));
+
+                    builder.record(if with_header {
+                        record.header(
+                            Header::builder()
+                                .key(Bytes::from_static(b"h"))
+                                .value(Bytes::from(vec![0; 99])),
+                        )
+                    } else {
+                        record
+                    })
+                })
+                .last_offset_delta(i32::try_from(in_batch - 1)?)
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, topition, batch).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offsets of the records that one engine read of `topition` from `offset`
+    /// returns within `max_bytes`.
+    async fn fetched_offsets(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+    ) -> Result<Vec<i64>> {
+        engine
+            .fetch_until_deadline(
+                topition,
+                offset,
+                1,
+                max_bytes,
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?
+            .batches
+            .into_iter()
+            .try_fold(Vec::new(), |mut offsets, batch| {
+                let batch = inflated::Batch::try_from(batch)?;
+
+                offsets.extend(
+                    batch
+                        .records
+                        .iter()
+                        .map(|record| batch.base_offset + i64::from(record.offset_delta)),
+                );
+
+                Ok(offsets)
+            })
+    }
+
+    /// One engine read returns at most `ROWS_PER_FETCH` rows, and a read from the last offset that
+    /// it returned gets the rest, with no gap and no repeat. Without the limit, each read covers
+    /// every row between its offset and the high watermark, so a consumer that is far behind pays
+    /// for its whole backlog on every read. The test covers the statement of an ordinary topic and
+    /// the statement of a virtual topic.
+    #[tokio::test]
+    async fn fetch_reads_a_bounded_number_of_rows_and_resumes_after_them() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, false, false).await?;
+
+            assert_eq!(
+                (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+                "one read must stop at the row limit, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, ROWS_PER_FETCH, u32::MAX).await?,
+                "a read from the last offset must return the rest, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A keyed read applies the key filter before the row limit, so a read from offset 0 returns
+    /// every record with the key, also when the limit is smaller than the number of records
+    /// that it scans. Every second record has another key, so a filter that runs after the limit
+    /// returns fewer.
+    #[tokio::test]
+    async fn keyed_fetch_filters_by_key_before_it_applies_the_row_limit() -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(true).await?;
+
+        produce_keyed_records(&engine, &produced, RECORDS, false, true).await?;
+
+        // The records at the even offsets have the key `k`, which is 5,025 of them. The limit
+        // of 10,000 rows covers 5,000 of them when it applies first.
+        assert_eq!(
+            (0..RECORDS).step_by(2).collect::<Vec<_>>(),
+            fetched_offsets(&engine, &fetched, 0, u32::MAX).await?,
+        );
+
+        Ok(())
+    }
+
+    /// The row limit applies to records that have headers, and a record's headers still count
+    /// toward `max_bytes` when the limit ends the read. A record costs 111 bytes with the 7 of
+    /// every record, so a budget of 1111 bytes returns 10 of them.
+    #[tokio::test]
+    async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
+    {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
+
+            assert_eq!(
+                (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, u32::MAX).await?,
+                "the row limit counts from the fetch offset, keyed: {keyed}",
+            );
+
+            assert_eq!(
+                (40..50).collect::<Vec<_>>(),
+                fetched_offsets(&engine, &fetched, 40, 1111).await?,
+                "the byte budget must count the headers, keyed: {keyed}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A read over more rows than the limit still returns the first record when that record
+    /// alone is larger than `max_bytes` (KIP-74), so that a consumer gets past it.
+    #[tokio::test]
+    async fn fetch_returns_the_first_record_larger_than_max_bytes_within_a_bounded_read()
+    -> Result<()> {
+        const RECORDS: i64 = ROWS_PER_FETCH + 50;
+
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
+
+            for offset in [0, ROWS_PER_FETCH - 1, ROWS_PER_FETCH] {
+                assert_eq!(
+                    vec![offset],
+                    fetched_offsets(&engine, &fetched, offset, 50).await?,
+                    "fetch at {offset}, keyed: {keyed}",
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the offset of each row of a fetch query's result.
+    async fn offsets_of(mut rows: Rows) -> Result<Vec<i64>> {
+        let mut offsets = vec![];
+
+        while let Some(row) = rows.next().await? {
+            offsets.push(row.get::<i64>(0)?);
+        }
+
+        Ok(offsets)
+    }
+
+    /// A fetch from the start of a backlog of large records runs within a heap of a few MB: the
+    /// window no longer copies the key and the value of every record into its temporary table. The
+    /// keyed query still reads through each value on libSQL (see `record_fetch_keyed.sql`), but
+    /// walking overflow pages uses little heap, so this test does not see it.
+    #[tokio::test]
+    async fn fetch_over_large_records_runs_within_a_small_heap() -> Result<()> {
+        const RECORDS: i64 = 40;
+        const VALUE_BYTES: usize = 500_000;
+        const KEY: &[u8] = b"k";
+
+        let _guard = init_tracing()?;
+
+        let cluster = "nisshi";
+        let topic = "test";
+
+        let (_temp_dir, connection) = scratch_connection().await?;
+
+        _ = connection
+            .connection
+            .execute("insert into cluster (name) values (?1)", [cluster])
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topic (cluster, name, uuid, partitions, replication_factor) \
+                 select id, ?2, ?3, 1, 1 from cluster where name = ?1",
+                (cluster, topic, Uuid::new_v4().to_string()),
+            )
+            .await?;
+
+        _ = connection
+            .connection
+            .execute(
+                "insert into topition (topic, partition) select id, 0 from topic where name = ?1",
+                [topic],
+            )
+            .await?;
+
+        let value = vec![b'x'; VALUE_BYTES];
+
+        for offset in 0..RECORDS {
+            _ = connection
+                .connection
+                .execute(
+                    "insert into record (topition, offset_id, k, v) \
+                     select id, ?1, ?2, ?3 from topition",
+                    (offset, KEY.to_vec(), value.clone()),
+                )
+                .await?;
+        }
+
+        // With the default temp store, SQLite spills the window's temporary table to a file, and
+        // the heap limit below would not see it.
+        _ = connection
+            .connection
+            .query("PRAGMA temp_store = memory", ())
+            .await?
+            .next()
+            .await?;
+
+        // The page cache of this connection counts toward the heap limit below. A small cache
+        // keeps the pages of the inserts above out of what the limit measures.
+        _ = connection
+            .connection
+            .query("PRAGMA cache_size = -256", ())
+            .await?
+            .next()
+            .await?;
+
+        // Each record is 500,001 bytes, more than the budget, so each fetch returns only its
+        // first record (KIP-74).
+        let max_bytes = 100_000_i64;
+        let high_watermark = RECORDS;
+
+        // The heap limit covers every SQLite connection in this process, and SQLite lets a later
+        // call only lower it, so nothing in this process can raise it again. The test is safe
+        // because nextest runs each test in a process of its own. Under `cargo test`, every test
+        // that runs after this one in the same binary would run within this limit.
+        //
+        // With the key and the value of each record in the window, these fetches need more than
+        // 6 MB, and without them they run within 3 MB. The edge depends on how SQLite buffers the
+        // rows of a window, so an update of libsql can move it.
+        _ = connection
+            .connection
+            .query("PRAGMA hard_heap_limit = 4000000", ())
+            .await?
+            .next()
+            .await?;
+
+        let plain = connection
+            .query(
+                "record_fetch.sql",
+                (
+                    cluster,
+                    topic,
+                    0,
+                    0,
+                    max_bytes,
+                    high_watermark,
+                    ROWS_PER_FETCH,
+                ),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(plain).await?);
+
+        let keyed = connection
+            .query(
+                "record_fetch_keyed.sql",
+                (
+                    cluster,
+                    topic,
+                    0,
+                    0,
+                    max_bytes,
+                    high_watermark,
+                    KEY.to_vec(),
+                    ROWS_PER_FETCH,
+                ),
+            )
+            .await?;
+
+        assert_eq!(vec![0], offsets_of(keyed).await?);
 
         Ok(())
     }
@@ -7127,6 +7354,63 @@ mod tests {
         Ok(())
     }
 
+    /// A record without a timestamp stores NO_TIMESTAMP, -1. Retention ages it from when the
+    /// broker appended it, so a sweep deletes it once `retention.ms` has passed since then, and
+    /// keeps a record appended within `retention.ms` in the same sweep.
+    #[tokio::test]
+    async fn retention_ages_a_record_without_a_timestamp_from_its_append_time() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "retention-record-without-timestamp-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        execute_on(
+            db_file,
+            "insert into topic_configuration (topic, name, value) \
+             select id, 'retention.ms', '600000' from topic where name = 't'",
+            (),
+        )
+        .await?;
+
+        for _ in 0..2 {
+            let batch = inflated::Batch::builder()
+                .base_timestamp(-1)
+                .max_timestamp(-1)
+                .record(Record::builder().value(Some(Bytes::from_static(b"a"))))
+                .build()
+                .and_then(TryInto::try_into)?;
+
+            _ = engine.produce(None, &topition, batch).await?;
+        }
+
+        // Offset 0 was appended an hour ago, which is longer than the retention. A sweep that
+        // aged it by the sweep time, which is also its age now, would keep it.
+        execute_on(
+            db_file,
+            "update record set created_at = datetime('now', '-1 hour') where offset_id = 0",
+            (),
+        )
+        .await?;
+
+        engine.maintain(SystemTime::now()).await?;
+
+        let mut rows = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?
+            .query("select offset_id from record order by offset_id", ())
+            .await?;
+
+        let mut stored = vec![];
+        while let Some(row) = rows.next().await? {
+            stored.push(row.get::<i64>(0)?);
+        }
+
+        assert_eq!(vec![1], stored);
+
+        Ok(())
+    }
+
     async fn scratch_connection() -> Result<(tempfile::TempDir, managed::Object<ConnectionManager>)>
     {
         let temp_dir = tempdir().inspect(|temporary| debug!(?temporary))?;
@@ -7295,7 +7579,7 @@ mod tests {
         let digest = crate::schema::schema_digest(
             DDL.values()
                 .map(|statement| statement.as_str())
-                .chain([SQL.get("nisshi_schema_version_create.sql")?]),
+                .chain([SQL.get(sql::NISSHI_SCHEMA_VERSION_CREATE)?]),
         );
 
         assert_eq!(
@@ -7305,6 +7589,50 @@ mod tests {
                 "4b97d00984999b16629d9d0a7a6da18e8458adc6a57cd0affa36f407b819d1dd"
             )
         );
+        Ok(())
+    }
+
+    /// Each query that libSQL runs returns every column that its module's `RowReader` reads, once.
+    /// The broker reads a query's rows only on the paths that run it, so this test finds a query
+    /// that doesn't match its row before a rare path does.
+    #[tokio::test]
+    async fn every_row_query_returns_the_columns_of_its_row() -> Result<()> {
+        use crate::sql::{
+            row_check::RowCheck, txn_detail_select_status_for_update, txn_detail_select_timed_out,
+            watermark_select_for_write,
+        };
+
+        let directory = tempdir()?;
+        let db = libsql::Builder::new_local(directory.path().join("nisshi.db"))
+            .build()
+            .await?;
+        ensure_schema(&db, Duration::from_secs(5)).await?;
+        let connection = db.connect()?;
+
+        let mut failures = Vec::new();
+        // libSQL doesn't run these queries, which use PostgreSQL's syntax. It runs
+        // `watermark_select_for_write::LITE_QUERY` instead of `watermark_select_for_write::QUERY`.
+        let skipped = [
+            txn_detail_select_status_for_update::QUERY.key(),
+            txn_detail_select_timed_out::QUERY.key(),
+            watermark_select_for_write::QUERY.key(),
+        ];
+        let checks = RowCheck::in_folders(&["sql", "lite"], &skipped);
+
+        for check in &checks {
+            let checked = match connection.prepare(SQL.get(check.query())?).await {
+                Ok(statement) => {
+                    check.check_columns(&ResultColumns::new(check.query(), &statement))
+                }
+                Err(error) => Err(error.into()),
+            };
+
+            if let Err(error) = checked {
+                failures.push(format!("{}: {error:?}", check.query()));
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
         Ok(())
     }
 
@@ -7696,8 +8024,57 @@ mod tests {
 
         assert_matches!(
             engine.init_producer(Some("txn"), 10_000, None, None).await,
-            Err(Error::TryFromInt(_))
+            Err(Error::UnreadableColumn { column: "epoch", source, .. })
+                if matches!(*source, Error::TryFromInt(_))
         );
+
+        Ok(())
+    }
+
+    /// Returns a connection of its own on `db_file`, which holds the topics `t` and `u`.
+    async fn connection_with_two_topics(db_file: &str) -> Result<PoolConnection> {
+        let (engine, _) = engine_with_topic(db_file).await?;
+
+        _ = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("u".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let connection = libsql::Builder::new_local(db_file)
+            .build()
+            .await?
+            .connect()?;
+
+        PoolConnection::new(connection).await
+    }
+
+    /// Each row that a read returns holds its own values. A libSQL `Row` reads from the
+    /// statement's current row, so a row read after the next step would hold the next row's
+    /// values.
+    #[tokio::test]
+    async fn query_leading_rows_keeps_each_rows_values() -> Result<()> {
+        let _guard = init_tracing()?;
+        let db_file = "query-leading-rows-values-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+        let connection = connection_with_two_topics(db_file).await?;
+
+        let mut names: Vec<String> = connection
+            .query_leading_rows(topic_by_cluster::QUERY, ["nisshi"], 2)
+            .await?
+            .into_iter()
+            .map(|topic| topic.name)
+            .collect();
+        // The query does not order its rows.
+        names.sort();
+
+        assert_eq!(vec!["t".to_owned(), "u".to_owned()], names);
 
         Ok(())
     }
@@ -7999,6 +8376,329 @@ mod tests {
                 NamedGroupDetail::error_code("missing".into(), ErrorCode::GroupIdNotFound),
             ],
             engine.describe_groups(Some(&group_ids), false).await?
+        );
+
+        Ok(())
+    }
+
+    /// A ListGroups must answer a stored group whose detail isn't text with
+    /// `UNKNOWN_SERVER_ERROR`, as it answers a detail that isn't JSON, and list the other groups
+    /// as usual.
+    #[tokio::test]
+    async fn list_groups_answers_unknown_server_error_for_a_detail_that_is_not_text() -> Result<()>
+    {
+        let _guard = init_tracing()?;
+
+        let db_file = "list-groups-detail-not-text-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let cluster = "nisshi";
+        let (engine, connection, stored) = engine_with_stored_groups(db_file, cluster).await?;
+
+        // SQLite never converts a blob to text for the column's affinity, so the detail stays a
+        // value that isn't text.
+        let changed = connection
+            .execute(
+                "update consumer_group_detail set detail = x'7b7d'
+                where consumer_group = (
+                    select cg.id from consumer_group cg join cluster c on c.id = cg.cluster
+                    where c.name = ?1 and cg.name = ?2
+                )",
+                (cluster, "undecodable"),
+            )
+            .await?;
+        // The update must change the group's row. An update that changes no row leaves the group
+        // readable, and the test then fails for that reason instead of testing the engine.
+        assert_eq!(1, changed);
+
+        let mut listed = engine.list_groups().await?;
+        // The query doesn't order its rows.
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(
+            vec![
+                NamedGroupDetail::found("healthy".into(), stored),
+                NamedGroupDetail::error_code("undecodable".into(), ErrorCode::UnknownServerError),
+            ],
+            listed
+        );
+
+        Ok(())
+    }
+
+    /// Returns an engine on `db_file` with a readable topic, and the topic `unreadable`, whose
+    /// stored row can't be read. Returns the readable topic's partition and the ID of
+    /// `unreadable`.
+    async fn engine_with_unreadable_topic(
+        db_file: &str,
+    ) -> Result<(ArcDynStorage, Topition, Uuid)> {
+        let (engine, healthy) = engine_with_topic(db_file).await?;
+
+        let unreadable = engine
+            .create_topic(
+                CreatableTopic::default()
+                    .name("unreadable".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        // SQLite stores text that isn't a number as text in an `int` column, and the reader of
+        // `partitions` then can't read it as an integer.
+        execute_on(
+            db_file,
+            "update topic set partitions = 'x' where name = ?1",
+            ["unreadable"],
+        )
+        .await?;
+
+        Ok((engine, healthy, unreadable))
+    }
+
+    /// A topic whose stored row can't be read fails each Metadata and DescribeTopicPartitions
+    /// request that reads it: by name, by ID, and in a list of every topic.
+    #[tokio::test]
+    async fn a_request_that_reads_an_unreadable_topic_fails() -> Result<()> {
+        use std::assert_matches;
+
+        let _guard = init_tracing()?;
+
+        let db_file = "unreadable-topic-request-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, _healthy, unreadable) = engine_with_unreadable_topic(db_file).await?;
+
+        let by_name = TopicId::from("unreadable");
+        let by_id = TopicId::from(unreadable);
+
+        for topics in [Some(vec![by_name.clone()]), Some(vec![by_id.clone()]), None] {
+            assert_matches!(
+                engine.metadata(topics.as_deref()).await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topics:?}"
+            );
+        }
+
+        for topic in [by_name, by_id] {
+            assert_matches!(
+                engine
+                    .describe_topic_partitions(Some(std::slice::from_ref(&topic)), i32::MAX, None)
+                    .await,
+                Err(Error::UnreadableColumn { .. }),
+                "{topic:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// DeleteTopics deletes a topic whose stored row can't be read, because it reads only the
+    /// topic's name, so that an operator can remove a corrupt topic without editing the database.
+    #[tokio::test]
+    async fn delete_topic_deletes_a_topic_with_an_unreadable_row() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "delete-topic-unreadable-row-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        // A UUID that doesn't parse makes the topic's row unreadable as a whole topic.
+        execute_on(
+            db_file,
+            "update topic set uuid = 'not-a-uuid' where name = ?1",
+            [topition.topic()],
+        )
+        .await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            engine
+                .delete_topic(&TopicId::from(topition.topic()))
+                .await?
+        );
+
+        // A deleted topic is unknown, where a topic that is still stored with its unreadable row
+        // is a server error.
+        assert_eq!(
+            vec![i16::from(ErrorCode::UnknownTopicOrPartition)],
+            engine
+                .metadata(Some(&[TopicId::from(topition.topic())]))
+                .await?
+                .topics
+                .iter()
+                .map(|topic| topic.error_code)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A by-ID lookup whose query fails answers `KAFKA_STORAGE_ERROR`, which clients retry,
+    /// because libSQL counts every error as transient. An answer of an unknown topic ID tells a
+    /// client that the topic is gone.
+    #[tokio::test]
+    async fn metadata_by_id_answers_a_storage_error_when_the_query_fails() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db_file = "metadata-by-id-query-fails-test.db";
+        let _db_file_guard = DbFileGuard::new(db_file);
+
+        let (engine, topition) = engine_with_topic(db_file).await?;
+
+        let topic_id = engine
+            .metadata(Some(&[TopicId::from(topition.topic())]))
+            .await?
+            .topics
+            .iter()
+            .find_map(|topic| topic.topic_id)
+            .map(Uuid::from_bytes)
+            .expect("the topic's ID");
+
+        // The test drops the table that the lookup reads, so the query fails. A local SQLite
+        // file can't be made to refuse a connection, so the test makes the query fail instead.
+        execute_on(db_file, "drop table topic", ()).await?;
+
+        let topics = engine
+            .metadata(Some(&[TopicId::from(topic_id)]))
+            .await?
+            .topics;
+
+        assert_eq!(
+            vec![(
+                i16::from(ErrorCode::KafkaStorageError),
+                Some(topic_id.into_bytes())
+            )],
+            topics
+                .iter()
+                .map(|topic| (topic.error_code, topic.topic_id))
+                .collect::<Vec<_>>()
+        );
+
+        let described = engine
+            .describe_topic_partitions(Some(&[TopicId::from(topic_id)]), i32::MAX, None)
+            .await?;
+
+        assert_eq!(
+            vec![i16::from(ErrorCode::KafkaStorageError)],
+            described
+                .iter()
+                .map(|topic| topic.error_code)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A record that the person schema cannot convert, because its value is not JSON.
+    fn unconvertible_person() -> Result<deflated::Batch> {
+        inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::from_static(b"\"345-67-6543\"")))
+                    .value(Some(Bytes::from_static(b"not json"))),
+            )
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// Returns a store with a Parquet lake that knows the person schema, and the topic `person`
+    /// with one partition and the given configs.
+    async fn person_storage_with_lake(
+        directory: &std::path::Path,
+        configs: Vec<CreatableTopicConfig>,
+    ) -> Result<ArcDynStorage> {
+        let registry = Registry::builder_try_from_url(&Url::parse("file://../etc/schema")?)
+            .map(|builder| builder.build())?;
+
+        // The lake writes nothing in these tests, because the record in them fails to convert. Its
+        // location is the build directory, so that a write that a test did not expect stays out of
+        // the source tree.
+        let lake = House::parquet()
+            .location(Url::parse("file://../target")?)
+            .schema_registry(registry.clone())
+            .build()?;
+
+        let storage = factory::LiteFactory
+            .build(nisshi_storage::StorageFactoryConfiguration {
+                node_id: 111,
+                cluster: String::from("nisshi"),
+                advertised_listener: Url::parse("tcp://127.0.0.1:9092")?,
+                storage: Url::parse(&format!(
+                    "sqlite:///{}",
+                    directory.join("nisshi.db").display()
+                ))?,
+                schema_registry: Some(registry),
+                lake_house: Some(lake),
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+
+        // The cluster row, which the topic's insert reads, exists once a broker has registered.
+        storage
+            .register_broker(BrokerRegistrationRequest {
+                broker_id: 111,
+                cluster_id: String::from("nisshi"),
+                incarnation_id: Uuid::new_v4(),
+                rack: None,
+            })
+            .await?;
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("person".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some(configs)),
+                false,
+            )
+            .await?;
+
+        Ok(storage)
+    }
+
+    /// Shows that the lake fails on the record, so that the test below passes because the engine
+    /// does not write the record to the lake and not because the lake accepts it.
+    #[tokio::test]
+    async fn a_record_that_breaks_the_schema_fails_in_the_lake_when_validation_is_on() -> Result<()>
+    {
+        let directory = tempdir()?;
+        let storage = person_storage_with_lake(directory.path(), vec![]).await?;
+
+        assert!(
+            storage
+                .produce(None, &Topition::new("person", 0), unconvertible_person()?)
+                .await
+                .is_err()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_validation_off_is_not_written_to_the_lake() -> Result<()> {
+        let directory = tempdir()?;
+        let storage = person_storage_with_lake(
+            directory.path(),
+            vec![
+                CreatableTopicConfig::default()
+                    .name(topic_config::SCHEMA_VALIDATION.into())
+                    .value(Some("false".into())),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            0,
+            storage
+                .produce(None, &Topition::new("person", 0), unconvertible_person()?)
+                .await?
         );
 
         Ok(())

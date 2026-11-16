@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -122,6 +122,7 @@ impl Fixture {
         let route = service::routes(
             broker.clone(),
             storage.clone(),
+            None,
             TopicCreationConfig::default(),
             AutoCreateRefusals::default(),
         )

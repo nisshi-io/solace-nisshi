@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ mod failing_object_store;
 mod fetch_listing;
 mod held_put_store;
 mod init_producer;
+mod lake_schema_validation;
 mod lake_sink_idempotence;
 mod latency;
 mod list_groups;

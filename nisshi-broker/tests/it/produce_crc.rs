@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -102,7 +102,8 @@ async fn produce(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let response = ProduceService { storage }
+    let response = ProduceService::new(storage)
+        .with_validation()
         .serve(RequestInput {
             request: ProduceRequest::default().acks(-1).topic_data(Some(vec![
                 TopicProduceData::default()

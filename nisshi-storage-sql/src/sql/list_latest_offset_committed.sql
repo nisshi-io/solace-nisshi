@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -72,7 +72,7 @@ last_stable as (
 
 select
 
-coalesce(last_stable.offset_id, requested_topition.high, 0),
+coalesce(last_stable.offset_id, requested_topition.high, 0) as offset_id,
 r.timestamp
 
 from

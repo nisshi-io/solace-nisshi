@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -30,4 +30,4 @@ select exists (
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     where c.relname = 'nisshi_schema_version'
     and n.nspname = any (current_schemas(false))
-)
+) as version_table_exists

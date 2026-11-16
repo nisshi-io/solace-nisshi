@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,9 @@
 //! from the published package.
 
 #![allow(clippy::expect_used)]
+// The broker's Produce route lays out the future of every step of the produce path in one type,
+// which overflows the default query depth.
+#![recursion_limit = "256"]
 
 use std::{
     any::Any,
@@ -207,6 +210,7 @@ fn broker_route(storage: ArcDynStorage) -> FrameRouteService<nisshi_broker::Erro
     routes(
         Controller::new(storage.clone(), GroupCoordinatorConfig::default()),
         storage,
+        None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
     )

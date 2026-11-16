@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,7 +58,6 @@ impl StorageFactory for LimboFactory {
             .node(configuration.node_id)
             .cluster(configuration.cluster)
             .advertised_listener(configuration.advertised_listener)
-            .schemas(configuration.schema_registry)
             .lake(configuration.lake_house)
             .build()
             .await

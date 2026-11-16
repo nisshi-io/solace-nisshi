@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -42,5 +42,5 @@ having coalesce(max(pe.epoch), -1) < 32767
 )
 
 insert into producer_epoch (producer, epoch)
-select * from curr
+select id, epoch from curr
 returning epoch;

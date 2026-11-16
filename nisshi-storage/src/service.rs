@@ -1,4 +1,8 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Or Hayat
+//   Shane Kennedy
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -107,7 +111,14 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge, Histogram},
 };
-pub use produce::{ProduceService, inflate_produced};
+pub use produce::{
+    AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
+    PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
+    ProduceService, ProduceTopicService, SchemaValidationLayer, SchemaValidationService,
+    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
+    UnknownPartitionLayer, UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic,
+    inflate_produced,
+};
 use rama::{Layer, Service};
 use tokio::{
     sync::{

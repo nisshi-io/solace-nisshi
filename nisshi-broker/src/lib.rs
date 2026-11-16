@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,15 +23,13 @@
     )
 )]
 use std::{
-    collections::HashMap,
-    env::vars,
     fmt, io,
     net::{AddrParseError, SocketAddr},
     num::TryFromIntError,
     result,
     str::{FromStr, Utf8Error},
     sync::{Arc, LazyLock, PoisonError},
-    time::{Duration, SystemTimeError},
+    time::SystemTimeError,
 };
 
 use glob::PatternError;
@@ -39,7 +37,6 @@ use jsonschema::ValidationError;
 use nisshi_sans_io::ErrorCode;
 use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-use regex::{Regex, Replacer};
 use thiserror::Error;
 use tokio::{sync::broadcast::error::SendError, task::JoinError};
 use tracing_subscriber::filter::ParseError;
@@ -53,15 +50,6 @@ pub mod service;
 pub enum CancelKind {
     Interrupt,
     Terminate,
-}
-
-impl From<CancelKind> for Duration {
-    fn from(cancellation: CancelKind) -> Self {
-        Duration::from_millis(match cancellation {
-            CancelKind::Interrupt => 0,
-            CancelKind::Terminate => 5_000,
-        })
-    }
 }
 
 pub const NODE_ID: i32 = 111;
@@ -123,8 +111,6 @@ pub enum Error {
     Poison,
 
     ProgressStyleTemplate(Arc<indicatif::style::TemplateError>),
-
-    Regex(#[from] regex::Error),
 
     SchemaRegistry(Arc<nisshi_schema::Error>),
     Service(#[from] nisshi_service::Error),
@@ -237,56 +223,5 @@ impl FromStr for TracingFormat {
             "json" => Ok(Self::Json),
             otherwise => Err(Error::UnsupportedTracingFormat(otherwise.to_owned())),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct VarRep(HashMap<String, String>);
-
-impl From<HashMap<String, String>> for VarRep {
-    fn from(value: HashMap<String, String>) -> Self {
-        Self(value)
-    }
-}
-
-impl VarRep {
-    fn replace(&self, haystack: &str) -> Result<String> {
-        Regex::new(r"\$\{(?<var>[^\}]+)\}")
-            .map(|re| re.replace(haystack, self).into_owned())
-            .map_err(Into::into)
-    }
-}
-
-impl Replacer for &VarRep {
-    fn replace_append(&mut self, caps: &regex::Captures<'_>, dst: &mut String) {
-        if let Some(variable) = caps.name("var")
-            && let Some(value) = self.0.get(variable.as_str())
-        {
-            dst.push_str(value);
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct EnvVarExp<T>(T);
-
-impl<T> EnvVarExp<T> {
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-impl<T> FromStr for EnvVarExp<T>
-where
-    T: FromStr,
-    Error: From<<T as FromStr>::Err>,
-{
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        VarRep::from(vars().collect::<HashMap<_, _>>())
-            .replace(s)
-            .and_then(|s| T::from_str(&s).map_err(Into::into))
-            .map(|t| Self(t))
     }
 }

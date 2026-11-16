@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// A test that awaits `ProduceService` makes the compiler lay out the future of every step of the
+// produce path in one type, which overflows the default query depth.
+#![recursion_limit = "256"]
 mod common;
 
 // `pub` keeps each file's `pub` helpers reachable, as when every file was its own crate.
@@ -42,8 +45,11 @@ pub mod dynostore_meta_cache;
 pub mod fetch;
 pub mod fetch_after_delete_records;
 pub mod fetch_deadline;
+pub mod fetch_empty_records;
 pub mod fetch_header_bytes;
 pub mod fetch_max_wait;
+pub mod fetch_metadata_storage_error;
+pub mod fetch_storage_error;
 pub mod fetch_unknown_partition;
 pub mod fetch_wire;
 pub mod find_coordinator;
@@ -60,6 +66,9 @@ pub mod list_partition_reassignments;
 pub mod log_append_time;
 pub mod log_redaction;
 pub mod metadata;
+pub mod metadata_authorized_operations;
+pub mod metadata_empty_topics;
+pub mod metadata_null_topics;
 pub mod metadata_topic_ids;
 pub mod new_cg;
 pub mod offset_commit_fence;
@@ -83,6 +92,7 @@ pub mod produce_idempotent_epoch_bump;
 pub mod produce_idempotent_first_sequence;
 #[cfg(feature = "postgres")]
 pub mod produce_idempotent_race;
+pub mod produce_idempotent_sequence_wrap;
 pub mod produce_inflated;
 pub mod produce_invalid_acks;
 pub mod produce_invalid_record;
@@ -91,6 +101,7 @@ pub mod produce_post_watermark_failure;
 pub mod produce_post_write_advance_failed;
 #[cfg(feature = "postgres")]
 pub mod produce_row_locks;
+pub mod produce_schema_validation;
 pub mod produce_unknown_partition_order;
 pub mod rebalance_timing;
 pub mod replication_factor;
@@ -99,6 +110,7 @@ pub mod retention_ms;
 #[cfg(feature = "libsql")]
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
+pub mod shutdown;
 pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;
 pub mod storage_capabilities;
@@ -127,6 +139,7 @@ pub mod txn_offset_commit_fence;
 pub mod txn_produce_unadded_partition;
 #[cfg(feature = "libsql")]
 pub mod unauthenticated;
+pub mod unknown_topic_id;
 pub mod update_group_conditional;
 pub mod version_gate;
 

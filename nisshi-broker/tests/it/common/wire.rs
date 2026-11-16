@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{Body, Frame, Header};
+use nisshi_schema::Registry;
 use nisshi_storage::ArcDynStorage;
 use rustls::ServerConfig;
 use tokio::{
@@ -72,15 +73,39 @@ pub(crate) async fn spawn_broker_with_authentication(
     tls: Option<ServerConfig>,
     authentication: bool,
 ) -> Result<RunningBroker> {
-    let port = free_port().await?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = Url::parse(&format!("tcp://{addr}"))?;
-
     let storage = if authentication {
         lite_url().await?
     } else {
         Url::parse("memory://")?
     };
+
+    spawn(tls, authentication, storage, None).await
+}
+
+/// Like [`spawn_broker`], with `schemas` as the registry that the broker validates produced
+/// records against.
+pub(crate) async fn spawn_broker_with_schemas(schemas: Option<Registry>) -> Result<RunningBroker> {
+    spawn(None, false, Url::parse("memory://")?, schemas).await
+}
+
+/// Like [`spawn_broker_with_authentication`], on the storage at `storage`.
+pub(crate) async fn spawn_broker_on(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+    storage: Url,
+) -> Result<RunningBroker> {
+    spawn(tls, authentication, storage, None).await
+}
+
+async fn spawn(
+    tls: Option<ServerConfig>,
+    authentication: bool,
+    storage: Url,
+    schemas: Option<Registry>,
+) -> Result<RunningBroker> {
+    let port = free_port().await?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = Url::parse(&format!("tcp://{addr}"))?;
 
     let mut broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
         .node_id(NODE_ID)
@@ -91,6 +116,7 @@ pub(crate) async fn spawn_broker_with_authentication(
         .listener(listener)
         .tls_server_config(tls)
         .authentication(authentication)
+        .schema_registry(schemas)
         .silent(true)
         .build()
         .await?;

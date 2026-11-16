@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,22 @@
 use std::collections::BTreeSet;
 
 use nisshi_sans_io::{
-    ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
-    create_topics_request::CreatableTopic, create_topics_response::CreatableTopicResult,
-    topic::is_valid_topic_name,
+    ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
+    RequestInput, create_topics_request::CreatableTopic,
+    create_topics_response::CreatableTopicResult, metadata_request::MetadataRequestTopic,
+    metadata_response::MetadataResponseTopic, topic::is_valid_topic_name,
 };
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
 pub use auto_create_refusals::AutoCreateRefusals;
 
-use super::create_topics::validation::ValidatedCreateTopicsRequest;
+use super::{
+    create_topics::validation::ValidatedCreateTopicsRequest, fetch::storage_failure_warns_now,
+};
 use crate::{
-    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, TopicCreationConfig,
-    TopicId,
+    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, StorageOperation,
+    TopicCreationConfig, TopicId, authorized_operations,
 };
 
 mod auto_create_refusals;
@@ -90,6 +93,81 @@ pub struct MetadataService<G> {
     pub auto_create_refusals: AutoCreateRefusals,
 }
 
+impl<G> MetadataService<G>
+where
+    G: Storage,
+{
+    /// Reads the metadata of `topics` from storage. When the read fails and the request names
+    /// topics, it answers each named topic with the code of the error, and keeps the brokers.
+    ///
+    /// A failed read does not close the connection, because the client sends its other requests
+    /// on it. A retriable code makes the Java client request the metadata again, as it does for
+    /// any `InvalidMetadataException`
+    /// ([`Metadata.handleMetadataResponse`]). The brokers come from a read of no topics, which
+    /// reads no topic rows. If that read fails too, this returns the original error.
+    ///
+    /// A request that names no topics asks for every topic, and this returns the original error
+    /// for it. An answer of the brokers with an empty topic list would tell the client that no
+    /// topic exists.
+    ///
+    /// [`Metadata.handleMetadataResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/Metadata.java#L530-L533
+    async fn read_metadata(&self, topics: Option<&[TopicId]>) -> Result<crate::MetadataResponse> {
+        let error = match self.storage.metadata(topics).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+
+        let named = topics.filter(|topics| !topics.is_empty());
+
+        let brokers = match named {
+            Some(_) => self.storage.metadata(Some(&[])).await,
+            None => Err(error.clone()),
+        };
+
+        let (Some(named), Ok(mut response)) = (named, brokers) else {
+            error!(?error);
+            return Err(error);
+        };
+
+        let error_code = error.error_code(ErrorCode::KafkaStorageError);
+
+        if error_code == ErrorCode::KafkaStorageError {
+            if storage_failure_warns_now(StorageOperation::Metadata) {
+                warn!(topics = named.len(), ?error, "metadata read failed");
+            } else {
+                debug!(topics = named.len(), ?error, "metadata read failed");
+            }
+        } else {
+            error!(
+                topics = named.len(),
+                ?error,
+                ?error_code,
+                "metadata read failed"
+            );
+        }
+
+        response.topics = named
+            .iter()
+            .map(|topic| {
+                let (name, topic_id) = match topic {
+                    TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
+                    TopicId::Id(id) => ("", id.into_bytes()),
+                };
+
+                MetadataResponseTopic::default()
+                    .error_code(error_code.into())
+                    .name(Some(name.into()))
+                    .topic_id(Some(topic_id))
+                    .is_internal(Some(false))
+                    .partitions(Some([].into()))
+                    .topic_authorized_operations(Some(-2147483648))
+            })
+            .collect();
+
+        Ok(response)
+    }
+}
+
 impl<G> ApiKey for MetadataService<G> {
     const KEY: i16 = MetadataRequest::KEY;
 }
@@ -106,16 +184,18 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let topics = input
-            .request
-            .topics
-            .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
+        let topics = input.request.topics.as_deref().map(requested_topics);
 
-        let mut response = self
-            .storage
-            .metadata(topics.as_deref())
-            .await
-            .inspect_err(|err| error!(?err))?;
+        // An empty list asks for no topics, and null for all of them
+        // ([`MetadataRequest.isAllTopics`]). The v0 rule, where an empty list means all of them,
+        // needs the API version, so `MetadataTopicIdLayer` applies it before the request gets here.
+        // We answer no topics whatever the storage lists, since a backend that lists every topic
+        // for an empty slice would otherwise send them all to a client that only wants the brokers.
+        //
+        // [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
+        let no_topics = topics.as_deref().is_some_and(<[TopicId]>::is_empty);
+
+        let mut response = self.read_metadata(topics.as_deref()).await?;
 
         // versions prior to 4 do not have allow_auto_topic_creation,
         // and behave as if it were true
@@ -200,37 +280,73 @@ where
             }
 
             if created {
-                response = self
-                    .storage
-                    .metadata(topics.as_deref())
-                    .await
-                    .inspect_err(|err| error!(?err))?;
+                response = self.read_metadata(topics.as_deref()).await?;
             }
         }
+        // The zero ID is left out: Kafka treats it as no ID at all.
+        let requested_ids = topics
+            .iter()
+            .flatten()
+            .filter_map(|topic| match topic {
+                TopicId::Id(id) if id.into_bytes() != NULL_TOPIC_ID => Some(id.into_bytes()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
         let brokers = Some(response.brokers().to_owned());
         let cluster_id = response.cluster().map(|s| s.into());
         let controller_id = response.controller();
-        let topics = Some(
-            response
-                .topics()
-                .iter()
-                .map(|topic| {
-                    if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
-                        && topic
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| !is_valid_topic_name(name))
-                    {
-                        topic
-                            .clone()
-                            .error_code(ErrorCode::InvalidTopicException.into())
-                    } else {
-                        topic.clone()
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-        let cluster_authorized_operations = Some(-1);
+        let mut topics = response
+            .topics()
+            .iter()
+            .filter(|_| !no_topics)
+            .map(|topic| {
+                let topic = if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    && topic
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !is_valid_topic_name(name))
+                {
+                    topic
+                        .clone()
+                        .error_code(ErrorCode::InvalidTopicException.into())
+                } else if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                    && topic.name.is_none()
+                    && topic
+                        .topic_id
+                        .is_some_and(|topic_id| requested_ids.contains(&topic_id))
+                {
+                    // Kafka picks the code in `KafkaApis` from whether the ID resolved to
+                    // a name, so the choice sits here and not in each storage engine,
+                    // which answers a miss the same for an ID and a name. The row's shape
+                    // alone does not say how the topic was asked for, so the request does.
+                    //
+                    // https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1336-L1340
+                    topic.clone().error_code(ErrorCode::UnknownTopicId.into())
+                } else {
+                    topic.clone()
+                };
+
+                let operations = authorized_operations::topic(
+                    input.request.include_topic_authorized_operations,
+                    topic.name.as_deref(),
+                );
+
+                topic.topic_authorized_operations(Some(operations))
+            })
+            .collect::<Vec<_>>();
+
+        // Kafka answers the unknown IDs before the other topics
+        // ([`KafkaApis.handleTopicMetadataRequest`]). The sort is stable, so the other topics
+        // keep the order that the storage answered them in.
+        //
+        // [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1419-L1420
+        topics.sort_by_key(|topic| topic.error_code != i16::from(ErrorCode::UnknownTopicId));
+
+        let topics = Some(topics);
+        let cluster_authorized_operations = Some(authorized_operations::cluster(
+            input.request.include_cluster_authorized_operations,
+        ));
 
         let throttle_time_ms = Some(0);
 
@@ -241,6 +357,37 @@ where
             .controller_id(controller_id)
             .topics(topics)
             .cluster_authorized_operations(cluster_authorized_operations))
+    }
+}
+
+/// The topics that a Metadata request for `topics` asks the storage for.
+///
+/// When an entry carries a topic ID other than the zero one, the request asks only by its IDs,
+/// each once, and its names are dropped, also the name of an entry that carries an ID, as Kafka
+/// reads it ([`KafkaApis.handleTopicMetadataRequest`]). Otherwise each entry asks by its name,
+/// and a name asked for twice is asked for once.
+///
+/// [`KafkaApis.handleTopicMetadataRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/KafkaApis.scala#L1331-L1347
+fn requested_topics(topics: &[MetadataRequestTopic]) -> Vec<TopicId> {
+    let mut seen = BTreeSet::new();
+
+    let ids = topics
+        .iter()
+        .filter_map(|topic| topic.topic_id)
+        .filter(|id| *id != NULL_TOPIC_ID && seen.insert(*id))
+        .map(TopicId::from)
+        .collect::<Vec<_>>();
+
+    if ids.is_empty() {
+        let mut asked = BTreeSet::new();
+
+        topics
+            .iter()
+            .map(TopicId::from)
+            .filter(|topic| asked.insert(topic.clone()))
+            .collect()
+    } else {
+        ids
     }
 }
 
@@ -296,7 +443,7 @@ mod tests {
     };
     use crate::{
         Result, TopicCreationConfig,
-        service::counting_storage::{CountingStorage, Listing},
+        service::counting_storage::{CountingStorage, Listing, Lookup},
     };
 
     fn service(
@@ -344,6 +491,47 @@ mod tests {
 
     fn unknown(name: &str) -> (String, ErrorCode) {
         (name.to_owned(), ErrorCode::UnknownTopicOrPartition)
+    }
+
+    /// An empty list asks for no topics, so the response has none and the storage lists none,
+    /// where a null list asks for all of them.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_list_answers_no_topics() -> Result<()> {
+        let storage = CountingStorage::new(Listing::Topics, &["a.b", "c.d"]);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(
+            Vec::<(String, ErrorCode)>::new(),
+            metadata(&service, &[]).await?
+        );
+        assert_eq!(0, storage.listings());
+        assert!(storage.created().is_empty());
+
+        let all = service
+            .serve(MetadataRequest::default().topics(None))
+            .await?;
+
+        assert_eq!(2, all.topics.unwrap_or_default().len());
+        assert_eq!(1, storage.listings());
+        Ok(())
+    }
+
+    /// The deprecated slatedb engine lists every topic for an empty slice, so the service itself
+    /// keeps an empty list from answering topics. [`Lookup::Listed`] stands in for it, since it
+    /// lists the topics whatever the lookup names.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_list_answers_no_topics_from_a_storage_that_lists_every_topic() -> Result<()> {
+        let storage =
+            CountingStorage::new(Listing::Topics, &["a.b", "c.d"]).with_lookup(Lookup::Listed);
+        let service = service(&storage, &AutoCreateRefusals::default());
+
+        assert_eq!(
+            Vec::<(String, ErrorCode)>::new(),
+            metadata(&service, &[]).await?
+        );
+        assert_eq!(1, storage.lookups());
+        assert!(storage.created().is_empty());
+        Ok(())
     }
 
     /// A producer retries Metadata for a name that collides with an existing topic. Only the

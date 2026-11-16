@@ -85,7 +85,7 @@ Cargo workspace (members, including `nisshi-fuzz-harness`, are listed in the roo
 | `nisshi-model` | Kafka JSON protocol definitions (used in build.rs) |
 | `nisshi-auth` | SASL authentication: mechanism handshake, SCRAM credential verification |
 | `nisshi-cat` | CLI: produce/consume Avro, JSON, Protobuf messages |
-| `nisshi-cli` | Clap-based CLI argument parsing |
+| `nisshi-cli` | Clap-based CLI argument parsing. `EnvVarExp<T>` wraps an argument so that `${VAR}` references expand at parse time, and a reference to an unset variable is a parse error |
 | `nisshi-fuzz-harness` | The encode, decode and byte-compare checks that the fuzz targets and their tests share |
 | `nisshi-generator` | CLI: generate fake data for schema-backed topics |
 | `nisshi-otel` | OpenTelemetry common configuration |
@@ -139,7 +139,6 @@ A read stuck in a blocking call can't be dropped, and the channel waits for it t
 
 - Node ID is always **111** (single-node, stateless design - this is intentional)
 - Group coordination in `nisshi-broker/src/coordinator/group/`
-- `EnvVarExp<T>` wrapper allows CLI args with `${VAR}` references expanded at parse time
 - All `Error` types implement `Clone` (non-Clone errors wrapped in `Arc`)
 
 ## Checking Against Apache Kafka
@@ -170,7 +169,7 @@ Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topi
 - Tests load `.env` via `dotenv().ok()`
 - Tests in `nisshi-broker` run against multiple backends: InMemory, Lite (libSQL), Postgres, SlateDb
 - `nisshi-broker`, `nisshi-sans-io` and `nisshi-service` each build one integration-test binary, `it`. To add a test file, create `tests/it/<name>.rs` and declare it with `pub mod <name>;` in `tests/it/main.rs`; Cargo ignores undeclared files, and the `every_test_file_is_declared` test fails if one is missed. Gate backend-specific tests with `#[cfg(feature = "...")]` on a module, not `required-features`. Run one file's tests with a name filter, e.g. `cargo nextest run -p nisshi-broker --all-features -E 'test(/^fetch::/)'`
-- Give each feature its own test file. Put the tests of one feature or one Kafka API in one file under `tests/it/`, named after it. Tests for a new feature go in a new file, not at the end of a file about another subject. A reader then finds them by name, and a name filter on the module selects them.
+- In `tests/it/`, give each feature its own test file. Put the tests of one feature or one Kafka API in one file there, named after it. Tests for a new feature go in a new file, not at the end of a file about another subject. A reader then finds them by name, and a name filter on the module selects them. (Unit tests in `src/` follow `.claude/rules/unit-test-layout.md`: a feature's unit tests go in `<module>/tests/<feature>.rs`.)
 - Assert a pattern with `assert_matches!(value, pattern)` from std (`use std::assert_matches;`, stable since Rust 1.96, no crate needed), not `assert!(matches!(value, pattern))` or the `assert_matches` crate. On failure it prints the value, and it reads as one assertion. Nothing enforces this yet, and some older tests still use `assert!(matches!(..))`; leave those alone unless you're already editing them.
 - `nisshi-smoke-test` runs the real Kafka CLI tools (in a `$KAFKA_IMAGE` container) against a broker, and stays out of `just test`; run it with `just smoke <engine>`. Its containers use the host network, so on macOS it needs Docker Desktop with host networking turned on, or, under colima, `NISSHI_SMOKE_DOCKER_HOST_IP=192.168.5.2`, which gives the Kafka CLI container its own network and sends its connections to `127.0.0.1` to this machine. Its tests talk to the shared broker through `KafkaCli::shared()`, or start their own with `Broker::isolated()`, and each uses its own topic and group names (`nisshi_smoke_test::unique::name`). A test that applies only to some engines is gated with `#[cfg(feature = "<engine>")]` or `#[cfg(any(...))]` on the engines' features, never with `cfg(not(...))`, because `just clippy` turns every feature on and would never compile it. The test files are grouped in folders under `tests/smoke/`: `main.rs` declares each folder's module, and `<folder>.rs` declares each file in it, which `every_test_file_is_declared` checks. S3 runs only `topic_admin::topic_lifecycle`, selected by the `smoke-s3` profile in `.config/nextest.toml`. A test that fails because of an open bug is marked `#[ignore = "<what is broken>"]`, or `#[cfg_attr(feature = "<engine>", ignore = "...")]` if it fails only on some engines. CI skips it, local runs still run it (`run.sh` passes `--run-ignored all` outside CI), and the change that fixes the bug removes the attribute
 - Single-file test targets with specific feature requirements (e.g. `nisshi-schema`'s `berg`) use `required-features` in their `Cargo.toml`
@@ -234,6 +233,10 @@ On a pull_request, a `changes` job in `ci.yml`, `codeql.yml`, `dependencies.yml`
 ## Comments
 
 Follow `.claude/rules/comments.md` for every comment and doc comment in the file types it lists. Before you hand off a change, reread each comment that you added or changed against that file's "Before You Hand Off" checklist.
+
+## File Headers
+
+Start every `.rs`, `.proto` and `.sql` file with the header that `.claude/rules/file-header.md` describes, and follow its rules for the `Contributors outside Solace:` list.
 
 ## Lint Configuration
 

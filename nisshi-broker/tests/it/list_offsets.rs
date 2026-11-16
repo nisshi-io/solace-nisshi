@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,6 +53,7 @@ where
     storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
+        None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
     )
@@ -1381,7 +1385,6 @@ mod turso {
         super::multi_record_batch(broker).await
     }
 
-    #[ignore = "the Turso engine has no virtual_topic table, which a lookup of a topic by name reads"]
     #[tokio::test]
     async fn no_timestamp_batch() -> Result<()> {
         let _guard = init_tracing()?;

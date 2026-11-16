@@ -1,4 +1,7 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -2393,7 +2396,7 @@ mod tests {
             let partition = 32123;
 
             let (schema_registry, record_batch) = {
-                let schema = Schema::from(definition.clone());
+                let schema = Schema::try_from(definition.clone())?;
                 let mut batch = Batch::builder().base_timestamp(1_234_567_890 * 1_000);
 
                 let values = [r(

@@ -1,5 +1,5 @@
 -- -*- mode: sql; sql-product: postgres; -*-
--- Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+-- Copyright (c) Solace Corporation
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 
 -- prepare txn_produce_offset_select_overlapping_txn (text, text, integer, integer, text, integer, integer) as
 
-select txn.name, p.id, pe.epoch, txn_d.status, txn_po.offset_start, txn_po.offset_end
+select txn.name, p.id as producer_id, pe.epoch as producer_epoch, txn_d.status, txn_po.offset_start, txn_po.offset_end
 
 from
 
@@ -39,7 +39,7 @@ and txn_d.status is not null
 
 except
 
-select txn.name, p.id, pe.epoch, txn_d.status, txn_po.offset_start, txn_po.offset_end
+select txn.name, p.id as producer_id, pe.epoch as producer_epoch, txn_d.status, txn_po.offset_start, txn_po.offset_end
 
 from
 

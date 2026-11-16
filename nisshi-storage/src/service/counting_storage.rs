@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! A [`Storage`] for service tests that holds only topic names, counts the `metadata` calls that
-//! list every topic and those that look up named topics, records the topics that it creates, and
-//! records each batch that it is asked to produce.
+//! list every topic and those that look up named topics, records the topics that it creates and
+//! deletes, and records each batch that it is asked to produce.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -76,8 +76,8 @@ pub(crate) enum Lookup {
     Named,
     /// Fails with an error.
     Error,
-    /// Answers as the `Listing` does, whatever topics the lookup names: the null engine lists every
-    /// topic.
+    /// Answers as the `Listing` does, whatever topics the lookup names, so that a test can
+    /// check the service against a lookup that answers for other topics.
     Listed,
 }
 
@@ -103,6 +103,9 @@ pub(crate) struct CountingStorage {
     lookups: Arc<Mutex<usize>>,
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
+    delete_topic_failure: Option<(TopicId, Error)>,
+    delete_topic_failure_delay: Duration,
+    deleted: Arc<Mutex<Vec<TopicId>>>,
     produced: Arc<Mutex<Vec<Produced>>>,
     produce_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
@@ -135,6 +138,29 @@ impl CountingStorage {
             create_topic_failure: Some((name.to_owned(), error)),
             ..Self::default()
         }
+    }
+
+    /// A storage whose `delete_topic` of `topic` fails with `error`. A delete of any other topic
+    /// succeeds.
+    pub(crate) fn failing_delete_topic(topic: TopicId, error: Error) -> Self {
+        Self {
+            delete_topic_failure: Some((topic, error)),
+            ..Self::default()
+        }
+    }
+
+    /// Returns this storage, with a failing `delete_topic` waiting `delay` before it fails, as a
+    /// call that runs into its deadline does. A test with a paused clock moves the time by it.
+    pub(crate) fn with_delete_failure_delay(self, delay: Duration) -> Self {
+        Self {
+            delete_topic_failure_delay: delay,
+            ..self
+        }
+    }
+
+    /// The topics that `delete_topic` deleted, in call order. A failed delete is not in it.
+    pub(crate) fn deleted(&self) -> Result<Vec<TopicId>> {
+        Ok(self.deleted.lock()?.clone())
     }
 
     /// Returns this storage, with the lookup of named topics answering as `lookup`.
@@ -320,8 +346,16 @@ impl Storage for CountingStorage {
         unimplemented!()
     }
 
-    async fn delete_topic(&self, _topic: &TopicId) -> Result<ErrorCode> {
-        unimplemented!()
+    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
+        if let Some((failing, error)) = &self.delete_topic_failure
+            && failing == topic
+        {
+            tokio::time::sleep(self.delete_topic_failure_delay).await;
+            return Err(error.clone());
+        }
+
+        self.deleted.lock()?.push(topic.clone());
+        Ok(ErrorCode::None)
     }
 
     async fn incremental_alter_resource(
@@ -383,12 +417,12 @@ impl Storage for CountingStorage {
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let topics = match topics {
-            Some(topics) if !topics.is_empty() => {
+            Some(topics) => {
                 *self.lookups.lock()? += 1;
                 self.lookup(topics)?
             }
 
-            _ => {
+            None => {
                 *self.listings.lock()? += 1;
                 self.list()?
             }
@@ -404,11 +438,24 @@ impl Storage for CountingStorage {
 
     async fn describe_config(
         &self,
-        _name: &str,
-        _resource: ConfigResource,
+        name: &str,
+        resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
-        Ok(DescribeConfigsResult::default().error_code(ErrorCode::None.into()))
+        let holds_topic = !matches!(resource, ConfigResource::Topic)
+            || self
+                .topics
+                .lock()
+                .expect("the topics lock is not poisoned")
+                .contains(name);
+
+        let error_code = if holds_topic {
+            ErrorCode::None
+        } else {
+            ErrorCode::UnknownTopicOrPartition
+        };
+
+        Ok(DescribeConfigsResult::default().error_code(error_code.into()))
     }
 
     async fn describe_topic_partitions(

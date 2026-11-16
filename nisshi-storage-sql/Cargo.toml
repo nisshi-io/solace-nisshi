@@ -58,6 +58,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 glob.workspace = true
+nisshi-schema = { workspace = true, features = ["parquet"] }
 opentelemetry_sdk.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

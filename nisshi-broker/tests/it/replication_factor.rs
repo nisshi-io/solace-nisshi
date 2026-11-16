@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -170,7 +170,6 @@ mod turso {
     use crate::common::{self, StorageType};
     use url::Url;
 
-    #[ignore = "the Turso engine has no virtual_topic table yet"]
     #[tokio::test]
     async fn stored_out_of_range() -> Result<()> {
         let _guard = init_tracing()?;

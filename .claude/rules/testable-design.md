@@ -41,7 +41,8 @@ changes.
   environment is missing, provide that environment around the calls that need it, instead of
   changing the code to run without it.
 - **Keep test helpers in test code.** A helper that builds a fixture or reads a result lives in
-  the `tests` module or under `tests/`, never in the item's `impl`.
+  the `tests` module of the code it serves, in a file under `<module>/tests/`, or in the
+  crate-root `tests/` folder for integration tests, never in the item's `impl`.
 - **When a test needs a hook, change the design.** A hook usually points at a value that the
   code hides, such as an outcome that it only logs. Return the value, or record it where a test
   can read it, as the code would for any other caller.

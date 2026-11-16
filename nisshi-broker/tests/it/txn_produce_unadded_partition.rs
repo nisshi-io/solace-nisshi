@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -333,6 +333,7 @@ async fn error_code_by_version(storage_type: StorageType) -> Result<()> {
     let route = nisshi_broker::service::storage::produce(
         FrameRouteService::<Error>::builder(),
         storage.clone(),
+        None,
     )
     .and_then(|builder| builder.build().map_err(Into::into))?;
 

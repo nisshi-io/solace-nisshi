@@ -39,6 +39,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+nisshi-schema = { workspace = true, features = ["parquet"] }
 rama.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio-util.workspace = true

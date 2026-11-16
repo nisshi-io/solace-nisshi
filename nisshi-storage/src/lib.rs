@@ -1,4 +1,9 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright (c) Solace Corporation
+//
+// Contributors outside Solace:
+//   Enwei Jiao
+//   Or Hayat
+//   Shane Kennedy
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -208,6 +213,7 @@ mod decoded_batch_probe;
 mod decoded_budget;
 pub mod fetched;
 mod inflate;
+pub mod lake_skip;
 mod latency;
 pub mod max_message_bytes;
 pub mod message_timestamp_type;
@@ -222,6 +228,20 @@ mod service;
 mod storage_double;
 mod topic_creation;
 mod topic_defaults;
+
+/// Returns the error code that a storage engine answers for a topic ID when the query that
+/// looks the topic up fails with `error`, as opposed to finding no topic.
+///
+/// A transient `error` answers `KAFKA_STORAGE_ERROR`, the code of Kafka's
+/// [`KafkaStorageException`], a retriable [`InvalidMetadataException`]. A permanent one answers
+/// `UNKNOWN_SERVER_ERROR`, which clients report at once, because a retry can't fix it. See
+/// [`Error::error_code`]. An unknown topic ID would tell a client that the topic is gone.
+///
+/// [`KafkaStorageException`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/errors/KafkaStorageException.java#L31
+/// [`InvalidMetadataException`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/errors/InvalidMetadataException.java#L22
+pub fn topic_id_query_error_code(error: &Error) -> ErrorCode {
+    error.error_code(ErrorCode::KafkaStorageError)
+}
 
 pub use assignment::{MAX_REPLICATION_FACTOR, assign_replicas, single_node_replicas};
 pub use batch::ProduceRequestBatcher;
@@ -243,20 +263,26 @@ pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
 
 pub use service::{
-    AlterUserScramCredentialsService, AutoCreateRefusals, ChannelRequest, ChannelRequestLayer,
-    ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService,
-    CreateTopicsValidationLayer, CreateTopicsValidationService, DELETE_RECORDS_CONCURRENCY,
-    DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
-    FetchService, FetchValidationLayer, FetchValidationService, FindCoordinatorService,
-    IncrementalAlterConfigsService, InitProducerIdService, LIST_OFFSETS_CONCURRENCY,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService,
-    MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService, OutcomeSender,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    AcksZeroLayer, AcksZeroService, Admission, AlterUserScramCredentialsService,
+    AutoCreateRefusals, BatchValidationLayer, BatchValidationService, ChannelRequest,
+    ChannelRequestLayer, ChannelRequestService, ConsumerGroupDescribeService, CreateAclsService,
+    CreateTopicsService, CreateTopicsValidationLayer, CreateTopicsValidationService,
+    DELETE_RECORDS_CONCURRENCY, DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
+    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
+    InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
+    MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService,
+    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
+    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
+    describe_groups_response, inflate_produced, list_groups_response,
 };
 
 #[cfg(feature = "dynostore")]
@@ -269,6 +295,20 @@ pub enum StartupFailure {
     StorageUnreachable,
     /// The broker failed to check or create its tables in the storage.
     SchemaSetup,
+}
+
+/// The kind of a value that libSQL or Turso returned, by SQLite's storage classes.
+///
+/// A text or blob value keeps only its length, because it can hold record data or SCRAM
+/// credentials, and the broker logs each error that holds this summary.
+#[cfg(any(feature = "libsql", feature = "turso"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SqliteValueSummary {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text { length: usize },
+    Blob { length: usize },
 }
 
 /// Storage Errors
@@ -304,6 +344,13 @@ pub enum Error {
     },
 
     ChronoParse(#[from] chrono::ParseError),
+
+    /// The result of `query` has more than one column named `column`, so a reader can't tell which
+    /// one holds the field.
+    DuplicateColumn {
+        query: &'static str,
+        column: &'static str,
+    },
 
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     DeadPoolBuild(#[from] deadpool::managed::BuildError),
@@ -375,6 +422,15 @@ pub enum Error {
         limit: usize,
     },
     Message(String),
+
+    /// The result of `query` does not have a column named `column`. `found` holds the names it
+    /// has.
+    MissingColumn {
+        query: &'static str,
+        column: &'static str,
+        found: Vec<String>,
+    },
+
     NoSuchEntry {
         nth: u32,
     },
@@ -408,6 +464,14 @@ pub enum Error {
 
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     Pool(Arc<Box<dyn error::Error + Send + Sync>>),
+
+    /// The PostgreSQL pool refused to open a new connection, because a new connection reached a
+    /// read-only server, and the pool opens at most one new connection per `interval` until a
+    /// new connection passes its check.
+    #[cfg(feature = "postgres")]
+    PoolConnectRateLimited {
+        interval: Duration,
+    },
 
     #[cfg(feature = "slatedb")]
     Postcard(#[from] postcard::Error),
@@ -450,11 +514,22 @@ pub enum Error {
 
     UnexpectedServiceResponse(Box<Response>),
 
-    #[cfg(feature = "turso")]
-    UnexpectedValue(turso::Value),
+    /// A column that a query's row declares as not null held a null.
+    UnexpectedNull,
 
-    #[cfg(feature = "libsql")]
-    UnexpectedLibSqlValue(libsql::Value),
+    /// The reader of `query`'s result could not read the column `column` of a row as the column's
+    /// declared type. `source` is the error of that read: the driver's error, an integer overflow,
+    /// or [`Error::UnexpectedNull`].
+    UnreadableColumn {
+        query: &'static str,
+        column: &'static str,
+        source: Box<Error>,
+    },
+
+    /// libSQL or Turso returned a value of this kind for a column whose declared type can't hold
+    /// it.
+    #[cfg(any(feature = "libsql", feature = "turso"))]
+    UnexpectedSqliteValue(SqliteValueSummary),
 
     UnknownCacheKey(String),
 
@@ -550,6 +625,10 @@ impl Error {
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             Self::Pool(_) => true,
 
+            // The limit ends when the pool's address leads to a writable server again.
+            #[cfg(feature = "postgres")]
+            Self::PoolConnectRateLimited { .. } => true,
+
             #[cfg(feature = "postgres")]
             Self::TokioPostgres(error) => match error.as_db_error() {
                 Some(db_error) => is_transient_sqlstate(db_error.code()),
@@ -579,6 +658,7 @@ impl Error {
             | Self::AcksZeroProduceFailed { .. }
             | Self::ChronoParse(_)
             | Self::Decode(_)
+            | Self::DuplicateColumn { .. }
             | Self::Boxed(_)
             | Self::FeatureNotEnabled { .. }
             | Self::Glob(_)
@@ -592,6 +672,7 @@ impl Error {
             | Self::LessThanMinTime { .. }
             | Self::MessageTooLarge { .. }
             | Self::Message(_)
+            | Self::MissingColumn { .. }
             | Self::NoSuchEntry { .. }
             | Self::NoSuchOffset(_)
             | Self::OsString(_)
@@ -614,7 +695,9 @@ impl Error {
             | Self::TryFromSlice(_)
             | Self::TryGet(_)
             | Self::UnexpectedBody(_)
+            | Self::UnexpectedNull
             | Self::UnexpectedServiceResponse(_)
+            | Self::UnreadableColumn { .. }
             | Self::UnknownCacheKey(_)
             | Self::InvalidStorageOptionValue { .. }
             | Self::UnrecognizedStorageOption { .. }
@@ -627,14 +710,11 @@ impl Error {
             #[cfg(any(feature = "postgres", feature = "libsql"))]
             Self::DeadPoolBuild(_) => false,
 
+            #[cfg(any(feature = "libsql", feature = "turso"))]
+            Self::UnexpectedSqliteValue(_) => false,
+
             #[cfg(feature = "slatedb")]
             Self::Postcard(_) => false,
-
-            #[cfg(feature = "turso")]
-            Self::UnexpectedValue(_) => false,
-
-            #[cfg(feature = "libsql")]
-            Self::UnexpectedLibSqlValue(_) => false,
         }
     }
 
@@ -2089,10 +2169,14 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Produce a deflated batch to this storage.
     ///
     /// Trusts the batch attributes as given: a batch with the control bit set
-    /// is written as a transaction marker, skipping schema validation and lake
-    /// writes. Only the broker may write control batches, so client Produce
-    /// batches must reach storage through [`ProduceService`], which rejects
-    /// them.
+    /// is written as a transaction marker, skipping lake writes. Only the broker
+    /// may write control batches, so client Produce batches must reach storage
+    /// through [`ProduceService`], which rejects them.
+    ///
+    /// A backend does not validate the records against the topic's schema.
+    /// [`ProduceService`] does that, on the records that it decodes for the
+    /// timestamp check, before it calls this method. A batch that reaches a
+    /// backend any other way is stored without validation.
     ///
     /// A backend that decodes the batch does so with [`inflate_produced`], so
     /// records that do not decode fail with `INVALID_RECORD`.
@@ -2151,6 +2235,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// returns the first batch at or after `offset` even when that batch alone is larger than
     /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
     /// so that a consumer whose fetch limit is smaller than a record can read past that record.
+    ///
+    /// `max_bytes` can be 0, and the read still returns that first batch. The fetch service
+    /// passes 0 for the first partition that has records when the request's limit is 0, as Kafka
+    /// does.
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
@@ -2251,6 +2339,15 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn pending_txn_offsets(&self, group_id: &str) -> Result<BTreeSet<Topition>>;
 
     /// Query broker and topic metadata.
+    ///
+    /// `None` asks for every topic, and an empty slice for no topic, only the brokers, the
+    /// cluster and the controller, as an empty Metadata request does from v1
+    /// ([`MetadataRequest.isAllTopics`]).
+    ///
+    /// A backend that lists every topic for an empty slice, as the deprecated `slatedb://` does,
+    /// still answers no topics to it: `MetadataService` enforces that for it.
+    ///
+    /// [`MetadataRequest.isAllTopics`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/requests/MetadataRequest.java#L162-L165
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
     async fn upsert_user_scram_credential(
