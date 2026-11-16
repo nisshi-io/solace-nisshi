@@ -38,6 +38,39 @@ pub const MAX_PARTITIONS_PER_REQUEST: i64 = 10_000;
 /// that `CreateTopics` creates with `num_partitions` of `-1`.
 pub const DEFAULT_NUM_PARTITIONS: i32 = 1;
 
+/// The name of Kafka's KRaft metadata log, which no request may create as a topic.
+pub(crate) const CLUSTER_METADATA_TOPIC_NAME: &str = "__cluster_metadata";
+
+/// The names of the topics that hold Kafka's coordinator state: committed offsets, transaction
+/// state and share group state ([`Topic.INTERNAL_TOPICS`]). This broker keeps that state in its
+/// storage engine.
+///
+/// [`Topic.INTERNAL_TOPICS`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/internals/Topic.java#L39-L40
+const INTERNAL_TOPIC_NAMES: [&str; 3] = [
+    "__consumer_offsets",
+    "__transaction_state",
+    "__share_group_state",
+];
+
+/// Returns whether `Metadata` may auto-create the topic `name`. If it may not, the unknown name
+/// keeps `UNKNOWN_TOPIC_OR_PARTITION`, and no `CreateTopics` runs for it.
+///
+/// Kafka's broker sends `__cluster_metadata` to its controller, which refuses it, so the topic
+/// never exists and each retry of the client gets `UNKNOWN_TOPIC_OR_PARTITION` again
+/// ([`AutoTopicCreationManager.sendCreateTopicRequest`]). We skip the `CreateTopics` instead
+/// of sending one, because the refusal store remembers only a colliding name, and each retry
+/// would then list every topic for the collision check. Kafka auto-creates `__consumer_offsets`
+/// and `__transaction_state` with their coordinators' settings, to hold the coordinators'
+/// state, and `__share_group_state` with the broker defaults
+/// ([`AutoTopicCreationManager.creatableTopic`]). This broker keeps that state in its storage
+/// engine, so there is no topic to create.
+///
+/// [`AutoTopicCreationManager.sendCreateTopicRequest`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L214-L222
+/// [`AutoTopicCreationManager.creatableTopic`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/AutoTopicCreationManager.scala#L232-L250
+pub(crate) fn auto_creatable(name: &str) -> bool {
+    name != CLUSTER_METADATA_TOPIC_NAME && !INTERNAL_TOPIC_NAMES.contains(&name)
+}
+
 /// The broker settings for topic creation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TopicCreationConfig {
