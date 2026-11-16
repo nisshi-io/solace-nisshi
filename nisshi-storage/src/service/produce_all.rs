@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests of the default [`Storage::produce_all`].
+//! Tests of `Storage::produce_all`, through [`CountingStorage`]'s own override and, for the default,
+//! through a wrapper that keeps it.
 
 use nisshi_sans_io::{
     ErrorCode,
@@ -21,7 +22,7 @@ use nisshi_sans_io::{
 use std::assert_matches;
 
 use crate::{
-    Error, ProduceEntry, Result, Storage, Topition,
+    Error, LatencyIntroducingStorage, ProduceEntry, Result, Storage, Topition,
     service::counting_storage::{CountingStorage, Listing},
 };
 
@@ -201,4 +202,43 @@ async fn no_entries_produce_nothing() {
 
     assert!(results.is_empty());
     assert!(storage.produced().is_empty());
+}
+
+#[tokio::test]
+async fn the_default_dispatches_each_entry_with_the_transaction_id_of_the_call() {
+    let storage = storage();
+
+    // `LatencyIntroducingStorage` does not override `produce_all`, so this runs the default body
+    // in `lib.rs`, which calls the wrapper's `produce` and `produce_inflated`, and not
+    // `CountingStorage`'s override.
+    let results = LatencyIntroducingStorage::new(storage.clone())
+        .with_latency(0..1)
+        .produce_all(
+            Some("transaction"),
+            vec![
+                entry(2, 10, Some(inflated::Batch::default())),
+                entry(0, 11, None),
+            ],
+        )
+        .await;
+
+    assert_eq!(
+        vec![2, 0],
+        results.into_iter().collect::<Result<Vec<_>>>().unwrap()
+    );
+    assert_eq!(0, storage.produce_all_calls());
+
+    let produced = storage.produced();
+    assert_eq!(
+        vec![
+            (Topition::new("abc", 2), Some("transaction".to_owned())),
+            (Topition::new("abc", 0), Some("transaction".to_owned())),
+        ],
+        produced
+            .iter()
+            .map(|produced| (produced.topition.clone(), produced.transaction_id.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_matches!(produced[0].inflated, Some(_));
+    assert_matches!(produced[1].inflated, None);
 }
