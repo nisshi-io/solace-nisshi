@@ -219,9 +219,9 @@ async fn duplicate(storage: impl Storage + Clone) -> Result<(), Error> {
 
 /// Topics with an invalid name must be rejected with `InvalidTopicException`,
 /// and must never actually reach storage. `DescribeTopicPartitions` never
-/// auto-creates (only `Metadata` does), so if the rejected name shows up as
-/// `UnknownTopicOrPartition` there, `CreateTopics` genuinely never called
-/// `Storage::create_topic` for it.
+/// auto-creates (only `Metadata` does), so if the rejected name answers with
+/// `InvalidTopicException` there, `CreateTopics` never created it. A topic
+/// created by mistake would answer `None` instead.
 async fn invalid_name_rejected(storage: impl Storage + Clone) -> Result<(), Error> {
     let create = CreateTopicsValidationLayer::new().layer(CreateTopicsService {
         storage: storage.clone(),

@@ -102,10 +102,16 @@ where
                 let topics = topics
                     .into_iter()
                     .map(|topic| {
-                        // Any error on an invalid name answers INVALID_TOPIC_EXCEPTION, because a
-                        // topic with an invalid name cannot exist, and an engine can fail the
-                        // lookup of such a name instead of missing it.
-                        if topic.error_code != i16::from(ErrorCode::None)
+                        // Kafka rewrites only the not-found case, and so does `MetadataService`.
+                        // UNKNOWN_SERVER_ERROR is rewritten too, because an engine can fail the
+                        // lookup of an invalid name instead of missing it (PostgreSQL refuses a NUL
+                        // byte). Any other code, such as an authorization failure, stays as it is.
+                        if [
+                            ErrorCode::UnknownTopicOrPartition,
+                            ErrorCode::UnknownServerError,
+                        ]
+                        .into_iter()
+                        .any(|code| topic.error_code == i16::from(code))
                             && topic
                                 .name
                                 .as_deref()
