@@ -13,11 +13,15 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    future::Future,
     sync::{Arc, LazyLock, Mutex, PoisonError},
+    time::Duration,
 };
 
 use opentelemetry::metrics::UpDownCounter;
+use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
 
 use crate::{METER, Topition};
 
@@ -51,12 +55,59 @@ type Key = (Topition, i64);
 #[derive(Clone, Debug, Default)]
 pub(super) struct Detached {
     writes: Arc<Mutex<HashMap<Key, usize>>>,
+    /// The task of each write that has started and not ended, whether or not its request still
+    /// waits for it.
+    tasks: TaskTracker,
+}
+
+/// The produce writes that still run when [`wait_for_detached_writes`] ends.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StillRunning {
+    /// How many writes still run, whether or not their request still waits for them.
+    pub writes: usize,
+    /// The partitions with a write whose request already answered at its deadline. A write whose
+    /// request was aborted by the shutdown, or that started during the wait, is in `writes` and
+    /// not here, so this can name fewer partitions than `writes` counts, or none.
+    pub detached_partitions: Vec<Topition>,
+}
+
+/// Waits until every produce write that runs in a task of its own has ended, for at most
+/// `remaining_grace`. Returns the writes that still run when the wait ends, with zero `writes`
+/// when all of them ended in time.
+///
+/// A write runs in a task of its own so that its request can answer at its deadline, and the
+/// task keeps running when its request has answered or its connection has closed. A write that
+/// starts during the wait is waited for as well, within the same `remaining_grace`. A write that
+/// still runs when the wait ends is left running. The writes are tracked for the whole process,
+/// so the wait covers the writes of every broker in it.
+pub async fn wait_for_detached_writes(remaining_grace: Duration) -> StillRunning {
+    let tasks = &PROCESS.tasks;
+
+    // The tracker completes its wait only once it is closed. A closed tracker still accepts a
+    // task, so a write that starts after this point is tracked too.
+    _ = tasks.close();
+
+    match timeout(remaining_grace, tasks.wait()).await {
+        Ok(()) => StillRunning::default(),
+        Err(_) => StillRunning {
+            writes: tasks.len(),
+            detached_partitions: PROCESS.partitions(),
+        },
+    }
 }
 
 impl Detached {
     /// Returns the set that all services of this process share.
     pub(super) fn process() -> Self {
         PROCESS.clone()
+    }
+
+    /// Runs `write` in a task of its own, and tracks the task until it ends, also when it panics.
+    pub(super) fn spawn<F>(&self, write: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        _ = self.tasks.spawn(write);
     }
 
     /// Returns whether a write that the deadline left running is still in flight for `topition`
@@ -68,6 +119,18 @@ impl Detached {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains_key(&(topition.clone(), producer_id))
+    }
+
+    /// Returns the partitions that have a write which its request no longer waits for, in order.
+    fn partitions(&self) -> Vec<Topition> {
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .map(|(topition, _)| topition.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Returns the tracker of a write to `topition` from `producer_id`, which starts as a write
