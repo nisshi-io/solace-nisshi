@@ -578,16 +578,21 @@ async fn a_partition_without_a_shared_permit_at_the_deadline_is_a_slot_wait() ->
     Ok(())
 }
 
-/// The shared permit of a write that the deadline left running goes back with its request's
-/// answer, so a stalled write does not hold the pool of the storage.
+/// The shared permit of a write that the deadline left running stays with the write until it
+/// ends, because the write holds the engine's connection until then.
 #[tokio::test(start_paused = true)]
-async fn a_write_left_running_at_the_deadline_gives_its_permit_back() -> Result<()> {
+async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -> Result<()> {
     let permits = Arc::new(Semaphore::new(2));
-    let (storage, _gate) = stalled();
+    let (storage, gate) = stalled();
     let storage = storage.with_produce_permits(Arc::clone(&permits));
     let service = service(&storage);
 
     _ = serve(&service, acked(&[0, 1])?).await?;
+
+    assert_eq!(0, permits.available_permits());
+
+    gate.add_permits(2);
+    settle().await;
 
     assert_eq!(2, permits.available_permits());
 

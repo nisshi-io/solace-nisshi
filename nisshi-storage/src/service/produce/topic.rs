@@ -76,12 +76,15 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         // The slot is held until the partition answers. If the deadline leaves a write running,
-        // the partition has answered, so the write holds no slot. The deadline can pass while the
+        // the partition has answered, so the write holds no slot. The shared permit goes with the
+        // request to the write task, which keeps it until the write ends: the write holds the
+        // engine's connection until then, and a request that arrives meanwhile must wait for a
+        // permit instead of taking a second connection. The deadline can pass while the
         // partition waits for a slot, or just after it got one. The partition answers
         // `REQUEST_TIMED_OUT` either way, and the ones that were written keep their offsets.
         let waiting_since = Instant::now();
 
-        let Some(_write) = topic.slots.take_write(&topic.topic.deadline).await else {
+        let Some(write) = topic.slots.take_write(&topic.topic.deadline).await else {
             warn!(
                 topic = topic.topic.name,
                 partition = partition.index,
@@ -93,6 +96,8 @@ where
 
             return Deadline::timed_out(Stage::SlotWait, partition.index);
         };
+
+        let (_slot, permit) = write.into_parts();
 
         if topic.topic.deadline.has_passed() {
             return Deadline::timed_out(Stage::NotStarted, partition.index);
@@ -115,6 +120,7 @@ where
                 admission: topic.admission.clone(),
                 deadline: topic.topic.deadline,
                 reservation: None,
+                permit,
                 batch: batches,
             })
             .await;

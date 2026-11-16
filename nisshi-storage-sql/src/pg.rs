@@ -537,7 +537,9 @@ fn delete_records_limit(max_size: usize) -> usize {
 /// [`PRODUCE_CONCURRENCY`] partitions take the whole pool, and metadata, group,
 /// offset commit and fetch calls then wait for a connection until the pool wait
 /// ends. A quarter of the pool keeps the writes, and the second connection of
-/// each lake write, within half of it. A write that waits for a permit at the
+/// each lake write, within half of it. A permit is held until its write ends,
+/// also when the request's deadline left the write running, because the write
+/// keeps its connection until then. A write that waits for a permit at the
 /// request's deadline is not started.
 fn produce_limit(max_size: usize) -> usize {
     (max_size / 4).max(1)

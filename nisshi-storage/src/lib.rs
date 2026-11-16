@@ -2273,7 +2273,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// storage limits them. The default is `None`, no limit across requests.
     ///
     /// A request writes at most [`Storage::produce_concurrency`] partitions at once, and each
-    /// write also takes a permit from this pool for as long as it runs. A pooled engine whose
+    /// write also takes a permit from this pool for as long as it runs, including after the
+    /// request's deadline left it running and the request answered. A pooled engine whose
     /// writes each hold a connection uses it to keep the writes of all requests together from
     /// taking the whole pool, as [`Storage::delete_records_concurrency`] does for DeleteRecords.
     /// A write that waits for a permit past the request's deadline is not started, and its

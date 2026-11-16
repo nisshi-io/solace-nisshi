@@ -25,7 +25,8 @@ use super::deadline::Deadline;
 /// left running has returned to its caller, so it holds no slot.
 ///
 /// A storage that limits its writes across requests, see [`Storage::produce_permits`], also gives
-/// each write a permit of that pool, held as long as the slot.
+/// each write a permit of that pool. The permit is held as long as the write runs, so a write that
+/// the deadline left running keeps it after the request answered and gave back its slot.
 ///
 /// [`Storage::produce_permits`]: crate::Storage::produce_permits
 #[derive(Clone, Debug)]
@@ -42,6 +43,18 @@ pub(crate) struct Write {
     _slot: OwnedSemaphorePermit,
     _shared: Option<OwnedSemaphorePermit>,
 }
+
+impl Write {
+    /// Splits the write into its request's slot, and the permit that the storage shares across
+    /// requests, if it has one. The write task keeps the permit for as long as the write runs.
+    pub(super) fn into_parts(self) -> (OwnedSemaphorePermit, Option<SharedPermit>) {
+        (self._slot, self._shared.map(Arc::new))
+    }
+}
+
+/// A permit of the pool that the writes of every request on a storage share. The request and its
+/// write task each hold a clone, so the permit returns to the pool when both are done.
+pub(crate) type SharedPermit = Arc<OwnedSemaphorePermit>;
 
 impl Slots {
     /// Returns `count` slots, at least one, and the writes of which also take a permit of

@@ -92,8 +92,10 @@ where
 {
     /// Writes the batch in a task of its own, and waits for its result until `at`.
     ///
-    /// The task owns the batch and the request's share of the decoded-bytes budget, so the budget
-    /// keeps counting the memory that the write holds after the request answered. The task runs
+    /// The task owns the batch, the request's share of the decoded-bytes budget, and the permit
+    /// that the storage shares across requests. The budget keeps counting the memory that the
+    /// write holds after the request answered, and the permit keeps counting the connection. The
+    /// task runs
     /// under the span of the request, and logs its own result when the request has left it.
     async fn write_until(
         &self,
@@ -110,10 +112,14 @@ where
             let storage = self.storage.clone();
             let transaction_id = request.transaction_id.clone();
             let reservation = request.reservation.clone();
+            let permit = request.permit.clone();
             let write = Arc::clone(&write);
 
             async move {
+                // Both live as long as the write holds the engine's connection, not as long as
+                // its request. Dropping the task drops them, on a panic and on an abort too.
                 let _reservation = reservation;
+                let _permit = permit;
                 let _end = End(Arc::clone(&write));
 
                 let result = run(
