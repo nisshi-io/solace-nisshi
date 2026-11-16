@@ -91,6 +91,16 @@ impl FailedStart {
             "the broker didn't exit with an error that names {text}: {self}"
         );
     }
+
+    /// Asserts nothing the broker printed contains `text`. A test uses this for a value that can
+    /// be a secret, such as a URL with a password.
+    #[track_caller]
+    pub fn assert_output_omits(&self, text: &str) {
+        assert!(
+            !self.log.contains(text),
+            "the broker printed {text}, which it must leave out: {self}"
+        );
+    }
 }
 
 impl fmt::Display for FailedStart {
@@ -144,11 +154,24 @@ mod tests {
     #[test]
     fn error_lines_include_an_argument_error_from_clap() {
         let failed_start = failed_start_with_log(
-            "error: invalid value 'not a url' for '--storage-engine <STORAGE_ENGINE>'\n\nFor more \
-             information, try '--help'.\n",
+            "error: invalid value for '--storage-engine <STORAGE_ENGINE>': invalid URL: relative \
+             URL without a base\n\nFor more information, try '--help'.\n",
         );
 
-        failed_start.assert_error_names("not a url");
+        failed_start.assert_error_names("--storage-engine");
+    }
+
+    #[test]
+    fn assert_output_omits_passes_when_the_text_is_absent() {
+        failed_start_with_log("error: invalid value for '--storage-engine'\n")
+            .assert_output_omits("not a url");
+    }
+
+    #[test]
+    #[should_panic(expected = "which it must leave out")]
+    fn assert_output_omits_fails_when_the_text_is_printed() {
+        failed_start_with_log("error: invalid value 'not a url'\n")
+            .assert_output_omits("not a url");
     }
 
     #[test]
