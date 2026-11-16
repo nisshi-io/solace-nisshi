@@ -26,7 +26,7 @@ use tokio::time::{Instant, sleep};
 
 use super::request_deadline::{acked, codes, serve, service_sharing, stalled};
 use crate::service::produce::detached::Detached;
-use crate::{Result, wait_for_detached_writes};
+use crate::{Result, StillRunning, wait_for_detached_writes};
 
 /// The grace that is left for the writes in every test.
 const REMAINING_GRACE: Duration = Duration::from_secs(5);
@@ -56,7 +56,7 @@ async fn a_write_that_ends_within_the_grace_is_waited_for() -> Result<()> {
 
     let still_running = wait_for_detached_writes(REMAINING_GRACE).await;
 
-    assert_eq!(0, still_running);
+    assert_eq!(StillRunning::default(), still_running);
     assert_eq!(Duration::from_secs(1), started_at.elapsed());
     assert_eq!(1, storage.produced().len());
 
@@ -76,7 +76,8 @@ async fn a_write_that_outlasts_the_grace_is_left_running() -> Result<()> {
 
     let still_running = wait_for_detached_writes(REMAINING_GRACE).await;
 
-    assert_eq!(1, still_running);
+    assert_eq!(1, still_running.writes);
+    assert_eq!(1, still_running.detached_partitions.len());
     assert_eq!(REMAINING_GRACE, started_at.elapsed());
     assert_eq!(1, storage.parked());
     assert!(storage.produced().is_empty());
@@ -114,7 +115,9 @@ async fn a_write_that_starts_during_the_wait_does_not_extend_it() -> Result<()> 
         _ = second => panic!("the second request answered before the wait ended"),
     };
 
-    assert_eq!(2, still_running);
+    // Both writes run, and only the first one's request has answered.
+    assert_eq!(2, still_running.writes);
+    assert_eq!(1, still_running.detached_partitions.len());
     assert_eq!(REMAINING_GRACE, started_at.elapsed());
     assert_eq!(2, storage.parked());
 

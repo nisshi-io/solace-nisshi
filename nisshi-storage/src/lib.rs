@@ -279,7 +279,7 @@ pub use service::{
     MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
     ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
     RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService,
+    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService, StillRunning,
     StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
     TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
     UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,

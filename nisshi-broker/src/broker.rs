@@ -545,9 +545,13 @@ where
                 let remaining_grace = shutdown_grace.saturating_sub(shutdown_started.elapsed());
                 let still_running = wait_for_detached_writes(remaining_grace).await;
 
-                if still_running > 0 {
+                if still_running.writes > 0 {
+                    // `writes` counts every running write. `detached_partitions` names only the
+                    // partitions of writes whose request already answered, so a write that its
+                    // request still waits for is in the count and not in the list.
                     warn!(
-                        writes = still_running,
+                        writes = still_running.writes,
+                        detached_partitions = ?still_running.detached_partitions,
                         "the shutdown grace ended with produce writes still running"
                     );
                 }

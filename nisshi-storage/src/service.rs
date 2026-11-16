@@ -117,9 +117,9 @@ pub use produce::{
     AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
     PartitionProduce, ProduceRequestValidationLayer, ProduceRequestValidationService,
     ProduceService, ProduceTopicService, SchemaValidationLayer, SchemaValidationService,
-    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
-    UnknownPartitionLayer, UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic,
-    inflate_produced, wait_for_detached_writes,
+    StillRunning, StorePartitionService, StoredPartitions, TimestampLayer, TimestampService,
+    TopicConfiguration, UnknownPartitionLayer, UnknownPartitionService, ValidatedProduceRequest,
+    ValidatedTopic, inflate_produced, wait_for_detached_writes,
 };
 use rama::{Layer, Service};
 use tokio::{
