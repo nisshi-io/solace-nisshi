@@ -2264,7 +2264,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// writes one at a time answers 1, so that a second call never queues inside the engine,
     /// where the deadline leaves it running after the request answered. A storage that wraps
     /// another answers what the storage it wraps answers, unless the wrapper changes how the
-    /// calls run.
+    /// calls run. The service treats an answer below 1 as 1.
     fn produce_concurrency(&self) -> usize {
         PRODUCE_CONCURRENCY
     }

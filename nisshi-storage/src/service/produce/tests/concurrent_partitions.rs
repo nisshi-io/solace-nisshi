@@ -513,3 +513,18 @@ async fn a_serial_storage_gets_one_write_of_a_request_at_a_time() -> Result<()> 
 
     Ok(())
 }
+
+/// A storage that answers 0 for its produce concurrency is served as if it answered 1: the
+/// request answers, and does not wait for a topic group that the buffer never starts.
+#[tokio::test(start_paused = true)]
+async fn a_storage_that_answers_zero_concurrency_is_served_as_one() -> Result<()> {
+    let storage = slow().with_produce_concurrency(0);
+    let service = service(&storage);
+
+    let responses = serve(&service, acked(&[0, 1])?).await?;
+
+    assert_eq!(vec![ErrorCode::None; 2], codes(&responses)?);
+    assert_eq!(vec![0, 1], produced_partitions(&storage));
+
+    Ok(())
+}

@@ -290,7 +290,8 @@ where
                 detached,
             ));
 
-        let concurrency = storage.produce_concurrency();
+        // At least 1: `buffer_unordered(0)` never starts a future, so a request would hang.
+        let concurrency = storage.produce_concurrency().max(1);
 
         Self {
             concurrency,
