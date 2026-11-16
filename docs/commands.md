@@ -271,13 +271,13 @@ Usage: nisshi proxy [OPTIONS]
 
 Options:
       --listener-url <LISTENER_URL>
-          The proxy will listen on this address [env: LISTENER_URL=] [default: tcp://0.0.0.0:9092]
+          The proxy will listen on this address [env: LISTENER_URL] [default: tcp://0.0.0.0:9092]
       --advertised-listener-url <ADVERTISED_LISTENER_URL>
-          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=] [default: tcp://127.0.0.1:9092]
+          This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL] [default: tcp://127.0.0.1:9092]
       --origin-url <ORIGIN_URL>
-          The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL=] [default: tcp://127.0.0.1:9092]
+          The proxy will forward traffic to this origin broker, which must not require authentication [env: ORIGIN_URL] [default: tcp://127.0.0.1:9092]
       --otlp-endpoint-url <OTLP_ENDPOINT_URL>
-          OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT=]
+          OTEL Exporter OTLP endpoint [env: OTEL_EXPORTER_OTLP_ENDPOINT]
   -h, --help
           Print help
 ```
