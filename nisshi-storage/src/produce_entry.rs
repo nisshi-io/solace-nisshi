@@ -1,0 +1,66 @@
+// Copyright (c) Solace Corporation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use nisshi_sans_io::record::{deflated, inflated};
+
+use crate::{Result, Storage, Topition};
+
+/// One batch for [`Storage::produce_all`] to write to one partition.
+#[derive(Clone, Debug)]
+pub struct ProduceEntry {
+    pub topition: Topition,
+
+    pub deflated: deflated::Batch,
+
+    /// `deflated` decoded, under the same conditions as for
+    /// [`Storage::produce_inflated`]. `None` leaves the decoding
+    /// to the storage, as [`Storage::produce`] does.
+    pub inflated: Option<inflated::Batch>,
+}
+
+impl ProduceEntry {
+    /// Produces each entry to `storage`, one after another, and returns one result per entry in
+    /// the order of `entries`: [`Storage::produce_inflated`] for an entry with a decoded batch, and
+    /// [`Storage::produce`] for one without.
+    pub(crate) async fn produce_each<S>(
+        storage: &S,
+        transaction_id: Option<&str>,
+        entries: Vec<Self>,
+    ) -> Vec<Result<i64>>
+    where
+        S: Storage + ?Sized,
+    {
+        let mut results = Vec::with_capacity(entries.len());
+
+        for Self {
+            topition,
+            deflated,
+            inflated,
+        } in entries
+        {
+            let result = match inflated {
+                Some(inflated) => {
+                    storage
+                        .produce_inflated(transaction_id, &topition, deflated, inflated)
+                        .await
+                }
+                None => storage.produce(transaction_id, &topition, deflated).await,
+            };
+
+            results.push(result);
+        }
+
+        results
+    }
+}

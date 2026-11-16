@@ -42,6 +42,8 @@ mod list_partition_reassignments;
 mod metadata;
 mod produce;
 #[cfg(test)]
+mod produce_all;
+#[cfg(test)]
 mod produce_budget;
 #[cfg(test)]
 mod produce_entry_points;
