@@ -43,9 +43,17 @@ impl ServedTopic {
 #[derive(Clone, Debug, Default)]
 struct RecordingTopics {
     served: Arc<Mutex<Vec<ServedTopic>>>,
+    slots: Arc<Mutex<Vec<Slots>>>,
 }
 
 impl RecordingTopics {
+    fn slots(&self) -> Vec<Slots> {
+        self.slots
+            .lock()
+            .expect("a test thread panicked while it held the lock")
+            .clone()
+    }
+
     fn served(&self) -> Vec<ServedTopic> {
         self.served
             .lock()
@@ -54,11 +62,18 @@ impl RecordingTopics {
     }
 }
 
-impl Service<ValidatedTopic> for RecordingTopics {
+impl Service<ProduceTopic> for RecordingTopics {
     type Output = TopicProduceResponse;
     type Error = Infallible;
 
-    async fn serve(&self, topic: ValidatedTopic) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, topic: ProduceTopic) -> Result<Self::Output, Self::Error> {
+        self.slots
+            .lock()
+            .expect("a test thread panicked while it held the lock")
+            .push(topic.slots);
+
+        let topic = topic.topic;
+
         self.served
             .lock()
             .expect("a test thread panicked while it held the lock")
@@ -88,7 +103,10 @@ async fn serve(
         .collect();
 
     let response = ProduceRequestValidationLayer::new()
-        .layer(ProduceService::from_topics(topics_service.clone()))
+        .layer(ProduceService::from_topics(
+            topics_service.clone(),
+            PRODUCE_CONCURRENCY,
+        ))
         .serve(RequestInput {
             request: ProduceRequest::default()
                 .acks(-1)
@@ -165,6 +183,46 @@ async fn a_request_without_topics_serves_no_topic() -> Result<()> {
 
     assert!(answered.is_empty());
     assert!(topics_service.served().is_empty());
+
+    Ok(())
+}
+
+/// The service builds the slots once for a request, from the concurrency that it was built with:
+/// every topic of the request gets the same slots, a request of its own gets others, and the
+/// validation layer decides neither.
+#[tokio::test]
+async fn the_service_builds_the_slots_once_for_each_request() -> Result<()> {
+    let topics_service = RecordingTopics::default();
+
+    let service = ProduceRequestValidationLayer::new()
+        .layer(ProduceService::from_topics(topics_service.clone(), 2));
+
+    for _ in 0..2 {
+        _ = service
+            .serve(RequestInput {
+                request: ProduceRequest::default().acks(-1).topic_data(Some(
+                    ["a", "b", "c"]
+                        .map(|name| {
+                            TopicProduceData::default()
+                                .name(name.into())
+                                .partition_data(Some(vec![
+                                    PartitionProduceData::default().index(0),
+                                ]))
+                        })
+                        .to_vec(),
+                )),
+                extensions: Extensions::default(),
+            })
+            .await?;
+    }
+
+    let slots = topics_service.slots();
+
+    assert_eq!(6, slots.len());
+    assert!(slots.iter().all(|each| each.count() == 2));
+    assert!(slots[..3].iter().all(|each| each.is_same_as(&slots[0])));
+    assert!(slots[3..].iter().all(|each| each.is_same_as(&slots[3])));
+    assert!(!slots[0].is_same_as(&slots[3]));
 
     Ok(())
 }

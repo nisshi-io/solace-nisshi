@@ -23,26 +23,48 @@ use super::deadline::Deadline;
 ///
 /// A slot is held for one call, and dropped when the call returns. A write that the deadline
 /// left running has returned to its caller, so it holds no slot.
+///
+/// A storage that limits its writes across requests, see [`Storage::produce_permits`], also gives
+/// each write a permit of that pool, held as long as the slot.
+///
+/// [`Storage::produce_permits`]: crate::Storage::produce_permits
 #[derive(Clone, Debug)]
 pub(crate) struct Slots {
     count: usize,
     permits: Arc<Semaphore>,
+    shared: Option<Arc<Semaphore>>,
+}
+
+/// What a write holds while it runs: its request's slot, and a permit that the storage shares
+/// across requests, if it has one.
+#[derive(Debug)]
+pub(crate) struct Write {
+    _slot: OwnedSemaphorePermit,
+    _shared: Option<OwnedSemaphorePermit>,
 }
 
 impl Slots {
-    /// Returns `count` slots, at least one.
-    pub(super) fn new(count: usize) -> Self {
+    /// Returns `count` slots, at least one, and the writes of which also take a permit of
+    /// `shared`, if there is one.
+    pub(super) fn new(count: usize, shared: Option<Arc<Semaphore>>) -> Self {
         let count = count.max(1);
 
         Self {
             count,
             permits: Arc::new(Semaphore::new(count)),
+            shared,
         }
     }
 
     /// How many calls of the request run at once.
     pub(super) fn count(&self) -> usize {
         self.count
+    }
+
+    /// Returns whether `other` is the same set of slots, not another set of the same size.
+    #[cfg(test)]
+    pub(super) fn is_same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.permits, &other.permits)
     }
 
     /// Waits for a slot until `deadline`, and returns `None` if the deadline passes first.
@@ -53,5 +75,30 @@ impl Slots {
             .await
             .ok()
             .and_then(Result::ok)
+    }
+
+    /// Waits until `deadline` for a slot and, if the storage shares permits across requests, one
+    /// of them, and returns `None` if the deadline passes first.
+    ///
+    /// The slot comes first, so a request never holds a shared permit while it waits for its own
+    /// slot, and the permits that it holds are the ones of its running writes.
+    pub(super) async fn take_write(&self, deadline: &Deadline) -> Option<Write> {
+        let slot = self.take(deadline).await?;
+
+        let shared = match &self.shared {
+            Some(shared) => Some(
+                deadline
+                    .bound(Arc::clone(shared).acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)?,
+            ),
+            None => None,
+        };
+
+        Some(Write {
+            _slot: slot,
+            _shared: shared,
+        })
     }
 }

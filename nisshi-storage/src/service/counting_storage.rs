@@ -136,6 +136,7 @@ pub(crate) struct CountingStorage {
     produce_delay: Option<Duration>,
     partition_failure: Option<(i32, Error)>,
     produce_concurrency: Option<usize>,
+    produce_permits: Option<Arc<Semaphore>>,
 }
 
 impl CountingStorage {
@@ -277,6 +278,15 @@ impl CountingStorage {
     pub(crate) fn with_produce_concurrency(self, concurrency: usize) -> Self {
         Self {
             produce_concurrency: Some(concurrency),
+            ..self
+        }
+    }
+
+    /// Returns this storage answering `permits` to [`Storage::produce_permits`], as an engine that
+    /// limits its writes across requests does.
+    pub(crate) fn with_produce_permits(self, permits: Arc<Semaphore>) -> Self {
+        Self {
+            produce_permits: Some(permits),
             ..self
         }
     }
@@ -535,6 +545,10 @@ impl Storage for CountingStorage {
     fn produce_concurrency(&self) -> usize {
         self.produce_concurrency
             .unwrap_or(crate::service::produce::PRODUCE_CONCURRENCY)
+    }
+
+    fn produce_permits(&self) -> Option<Arc<Semaphore>> {
+        self.produce_permits.clone()
     }
 
     async fn offset_commit(

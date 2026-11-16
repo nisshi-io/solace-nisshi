@@ -21,20 +21,21 @@ use nisshi_sans_io::{
     record::deflated,
 };
 use rama::Service;
-use tracing::{error, instrument};
+use tokio::time::Instant;
+use tracing::{error, instrument, warn};
 
 use super::{
     deadline::{Deadline, Stage},
     grouping,
     partition::PartitionProduce,
     rejection::storage_error_code,
-    request_validation::ValidatedTopic,
+    request_validation::ProduceTopic,
     response,
     topic_configuration::TopicConfiguration,
 };
 use crate::Storage;
 
-/// A [`Service`] using its [`Storage`] taking [`ValidatedTopic`] returning
+/// A [`Service`] using its [`Storage`] taking [`ProduceTopic`] returning
 /// [`TopicProduceResponse`].
 ///
 /// The service reads the topic's configuration, and answers each partition of the topic with what
@@ -70,7 +71,7 @@ where
     /// `REQUEST_TIMED_OUT` without a write if the deadline passes first.
     async fn serve_partition(
         &self,
-        topic: &ValidatedTopic,
+        topic: &ProduceTopic,
         configuration: &Arc<TopicConfiguration>,
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
@@ -78,11 +79,22 @@ where
         // the partition has answered, so the write holds no slot. The deadline can pass while the
         // partition waits for a slot, or just after it got one. The partition answers
         // `REQUEST_TIMED_OUT` either way, and the ones that were written keep their offsets.
-        let Some(_slot) = topic.slots.take(&topic.deadline).await else {
-            return Deadline::timed_out(Stage::NotStarted, partition.index);
+        let waiting_since = Instant::now();
+
+        let Some(_write) = topic.slots.take_write(&topic.topic.deadline).await else {
+            warn!(
+                topic = topic.topic.name,
+                partition = partition.index,
+                waited = ?waiting_since.elapsed(),
+                remaining = ?topic.topic.deadline.remaining(),
+                slots = topic.slots.count(),
+                "produce partition waited for a write slot until the request's deadline"
+            );
+
+            return Deadline::timed_out(Stage::SlotWait, partition.index);
         };
 
-        if topic.deadline.has_passed() {
+        if topic.topic.deadline.has_passed() {
             return Deadline::timed_out(Stage::NotStarted, partition.index);
         }
 
@@ -96,12 +108,12 @@ where
         let Ok(response) = self
             .partitions
             .serve(PartitionProduce {
-                topic: topic.name.clone(),
+                topic: topic.topic.name.clone(),
                 index: partition.index,
-                transaction_id: topic.transaction_id.clone(),
+                transaction_id: topic.topic.transaction_id.clone(),
                 configuration: Arc::clone(configuration),
                 admission: topic.admission.clone(),
-                deadline: topic.deadline,
+                deadline: topic.topic.deadline,
                 reservation: None,
                 batch: batches,
             })
@@ -111,7 +123,7 @@ where
     }
 }
 
-impl<G, S> Service<ValidatedTopic> for ProduceTopicService<G, S>
+impl<G, S> Service<ProduceTopic> for ProduceTopicService<G, S>
 where
     G: Storage,
     S: Service<
@@ -124,30 +136,44 @@ where
     type Error = Infallible;
 
     #[instrument(skip_all)]
-    async fn serve(&self, topic: ValidatedTopic) -> Result<Self::Output, Self::Error> {
+    async fn serve(&self, topic: ProduceTopic) -> Result<Self::Output, Self::Error> {
         let mut topic = topic;
-        let partitions = std::mem::take(&mut topic.partitions);
+        let partitions = std::mem::take(&mut topic.topic.partitions);
 
         // A read is safe to drop, so the deadline stops it. A partition that the deadline stopped
         // answers `REQUEST_TIMED_OUT` and is not written. The slot of the read is given back
         // before the partitions are served, so a topic never holds a slot while it waits for
         // another one.
-        let read = match topic.slots.take(&topic.deadline).await {
+        let waiting_since = Instant::now();
+
+        let read = match topic.slots.take(&topic.topic.deadline).await {
             Some(_slot) => topic
+                .topic
                 .deadline
-                .bound(TopicConfiguration::read(&self.storage, &topic.name))
+                .bound(TopicConfiguration::read(&self.storage, &topic.topic.name))
                 .await
-                .ok(),
-            None => None,
+                .map_err(|_elapsed| Stage::NotStarted),
+            None => {
+                warn!(
+                    topic = topic.topic.name,
+                    partitions = partitions.len(),
+                    waited = ?waiting_since.elapsed(),
+                    remaining = ?topic.topic.deadline.remaining(),
+                    slots = topic.slots.count(),
+                    "produce topic waited for a slot to read its configuration until the request's deadline"
+                );
+
+                Err(Stage::SlotWait)
+            }
         };
 
         let responses = match read {
-            None => partitions
+            Err(stage) => partitions
                 .iter()
-                .map(|partition| Deadline::timed_out(Stage::NotStarted, partition.index))
+                .map(|partition| Deadline::timed_out(stage, partition.index))
                 .collect(),
 
-            Some(Ok(configuration)) => {
+            Ok(Ok(configuration)) => {
                 let configuration = Arc::new(configuration);
 
                 // If a request names a partition twice, the entries of that index are one group,
@@ -184,9 +210,9 @@ where
                 grouping::in_request_order(answered)
             }
 
-            Some(Err(error)) => {
+            Ok(Err(error)) => {
                 error!(
-                    topic = topic.name,
+                    topic = topic.topic.name,
                     ?error,
                     "topic configuration read failed"
                 );
@@ -201,7 +227,7 @@ where
         };
 
         Ok(TopicProduceResponse::default()
-            .name(topic.name)
+            .name(topic.topic.name)
             .partition_responses(Some(responses)))
     }
 }

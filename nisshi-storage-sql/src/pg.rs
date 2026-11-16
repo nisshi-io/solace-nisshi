@@ -165,6 +165,12 @@ pub struct Postgres {
     /// `delete_records_writes`, see
     /// [`Storage::delete_records_concurrency`].
     delete_records_per_request: usize,
+    /// Permits for the produce writes in flight across every request, see
+    /// [`produce_limit`].
+    produce_writes: Arc<Semaphore>,
+    /// How many produce writes one request makes at once, at most `produce_writes`, see
+    /// [`Storage::produce_concurrency`].
+    produce_per_request: usize,
     /// The shares of `list_offsets_reads` that clients hold, see
     /// [`ReadLimits::list_offsets_per_client`].
     list_offsets_client_shares: ClientReadShares,
@@ -352,6 +358,7 @@ impl Builder<String, i32, Url, PoolParts> {
     pub fn build(self) -> Postgres {
         let pool = self.pool.pool_of(&self.cluster, self.node);
         let delete_records_limit = delete_records_limit(pool.status().max_size);
+        let produce_limit = produce_limit(pool.status().max_size);
 
         Postgres {
             cluster: self.cluster,
@@ -365,6 +372,8 @@ impl Builder<String, i32, Url, PoolParts> {
             fetch_reads_per_connection: self.read_limits.fetch_per_connection(),
             delete_records_writes: Arc::new(Semaphore::new(delete_records_limit)),
             delete_records_per_request: DELETE_RECORDS_CONCURRENCY.min(delete_records_limit),
+            produce_writes: Arc::new(Semaphore::new(produce_limit)),
+            produce_per_request: PRODUCE_CONCURRENCY.min(produce_limit),
             list_offsets_client_shares: ClientReadShares::default(),
             fetch_client_shares: ClientReadShares::default(),
             list_offsets_reads_per_client: self.read_limits.list_offsets_per_client(),
@@ -515,6 +524,22 @@ impl ReadLimits {
 /// each purge interval. The calls of a request wait for a permit, and a call
 /// still waiting at the request's deadline is not started.
 fn delete_records_limit(max_size: usize) -> usize {
+    (max_size / 4).max(1)
+}
+
+/// How many produce writes this engine has in flight at once, across every
+/// request, for a pool of `max_size` connections: a quarter of the pool, and at
+/// least one.
+///
+/// Each write holds a pooled connection for its transaction, and a write to a
+/// lake topic reads the topic's configuration over a second connection while it
+/// still holds the first. Without this limit, a few requests that each write
+/// [`PRODUCE_CONCURRENCY`] partitions take the whole pool, and metadata, group,
+/// offset commit and fetch calls then wait for a connection until the pool wait
+/// ends. A quarter of the pool keeps the writes, and the second connection of
+/// each lake write, within half of it. A write that waits for a permit at the
+/// request's deadline is not started.
+fn produce_limit(max_size: usize) -> usize {
     (max_size / 4).max(1)
 }
 
@@ -4220,11 +4245,16 @@ impl Storage for Postgres {
     }
 
     /// Each write holds a pooled connection, so a request writes at most as many partitions at
-    /// once as the pool has connections, so that the writes of one request never wait for each
-    /// other's connection past the request's deadline. The writes of other requests still queue
-    /// on the pool.
+    /// once as the engine allows all requests together, see `produce_limit`, and at most
+    /// [`PRODUCE_CONCURRENCY`].
     fn produce_concurrency(&self) -> usize {
-        PRODUCE_CONCURRENCY.min(self.pool.status().max_size)
+        self.produce_per_request
+    }
+
+    /// The writes of every request take a permit from one pool, so that requests that each write
+    /// several partitions cannot hold more of the connection pool than a quarter of it.
+    fn produce_permits(&self) -> Option<Arc<Semaphore>> {
+        Some(Arc::clone(&self.produce_writes))
     }
 
     #[instrument(skip_all)]
@@ -6619,6 +6649,68 @@ pub(crate) mod tests {
 
         assert_eq!(0, second.available_permits());
         assert_eq!(taken.len(), 4);
+
+        Ok(())
+    }
+
+    /// Produce writes across every request take a quarter of the pool, and at
+    /// least one connection, and one request writes at most
+    /// [`PRODUCE_CONCURRENCY`] partitions at once, and never more than the
+    /// limit.
+    #[test]
+    fn produce_writes_take_a_quarter_of_the_pool() -> Result<()> {
+        for (pool_max_size, limit, per_request) in [(16, 4, 4), (32, 8, 4), (8, 2, 2), (2, 1, 1)] {
+            let storage =
+                Postgres::builder(&format!("{}?pool_max_size={pool_max_size}", *CONNECTION))?
+                    .cluster("sized")
+                    .node(0)
+                    .build();
+
+            assert_eq!(
+                per_request,
+                storage.produce_concurrency(),
+                "{pool_max_size}"
+            );
+            assert_eq!(
+                limit,
+                storage
+                    .produce_permits()
+                    .map(|permits| permits.available_permits())
+                    .expect("permits shared across requests"),
+                "{pool_max_size}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Two requests that ask the same engine, or a clone of it as each client
+    /// connection has, get the same permits, so the writes of both together
+    /// stay within the limit: with the default pool of 16, four requests that
+    /// each write four partitions hold 4 connections, not 16.
+    #[test]
+    fn produce_permits_are_shared_across_requests() -> Result<()> {
+        let storage = Postgres::builder(&CONNECTION)?
+            .cluster("shared")
+            .node(0)
+            .build();
+
+        let (first, second) = (
+            storage.produce_permits().expect("permits"),
+            storage.clone().produce_permits().expect("permits"),
+        );
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // the writes of one request take permits that another request then lacks
+        let taken = (0..storage.produce_concurrency())
+            .map(|_| Arc::clone(&first).try_acquire_owned())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::Message(error.to_string()))?;
+
+        assert_eq!(taken.len(), 4);
+        assert_eq!(0, second.available_permits());
+        assert!(Arc::clone(&second).try_acquire_owned().is_err());
 
         Ok(())
     }

@@ -116,9 +116,9 @@ use opentelemetry::{
 pub use produce::{
     AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
     PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
-    ProduceRequestValidationService, ProduceService, ProduceTopicService, SchemaValidationLayer,
-    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions,
-    TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,
+    ProduceRequestValidationService, ProduceService, ProduceTopic, ProduceTopicService,
+    SchemaValidationLayer, SchemaValidationService, StillRunning, StorePartitionService,
+    StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,
     UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic, inflate_produced,
     wait_for_detached_writes,
 };

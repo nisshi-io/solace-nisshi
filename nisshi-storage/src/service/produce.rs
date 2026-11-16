@@ -41,6 +41,7 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::Registry;
 use rama::{Layer as _, Service};
+use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 
 pub use self::{
@@ -50,8 +51,8 @@ pub use self::{
     detached::{StillRunning, wait_for_detached_writes},
     partition::PartitionProduce,
     request_validation::{
-        ProduceRequestValidationLayer, ProduceRequestValidationService, ValidatedProduceRequest,
-        ValidatedTopic,
+        ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceTopic,
+        ValidatedProduceRequest, ValidatedTopic,
     },
     schema::{SchemaValidationLayer, SchemaValidationService},
     store::StorePartitionService,
@@ -244,6 +245,7 @@ pub struct ProduceService<S> {
     budget: Arc<DecodedBytesBudget>,
     wait: Duration,
     concurrency: usize,
+    shared: Option<Arc<Semaphore>>,
 }
 
 impl<S> ApiKey for ProduceService<S> {
@@ -292,10 +294,11 @@ where
 
         // At least 1: `buffer_unordered(0)` never starts a future, so a request would hang.
         let concurrency = storage.produce_concurrency().max(1);
+        let shared = storage.produce_permits();
 
         Self {
-            concurrency,
-            ..Self::from_topics(ProduceTopicService::new(storage, partitions))
+            shared,
+            ..Self::from_topics(ProduceTopicService::new(storage, partitions), concurrency)
         }
     }
 
@@ -307,15 +310,17 @@ where
 }
 
 impl<S> ProduceService<S> {
-    /// Returns a service that serves each topic with `topics`, up to [`PRODUCE_CONCURRENCY`]
-    /// storage calls at once, and holds the decoded batches of a request against the process-wide
-    /// budget, for which a request waits at most [`decoded_budget::WAIT_TIMEOUT`].
-    fn from_topics(topics: S) -> Self {
+    /// Returns a service that serves each topic with `topics`, up to `concurrency` storage calls
+    /// of a request at once, and holds the decoded batches of a request against the process-wide
+    /// budget, for which a request waits at most [`decoded_budget::WAIT_TIMEOUT`]. A
+    /// `concurrency` below 1 counts as 1.
+    fn from_topics(topics: S, concurrency: usize) -> Self {
         Self {
             topics,
             budget: decoded_budget::produce(),
             wait: decoded_budget::WAIT_TIMEOUT,
-            concurrency: PRODUCE_CONCURRENCY,
+            concurrency: concurrency.max(1),
+            shared: None,
         }
     }
 
@@ -337,7 +342,7 @@ impl<S> ProduceService<S> {
 
 impl<S> ProduceService<S>
 where
-    S: Service<ValidatedTopic, Output = TopicProduceResponse, Error = Infallible>,
+    S: Service<ProduceTopic, Output = TopicProduceResponse, Error = Infallible>,
 {
     /// Returns this service behind the layers that give it a [`ValidatedProduceRequest`] and that
     /// close the connection of a failed `acks=0` request: [`AcksZeroLayer`] around
@@ -351,7 +356,7 @@ where
 
 impl<S> Service<ValidatedProduceRequest> for ProduceService<S>
 where
-    S: Service<ValidatedTopic, Output = TopicProduceResponse, Error = Infallible>,
+    S: Service<ProduceTopic, Output = TopicProduceResponse, Error = Infallible>,
 {
     type Output = ProduceResponse;
     type Error = Error;
@@ -364,7 +369,7 @@ where
 
         // One set of slots for the whole request, so that its topics together never make more
         // than `concurrency` storage calls at once.
-        let slots = Slots::new(self.concurrency);
+        let slots = Slots::new(self.concurrency, self.shared.clone());
 
         // If a request names a topic twice, the entries of that name are one group, and a group
         // is served one entry after another, so the writes to a partition keep the request's
@@ -375,11 +380,7 @@ where
                 let mut answered = Vec::with_capacity(group.len());
 
                 for (position, topic) in group {
-                    let topic = ValidatedTopic {
-                        admission: admission.clone(),
-                        slots: slots.clone(),
-                        ..topic
-                    };
+                    let topic = ProduceTopic::new(topic, admission.clone(), slots.clone());
 
                     let Ok(response) = self.topics.serve(topic).await;
                     answered.push((position, response));

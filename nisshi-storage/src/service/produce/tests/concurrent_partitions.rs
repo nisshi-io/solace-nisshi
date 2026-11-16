@@ -37,7 +37,7 @@ use tokio::{
 
 use super::super::{
     PRODUCE_CONCURRENCY,
-    deadline::{NOT_STARTED, WRITING},
+    deadline::{NOT_STARTED, SLOT_WAIT, WRITING},
 };
 use crate::{
     Error, ProduceService, Result,
@@ -458,7 +458,7 @@ async fn a_failed_partition_leaves_the_others_their_answers() -> Result<()> {
 
 /// The deadline answers the partitions that it reached as it did: six partitions over a stalled
 /// store answer at 20 s, the four whose writes run as writing, and the two that got no slot as
-/// not started, which never reached storage.
+/// not started: their group began after the earlier ones had answered, so none waited for a slot.
 #[tokio::test(start_paused = true)]
 async fn the_deadline_answers_the_partitions_it_reached_as_before() -> Result<()> {
     let (storage, _gate) = stalled();
@@ -525,6 +525,71 @@ async fn a_storage_that_answers_zero_concurrency_is_served_as_one() -> Result<()
 
     assert_eq!(vec![ErrorCode::None; 2], codes(&responses)?);
     assert_eq!(vec![0, 1], produced_partitions(&storage));
+
+    Ok(())
+}
+
+/// A storage that shares two permits across requests gets at most two writes at once from two
+/// requests that each have four partitions: the pool bounds the requests together, not each
+/// request alone.
+#[tokio::test(start_paused = true)]
+async fn the_writes_of_two_requests_share_the_storage_permits() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(2));
+    let storage = slow().with_produce_permits(Arc::clone(&permits));
+    let service = service(&storage);
+    let started_at = Instant::now();
+
+    let (first, second) = tokio::join!(
+        serve(&service, acked(&[0, 1, 2, 3])?),
+        serve(&service, acked(&[4, 5, 6, 7])?),
+    );
+
+    assert_eq!(vec![ErrorCode::None; 4], codes(&first?)?);
+    assert_eq!(vec![ErrorCode::None; 4], codes(&second?)?);
+
+    // Eight writes of one second, two at a time.
+    assert_eq!(4 * WRITE, started_at.elapsed());
+    assert_eq!(2, permits.available_permits());
+
+    Ok(())
+}
+
+/// A partition that waits for a permit that the storage shares at the deadline answers
+/// `REQUEST_TIMED_OUT` as a slot wait, and storage never gets its write.
+#[tokio::test(start_paused = true)]
+async fn a_partition_without_a_shared_permit_at_the_deadline_is_a_slot_wait() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(1));
+    let (storage, _gate) = stalled();
+    let storage = storage.with_produce_permits(permits);
+    let service = service(&storage);
+
+    let responses = serve(&service, acked(&[0, 1])?).await?;
+
+    assert_eq!(vec![ErrorCode::RequestTimedOut; 2], codes(&responses)?);
+    assert_matches!(
+        responses
+            .iter()
+            .map(|response| response.error_message.as_deref())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Some(WRITING), Some(SLOT_WAIT)]
+    );
+
+    Ok(())
+}
+
+/// The shared permit of a write that the deadline left running goes back with its request's
+/// answer, so a stalled write does not hold the pool of the storage.
+#[tokio::test(start_paused = true)]
+async fn a_write_left_running_at_the_deadline_gives_its_permit_back() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(2));
+    let (storage, _gate) = stalled();
+    let storage = storage.with_produce_permits(Arc::clone(&permits));
+    let service = service(&storage);
+
+    _ = serve(&service, acked(&[0, 1])?).await?;
+
+    assert_eq!(2, permits.available_permits());
 
     Ok(())
 }

@@ -277,15 +277,15 @@ pub use service::{
     InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
     MetadataService, OutcomeSender, PRODUCE_CONCURRENCY, PartitionProduce,
-    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService, ProduceTopic,
     ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
     RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
-    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions,
-    TimestampLayer, TimestampService, TopicConfiguration, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer,
-    UnknownPartitionService, ValidatedCreateTopicsRequest, ValidatedFetchRequest,
-    ValidatedProduceRequest, ValidatedTopic, bounded_channel, describe_groups_response,
-    inflate_produced, list_groups_response, wait_for_detached_writes,
+    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions, TimestampLayer,
+    TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer, UnknownPartitionService,
+    ValidatedCreateTopicsRequest, ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic,
+    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    wait_for_detached_writes,
 };
 
 #[cfg(feature = "dynostore")]
@@ -2269,6 +2269,20 @@ pub trait Storage: Debug + Send + Sync + 'static {
         PRODUCE_CONCURRENCY
     }
 
+    /// Returns the permits that the writes of every Produce request on this storage share, if the
+    /// storage limits them. The default is `None`, no limit across requests.
+    ///
+    /// A request writes at most [`Storage::produce_concurrency`] partitions at once, and each
+    /// write also takes a permit from this pool for as long as it runs. A pooled engine whose
+    /// writes each hold a connection uses it to keep the writes of all requests together from
+    /// taking the whole pool, as [`Storage::delete_records_concurrency`] does for DeleteRecords.
+    /// A write that waits for a permit past the request's deadline is not started, and its
+    /// partition answers `REQUEST_TIMED_OUT`. A storage that wraps another answers what the
+    /// storage it wraps answers.
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        None
+    }
+
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
     /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
@@ -2590,6 +2604,10 @@ where
         self.as_ref().produce_concurrency()
     }
 
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.as_ref().produce_permits()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2908,6 +2926,10 @@ where
 
     fn produce_concurrency(&self) -> usize {
         self.as_ref().produce_concurrency()
+    }
+
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.as_ref().produce_permits()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
