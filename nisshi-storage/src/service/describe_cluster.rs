@@ -131,8 +131,8 @@ where
 
 /// Logs a describe that failed in `operation` with `error` and was answered with `response`.
 ///
-/// `KAFKA_STORAGE_ERROR` answers a failure that a retry may clear, which a client retries as
-/// often as it likes. That answer logs at `warn` at most once in each interval for each
+/// `KAFKA_STORAGE_ERROR` answers a failure that a retry may clear, which an application retries
+/// as often as it likes. That answer logs at `warn` at most once in each interval for each
 /// operation, and at debug after that. Any other code is a failure that a retry does not fix, so
 /// it logs at error each time.
 fn log_storage_failure(
