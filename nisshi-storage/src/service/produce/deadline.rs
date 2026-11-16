@@ -56,8 +56,7 @@ const WRITING: &str = "the request's deadline passed while the broker wrote this
                        write may still complete, retry it";
 
 /// The message of a partition that the broker did not start because an earlier write to it runs.
-const IN_FLIGHT: &str =
-    "the broker still runs an earlier write to this partition, retry the request";
+const IN_FLIGHT: &str = "the broker still runs an earlier write from this producer to this partition, retry the request";
 
 static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -78,8 +77,8 @@ pub(super) enum Stage {
     BudgetWait,
     /// The storage write had started, and the broker answered without its result.
     Writing,
-    /// The broker did not start a write, because an earlier write to the partition that its
-    /// request left running has not ended.
+    /// The broker did not start a write, because an earlier write from the same idempotent
+    /// producer to the partition that its request left running has not ended.
     InFlight,
 }
 

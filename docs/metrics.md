@@ -44,9 +44,9 @@ A Produce request that waits for an answer has a deadline, see the Produce row o
   when the deadline passed before the broker started a write, `budget_wait` when it
   passed while the partition waited for the decoded-batch budget (see
   [Storage](storage.md)), `writing` when it answered while a write ran, and `in_flight`
-  when it did not start a write because an earlier write to the partition, left running
-  at a deadline, had not ended.
+  when it did not start a write because an earlier write from the same idempotent
+  producer to the partition, left running at a deadline, had not ended.
 - `nisshi_produce_detached_writes` is the number of writes that run on after the broker
   answered their request at the deadline. A value that stays above zero means a
-  storage backend call that does not end, and the partition it writes takes no other
-  write from that broker until it does.
+  storage backend call that does not end, and that broker takes no idempotent write
+  from the same producer to the partition until it does.

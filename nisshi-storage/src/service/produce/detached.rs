@@ -34,18 +34,23 @@ static DETACHED_WRITES: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 /// broker builds a produce service for each connection, and a retry usually arrives on a new one.
 static PROCESS: LazyLock<Detached> = LazyLock::new(Detached::default);
 
-/// The partitions that have a write which the broker left running when it answered the write's
-/// request at its deadline, each with how many such writes it has.
+/// A partition and the producer that wrote to it. A non-idempotent batch has the producer ID -1.
+type Key = (Topition, i64);
+
+/// The writes that the broker left running when it answered their request at its deadline, for
+/// each partition and producer, with how many such writes each has.
 ///
-/// A produce to one of these partitions is not started. The storage engine answers the retry of
-/// an idempotent batch as a duplicate only after the first write advanced the producer's
-/// sequence, so a retry that starts while the first write runs is stored a second time, and a
-/// later batch could be stored ahead of the one that still runs. The set is the process's, so
-/// it covers the requests that this process serves, on any connection, and not a retry that reaches
-/// another node.
+/// An idempotent produce from a producer to a partition where that producer has such a write is
+/// not started. The storage engine answers the retry of an idempotent batch as a duplicate only
+/// after the first write advanced the producer's sequence, so a retry that starts while the first
+/// write runs is stored a second time, and a later batch from the producer could be stored ahead
+/// of the one that still runs. Another producer, and a non-idempotent batch, have no sequence to
+/// protect and are not held. A client chooses its `timeout_ms`, and it must not hold the
+/// partition for the others with it. The set is the process's, so it covers the requests that
+/// this process serves, on any connection, and not a retry that reaches another node.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Detached {
-    writes: Arc<Mutex<HashMap<Topition, usize>>>,
+    writes: Arc<Mutex<HashMap<Key, usize>>>,
 }
 
 impl Detached {
@@ -54,43 +59,46 @@ impl Detached {
         PROCESS.clone()
     }
 
-    /// Returns whether a write that the deadline left running is still in flight for `topition`.
-    pub(super) fn contains(&self, topition: &Topition) -> bool {
-        self.writes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(topition)
+    /// Returns whether a write that the deadline left running is still in flight for `topition`
+    /// from `producer_id`. A non-idempotent batch (`producer_id` below 0) is never held.
+    pub(super) fn contains(&self, topition: &Topition, producer_id: i64) -> bool {
+        producer_id >= 0
+            && self
+                .writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&(topition.clone(), producer_id))
     }
 
-    /// Returns the tracker of a write to `topition`, which starts as a write that its request
-    /// still waits for.
-    pub(super) fn track(&self, topition: Topition) -> Write {
+    /// Returns the tracker of a write to `topition` from `producer_id`, which starts as a write
+    /// that its request still waits for.
+    pub(super) fn track(&self, topition: Topition, producer_id: i64) -> Write {
         Write {
             detached: self.clone(),
-            topition,
+            key: (topition, producer_id),
             state: Mutex::new(State::Running),
         }
     }
 
-    fn add(&self, topition: &Topition) {
+    fn add(&self, key: &Key) {
         *self
             .writes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(topition.clone())
+            .entry(key.clone())
             .or_default() += 1;
 
         DETACHED_WRITES.add(1, &[]);
     }
 
-    fn remove(&self, topition: &Topition) {
+    fn remove(&self, key: &Key) {
         let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
 
-        if let Some(count) = writes.get_mut(topition) {
+        if let Some(count) = writes.get_mut(key) {
             *count -= 1;
 
             if *count == 0 {
-                _ = writes.remove(topition);
+                _ = writes.remove(key);
             }
         }
 
@@ -113,7 +121,7 @@ enum State {
 #[derive(Debug)]
 pub(super) struct Write {
     detached: Detached,
-    topition: Topition,
+    key: Key,
     state: Mutex<State>,
 }
 
@@ -132,7 +140,7 @@ impl Write {
         }
 
         *state = State::Detached;
-        self.detached.add(&self.topition);
+        self.detached.add(&self.key);
 
         true
     }
@@ -148,7 +156,7 @@ impl Write {
         let mut state = self.state();
 
         if *state == State::Detached {
-            self.detached.remove(&self.topition);
+            self.detached.remove(&self.key);
         }
 
         *state = State::Finished;

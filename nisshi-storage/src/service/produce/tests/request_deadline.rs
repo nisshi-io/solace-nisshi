@@ -57,13 +57,17 @@ const LONG: i32 = 600_000;
 /// How long a client with default settings waits for a response before it closes the connection.
 const CLIENT_GIVES_UP: Duration = Duration::from_secs(30);
 
-fn batch() -> Result<deflated::Batch> {
+/// A batch from the producer `producer_id`. The ID -1 is a batch that is not idempotent.
+fn batch(producer_id: i64) -> Result<deflated::Batch> {
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
 
     inflated::Batch::builder()
         .base_timestamp(now)
         .max_timestamp(now)
         .last_offset_delta(0)
+        .producer_id(producer_id)
+        .producer_epoch(if producer_id < 0 { -1 } else { 0 })
+        .base_sequence(if producer_id < 0 { -1 } else { 0 })
         .record(
             Record::builder()
                 .value(Bytes::from_static(b"value").into())
@@ -74,15 +78,20 @@ fn batch() -> Result<deflated::Batch> {
         .map_err(Into::into)
 }
 
-/// A request with one batch for each of `partitions`, in order.
-fn request(partitions: &[i32], acks: Ack, timeout_ms: i32) -> Result<RequestInput<ProduceRequest>> {
+/// A request with one batch for each of `partitions`, in order, from the producer `producer_id`.
+fn request_from(
+    producer_id: i64,
+    partitions: &[i32],
+    acks: Ack,
+    timeout_ms: i32,
+) -> Result<RequestInput<ProduceRequest>> {
     let partitions = partitions
         .iter()
         .map(|index| {
             Ok(PartitionProduceData::default()
                 .index(*index)
                 .records(Some(Frame {
-                    batches: vec![batch()?],
+                    batches: vec![batch(producer_id)?],
                 })))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -99,6 +108,17 @@ fn request(partitions: &[i32], acks: Ack, timeout_ms: i32) -> Result<RequestInpu
             )),
         extensions: Extensions::default(),
     })
+}
+
+/// A request with one batch for each of `partitions`, in order, that is not idempotent.
+fn request(partitions: &[i32], acks: Ack, timeout_ms: i32) -> Result<RequestInput<ProduceRequest>> {
+    request_from(-1, partitions, acks, timeout_ms)
+}
+
+/// A request for `partitions` from the idempotent producer `producer_id` that waits for the
+/// broker's answer, with a `timeout_ms` that no test reaches.
+fn acked_by(producer_id: i64, partitions: &[i32]) -> Result<RequestInput<ProduceRequest>> {
+    request_from(producer_id, partitions, Ack::Leader, LONG)
 }
 
 /// A request for `partitions` that waits for the broker's answer, with a `timeout_ms` that no
@@ -267,17 +287,17 @@ async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() 
     let connection = service_sharing(&storage, detached.clone());
     let other_connection = service_sharing(&storage, detached.clone());
 
-    let first = serve(&connection, acked(&[0])?).await?;
+    let first = serve(&connection, acked_by(7, &[0])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&first)?);
 
     let retried_at = Instant::now();
-    let retry = serve(&other_connection, acked(&[0])?).await?;
+    let retry = serve(&other_connection, acked_by(7, &[0])?).await?;
 
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&retry)?);
     assert_eq!(Duration::ZERO, retried_at.elapsed());
 
-    // A partition that has no write in flight is not refused.
-    let other = serve(&other_connection, acked(&[1])?).await?;
+    // A partition that the producer has no write in flight to is not refused.
+    let other = serve(&other_connection, acked_by(7, &[1])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&other)?);
 
     gate.add_permits(3);
@@ -286,9 +306,48 @@ async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() 
     // One write for partition 0, and one for partition 1.
     assert_eq!(vec![0, 1], produced_partitions(&storage));
 
-    let after = serve(&other_connection, acked(&[0])?).await?;
+    let after = serve(&other_connection, acked_by(7, &[0])?).await?;
     assert_eq!(vec![ErrorCode::None], codes(&after)?);
     assert_eq!(vec![0, 1, 0], produced_partitions(&storage));
+
+    Ok(())
+}
+
+/// A produce from another producer, and a batch that is not idempotent, are not refused while
+/// one producer's write to the partition is in flight. A client that detaches its own writes with
+/// a short `timeout_ms` must not hold the partition for the others.
+#[tokio::test(start_paused = true)]
+async fn another_producer_and_a_non_idempotent_batch_are_not_refused_by_a_write_in_flight()
+-> Result<()> {
+    let (storage, gate) = stalled();
+    let detached = Detached::default();
+    let service = service_sharing(&storage, detached.clone());
+
+    let first = serve(&service, acked_by(7, &[0])?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&first)?);
+
+    // The same producer is refused without a write, as in the retry test.
+    let refused = serve(&service, acked_by(7, &[0])?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&refused)?);
+    assert_eq!(1, storage.parked());
+
+    // Producer 8 and a batch with no producer ID each start a write, and each answers at its own
+    // deadline, not at once.
+    let other_started_at = Instant::now();
+    let other = serve(&service, acked_by(8, &[0])?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&other)?);
+    assert_eq!(Duration::from_secs(20), other_started_at.elapsed());
+
+    let plain_started_at = Instant::now();
+    let plain = serve(&service, acked(&[0])?).await?;
+    assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&plain)?);
+    assert_eq!(Duration::from_secs(20), plain_started_at.elapsed());
+    assert_eq!(3, storage.parked());
+
+    gate.add_permits(3);
+    settle().await;
+
+    assert_eq!(vec![0, 0, 0], produced_partitions(&storage));
 
     Ok(())
 }
@@ -560,11 +619,11 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     let (storage, gate) = stalled();
     let service = service(&storage);
 
-    let responses = serve(&service, acked(&[0, 1, 2])?).await?;
+    let responses = serve(&service, acked_by(7, &[0, 1, 2])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut; 3], codes(&responses)?);
 
     // A retry meets the write that the first request left running.
-    let retry = serve(&service, acked(&[0])?).await?;
+    let retry = serve(&service, acked_by(7, &[0])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&retry)?);
 
     let mut exceeded = recorded(&provider, &exporter, "nisshi_produce_deadline_exceeded");

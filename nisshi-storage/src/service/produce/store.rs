@@ -35,9 +35,10 @@ use super::{
 };
 use crate::{Error, Result, Storage, Topition};
 
-/// How long past the request's deadline a write runs before it is logged as stuck. A partition
-/// whose write never ends takes no writes from this process until it restarts, so the engine
-/// must bound its calls, and this line tells an operator which write did not.
+/// How long past the request's deadline a write runs before it is logged as stuck. A producer
+/// whose write to a partition never ends gets no further idempotent write to it through this
+/// process until it restarts, so the engine must bound its calls, and this line tells an
+/// operator which write did not.
 const STUCK_AFTER: Duration = Duration::from_secs(60);
 
 /// A [`Service`] using its [`Storage`] taking a [`PartitionProduce`] of a validated batch and its
@@ -102,7 +103,7 @@ where
         batch: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Waited {
-        let write = Arc::new(self.detached.track(topition.clone()));
+        let write = Arc::new(self.detached.track(topition.clone(), batch.producer_id));
         let (sender, receiver) = oneshot::channel();
 
         let task = {
@@ -195,7 +196,7 @@ where
                 ?topition,
                 stuck_after = ?STUCK_AFTER,
                 "a produce write still runs long after its request's deadline, and takes no \
-                 other write to its partition until it ends"
+                 other idempotent write from its producer to its partition until it ends"
             );
 
             write.await
@@ -257,7 +258,7 @@ where
                     return Ok(Deadline::timed_out(Stage::NotStarted, request.index));
                 }
 
-                if self.detached.contains(&topition) {
+                if self.detached.contains(&topition, producer_id) {
                     return Ok(Deadline::timed_out(Stage::InFlight, request.index));
                 }
 
