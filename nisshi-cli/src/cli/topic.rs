@@ -14,7 +14,7 @@
 
 use std::{collections::HashMap, error::Error, str::FromStr};
 
-use crate::Result;
+use crate::{Result, env_var_exp_parser::UrlParser};
 use clap::Subcommand;
 use nisshi_sans_io::ErrorCode;
 use nisshi_topic::{Format, Topic};
@@ -27,7 +27,7 @@ pub(super) enum Command {
     /// Create a topic
     Create {
         /// Broker URL
-        #[arg(long, default_value = DEFAULT_BROKER)]
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
         broker: Url,
 
         /// The name of the topic to create
@@ -56,7 +56,7 @@ pub(super) enum Command {
     /// Delete an existing topic
     Delete {
         /// Broker URL
-        #[arg(long, default_value = DEFAULT_BROKER)]
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
         broker: Url,
 
         /// The name of the topic to delete
@@ -73,7 +73,7 @@ pub(super) enum Command {
     /// List existing topics
     List {
         /// Broker URL
-        #[arg(long, default_value = DEFAULT_BROKER)]
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
         broker: Url,
 
         /// Print a table of topics and partition counts, or the broker's metadata as JSON

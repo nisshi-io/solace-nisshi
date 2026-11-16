@@ -13,16 +13,22 @@
 // limitations under the License.
 
 //! Tests that the broker uses the storage URL it is given, or stops at startup with a message that
-//! names the bad value. A broker that ignores a value runs with a setting the user didn't choose,
-//! and one that panics gives the user only a backtrace.
+//! names the bad value. The exception is a storage URL that doesn't parse: its value can carry a
+//! password, so the message names the option and leaves the value out. A broker that ignores a
+//! value runs with a setting the user didn't choose, and one that panics gives the user only a
+//! backtrace.
 
 use nisshi_smoke_test::{Broker, LaunchOptions, StorageUrl, settings};
 
-/// A storage URL that doesn't parse must stop the broker with a message that names it.
+/// A storage URL that doesn't parse must stop the broker with a message that names the option and
+/// leaves the value out, because the value can carry a password.
 #[test]
 fn unparsable_storage_url_stops_the_broker() {
-    Broker::launch_expecting_refusal(LaunchOptions::new(StorageUrl::as_given("not a url")))
-        .assert_error_names("not a url");
+    let refused =
+        Broker::launch_expecting_refusal(LaunchOptions::new(StorageUrl::as_given("not a url")));
+
+    refused.assert_error_names("--storage-engine");
+    refused.assert_output_omits("not a url");
 }
 
 /// A `maintenance_interval` that doesn't parse must stop the broker with a message that names it,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Result;
+use crate::{Result, env_var_exp_parser::UrlParser};
 use bytes::{Bytes, BytesMut};
 use clap::{Subcommand, ValueEnum};
 use nisshi_client::{Client, ConnectionManager};
@@ -34,7 +34,7 @@ pub(super) enum Command {
     /// Create a user
     Create {
         /// Broker URL
-        #[arg(long, default_value = DEFAULT_BROKER)]
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
         broker: Url,
 
         /// The name of the user
@@ -63,7 +63,7 @@ pub(super) enum Command {
     /// Delete a user
     Delete {
         /// Broker URL
-        #[arg(long, default_value = DEFAULT_BROKER)]
+        #[arg(long, default_value = DEFAULT_BROKER, value_parser = UrlParser)]
         broker: Url,
 
         /// The name of the user

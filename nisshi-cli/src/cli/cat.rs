@@ -17,7 +17,7 @@ use super::{
     client_security::ClientSecurity,
     output::{JsonOnly, Output},
 };
-use crate::{EnvVarExp, Result};
+use crate::{EnvVarExp, Result, env_var_exp_parser::UrlParser};
 use clap::Subcommand;
 use nisshi_cat::Cat;
 use nisshi_sans_io::ErrorCode;
@@ -28,7 +28,7 @@ pub(super) enum Command {
     /// Produce Avro/JSON/Protobuf messages to a topic
     Produce {
         /// The URL of the broker to produce messages into
-        #[arg(long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
+        #[arg(hide_env_values = true, long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL", value_parser = UrlParser)]
         broker: Url,
 
         /// The topic to produce messages into
@@ -44,7 +44,7 @@ pub(super) enum Command {
         partition: i32,
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
-        #[arg(long, env = "SCHEMA_REGISTRY")]
+        #[arg(hide_env_values = true, long, env = "SCHEMA_REGISTRY")]
         schema_registry: Option<EnvVarExp<Url>>,
 
         /// Print no confirmation on success (errors still print). With --output json the
@@ -63,7 +63,7 @@ pub(super) enum Command {
     /// Consume Avro/JSON/Protobuf messages from a topic
     Consume {
         /// The URL of the broker to consume messages from
-        #[arg(long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
+        #[arg(hide_env_values = true, long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL", value_parser = UrlParser)]
         broker: Url,
 
         /// The topic to consume messages from
@@ -75,7 +75,7 @@ pub(super) enum Command {
         partition: i32,
 
         /// Schema registry examples are: file://./etc/schema or s3://nisshi/, containing: topic.json, topic.proto or topic.avsc
-        #[arg(long, env = "SCHEMA_REGISTRY")]
+        #[arg(hide_env_values = true, long, env = "SCHEMA_REGISTRY")]
         schema_registry: Option<EnvVarExp<Url>>,
 
         /// The maximum time in milliseconds to wait for a message

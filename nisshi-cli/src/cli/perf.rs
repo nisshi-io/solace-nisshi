@@ -69,7 +69,7 @@ pub(super) struct Arg {
     command: Command,
 
     /// The URL of the broker
-    #[arg(long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
+    #[arg(hide_env_values = true, long, default_value = DEFAULT_BROKER, env = "ADVERTISED_LISTENER_URL")]
     broker: EnvVarExp<Url>,
 
     /// The topic to generate messages into

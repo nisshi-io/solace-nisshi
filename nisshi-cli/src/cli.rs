@@ -280,6 +280,7 @@ mod tests {
     use super::*;
     use crate::EnvVarExp;
     use clap::CommandFactory;
+    use std::any::TypeId;
     use url::Url;
 
     fn long_help(tool: &str) -> String {
@@ -475,6 +476,64 @@ mod tests {
 
         let cli = Cli::command();
         check(&cli, &[], cli.get_name());
+    }
+
+    /// A URL option can hold a password, so it must hide its environment value in `--help` and
+    /// keep its value out of a parse error. Walks every command, so an option added later is
+    /// covered. An option is a URL option when it is `--broker` or its value is a `Url`.
+    #[test]
+    fn every_url_option_hides_its_value() {
+        const SECRET: &str = "s3cr3t-hunter2";
+        let typo = format!("postgres://user:{SECRET}@ho st/db");
+
+        fn check(command: &clap::Command, path: &str, typo: &str, urls: &mut usize) {
+            for arg in command.get_arguments() {
+                let id = arg.get_value_parser().type_id();
+                let is_url = arg.get_long() == Some("broker")
+                    || id == TypeId::of::<Url>()
+                    || id == TypeId::of::<EnvVarExp<Url>>();
+                if !is_url {
+                    continue;
+                }
+                *urls += 1;
+                if arg.get_env().is_some() {
+                    assert!(
+                        arg.is_hide_env_values_set(),
+                        "`{path}` shows the environment value of `--{}` in --help",
+                        arg.get_id(),
+                    );
+                }
+                // clap offers no public way to run one argument's parser, so parse a command
+                // line with only this option. The value is checked before a required argument
+                // or subcommand is missed.
+                let long = arg.get_long().expect("a URL option has a long name");
+                let err = command
+                    .clone()
+                    .try_get_matches_from(["nisshi", &format!("--{long}"), typo])
+                    .expect_err("a space in the host does not parse");
+                assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{err}");
+                let message = err.to_string();
+                assert!(
+                    !message.contains(SECRET) && !message.contains("ho st"),
+                    "`{path}` prints the value of `--{}` in its parse error: {message}",
+                    arg.get_id(),
+                );
+            }
+            for subcommand in command.get_subcommands() {
+                check(
+                    subcommand,
+                    &format!("{path} {}", subcommand.get_name()),
+                    typo,
+                    urls,
+                );
+            }
+        }
+
+        let cli = Cli::command();
+        let mut urls = 0;
+        check(&cli, cli.get_name(), &typo, &mut urls);
+        // Fails if the walk stops finding options, instead of passing on nothing.
+        assert!(urls >= 7, "found only {urls} URL options");
     }
 
     #[test]
