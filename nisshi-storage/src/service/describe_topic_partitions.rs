@@ -14,7 +14,8 @@
 
 use nisshi_sans_io::{
     ApiKey, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse, ErrorCode,
-    RequestInput, topic::is_valid_topic_name,
+    RequestInput,
+    topic::{is_internal, is_valid_topic_name},
 };
 use rama::Service;
 use tracing::instrument;
@@ -121,6 +122,17 @@ where
                         } else {
                             topic
                         }
+                    })
+                    .map(|topic| {
+                        // Kafka answers `is_internal` from the name alone, for a known topic
+                        // ([`known topic`]) and an unknown one ([`unknown topic`]), so the service
+                        // sets it here, on every row including one rewritten above, and no engine
+                        // has to know the names.
+                        //
+                        // [`known topic`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/metadata/KRaftMetadataCache.scala#L300
+                        // [`unknown topic`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/metadata/KRaftMetadataCache.scala#L326
+                        let internal = topic.name.as_deref().is_some_and(is_internal);
+                        topic.is_internal(internal)
                     })
                     .collect();
 

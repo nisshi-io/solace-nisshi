@@ -12,7 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nisshi_sans_io::topic::{has_collision_chars, is_valid_topic_name, unify_collision_chars};
+use nisshi_sans_io::topic::{
+    has_collision_chars, is_internal, is_valid_topic_name, unify_collision_chars,
+};
+
+#[test]
+fn internal_topics_are_the_three_kafka_names() {
+    assert!(is_internal("__consumer_offsets"));
+    assert!(is_internal("__transaction_state"));
+    assert!(is_internal("__share_group_state"));
+}
+
+#[test]
+fn other_names_are_not_internal() {
+    assert!(!is_internal(""));
+    assert!(!is_internal("orders"));
+    assert!(!is_internal("__cluster_metadata"));
+
+    // Kafka compares the whole name, so a prefix, a suffix or a case change is a different
+    // topic.
+    assert!(!is_internal("consumer_offsets"));
+    assert!(!is_internal("_consumer_offsets"));
+    assert!(!is_internal("__consumer_offsets2"));
+    assert!(!is_internal("__Consumer_Offsets"));
+}
 
 #[test]
 fn accepts_legal_names() {
