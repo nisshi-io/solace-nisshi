@@ -301,7 +301,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
                 if fault_this_batch {
                     object_store.schedule_record_write(true);
 
-                    let response1 = future::block_on(
+                    let response1 = block_on_tokio(
                         produce.serve(RequestInput {
                             request: ProduceRequest::default()
                                 .transactional_id(None)
@@ -337,7 +337,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
                     // ambiguous error, using the same base_sequence.
                     object_store.schedule_record_write(false);
 
-                    let response2 = future::block_on(
+                    let response2 = block_on_tokio(
                         produce.serve(RequestInput {
                             request: ProduceRequest::default()
                                 .transactional_id(None)
@@ -375,7 +375,7 @@ fn record_write_failure_never_causes_silent_data_loss() {
 
                     client_believes_durable += 1;
                 } else {
-                    let response = future::block_on(
+                    let response = block_on_tokio(
                         produce.serve(RequestInput {
                             request: ProduceRequest::default()
                                 .transactional_id(None)

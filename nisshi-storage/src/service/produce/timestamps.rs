@@ -15,6 +15,7 @@
 use std::{
     convert::Infallible,
     fmt::{self, Debug},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,17 +25,23 @@ use nisshi_sans_io::{
     record::{deflated, inflated},
 };
 use rama::{Layer, Service};
+use tokio::time::Instant;
 use tracing::{error, instrument, warn};
 
 use super::{
     admission::{BUDGET_SPENT, decoded_upper_bound},
     batch_validation::corrupt_batch,
+    deadline::{Deadline, Stage},
     inflate_produced,
     partition::PartitionProduce,
     rejection::{Rejection, undecodable_batch},
     response,
 };
-use crate::{Result, decoded_budget::Exhausted, offload};
+use crate::{
+    Result,
+    decoded_budget::{Exhausted, record_wait},
+    offload,
+};
 
 /// Kafka's wire sentinel for "no timestamp", also the fold-start value
 /// `LogValidator` uses for a batch's running maximum.
@@ -388,10 +395,32 @@ where
         // The reservation is held until the inner service returns, so that the decoded batch is
         // counted while storage holds it, and dropped on every other path out of this function. A
         // partition that waits here holds only its compressed batch.
+        //
+        // The wait ends at the request's deadline if that comes first. Nothing was written, so
+        // the partition answers as one that was not started, with a stage of its own and a
+        // warning of its own, so that an operator sees budget back-pressure. The cut-off drops the
+        // wait, so the wait is recorded here.
         let compression = Compression::try_from(batch.attributes).unwrap_or_default();
-        let mut reservation = match request.admission.reserve(decoded_upper_bound(&batch)).await {
-            Ok(reservation) => reservation,
-            Err(Exhausted { requested, waited }) => {
+        let waiting = Instant::now();
+        let reserved = request
+            .deadline
+            .bound(request.admission.reserve(decoded_upper_bound(&batch)))
+            .await;
+
+        let mut reservation = match reserved {
+            Err(_) => {
+                record_wait(waiting.elapsed());
+                warn!(
+                    topic = request.topic,
+                    partition = request.index,
+                    "the request's deadline ended the wait for the decoded-batch budget, \
+                     answering REQUEST_TIMED_OUT"
+                );
+
+                return Ok(Deadline::timed_out(Stage::BudgetWait, request.index));
+            }
+            Ok(Ok(reservation)) => reservation,
+            Ok(Err(Exhausted { requested, waited })) => {
                 warn!(
                     topic = request.topic,
                     partition = request.index,
@@ -420,8 +449,16 @@ where
                         .unwrap_or_else(|_| reservation.bytes()),
                 );
 
+                // A write that the deadline leaves running keeps the bytes until it ends, so the
+                // reservation is shared with it.
+                let reservation = Arc::new(reservation);
+
                 self.inner
-                    .serve(request.with_batch((batch, inflated)))
+                    .serve(
+                        request
+                            .with_reservation(Arc::clone(&reservation))
+                            .with_batch((batch, inflated)),
+                    )
                     .await
             }
 

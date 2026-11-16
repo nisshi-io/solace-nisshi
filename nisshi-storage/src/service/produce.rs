@@ -15,6 +15,8 @@
 mod acks_zero;
 mod admission;
 mod batch_validation;
+mod deadline;
+mod detached;
 mod partition;
 mod rejection;
 mod request_validation;
@@ -38,6 +40,7 @@ use nisshi_schema::Registry;
 use rama::{Layer as _, Service};
 use tracing::{debug, instrument};
 
+use self::detached::Detached;
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
     admission::Admission,
@@ -247,15 +250,30 @@ where
     /// schema of its topic in `schemas`, the registry that holds the schema of each topic, unless
     /// the topic's `schema.validation` is `false`.
     pub fn with_schemas(storage: G, schemas: Option<Registry>) -> Self {
+        Self::with_detached(storage, schemas, Detached::process())
+    }
+
+    /// Returns a service like [`ProduceService::with_schemas`] that tracks the writes that the
+    /// deadline leaves running in `detached`, not in the set of the process.
+    fn with_detached(storage: G, schemas: Option<Registry>, detached: Detached) -> Self {
         let partitions = (
             UnknownPartitionLayer::new(storage.clone()),
             BatchValidationLayer::new(),
             TimestampLayer::new(),
             SchemaValidationLayer::new(schemas),
         )
-            .into_layer(StorePartitionService::new(storage.clone()));
+            .into_layer(StorePartitionService::with_detached(
+                storage.clone(),
+                detached,
+            ));
 
         Self::from_topics(ProduceTopicService::new(storage, partitions))
+    }
+
+    /// Returns a service like [`ProduceService::new`] over `detached`, a set of its own.
+    #[cfg(test)]
+    fn new_sharing(storage: G, detached: Detached) -> Self {
+        Self::with_detached(storage, None, detached)
     }
 }
 

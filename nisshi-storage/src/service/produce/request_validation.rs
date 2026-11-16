@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::{admission::Admission, response};
+use super::{admission::Admission, deadline::Deadline, response};
 use crate::{Error, Result};
 
 /// A [`ProduceRequest`] whose `acks` is valid.
@@ -43,6 +43,7 @@ pub struct ValidatedTopic {
     pub(super) transaction_id: Option<String>,
     pub(super) partitions: Vec<PartitionProduceData>,
     pub(super) admission: Admission,
+    pub(super) deadline: Deadline,
 }
 
 /// A [`Layer`] that gives its inner [`Service`] a [`ValidatedProduceRequest`], and answers a
@@ -101,7 +102,7 @@ where
         // still fails, only with another error code.
         //
         // [`ReplicaManager.appendRecords`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L762-L765
-        if Ack::try_from(request.acks).is_err() {
+        let Ok(acks) = Ack::try_from(request.acks) else {
             warn!(
                 acks = request.acks,
                 topics = topics.len(),
@@ -114,7 +115,11 @@ where
                     .map(|topic| response::topic_error(topic, ErrorCode::InvalidRequiredAcks))
                     .collect(),
             ));
-        }
+        };
+
+        // One deadline for the whole request, so that its partitions share the time. It starts
+        // when the request reaches the service, because the client's wait started before that.
+        let deadline = Deadline::new(acks, request.timeout_ms);
 
         self.inner
             .serve(ValidatedProduceRequest {
@@ -125,6 +130,7 @@ where
                         transaction_id: request.transactional_id.clone(),
                         partitions: topic.partition_data.unwrap_or_default(),
                         admission: Admission::default(),
+                        deadline,
                     })
                     .collect(),
             })

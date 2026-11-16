@@ -111,6 +111,8 @@ pub(crate) struct CountingStorage {
     produce_failure: Option<(Topition, Error)>,
     produce_gate: Option<Arc<Semaphore>>,
     produce_all_calls: Arc<AtomicUsize>,
+    gated_partitions: Option<BTreeSet<i32>>,
+    config_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
 }
 
@@ -189,10 +191,28 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with the gate holding only the produces to `partitions`. A produce to
+    /// another partition goes through at once.
+    pub(crate) fn with_gated_partitions(self, partitions: &[i32]) -> Self {
+        Self {
+            gated_partitions: Some(partitions.iter().copied().collect()),
+            ..self
+        }
+    }
+
     /// The number of calls to `produce_all` on this storage. A wrapper that does not forward
     /// `produce_all` calls `produce` on this storage instead, and leaves this count unchanged.
     pub(crate) fn produce_all_calls(&self) -> usize {
         self.produce_all_calls.load(Ordering::SeqCst)
+    }
+
+    /// Returns this storage, with each read of a topic's configuration waiting for a permit of
+    /// `gate` before it answers, as a read waits for an engine connection.
+    pub(crate) fn with_config_gate(self, gate: Arc<Semaphore>) -> Self {
+        Self {
+            config_gate: Some(gate),
+            ..self
+        }
     }
 
     /// The number of produces now waiting for the gate.
@@ -212,7 +232,12 @@ impl CountingStorage {
         deflated: deflated::Batch,
         inflated: Option<inflated::Batch>,
     ) -> Result<i64> {
-        if let Some(gate) = &self.produce_gate {
+        let gated = self
+            .gated_partitions
+            .as_ref()
+            .is_none_or(|partitions| partitions.contains(&topition.partition()));
+
+        if gated && let Some(gate) = &self.produce_gate {
             _ = self.parked.fetch_add(1, Ordering::SeqCst);
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
@@ -479,6 +504,12 @@ impl Storage for CountingStorage {
         resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
+        if matches!(resource, ConfigResource::Topic)
+            && let Some(gate) = &self.config_gate
+        {
+            gate.acquire().await?.forget();
+        }
+
         let holds_topic = !matches!(resource, ConfigResource::Topic)
             || self
                 .topics
