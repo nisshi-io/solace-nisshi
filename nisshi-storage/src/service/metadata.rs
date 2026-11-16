@@ -211,7 +211,13 @@ where
                 .filter(|topic| topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition))
                 .filter_map(|topic| topic.name.clone())
                 .filter(|name| is_valid_topic_name(name))
-                .filter(|name| topic_creation::auto_creatable(name))
+                .filter(|name| {
+                    let creatable = topic_creation::auto_creatable(name);
+                    if !creatable {
+                        debug!(topic = name, "not auto-creating an internal topic name");
+                    }
+                    creatable
+                })
                 .filter(|name| {
                     let refused = self.auto_create_refusals.is_refused(name);
                     if refused {

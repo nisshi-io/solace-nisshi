@@ -71,8 +71,9 @@ Kafka does, and that topic is an ordinary topic that holds none of the broker's 
 refuses to create `__cluster_metadata`, the name of Kafka's KRaft metadata log, as Kafka 3.9.1
 does: CreateTopics answers INVALID_REQUEST with the message `Creation of internal topic
 __cluster_metadata is prohibited.`, and Metadata answers UNKNOWN_TOPIC_OR_PARTITION and does not
-auto-create it. A `__cluster_metadata` topic that an earlier version of Nisshi created stays until
-it is deleted.
+auto-create it. A topic with one of these four names that an earlier version of Nisshi
+auto-created stays until it is deleted, and Metadata keeps listing it with no error, while it holds
+none of the broker's state.
 
 ### Consumer groups
 
