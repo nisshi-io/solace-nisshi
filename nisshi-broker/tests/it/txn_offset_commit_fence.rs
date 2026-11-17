@@ -125,6 +125,7 @@ impl Fixture {
             None,
             TopicCreationConfig::default(),
             AutoCreateRefusals::default(),
+            None,
         )
         .and_then(|builder| builder.build().map_err(Into::into))?;
 

@@ -213,6 +213,7 @@ fn broker_route(storage: ArcDynStorage) -> FrameRouteService<nisshi_broker::Erro
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        None,
     )
     .expect("the broker's routes build")
     .build()

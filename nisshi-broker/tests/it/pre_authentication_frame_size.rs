@@ -121,6 +121,7 @@ async fn spawn_broker(sasl: bool) -> Result<RunningBroker> {
                 None,
                 TopicCreationConfig::default(),
                 AutoCreateRefusals::default(),
+                None,
                 sasl_config.clone(),
             ) else {
                 return;

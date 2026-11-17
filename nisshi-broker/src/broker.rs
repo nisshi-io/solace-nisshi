@@ -27,7 +27,7 @@ use crate::{
         administrator::{Controller, GroupCoordinatorConfig},
     },
     otel,
-    service::services,
+    service::{route_extension::RouteExtension, services},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -291,6 +291,7 @@ pub struct Broker<G, S> {
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    routes: Option<RouteExtension<G, S>>,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -350,6 +351,7 @@ where
             schemas: None,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
+            routes: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -380,6 +382,18 @@ where
 
     pub fn builder() -> PhantomBuilder {
         Builder::default()
+    }
+
+    /// Returns this broker with `routes` as the extension that changes the routes of each
+    /// connection's service, after the broker has registered its own.
+    ///
+    /// See [`RouteExtension`] for what an extension may do, and for the versions that a
+    /// replacement of a built-in route has to serve.
+    pub fn with_routes(self, routes: RouteExtension<G, S>) -> Self {
+        Self {
+            routes: Some(routes),
+            ..self
+        }
     }
 
     /// Returns the broker with the given cancellation token: cancelling it starts the broker's
@@ -742,6 +756,7 @@ where
                         self.schemas.clone(),
                         self.topic_creation,
                         self.auto_create_refusals.clone(),
+                        self.routes.as_ref(),
                         self.sasl_config.clone()
                     )?;
 
@@ -946,6 +961,7 @@ pub struct Builder<N, C, I, A, S, L> {
     banner: Option<String>,
     group_coordinator: GroupCoordinatorConfig,
     topic_creation: TopicCreationConfig,
+    routes: Option<RouteExtension<Controller<ArcDynStorage>, ArcDynStorage>>,
 
     cancellation: CancellationToken,
 }
@@ -977,6 +993,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -999,6 +1016,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -1021,6 +1039,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -1046,6 +1065,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -1070,6 +1090,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -1094,6 +1115,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
+            routes: self.routes,
             cancellation: self.cancellation,
         }
     }
@@ -1153,6 +1175,18 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn topic_creation(self, topic_creation: TopicCreationConfig) -> Self {
         Self {
             topic_creation,
+            ..self
+        }
+    }
+
+    /// Returns this builder with `routes` as the extension that changes the routes of each
+    /// connection's service, after the broker has registered its own.
+    ///
+    /// See [`RouteExtension`] for what an extension may do, and for the versions that a
+    /// replacement of a built-in route has to serve.
+    pub fn routes(self, routes: RouteExtension<Controller<ArcDynStorage>, ArcDynStorage>) -> Self {
+        Self {
+            routes: Some(routes),
             ..self
         }
     }
@@ -1240,6 +1274,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             schemas: self.schema_registry,
             topic_creation: self.topic_creation,
             auto_create_refusals: AutoCreateRefusals::default(),
+            routes: self.routes,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 

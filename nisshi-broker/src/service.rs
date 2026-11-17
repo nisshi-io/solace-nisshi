@@ -27,26 +27,33 @@ use tracing::debug;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
+use self::route_extension::RouteExtension;
+
 pub mod auth;
 pub mod coordinator;
+pub mod route_extension;
 pub mod storage;
 pub mod txn_offset_commit;
 
 type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<Error>>>>;
 
-/// Returns the broker's routes, before `build` adds `ApiVersions`.
+/// Returns the broker's routes, with `extension` applied last, before `build` adds `ApiVersions`.
 pub fn routes<C, S>(
     coordinator: C,
     storage: S,
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    extension: Option<&RouteExtension<C, S>>,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
     C: Coordinator,
 {
+    let extension_inputs =
+        extension.map(|extension| (extension, coordinator.clone(), storage.clone()));
+
     storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
@@ -60,8 +67,13 @@ where
     })
     .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator))
     .and_then(auth::services)
+    .and_then(|builder| match extension_inputs {
+        Some((extension, coordinator, storage)) => extension.apply(builder, &coordinator, &storage),
+        None => Ok(builder),
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
@@ -69,6 +81,7 @@ pub fn services<C, S>(
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    extension: Option<&RouteExtension<C, S>>,
     sasl_config: Option<Arc<SASLConfig>>,
 ) -> Result<TcpRouteFrame, Error>
 where
@@ -81,6 +94,7 @@ where
         schemas,
         topic_creation,
         auto_create_refusals,
+        extension,
     )
     .and_then(|builder| builder.build().map_err(Into::into))
     .map(|route| {

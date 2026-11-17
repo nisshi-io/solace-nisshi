@@ -106,6 +106,7 @@ pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;
 pub mod retention_ms;
+pub mod route_extension;
 #[cfg(feature = "libsql")]
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;
