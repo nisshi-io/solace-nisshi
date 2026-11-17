@@ -110,7 +110,7 @@ pub(in super::super) fn partition_produce<B>(
         admission: Admission::default(),
         deadline: Deadline::none(),
         reservation: None,
-        permit: None,
+        pool: None,
         batch,
     }
 }

@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{Instant, error::Elapsed, timeout_at},
+};
 
-use super::deadline::Deadline;
+use super::deadline::{Deadline, PRODUCE_REQUEST_DEADLINE};
 
 /// The slots for the storage calls of one Produce request, which its topics share: at most
 /// `count` calls of the request run at once, whichever topics they belong to.
@@ -25,7 +28,8 @@ use super::deadline::Deadline;
 /// left running has returned to its caller, so it holds no slot.
 ///
 /// A storage that limits its writes across requests, see [`Storage::produce_permits`], also gives
-/// each write a permit of that pool. The permit is held as long as the write runs, so a write that
+/// each write a permit of that pool, which the partition takes after its slot, right before the
+/// write starts, see [`take_shared`]. The permit is held as long as the write runs, so a write that
 /// the deadline left running keeps it after the request answered and gave back its slot.
 ///
 /// [`Storage::produce_permits`]: crate::Storage::produce_permits
@@ -34,22 +38,6 @@ pub(crate) struct Slots {
     count: usize,
     permits: Arc<Semaphore>,
     shared: Option<Arc<Semaphore>>,
-}
-
-/// What a write holds while it runs: its request's slot, and a permit that the storage shares
-/// across requests, if it has one.
-#[derive(Debug)]
-pub(crate) struct Write {
-    _slot: OwnedSemaphorePermit,
-    _shared: Option<OwnedSemaphorePermit>,
-}
-
-impl Write {
-    /// Splits the write into its request's slot, and the permit that the storage shares across
-    /// requests, if it has one. The write task keeps the permit for as long as the write runs.
-    pub(super) fn into_parts(self) -> (OwnedSemaphorePermit, Option<SharedPermit>) {
-        (self._slot, self._shared.map(Arc::new))
-    }
 }
 
 /// A permit of the pool that the writes of every request on a storage share. The request and its
@@ -90,28 +78,37 @@ impl Slots {
             .and_then(Result::ok)
     }
 
-    /// Waits until `deadline` for a slot and, if the storage shares permits across requests, one
-    /// of them, and returns `None` if the deadline passes first.
-    ///
-    /// The slot comes first, so a request never holds a shared permit while it waits for its own
-    /// slot, and the permits that it holds are the ones of its running writes.
-    pub(super) async fn take_write(&self, deadline: &Deadline) -> Option<Write> {
-        let slot = self.take(deadline).await?;
-
-        let shared = match &self.shared {
-            Some(shared) => Some(
-                deadline
-                    .bound(Arc::clone(shared).acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok)?,
-            ),
-            None => None,
-        };
-
-        Some(Write {
-            _slot: slot,
-            _shared: shared,
-        })
+    /// The pool of permits that the storage shares across requests, if it has one. A partition
+    /// takes a permit of it with [`take_shared`] right before its write starts.
+    pub(super) fn shared(&self) -> Option<Arc<Semaphore>> {
+        self.shared.clone()
     }
+}
+
+/// Waits for a permit of `pool`, if there is one, and returns `None` for a storage without one.
+/// The wait ends at `deadline`, or at [`PRODUCE_REQUEST_DEADLINE`] from now for a request that has
+/// none (`acks=0`): the request must not park for as long as the writes ahead of it run, and
+/// before the pool was shared, an `acks=0` produce waited for a connection at most as long as the
+/// engine's own pool wait.
+///
+/// The permit comes after the request's slot, so a request never holds a permit while it waits
+/// for its own slot, and the permits that it holds are the ones of its running writes.
+///
+/// [`PRODUCE_REQUEST_DEADLINE`]: super::deadline::PRODUCE_REQUEST_DEADLINE
+pub(super) async fn take_shared(
+    pool: Option<&Arc<Semaphore>>,
+    deadline: &Deadline,
+) -> Result<Option<SharedPermit>, Elapsed> {
+    let Some(pool) = pool else {
+        return Ok(None);
+    };
+
+    let at = deadline
+        .at()
+        .unwrap_or_else(|| Instant::now() + PRODUCE_REQUEST_DEADLINE);
+
+    // The semaphore is never closed, so the only way to get no permit is the wait running out.
+    timeout_at(at, Arc::clone(pool).acquire_owned())
+        .await
+        .map(|permit| permit.ok().map(Arc::new))
 }

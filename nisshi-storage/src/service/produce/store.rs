@@ -31,6 +31,7 @@ use super::{
     detached::{Detached, Write},
     partition::PartitionProduce,
     response,
+    slots::{SharedPermit, take_shared},
     timestamps::NO_TIMESTAMP,
 };
 use crate::{Error, Result, Storage, Topition};
@@ -92,15 +93,16 @@ where
 {
     /// Writes the batch in a task of its own, and waits for its result until `at`.
     ///
-    /// The task owns the batch, the request's share of the decoded-bytes budget, and the permit
-    /// that the storage shares across requests. The budget keeps counting the memory that the
-    /// write holds after the request answered, and the permit keeps counting the connection. The
-    /// task runs
-    /// under the span of the request, and logs its own result when the request has left it.
+    /// The task owns the batch, the request's share of the decoded-bytes budget, and `permit`, the
+    /// permit that the storage shares across requests. The budget keeps counting the memory that
+    /// the write holds after the request answered, and the permit keeps counting the connection.
+    /// The task runs under the span of the request, and logs its own result when the request has
+    /// left it.
     async fn write_until(
         &self,
         at: Instant,
         request: &PartitionProduce<()>,
+        permit: Option<SharedPermit>,
         topition: Topition,
         batch: deflated::Batch,
         inflated: inflated::Batch,
@@ -112,7 +114,6 @@ where
             let storage = self.storage.clone();
             let transaction_id = request.transaction_id.clone();
             let reservation = request.reservation.clone();
-            let permit = request.permit.clone();
             let write = Arc::clone(&write);
 
             async move {
@@ -247,8 +248,21 @@ where
 
         let stored = match request.deadline.at() {
             // A request that does not wait for an answer has no deadline, and its write is
-            // waited for as it always was.
+            // waited for as it always was. Its wait for a shared permit is bounded, though, so
+            // that a pool held by writes that never end fails the request and closes the
+            // connection, as an exhausted pool did before the pool was shared.
             None => {
+                let Ok(_permit) = take_shared(request.pool.as_ref(), &request.deadline).await
+                else {
+                    warn!(
+                        ?topition,
+                        "an acks=0 produce waited for the write permits of the storage until the \
+                         wait's limit"
+                    );
+
+                    return Ok(Deadline::timed_out(Stage::SlotWait, request.index));
+                };
+
                 self.storage
                     .produce_inflated(
                         request.transaction_id.as_deref(),
@@ -268,8 +282,21 @@ where
                     return Ok(Deadline::timed_out(Stage::InFlight, request.index));
                 }
 
+                // After the checks above and the request's slot, so a partition that is not
+                // written holds no permit, and the permit is held as long as the write runs.
+                let Ok(permit) = take_shared(request.pool.as_ref(), &request.deadline).await else {
+                    warn!(
+                        ?topition,
+                        remaining = ?request.deadline.remaining(),
+                        "produce partition waited for a write permit of the storage until the \
+                         request's deadline"
+                    );
+
+                    return Ok(Deadline::timed_out(Stage::SlotWait, request.index));
+                };
+
                 match self
-                    .write_until(at, &request, topition, batch, inflated)
+                    .write_until(at, &request, permit, topition, batch, inflated)
                     .await
                 {
                     Waited::Ended(stored) => stored,

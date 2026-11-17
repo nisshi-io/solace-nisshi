@@ -27,7 +27,7 @@ use nisshi_sans_io::{
     Ack, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::PartitionProduceResponse,
-    record::{Record, deflated, deflated::Frame, inflated},
+    record::{MAX_DECODED_BATCH_BYTES, Record, deflated, deflated::Frame, inflated},
 };
 use rama::{Service, extensions::Extensions};
 use tokio::{
@@ -37,10 +37,12 @@ use tokio::{
 
 use super::super::{
     PRODUCE_CONCURRENCY,
-    deadline::{NOT_STARTED, SLOT_WAIT, WRITING},
+    deadline::{NOT_STARTED, PRODUCE_REQUEST_DEADLINE, SLOT_WAIT, WRITING},
+    detached::Detached,
 };
 use crate::{
     Error, ProduceService, Result,
+    decoded_budget::DecodedBytesBudget,
     service::counting_storage::{CountingStorage, Listing},
 };
 
@@ -595,6 +597,72 @@ async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -
     settle().await;
 
     assert_eq!(2, permits.available_permits());
+
+    Ok(())
+}
+
+/// A request that does not wait for an answer waits for a shared permit at most
+/// [`PRODUCE_REQUEST_DEADLINE`], and then answers an error, so that the layer above closes the
+/// connection. Writes that never end hold every permit, as a stalled engine does.
+#[tokio::test(start_paused = true)]
+async fn an_acks_zero_request_stops_waiting_for_a_shared_permit() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(1));
+    let (storage, _gate) = stalled();
+    let storage = storage.with_produce_permits(Arc::clone(&permits));
+    let service = service(&storage);
+
+    // The write is left running at its deadline and keeps the only permit.
+    _ = serve(&service, acked(&[0])?).await?;
+    assert_eq!(0, permits.available_permits());
+
+    let started_at = Instant::now();
+    let outcome = serve(
+        &service,
+        request(vec![topic(TOPIC, &entries(&[1], b"value"))?], Ack::None),
+    )
+    .await;
+
+    // The acks=0 layer fails the request, which closes the connection.
+    assert_matches!(
+        outcome,
+        Err(Error::AcksZeroProduceFailed {
+            error_code: ErrorCode::RequestTimedOut,
+            ..
+        })
+    );
+    assert_eq!(PRODUCE_REQUEST_DEADLINE, started_at.elapsed());
+
+    // Only the first write reached storage, and it still waits for its gate.
+    assert_eq!(1, storage.parked());
+
+    Ok(())
+}
+
+/// A partition that waits for the decoded-batch budget holds no shared permit, so a request that
+/// needs no budget writes meanwhile.
+#[tokio::test(start_paused = true)]
+async fn a_partition_waiting_for_the_budget_holds_no_shared_permit() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(1));
+    let storage = slow().with_produce_permits(Arc::clone(&permits));
+    let budget = Arc::new(DecodedBytesBudget::new(MAX_DECODED_BATCH_BYTES));
+    let _held = budget
+        .reserve(
+            MAX_DECODED_BATCH_BYTES,
+            Instant::now() + Duration::from_secs(600),
+        )
+        .await;
+    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
+        .with_decoded_budget(budget, Duration::from_secs(60))
+        .with_validation();
+    let mut waiting = std::pin::pin!(serve(&service, acked(&[0])?));
+
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("the request answered while the budget was held"),
+        () = sleep(Duration::from_secs(1)) => {}
+    }
+
+    assert_eq!(1, permits.available_permits());
 
     Ok(())
 }

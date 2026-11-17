@@ -44,7 +44,8 @@ A Produce request that waits for an answer has a deadline, see the Produce row o
   when the deadline passed before the broker started a write, `slot_wait` when it
   passed while the partition waited for a place among the writes of its request, or
   for a permit among the writes that the engine shares across requests (PostgreSQL),
-  because the writes ahead of it were slow (the log has a `warn` line with the topic,
+  because the writes ahead of it were slow (an `acks=0` partition counts here too when its
+  20 s wait for a permit ran out, and the broker closes the connection; the log has a `warn` line with the topic,
   the partition and how long it waited), `budget_wait` when it
   passed while the partition waited for the decoded-batch budget (see
   [Storage](storage.md)), `writing` when it answered while a write ran, and `in_flight`
