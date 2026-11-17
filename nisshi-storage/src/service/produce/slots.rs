@@ -44,8 +44,8 @@ pub(crate) struct Slots {
 /// How the writes of one request take their place among the writes that the storage shares
 /// across requests.
 ///
-/// The request's first write takes no permit of the shared pool, as it took none before the pool
-/// existed: it uses the request's own lane, which has one place. The writes beyond it each try for
+/// The request's first write takes no permit of the shared pool: it uses the request's own lane,
+/// which has one place. The writes beyond it each try for
 /// a permit of the shared pool, and a write that finds none free waits for the lane, so a request
 /// that gets no permit writes its partitions one at a time. The shared pool therefore caps only
 /// the extra writes, and no request writes more slowly than it would without the pool.

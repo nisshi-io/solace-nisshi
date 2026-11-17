@@ -553,7 +553,7 @@ async fn the_extra_writes_of_two_requests_share_the_storage_permits() -> Result<
         }
     };
 
-    let (first, second) = tokio::join!(timed(&[0, 1, 2, 3]), timed(&[4, 5, 6, 7]));
+    let (first, second) = tokio::join!(biased; timed(&[0, 1, 2, 3]), timed(&[4, 5, 6, 7]));
     let (first_codes, first_took) = first?;
     let (second_codes, second_took) = second?;
 
@@ -628,7 +628,7 @@ async fn many_requests_each_write_their_first_partition_at_once() -> Result<()> 
 }
 
 /// A request that finds no free permit of the shared pool still finishes: it writes its partitions
-/// one at a time, as it did before the pool existed, and every partition has its offset.
+/// one at a time, and every partition has its offset.
 #[tokio::test(start_paused = true)]
 async fn a_request_without_a_free_permit_writes_its_partitions_one_at_a_time() -> Result<()> {
     let permits = Arc::new(Semaphore::new(0));

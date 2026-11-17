@@ -531,12 +531,11 @@ fn delete_records_limit(max_size: usize) -> usize {
 /// every request, for a pool of `max_size` connections: a quarter of the pool,
 /// and at least one.
 ///
-/// Each request's first write takes no permit, as before this limit existed:
-/// it holds one pooled connection for its transaction, and a request that
-/// writes one partition at a time never waits for a permit. Only the writes
-/// beyond the first, up to [`PRODUCE_CONCURRENCY`] for one request, take a
-/// permit, and a request that finds none free writes those partitions one at a
-/// time. Without the limit, a few requests that each write
+/// Each request's first write takes no permit: it holds one pooled connection
+/// for its transaction, and a request that writes one partition at a time never
+/// waits for a permit. Only the writes beyond the first take a permit, up to
+/// one fewer than [`PRODUCE_CONCURRENCY`] for one request, and a request that
+/// finds none free writes those partitions one at a time. Without the limit, a few requests that each write
 /// [`PRODUCE_CONCURRENCY`] partitions take the whole pool, and metadata, group,
 /// offset commit and fetch calls then wait for a connection until the pool wait
 /// ends. The pool is process-wide and set by `pool_max_size`, so raising
