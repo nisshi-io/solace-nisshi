@@ -37,7 +37,7 @@ use tokio::{
 
 use super::super::{
     PRODUCE_CONCURRENCY,
-    deadline::{NOT_STARTED, PRODUCE_REQUEST_DEADLINE, SLOT_WAIT, WRITING},
+    deadline::{NOT_STARTED, SLOT_WAIT, WRITING},
     detached::Detached,
 };
 use crate::{
@@ -531,36 +531,49 @@ async fn a_storage_that_answers_zero_concurrency_is_served_as_one() -> Result<()
     Ok(())
 }
 
-/// A storage that shares two permits across requests gets at most two writes at once from two
-/// requests that each have four partitions: the pool bounds the requests together, not each
-/// request alone.
+/// The first write of a request takes no permit of the shared pool, and the writes beyond it do.
+/// With two permits, a request for four partitions writes three at once, one on its own lane and
+/// two on permits, and the fourth waits for the lane. A second request starts at the same time,
+/// finds the pool taken, and writes its partitions one at a time on its own lane, so each request
+/// is as fast as it would be with fewer permits, and neither waits for the other's writes.
 #[tokio::test(start_paused = true)]
-async fn the_writes_of_two_requests_share_the_storage_permits() -> Result<()> {
+async fn the_extra_writes_of_two_requests_share_the_storage_permits() -> Result<()> {
     let permits = Arc::new(Semaphore::new(2));
     let storage = slow().with_produce_permits(Arc::clone(&permits));
     let service = service(&storage);
     let started_at = Instant::now();
 
-    let (first, second) = tokio::join!(
-        serve(&service, acked(&[0, 1, 2, 3])?),
-        serve(&service, acked(&[4, 5, 6, 7])?),
-    );
+    let timed = |partitions: &'static [i32]| {
+        let service = &service;
 
-    assert_eq!(vec![ErrorCode::None; 4], codes(&first?)?);
-    assert_eq!(vec![ErrorCode::None; 4], codes(&second?)?);
+        async move {
+            let responses = serve(service, acked(partitions)?).await?;
 
-    // Eight writes of one second, two at a time.
-    assert_eq!(4 * WRITE, started_at.elapsed());
+            Ok::<_, Error>((codes(&responses)?, started_at.elapsed()))
+        }
+    };
+
+    let (first, second) = tokio::join!(timed(&[0, 1, 2, 3]), timed(&[4, 5, 6, 7]));
+    let (first_codes, first_took) = first?;
+    let (second_codes, second_took) = second?;
+
+    assert_eq!(vec![ErrorCode::None; 4], first_codes);
+    assert_eq!(vec![ErrorCode::None; 4], second_codes);
+
+    // The first request wrote three at once and the fourth after them, and the second wrote all
+    // four one after another.
+    assert_eq!(2 * WRITE, first_took);
+    assert_eq!(4 * WRITE, second_took);
     assert_eq!(2, permits.available_permits());
 
     Ok(())
 }
 
-/// A partition that waits for a permit that the storage shares at the deadline answers
-/// `REQUEST_TIMED_OUT` as a slot wait, and storage never gets its write.
+/// A partition that finds no free permit of the shared pool waits for its request's own lane, and
+/// at the deadline answers `REQUEST_TIMED_OUT` as a slot wait, and storage never gets its write.
 #[tokio::test(start_paused = true)]
-async fn a_partition_without_a_shared_permit_at_the_deadline_is_a_slot_wait() -> Result<()> {
-    let permits = Arc::new(Semaphore::new(1));
+async fn a_partition_waiting_for_the_request_lane_at_the_deadline_is_a_slot_wait() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(0));
     let (storage, _gate) = stalled();
     let storage = storage.with_produce_permits(permits);
     let service = service(&storage);
@@ -576,15 +589,69 @@ async fn a_partition_without_a_shared_permit_at_the_deadline_is_a_slot_wait() ->
             .as_slice(),
         [Some(WRITING), Some(SLOT_WAIT)]
     );
+    assert_eq!(1, storage.parked());
 
     Ok(())
 }
 
-/// The shared permit of a write that the deadline left running stays with the write until it
-/// ends, because the write holds the engine's connection until then.
+/// More requests than the shared pool has permits each get their first write at once: the first
+/// write takes no permit, so no request waits for the pool, and all of them answer in one write's
+/// time. The pool keeps its permits.
+#[tokio::test(start_paused = true)]
+async fn many_requests_each_write_their_first_partition_at_once() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(2));
+    let storage = slow().with_produce_permits(Arc::clone(&permits));
+    let service = service(&storage);
+    let started_at = Instant::now();
+
+    let requests = (0..4 * PRODUCE_CONCURRENCY)
+        .map(|index| {
+            let service = &service;
+
+            async move { serve(service, acked(&[i32::try_from(index)?])?).await }
+        })
+        .collect::<Vec<_>>();
+
+    let answers = futures::future::join_all(requests).await;
+
+    assert_eq!(WRITE, started_at.elapsed());
+    assert_eq!(4 * PRODUCE_CONCURRENCY, answers.len());
+
+    for responses in answers {
+        assert_eq!(vec![ErrorCode::None], codes(&responses?)?);
+    }
+
+    assert_eq!(2, permits.available_permits());
+    assert_eq!(4 * PRODUCE_CONCURRENCY, storage.produced().len());
+
+    Ok(())
+}
+
+/// A request that finds no free permit of the shared pool still finishes: it writes its partitions
+/// one at a time, as it did before the pool existed, and every partition has its offset.
+#[tokio::test(start_paused = true)]
+async fn a_request_without_a_free_permit_writes_its_partitions_one_at_a_time() -> Result<()> {
+    let permits = Arc::new(Semaphore::new(0));
+    let storage = slow().with_produce_permits(Arc::clone(&permits));
+    let service = service(&storage);
+    let started_at = Instant::now();
+
+    let responses = serve(&service, acked(&[0, 1, 2, 3])?).await?;
+
+    assert_eq!(4 * WRITE, started_at.elapsed());
+    assert_eq!(vec![ErrorCode::None; 4], codes(&responses)?);
+    assert_eq!(vec![0, 1, 2, 3], offsets(&responses));
+    assert_eq!(0, permits.available_permits());
+
+    Ok(())
+}
+
+/// The permit of a write that the deadline left running stays with the write until it ends,
+/// because the write holds the engine's connection until then. The first write of the request
+/// takes none, so with one permit the second write holds it.
 #[tokio::test(start_paused = true)]
 async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -> Result<()> {
-    let permits = Arc::new(Semaphore::new(2));
+    let permits = Arc::new(Semaphore::new(1));
     let (storage, gate) = stalled();
     let storage = storage.with_produce_permits(Arc::clone(&permits));
     let service = service(&storage);
@@ -596,44 +663,7 @@ async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -
     gate.add_permits(2);
     settle().await;
 
-    assert_eq!(2, permits.available_permits());
-
-    Ok(())
-}
-
-/// A request that does not wait for an answer waits for a shared permit at most
-/// [`PRODUCE_REQUEST_DEADLINE`], and then answers an error, so that the layer above closes the
-/// connection. Writes that never end hold every permit, as a stalled engine does.
-#[tokio::test(start_paused = true)]
-async fn an_acks_zero_request_stops_waiting_for_a_shared_permit() -> Result<()> {
-    let permits = Arc::new(Semaphore::new(1));
-    let (storage, _gate) = stalled();
-    let storage = storage.with_produce_permits(Arc::clone(&permits));
-    let service = service(&storage);
-
-    // The write is left running at its deadline and keeps the only permit.
-    _ = serve(&service, acked(&[0])?).await?;
-    assert_eq!(0, permits.available_permits());
-
-    let started_at = Instant::now();
-    let outcome = serve(
-        &service,
-        request(vec![topic(TOPIC, &entries(&[1], b"value"))?], Ack::None),
-    )
-    .await;
-
-    // The acks=0 layer fails the request, which closes the connection.
-    assert_matches!(
-        outcome,
-        Err(Error::AcksZeroProduceFailed {
-            error_code: ErrorCode::RequestTimedOut,
-            ..
-        })
-    );
-    assert_eq!(PRODUCE_REQUEST_DEADLINE, started_at.elapsed());
-
-    // Only the first write reached storage, and it still waits for its gate.
-    assert_eq!(1, storage.parked());
+    assert_eq!(1, permits.available_permits());
 
     Ok(())
 }

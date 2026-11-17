@@ -42,11 +42,9 @@ A Produce request that waits for an answer has a deadline, see the Produce row o
 - `nisshi_produce_deadline_exceeded` counts the partitions that answered
   `REQUEST_TIMED_OUT` because of the deadline. The `stage` attribute is `not_started`
   when the deadline passed before the broker started a write, `slot_wait` when it
-  passed while the partition waited for a place among the writes of its request, or
-  for a permit among the writes that the engine shares across requests (PostgreSQL),
-  because the writes ahead of it were slow (an `acks=0` partition counts here too when its
-  20 s wait for a permit ran out, and the broker closes the connection; the log has a `warn` line with the topic,
-  the partition), `budget_wait` when it
+  passed while the partition waited for a place among the writes of its request,
+  because the writes ahead of it were slow (the log has a `warn` line with the topic
+  and the partition), `budget_wait` when it
   passed while the partition waited for the decoded-batch budget (see
   [Storage](storage.md)), `writing` when it answered while a write ran, and `in_flight`
   when it did not start a write because an earlier write from the same idempotent

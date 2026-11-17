@@ -2272,14 +2272,16 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Returns the permits that the writes of every Produce request on this storage share, if the
     /// storage limits them. The default is `None`, no limit across requests.
     ///
-    /// A request writes at most [`Storage::produce_concurrency`] partitions at once, and each
-    /// write also takes a permit from this pool for as long as it runs, including after the
-    /// request's deadline left it running and the request answered. A pooled engine whose
-    /// writes each hold a connection uses it to keep the writes of all requests together from
-    /// taking the whole pool, as [`Storage::delete_records_concurrency`] does for DeleteRecords.
-    /// A write that waits for a permit past the request's deadline is not started, and its
-    /// partition answers `REQUEST_TIMED_OUT`. A storage that wraps another answers what the
-    /// storage it wraps answers.
+    /// A request writes at most [`Storage::produce_concurrency`] partitions at once. Its first
+    /// write takes no permit, so a request never waits for another request's write. Each write
+    /// beyond the first tries for a permit from this pool, and holds it for as long as the write
+    /// runs, including after the request's deadline left it running and the request answered. A
+    /// write that finds no permit free waits for the request's own earlier write to end instead,
+    /// so the request writes one partition at a time, as it would without the pool. A pooled
+    /// engine whose writes each hold a connection uses it to keep the extra writes of all
+    /// requests together from taking the whole pool, as [`Storage::delete_records_concurrency`]
+    /// does for DeleteRecords. A storage that wraps another answers what the storage it wraps
+    /// answers.
     fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
         None
     }

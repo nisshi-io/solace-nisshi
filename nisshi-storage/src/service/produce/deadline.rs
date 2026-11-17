@@ -47,7 +47,7 @@ pub(super) const NOT_STARTED: &str =
     "the request's deadline passed before the broker started this partition's write, retry it";
 
 /// The message of a partition that the deadline stopped while it waited for a place among the
-/// writes of its request, or among the writes that the storage shares across requests.
+/// writes of its request.
 pub(super) const SLOT_WAIT: &str = "the request's deadline passed while this partition waited for the broker's \
      write slots, retry it";
 
@@ -77,9 +77,10 @@ static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(super) enum Stage {
     /// No storage write had started for the partition.
     NotStarted,
-    /// The partition waited for a slot among the writes of its request, or for a permit among
-    /// the writes that the storage shares across requests, and the deadline ended the wait. The
-    /// writes ahead of it were slow, and no write of the partition had started.
+    /// The partition waited for a slot among the writes of its request, or for the request's
+    /// write lane after it found no permit of the pool that the storage shares across requests,
+    /// and the deadline ended the wait. The writes ahead of it were slow, and no write of the
+    /// partition had started.
     SlotWait,
     /// The partition waited for the decoded-batch budget, and the deadline ended the wait before
     /// the budget's own wait did. No storage write had started.

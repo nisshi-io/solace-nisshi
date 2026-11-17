@@ -165,7 +165,7 @@ pub struct Postgres {
     /// `delete_records_writes`, see
     /// [`Storage::delete_records_concurrency`].
     delete_records_per_request: usize,
-    /// Permits for the produce writes in flight across every request, see
+    /// Permits for the extra produce writes in flight across every request, see
     /// [`produce_limit`].
     produce_writes: Arc<Semaphore>,
     /// How many produce writes one request makes at once, at most `produce_writes`, see
@@ -527,20 +527,22 @@ fn delete_records_limit(max_size: usize) -> usize {
     (max_size / 4).max(1)
 }
 
-/// How many produce writes this engine has in flight at once, across every
-/// request, for a pool of `max_size` connections: a quarter of the pool, and at
-/// least one.
+/// How many extra produce writes this engine has in flight at once, across
+/// every request, for a pool of `max_size` connections: a quarter of the pool,
+/// and at least one.
 ///
-/// Each write holds a pooled connection for its transaction, and a write to a
-/// lake topic reads the topic's configuration over a second connection while it
-/// still holds the first. Without this limit, a few requests that each write
+/// Each request's first write takes no permit, as before this limit existed:
+/// it holds one pooled connection for its transaction, and a request that
+/// writes one partition at a time never waits for a permit. Only the writes
+/// beyond the first, up to [`PRODUCE_CONCURRENCY`] for one request, take a
+/// permit, and a request that finds none free writes those partitions one at a
+/// time. Without the limit, a few requests that each write
 /// [`PRODUCE_CONCURRENCY`] partitions take the whole pool, and metadata, group,
 /// offset commit and fetch calls then wait for a connection until the pool wait
-/// ends. A quarter of the pool keeps the writes, and the second connection of
-/// each lake write, within half of it. A permit is held until its write ends,
-/// also when the request's deadline left the write running, because the write
-/// keeps its connection until then. A write that waits for a permit at the
-/// request's deadline is not started.
+/// ends. The pool is process-wide and set by `pool_max_size`, so raising
+/// `pool_max_size` raises it. A permit is held until its write ends, also when
+/// the request's deadline left the write running, because the write keeps its
+/// connection until then.
 fn produce_limit(max_size: usize) -> usize {
     (max_size / 4).max(1)
 }
@@ -4246,15 +4248,16 @@ impl Storage for Postgres {
         )
     }
 
-    /// Each write holds a pooled connection, so a request writes at most as many partitions at
-    /// once as the engine allows all requests together, see `produce_limit`, and at most
-    /// [`PRODUCE_CONCURRENCY`].
+    /// Each write holds a pooled connection, so a request writes at most [`PRODUCE_CONCURRENCY`]
+    /// partitions at once, and no more than the engine allows all requests together, see
+    /// `produce_limit`.
     fn produce_concurrency(&self) -> usize {
         self.produce_per_request
     }
 
-    /// The writes of every request take a permit from one pool, so that requests that each write
-    /// several partitions cannot hold more of the connection pool than a quarter of it.
+    /// The extra writes of every request, those beyond its first, take a permit from one pool, so
+    /// that requests that each write several partitions cannot hold more of the connection pool
+    /// than a quarter of it for them. The first write of a request takes none.
     fn produce_permits(&self) -> Option<Arc<Semaphore>> {
         Some(Arc::clone(&self.produce_writes))
     }
@@ -6655,10 +6658,10 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Produce writes across every request take a quarter of the pool, and at
-    /// least one connection, and one request writes at most
-    /// [`PRODUCE_CONCURRENCY`] partitions at once, and never more than the
-    /// limit.
+    /// The extra produce writes across every request, those beyond the first
+    /// write of a request, take a quarter of the pool, and at least one
+    /// connection. One request writes at most [`PRODUCE_CONCURRENCY`]
+    /// partitions at once, and never more than the limit.
     #[test]
     fn produce_writes_take_a_quarter_of_the_pool() -> Result<()> {
         for (pool_max_size, limit, per_request) in [(16, 4, 4), (32, 8, 4), (8, 2, 2), (2, 1, 1)] {
@@ -6687,9 +6690,10 @@ pub(crate) mod tests {
     }
 
     /// Two requests that ask the same engine, or a clone of it as each client
-    /// connection has, get the same permits, so the writes of both together
-    /// stay within the limit: with the default pool of 16, four requests that
-    /// each write four partitions hold 4 connections, not 16.
+    /// connection has, get the same permits, so the extra writes of both
+    /// together stay within the limit: with the default pool of 16, requests
+    /// that each write four partitions hold at most 4 permits for the writes
+    /// beyond their first, however many requests there are.
     #[test]
     fn produce_permits_are_shared_across_requests() -> Result<()> {
         let storage = Postgres::builder(&CONNECTION)?
@@ -6704,7 +6708,7 @@ pub(crate) mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
 
-        // the writes of one request take permits that another request then lacks
+        // the extra writes of one request take permits that another request then lacks
         let taken = (0..storage.produce_concurrency())
             .map(|_| Arc::clone(&first).try_acquire_owned())
             .collect::<std::result::Result<Vec<_>, _>>()

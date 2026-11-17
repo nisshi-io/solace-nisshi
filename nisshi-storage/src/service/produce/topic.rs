@@ -76,9 +76,10 @@ where
         partition: PartitionProduceData,
     ) -> PartitionProduceResponse {
         // The slot is held until the partition answers. If the deadline leaves a write running,
-        // the partition has answered, so the write holds no slot. The shared permit is not taken
-        // here: the partition still validates its batch and waits for the decoded-batch budget,
-        // and a permit held through that would sit idle while other requests wait for the pool.
+        // the partition has answered, so the write holds no slot. The write's place among the
+        // shared writes is not taken here: the partition still validates its batch and waits for
+        // the decoded-batch budget, and a place held through that would sit idle while other
+        // writes wait for it.
         // The deadline can pass while the partition waits for a slot, or just after it got one.
         // The partition answers `REQUEST_TIMED_OUT` either way, and the ones that were written
         // keep their offsets.
@@ -118,7 +119,7 @@ where
                 admission: topic.admission.clone(),
                 deadline: topic.topic.deadline,
                 reservation: None,
-                pool: topic.slots.shared(),
+                pool: topic.slots.pool(),
                 batch: batches,
             })
             .await;
