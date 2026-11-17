@@ -207,6 +207,40 @@ HEAP_OPTS="-Xms4G -Xmx4G -Dlog4j.configurationFile=$PWD/log4j2-connections.xml -
     ./run.sh run workloads/smoke.yaml
 ```
 
+### Three nisshi brokers behind a balancer
+
+`NISSHI_BROKERS=3` starts three nisshi brokers on the one postgres, on ports 9192, 9292 and 9392, each with a log of its
+own (`broker-1.log` and so on). Each advertises `localhost:9092`, where `balance.py`, a small TCP balancer, hands each
+connection to the next broker in turn, like a layer 4 balancer. Every broker keeps node 111, so Metadata still lists one
+broker and the clients see a single one. The sampler adds up the sockets of the three brokers, and `sweep` reports each
+broker's connections as `<run>.broker-N.md` and `.csv` in `results/sweep-nisshi-3/`.
+
+```shell
+NISSHI_BROKERS=3 ./run.sh sweep
+```
+
+The sweep held its rate in every run with no write errors, and the consumer groups formed with their members on
+different brokers. The peak connections, one run of each combination, are the same as for one nisshi broker in all 8:
+7, 13, 16 and 42, and 38 for 8 producers and 8 consumers on 4 partitions. The clients can't tell the three brokers from
+one, so each opens the connections that it opens to one broker, and a producer holds 2, where it holds 4 on 3 Kafka
+brokers (see the table above).
+
+The balancer splits the connections evenly and the `Produce` traffic much less. A producer sends every partition on
+one data connection, so all of a producer's `Produce` requests go to the one broker that got that connection:
+
+| producers | consumers | partitions | connections at the peak, per broker | `Produce` requests per broker | producers with data on each |
+|---|---|---|---|---|---|
+| 1 | 1 | 4 | 2 / 3 / 2 | 189k / 0 / 0 | 1 / 0 / 0 |
+| 4 | 1 | 4 | 4 / 5 / 4 | 332k / 165k / 166k | 2 / 1 / 1 |
+| 1 | 4 | 4 | 5 / 6 / 5 | 194k / 0 / 0 | 1 / 0 / 0 |
+| 8 | 8 | 4 | 12 / 13 / 13 | 284k / 277k / 183k | 3 / 3 / 2 |
+| 8 | 8 | 16 | 14 / 14 / 14 | 334k / 334k / 227k | 3 / 3 / 2 |
+
+The 16-partition runs for 1 and 4 producers split like the 4-partition ones. The balancer spreads producers, not the
+partitions of one producer, so a single heavy producer loads one broker, where on Kafka it would use every broker that
+leads one of its partitions. Spreading one producer's partitions over brokers takes distinct node ids in Metadata, which
+nisshi does not have, so the brokers behind the balancer do not give it.
+
 ## Checking queries against large volumes
 
 `seed.sql` fills a topic with generated records straight in postgres, far faster than producing

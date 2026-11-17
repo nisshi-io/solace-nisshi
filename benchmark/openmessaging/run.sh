@@ -58,6 +58,12 @@
 # no connection log, and `sweep` saves into results/sweep-kafka/ (results/sweep-kafka-N/ when
 # KAFKA_BROKERS is set) and skips the report.
 #
+# NISSHI_BROKERS=N (default 1) starts N nisshi brokers on the one postgres, each with a log of its own
+# (broker-1.log and so on) and each advertising localhost:9092, where balance.py listens and hands each
+# connection to the next broker in turn, like a layer 4 balancer. Pass it to `broker`, `run`, `sweep`
+# and `stop`. Metadata still lists one broker, node 111, so the clients see a single broker. `sweep`
+# saves into results/sweep-nisshi-N/ and reports each broker's connections as <run>.broker-N.md.
+#
 # DRIVER is the benchmark driver file `run` uses, driver-nisshi.yaml by default. Copy that file to
 # change the producer or consumer settings, for example consumerConfig's fetch.max.wait.ms.
 set -euo pipefail
@@ -73,6 +79,28 @@ pg_bin=${PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}
 pg_dir="$here/.pg"
 pg_port=${POSTGRES_PORT:-5432}
 broker_port=9092
+nisshi_brokers=${NISSHI_BROKERS:-1}
+
+# The ports that the nisshi brokers listen on: $broker_port for one broker. For more, each listens
+# on its own port from $broker_port + 100, and the balancer takes $broker_port.
+nisshi_ports() {
+    local i
+    if ((nisshi_brokers == 1)); then
+        echo "$broker_port"
+        return
+    fi
+    for ((i = 1; i <= nisshi_brokers; i++)); do echo $((broker_port + 100 * i)); done
+}
+
+# The file for broker $1 (1 to NISSHI_BROKERS) with the extension $2
+broker_file() {
+    if ((nisshi_brokers == 1)); then echo "$here/broker.$2"; else echo "$here/broker-$1.$2"; fi
+}
+
+stop_balancer() {
+    [[ -f "$here/balance.pid" ]] && kill "$(cat "$here/balance.pid")" 2>/dev/null || true
+    rm -f "$here/balance.pid"
+}
 
 # The upstream commit that the patch and the build flags below were made for. Set OMB_COMMIT to
 # try another.
@@ -249,14 +277,30 @@ broker() {
     storage=$storage${STORAGE_QUERY:+?$STORAGE_QUERY}
     cargo build --release --bin nisshi --no-default-features --features postgres
     pkill -f 'target/release/nisshi broker' 2>/dev/null || true
-    RUST_LOG=${RUST_LOG:-warn,nisshi::connection=info} \
-        CONNECTION_SNAPSHOT_INTERVAL=${CONNECTION_SNAPSHOT_INTERVAL:-10s} \
-        nohup target/release/nisshi broker \
-        --storage-engine="$storage" \
-        --advertised-listener-url=tcp://localhost:$broker_port \
-        >"$here/broker.log" 2>&1 &
-    echo $! >"$here/broker.pid"
-    echo "broker pid $(cat "$here/broker.pid"), log $here/broker.log"
+    stop_balancer
+    local i=0 port
+    for port in $(nisshi_ports); do
+        i=$((i + 1))
+        RUST_LOG=${RUST_LOG:-warn,nisshi::connection=info} \
+            CONNECTION_SNAPSHOT_INTERVAL=${CONNECTION_SNAPSHOT_INTERVAL:-10s} \
+            nohup target/release/nisshi broker \
+            --storage-engine="$storage" \
+            --listener-url="tcp://[::]:$port" \
+            --advertised-listener-url=tcp://localhost:$broker_port \
+            >"$(broker_file "$i" log)" 2>&1 &
+        echo $! >"$(broker_file "$i" pid)"
+        echo "broker $i pid $(cat "$(broker_file "$i" pid)"), port $port, log $(broker_file "$i" log)"
+    done
+    if ((nisshi_brokers > 1)); then
+        # the balancer starts when every broker listens, or it would refuse the first clients
+        for port in $(nisshi_ports); do wait_for_port "$port"; done
+        local backends
+        backends=$(nisshi_ports | tr '\n' ' ')
+        # shellcheck disable=SC2086 # backends is a list of ports, split on purpose
+        nohup python3 "$here/balance.py" "$broker_port" $backends >"$here/balance.log" 2>&1 &
+        echo $! >"$here/balance.pid"
+        echo "balancer pid $(cat "$here/balance.pid") on port $broker_port"
+    fi
 }
 
 # Prints how many ESTABLISHED TCP sockets of process $1 have a name that matches the extended
@@ -273,15 +317,19 @@ established() {
 # so the two columns agree except while a connection opens or closes, or when a client outside
 # the benchmark is connected.
 sample_sockets() {
-    local file=$1 interval=$2 broker_pid jvm_pid broker_count client_ports
+    local file=$1 interval=$2 pid_file jvm_pid broker_count client_ports ports_regex
     client_ports=$(kafka_ports | paste -sd'|' -)
+    ports_regex=$(nisshi_ports | paste -sd'|' -)
     echo "time,broker_established,benchmark_established" >"$file"
     while true; do
         if [[ ${BROKER:-nisshi} == kafka ]]; then
             broker_count=$(kafka_established)
         else
-            broker_pid=$(cat "$here/broker.pid" 2>/dev/null || true)
-            broker_count=$(established "$broker_pid" ":$broker_port->")
+            broker_count=0
+            for pid_file in "$here"/broker*.pid; do
+                [[ -f $pid_file ]] || continue
+                broker_count=$((broker_count + $(established "$(cat "$pid_file")" ":($ports_regex)->")))
+            done
         fi
         jvm_pid=$(pgrep -n -f io.openmessaging.benchmark.Benchmark || true)
         echo "$(date +%Y-%m-%dT%H:%M:%S),$broker_count,$(established "$jvm_pid" "->.*:($client_ports)\$")" >>"$file"
@@ -313,10 +361,11 @@ sockets() {
 }
 
 connections() {
-    [[ -f "$here/broker.log" ]] || { echo "run.sh: no broker.log, run.sh broker first" >&2; exit 1; }
+    local log=${CONNECTIONS_LOG:-$here/broker.log}
+    [[ -f "$log" ]] || { echo "run.sh: no $log, run.sh broker first" >&2; exit 1; }
     cargo run --quiet --release --manifest-path "$root/Cargo.toml" -p nisshi-broker \
         --no-default-features --features postgres --bin connections -- \
-        --filename "$here/broker.log" "$@"
+        --filename "$log" "$@"
 }
 
 run() {
@@ -345,14 +394,18 @@ run() {
 
 # Waits until the broker accepts connections. The probe is a connection of its own, which the
 # broker logs as a connection that sent no request.
-wait_for_broker() {
-    local _
+wait_for_port() {
+    local port=$1 _
     for _ in $(seq 120); do
-        (exec 3<>"/dev/tcp/127.0.0.1/$broker_port") 2>/dev/null && return
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return
         sleep 0.5
     done
-    echo "run.sh: the broker is not listening on port $broker_port" >&2
+    echo "run.sh: nothing is listening on port $port" >&2
     return 1
+}
+
+wait_for_broker() {
+    wait_for_port "$broker_port"
 }
 
 # Runs a workload for each number of partitions and each count of producers and consumers, on a
@@ -361,8 +414,9 @@ wait_for_broker() {
 # samples. SWEEP_MINUTES is the test duration of each run (default 1) and SWEEP_RATE the producer
 # rate of each run in messages per second (default 5000).
 sweep() {
-    local out="$results/sweep" partitions combo producers consumers name
+    local out="$results/sweep" partitions combo producers consumers name i suffix
     [[ ${BROKER:-nisshi} == kafka ]] && out="$results/sweep-kafka${KAFKA_BROKERS:+-$KAFKA_BROKERS}"
+    [[ ${BROKER:-nisshi} == nisshi && $nisshi_brokers -gt 1 ]] && out="$results/sweep-nisshi-$nisshi_brokers"
     mkdir -p "$out"
     for partitions in 4 16; do
         for combo in "1 1" "4 1" "1 4" "8 8"; do
@@ -389,7 +443,11 @@ WORKLOAD
             # logs each close a moment later
             sleep 2
             if [[ ${BROKER:-nisshi} != kafka ]]; then
-                connections --connections --csv "$out/$name.csv" >"$out/$name.md"
+                for ((i = 1; i <= nisshi_brokers; i++)); do
+                    suffix=$([[ $nisshi_brokers -gt 1 ]] && echo ".broker-$i" || true)
+                    CONNECTIONS_LOG=$(broker_file "$i" log) \
+                        connections --connections --csv "$out/$name$suffix.csv" >"$out/$name$suffix.md"
+                done
             fi
         done
     done
@@ -431,8 +489,12 @@ explain() {
 }
 
 stop() {
-    [[ -f "$here/broker.pid" ]] && kill "$(cat "$here/broker.pid")" 2>/dev/null || true
-    rm -f "$here/broker.pid"
+    local pid_file
+    for pid_file in "$here"/broker*.pid; do
+        [[ -f $pid_file ]] && kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    done
+    stop_balancer
     docker rm -f nisshi-omb-postgres >/dev/null 2>&1 || true
     remove_kafka
     stop_local_postgres
