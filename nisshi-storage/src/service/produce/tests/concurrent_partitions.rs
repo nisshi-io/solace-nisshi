@@ -179,13 +179,25 @@ fn stalled() -> (CountingStorage, Arc<Semaphore>) {
     )
 }
 
-/// The partitions that storage got a produce for, in order.
+/// The partitions that storage got a produce for, in the order of its calls.
+///
+/// The order is not a contract between partitions. Each partition inflates its batch on the
+/// blocking pool before its write starts, so the partitions of a request reach storage in the
+/// order in which those threads finish. A test that serves partitions at once compares
+/// [`produced_partitions_sorted`].
 fn produced_partitions(storage: &CountingStorage) -> Vec<i32> {
     storage
         .produced()
         .iter()
         .map(|produced| produced.topition.partition)
         .collect()
+}
+
+/// The partitions that storage got a produce for, by index.
+fn produced_partitions_sorted(storage: &CountingStorage) -> Vec<i32> {
+    let mut partitions = produced_partitions(storage);
+    partitions.sort_unstable();
+    partitions
 }
 
 /// Lets the tasks that are ready run, so that a write that a test released has finished.
@@ -242,7 +254,10 @@ async fn a_slow_partition_does_not_hold_the_later_ones_back() -> Result<()> {
         .concat(),
         codes(&responses)?
     );
-    assert_eq!(partitions[1..].to_vec(), produced_partitions(&storage));
+    assert_eq!(
+        partitions[1..].to_vec(),
+        produced_partitions_sorted(&storage)
+    );
 
     Ok(())
 }
@@ -416,7 +431,7 @@ async fn the_partitions_answer_in_request_order_with_their_own_offsets() -> Resu
         () = settle() => {}
     }
 
-    assert_eq!(vec![0, 1], produced_partitions(&storage));
+    assert_eq!(vec![0, 1], produced_partitions_sorted(&storage));
 
     gate.add_permits(1);
     let responses = produce.await?;
@@ -581,13 +596,28 @@ async fn a_partition_waiting_for_the_request_lane_at_the_deadline_is_a_slot_wait
     let responses = serve(&service, acked(&[0, 1])?).await?;
 
     assert_eq!(vec![ErrorCode::RequestTimedOut; 2], codes(&responses)?);
-    assert_matches!(
-        responses
+
+    // Which partition takes the lane is not fixed: the partitions inflate their batches on the
+    // blocking pool, and the first one to finish writes.
+    let messages = responses
+        .iter()
+        .map(|response| response.error_message.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        1,
+        messages
             .iter()
-            .map(|response| response.error_message.as_deref())
-            .collect::<Vec<_>>()
-            .as_slice(),
-        [Some(WRITING), Some(SLOT_WAIT)]
+            .filter(|message| **message == Some(WRITING))
+            .count(),
+        "{messages:?}"
+    );
+    assert_eq!(
+        1,
+        messages
+            .iter()
+            .filter(|message| **message == Some(SLOT_WAIT))
+            .count(),
+        "{messages:?}"
     );
     assert_eq!(1, storage.parked());
 
