@@ -93,6 +93,111 @@ benchmark JVM holds to the broker. Each connection has one of each, so the colum
 connection opens or closes, and `broker_established` should reach the broker's `open at the peak` figure
 from `connections`. `./run.sh sockets 1` samples every second without a run, for another client.
 
+### Connections that the OMB Kafka driver opens
+
+`./run.sh sweep` runs 1, 4 and 8 producers with 1, 4 and 8 consumers on a topic of 4 and of 16 partitions, at 5000
+messages per second of 1 KiB, for 1 minute after the benchmark's 1 minute warm-up (`SWEEP_RATE` and `SWEEP_MINUTES`
+change those). Each run has a new broker, so its log holds that run's connections only, and `results/sweep/` keeps
+the report, the CSV and the socket samples of each. The table is one run of each combination, on the benchmark
+commit that `build` checks out, with Kafka's Java client 3.6.1 and the broker on Postgres.
+
+| producers | consumers | partitions | accepted | open at the peak | `lsof` peak, broker | `lsof` peak, benchmark |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 4 | 8 | 7 | 7 | 7 |
+| 4 | 1 | 4 | 14 | 13 | 13 | 13 |
+| 1 | 4 | 4 | 17 | 16 | 16 | 16 |
+| 8 | 8 | 4 | 43 | 38 | 38 | 38 |
+| 1 | 1 | 16 | 8 | 7 | 7 | 7 |
+| 4 | 1 | 16 | 14 | 13 | 13 | 13 |
+| 1 | 4 | 16 | 17 | 16 | 16 | 16 |
+| 8 | 8 | 16 | 43 | 42 | 42 | 42 |
+
+Each client holds these connections, and none of them depends on the number of partitions:
+
+| client | connections | what each carries |
+|---|---|---|
+| producer | 2 | the first: `ApiVersions`, `Metadata`, `InitProducerId`. The second: `ApiVersions`, `Metadata` and every `Produce` |
+| consumer | 3 | the first: `FindCoordinator`, `Metadata`. The second: `JoinGroup`, `SyncGroup`, `Heartbeat`, `OffsetCommit`, `OffsetFetch`, `LeaveGroup`. The third: `Fetch`, `ListOffsets` |
+| admin client (the benchmark's topic creator) | 2 | the first: `Metadata`. The second: `CreateTopics`. Both stay open for the whole run |
+
+- The open connections at the peak are 2 + 2 × producers + 3 × consumers, so 7, 13, 16 and 42. The 8 producer and 8
+  consumer run on 4 partitions peaked at 38, because a consumer opens its third connection, the one that fetches, only
+  when it has a partition. Four of the eight consumers had none until the end of the run, when the others left the
+  group and the partitions moved. Their fetch connections lived 0.5 to 2 seconds, and they are the 4 extra connections
+  in that run's 43 accepted.
+- A producer sends the `Produce` requests for every partition on one connection, because the broker is the leader of
+  all of them. With 4 partitions, one connection carried 99001 `Produce` requests with 635768 records.
+- The connection that `run.sh` opens to wait for the broker is the one `(no request)` connection of each run, and it is
+  one of the accepted connections.
+- The log's peak and the `lsof` peak at both ends agree in every run. Each run held its 5000 messages per second and the
+  consumers kept up, with a publish p99 between 2.6 and 28.6 ms, the highest with 8 producers.
+- The OMB consumer calls `commitAsync` after each poll that returns records, so the coordinator connection of a
+  consumer carries about as many `OffsetCommit` requests as its fetch connection carries `Fetch` requests (29478 and 29496
+  for the first consumer of the 8 producer and 8 consumer run on 4 partitions).
+
+These counts are what Kafka's Java client does against nisshi, and the roles in the table are read from the requests
+on each connection. The consumer ids that OMB sets end in a random suffix, so the `kind` column of a consumer differs
+from run to run. The next section runs the same workloads against Apache Kafka.
+
+### The same workloads on Apache Kafka
+
+`BROKER=kafka` runs the `apache/kafka` image (3.9.2, `KAFKA_IMAGE`) in docker in place of nisshi and postgres, in KRaft
+mode, with the driver's settings unchanged. `KAFKA_BROKERS=3` starts three brokers, each also a controller, on ports
+9092, 9192 and 9292. They replicate over an internal listener, so the broker-side count holds client connections only,
+and `driver-kafka3.yaml` is the driver with `replicationFactor: 3`. Each broker's log directory is a tmpfs of
+`KAFKA_TMPFS_SIZE` (default 1g), which is cleared with each run, so a run needs no disk in the docker VM. At the sweep's
+rate a run writes about 1 GB in 3 minutes, so give a broker that serves more than one run a larger tmpfs. Kafka has no
+connection log, so the sampler counts the sockets with `netstat` inside each container and the report is skipped.
+
+```shell
+BROKER=kafka ./run.sh sweep                                                    # results/sweep-kafka/
+BROKER=kafka KAFKA_BROKERS=3 DRIVER="$PWD/driver-kafka3.yaml" ./run.sh sweep   # results/sweep-kafka-3/
+```
+
+Peak established sockets on the broker, one run of each combination. The benchmark's own count agrees in every run. Each
+Kafka cluster is new for each run:
+
+| producers | consumers | partitions | nisshi | Kafka, 1 broker | Kafka, 3 brokers |
+|---|---|---|---|---|---|
+| 1 | 1 | 4 | 7 | 7 | 11 |
+| 4 | 1 | 4 | 13 | 13 | 23 |
+| 1 | 4 | 4 | 16 | 16 | 22 |
+| 8 | 8 | 4 | 38 | 42 | 61 |
+| 1 | 1 | 16 | 7 | 7 | 11 |
+| 4 | 1 | 16 | 13 | 13 | 23 |
+| 1 | 4 | 16 | 16 | 16 | 25 |
+| 8 | 8 | 16 | 42 | 42 | 67 |
+
+- One Kafka broker gives nisshi's counts, except for the 8 producer and 8 consumer run on 4 partitions: 42, against
+  nisshi's 38. nisshi's 38 is repeatable (two sweeps).
+- The 4 extra connections are a cold start of Kafka. A consumer asks for its group coordinator first, and on a new
+  cluster Kafka answers `COORDINATOR_NOT_AVAILABLE` (error 15), because it creates `__consumer_offsets` on that first
+  request. The request log has that error 8 times, once for each consumer. The client then retries on a connection to
+  the broker's own node id, and keeps it for the run. A consumer without a partition held 3 connections on Kafka
+  (bootstrap, node 1, coordinator) and 2 on nisshi (bootstrap, coordinator), which answers `FindCoordinator` the first
+  time. The client log of one such consumer on each broker shows this.
+- Run twice on one Kafka broker, the second run, with `__consumer_offsets` in place, peaked at 38 like nisshi. There the
+  consumer without a partition opened its node connection only when it got a partition, as the group wound down. A
+  3 second `group.initial.rebalance.delay.ms` instead of 0 changes nothing: 42 with 1 broker and 62 with 3.
+- With three brokers a client opens a connection to each broker that it uses, so a producer holds more than 2. The
+  counts fit a producer of 1 bootstrap connection and 1 for each broker it produces to, and a consumer of a bootstrap
+  and a coordinator connection and 1 for each broker that it fetches from. That is read from the totals, not from the
+  requests per connection, and it ignores the extra connection of a cold start, which is in these numbers too. A
+  consumer's connection to its node can also be its fetch connection to that broker. A warm 3-broker run is not
+  measured.
+
+To see which requests each connection carries on Kafka, `KAFKA_REQUEST_LOG=1` sets `kafka.request.logger` to DEBUG once
+the brokers are up. The log is in `/opt/kafka/logs/kafka-request.log` of each container, one JSON line per request with
+its connection id, client id and API, and `docker exec <container> cat` reads it before `run.sh stop` removes the
+container. It slows the broker, so use it for the connection profile and not for rates. To see when a Java client opens
+and closes each connection, run with `log4j2-connections.xml`, which writes the connection lines of `NetworkClient` and
+`Selector` to a file:
+
+```shell
+HEAP_OPTS="-Xms4G -Xmx4G -Dlog4j.configurationFile=$PWD/log4j2-connections.xml -Dclient.log=$PWD/client.log" \
+    ./run.sh run workloads/smoke.yaml
+```
+
 ## Checking queries against large volumes
 
 `seed.sql` fills a topic with generated records straight in postgres, far faster than producing

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Console at INFO as the benchmark's own, plus a file of the Kafka client's connection events:
+     NetworkClient and Selector at DEBUG, filtered to the lines about connections opening and closing -->
+<Configuration status="warn">
+  <Appenders>
+    <Console name="Console" target="SYSTEM_OUT">
+      <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5p %c{1} - %m%n"/>
+    </Console>
+    <File name="Connections" fileName="${sys:client.log}" append="false">
+      <RegexFilter regex=".*(Initiating connection|Completed connection|Created socket|isconnect|Closing the Kafka|Cancelled|Connection with|Node [-0-9]+ disconnected).*" onMatch="ACCEPT" onMismatch="DENY"/>
+      <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %c{1} - %m%n"/>
+    </File>
+  </Appenders>
+  <Loggers>
+    <Logger name="org.apache.kafka.clients.NetworkClient" level="debug" additivity="false">
+      <AppenderRef ref="Connections"/>
+    </Logger>
+    <Logger name="org.apache.kafka.common.network.Selector" level="debug" additivity="false">
+      <AppenderRef ref="Connections"/>
+    </Logger>
+    <Root level="info">
+      <AppenderRef ref="Console"/>
+    </Root>
+  </Loggers>
+</Configuration>
