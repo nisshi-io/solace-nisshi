@@ -46,7 +46,7 @@ A Produce request that waits for an answer has a deadline, see the Produce row o
   for a permit among the writes that the engine shares across requests (PostgreSQL),
   because the writes ahead of it were slow (an `acks=0` partition counts here too when its
   20 s wait for a permit ran out, and the broker closes the connection; the log has a `warn` line with the topic,
-  the partition and how long it waited), `budget_wait` when it
+  the partition), `budget_wait` when it
   passed while the partition waited for the decoded-batch budget (see
   [Storage](storage.md)), `writing` when it answered while a write ran, and `in_flight`
   when it did not start a write because an earlier write from the same idempotent

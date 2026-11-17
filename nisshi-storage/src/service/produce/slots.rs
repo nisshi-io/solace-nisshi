@@ -40,9 +40,9 @@ pub(crate) struct Slots {
     shared: Option<Arc<Semaphore>>,
 }
 
-/// A permit of the pool that the writes of every request on a storage share. The request and its
-/// write task each hold a clone, so the permit returns to the pool when both are done.
-pub(crate) type SharedPermit = Arc<OwnedSemaphorePermit>;
+/// A permit of the pool that the writes of every request on a storage share. The write task
+/// holds it until the write ends, so a write that the deadline left running keeps its place.
+pub(crate) type SharedPermit = OwnedSemaphorePermit;
 
 impl Slots {
     /// Returns `count` slots, at least one, and the writes of which also take a permit of
@@ -110,5 +110,5 @@ pub(super) async fn take_shared(
     // The semaphore is never closed, so the only way to get no permit is the wait running out.
     timeout_at(at, Arc::clone(pool).acquire_owned())
         .await
-        .map(|permit| permit.ok().map(Arc::new))
+        .map(Result::ok)
 }
