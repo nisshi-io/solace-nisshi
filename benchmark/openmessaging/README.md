@@ -179,12 +179,21 @@ Kafka cluster is new for each run:
 - Run twice on one Kafka broker, the second run, with `__consumer_offsets` in place, peaked at 38 like nisshi. There the
   consumer without a partition opened its node connection only when it got a partition, as the group wound down. A
   3 second `group.initial.rebalance.delay.ms` instead of 0 changes nothing: 42 with 1 broker and 62 with 3.
-- With three brokers a client opens a connection to each broker that it uses, so a producer holds more than 2. The
-  counts fit a producer of 1 bootstrap connection and 1 for each broker it produces to, and a consumer of a bootstrap
-  and a coordinator connection and 1 for each broker that it fetches from. That is read from the totals, not from the
-  requests per connection, and it ignores the extra connection of a cold start, which is in these numbers too. A
-  consumer's connection to its node can also be its fetch connection to that broker. A warm 3-broker run is not
-  measured.
+- With three brokers a client opens a connection to each broker that it uses. The 8 producer and 8 consumer run on 4
+  partitions, run twice on one cluster of 3 brokers, peaked at 60 the first time and 54 the second, which is the warm
+  cluster. The warm peak is the sum of these connections, and the client logs count the same initiations:
+
+  | client | connections each | clients | total |
+  |---|---|---|---|
+  | admin | 2 | 1 | 2 |
+  | producer | 4: bootstrap, and one to each of the 3 brokers | 8 | 32 |
+  | consumer with a partition | 3: bootstrap, coordinator, and one fetch connection to the broker that leads its partition | 4 | 12 |
+  | consumer without a partition | 2: bootstrap, coordinator | 4 | 8 |
+
+  The 6 extra connections of the cold run are the retry of the first `FindCoordinator`, which opens a connection to a
+  broker's own node id. Eight consumers would add up to 8, but a consumer that has a partition may fetch from the
+  broker that the retry used, and then the two share one connection. That split is read from the totals and not
+  checked per connection. The 3-broker rows of the table above are cold runs.
 
 To see which requests each connection carries on Kafka, `KAFKA_REQUEST_LOG=1` sets `kafka.request.logger` to DEBUG once
 the brokers are up. The log is in `/opt/kafka/logs/kafka-request.log` of each container, one JSON line per request with
