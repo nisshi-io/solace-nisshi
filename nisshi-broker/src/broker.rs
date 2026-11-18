@@ -15,10 +15,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod connection_drain;
 pub mod group;
 mod maintenance;
 mod sweep_failures;
 
+pub use self::connection_drain::ConnectionDrain;
 use self::sweep_failures::SweepFailures;
 use crate::{
     CancelKind, Error, Result,
@@ -51,6 +53,7 @@ use std::{
     future::Future,
     io::{self, ErrorKind},
     marker::PhantomData,
+    mem,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
     result,
     sync::Arc,
@@ -304,6 +307,7 @@ pub struct Broker<G, S> {
     storage_engine: String,
 
     cancellation: CancellationToken,
+    connection_drain: ConnectionDrain,
     shutdown_grace: Duration,
 
     /// Cancelled when the shutdown grace ends, which aborts the connections and sweeps that are
@@ -364,6 +368,7 @@ where
             storage_engine: String::from("unknown"),
 
             cancellation: CancellationToken::new(),
+            connection_drain: ConnectionDrain::new(),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             shutdown_deadline: CancellationToken::new(),
             storage_cancellation: CancellationToken::new(),
@@ -393,6 +398,14 @@ where
             cancellation,
             ..self
         }
+    }
+
+    /// Returns the connection drain of this broker: the handle that drains the client connections
+    /// that the broker has open, while the broker keeps running.
+    ///
+    /// Take the handle before [`Self::run`] or [`Self::main`], because each consumes the broker.
+    pub fn connection_drain(&self) -> ConnectionDrain {
+        self.connection_drain.clone()
     }
 
     /// Returns the broker with the given shutdown grace: how long a broker that shuts down
@@ -702,6 +715,13 @@ where
         // is kept short and capped.
         let mut consecutive_accept_errors: u32 = 0;
 
+        let mut drain_requests = self.connection_drain.requests();
+
+        // The token that the connections accepted since the last drain hold. A drain cancels it
+        // and puts a new token in its place, so the connections accepted later stay open. Each
+        // token is a child of the broker's token, so a shutdown drains every connection.
+        let mut connections_drain = self.cancellation.child_token();
+
         loop {
             connections += 1;
 
@@ -743,7 +763,7 @@ where
 
                     let extensions = Extensions::default();
                     _ = extensions.insert(PeerAddressExtension::new(addr));
-                    _ = extensions.insert(ShutdownExtension::new(self.cancellation.clone()));
+                    _ = extensions.insert(ShutdownExtension::new(connections_drain.clone()));
 
                     let pb = if self.silent {
                         None
@@ -908,6 +928,15 @@ where
 
                 v = set.join_next(), if !set.is_empty() => {
                     debug!(?v);
+                }
+
+                Ok(()) = drain_requests.changed() => {
+                    info!(
+                        tasks = set.len(),
+                        "draining the open connections, the listener stays open"
+                    );
+
+                    mem::replace(&mut connections_drain, self.cancellation.child_token()).cancel();
                 }
 
                 message = self.cancellation.cancelled() => {
@@ -1272,6 +1301,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             transaction_maintenance_interval: intervals.transaction_maintenance,
             storage_engine,
             cancellation: self.cancellation,
+            connection_drain: ConnectionDrain::new(),
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             shutdown_deadline: CancellationToken::new(),
             storage_cancellation,
