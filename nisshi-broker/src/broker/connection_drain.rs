@@ -25,7 +25,9 @@ use tokio::sync::watch;
 /// broker names only itself in a Metadata response, at its advertised listener, so the response
 /// cannot send a client to another broker, and a client keeps its connection until the broker
 /// closes it. A program that runs several brokers behind one address drains a broker to send
-/// its clients back through that address.
+/// its clients back through that address. Take the broker out of the load balancer before the
+/// drain, because the listener stays open and a drained client may otherwise reconnect to the
+/// same broker.
 ///
 /// A client sees the connection end between two responses, as it does when a Kafka broker
 /// closes an idle connection ([`maybeCloseOldestConnection`]). The broker does not read a
@@ -53,9 +55,8 @@ impl ConnectionDrain {
     ///
     /// The broker's listener starts the drain when it next waits for a connection, so the drain
     /// also closes a connection that the broker accepts until then. A connection that the broker
-    /// accepts later stays open until the next drain. Drains that are requested before the
-    /// listener starts one count as one drain, and a drain of a broker that does not listen does
-    /// nothing.
+    /// accepts later stays open until the next drain. A drain has no effect until the broker is
+    /// serving, and the drains that are requested while the listener is busy count as one drain.
     ///
     /// A connection closes only after it has answered the request that it holds, so a slow
     /// request keeps its connection open for as long as the request takes.

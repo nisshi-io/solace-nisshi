@@ -19,15 +19,24 @@
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Result;
-use nisshi_sans_io::{ApiKey as _, ErrorCode, Frame, Header, MetadataRequest, MetadataResponse};
+use nisshi_sans_io::{
+    ApiKey as _, ErrorCode, FetchRequest, FetchResponse, MetadataRequest, MetadataResponse,
+    fetch_request::{FetchPartition, FetchTopic},
+};
+use opentelemetry::global;
+use opentelemetry_sdk::metrics::{
+    InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+    data::{AggregatedMetrics, MetricData},
+};
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::AsyncReadExt as _,
     net::TcpStream,
     time::{Instant, sleep, timeout},
 };
 
 use crate::{
-    common::{init_tracing, wire::round_trip},
+    common::{alphanumeric_string, init_tracing, wire::round_trip},
+    fetch_wire::create_topic,
     shutdown::run_broker,
 };
 
@@ -38,7 +47,15 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 const METADATA_VERSION: i16 = 12;
+const FETCH_VERSION: i16 = 12;
 const CORRELATION_ID: i32 = 7;
+
+/// How long a Fetch of [`fetch_request`] waits for a record, in milliseconds, and so how long
+/// the broker holds that request when the topic stays empty.
+const FETCH_MAX_WAIT_MS: i32 = 2_000;
+
+/// The counter of the bytes of the requests that the broker has read.
+const BYTES_RECEIVED: &str = "nisshi_bytes_received";
 
 fn metadata_request() -> MetadataRequest {
     MetadataRequest::default()
@@ -46,6 +63,58 @@ fn metadata_request() -> MetadataRequest {
         .allow_auto_topic_creation(Some(false))
         .include_cluster_authorized_operations(Some(false))
         .include_topic_authorized_operations(Some(false))
+}
+
+/// Returns a Fetch of partition 0 of `topic` that waits [`FETCH_MAX_WAIT_MS`] for a record.
+fn fetch_request(topic: &str) -> FetchRequest {
+    FetchRequest::default()
+        .replica_id(Some(-1))
+        .max_wait_ms(FETCH_MAX_WAIT_MS)
+        .min_bytes(1)
+        .max_bytes(Some(50 * 1024))
+        .isolation_level(Some(0))
+        .session_id(Some(0))
+        .session_epoch(Some(-1))
+        .topics(Some(
+            [FetchTopic::default()
+                .topic(Some(topic.into()))
+                .partitions(Some(
+                    [FetchPartition::default()
+                        .partition(0)
+                        .current_leader_epoch(Some(-1))
+                        .fetch_offset(0)
+                        .last_fetched_epoch(Some(-1))
+                        .log_start_offset(Some(-1))
+                        .partition_max_bytes(50 * 1024)]
+                    .into(),
+                ))]
+            .into(),
+        ))
+        .forgotten_topics_data(Some([].into()))
+        .rack_id(Some("".into()))
+}
+
+/// Returns the value of the [`BYTES_RECEIVED`] counter, or 0 before the broker has read a
+/// request.
+fn bytes_received(provider: &SdkMeterProvider, exporter: &InMemoryMetricExporter) -> Result<u64> {
+    provider.force_flush()?;
+
+    // The exporter keeps every export, and the counter only grows, so the largest value is
+    // the current one.
+    Ok(exporter
+        .get_finished_metrics()?
+        .iter()
+        .flat_map(|resource| resource.scope_metrics())
+        .flat_map(|scope| scope.metrics())
+        .filter(|metric| metric.name() == BYTES_RECEIVED)
+        .filter_map(|metric| match metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+            _ => None,
+        })
+        .flat_map(|sum| sum.data_points())
+        .map(|point| point.value())
+        .max()
+        .unwrap_or_default())
 }
 
 /// Sends a Metadata request on `client` and fails unless the broker answers it.
@@ -142,41 +211,57 @@ async fn each_drain_closes_the_connections_opened_since_the_drain_before_it() ->
 }
 
 #[tokio::test]
-async fn a_request_that_has_started_arriving_is_answered_before_the_connection_closes() -> Result<()>
-{
+async fn a_request_in_progress_is_answered_before_the_connection_closes() -> Result<()> {
     let _guard = init_tracing()?;
+
+    // The broker's counters report to the provider that is installed when the broker first
+    // uses them, so the test installs its provider before it starts the broker.
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    global::set_meter_provider(provider.clone());
 
     let broker = run_broker(SHUTDOWN_GRACE).await?;
     let mut client = accepted_connection(broker.addr).await?;
 
-    let request = Frame::request(
-        Header::Request {
-            api_key: MetadataRequest::KEY,
-            api_version: METADATA_VERSION,
-            correlation_id: CORRELATION_ID,
-            client_id: Some(env!("CARGO_PKG_NAME").into()),
-        },
-        metadata_request().into(),
-    )?;
+    let topic = alphanumeric_string(15);
+    create_topic(&mut client, &topic).await?;
 
-    let (head, tail) = request.split_at(2);
-    client.write_all(head).await?;
+    let read_before_the_fetch = bytes_received(&provider, &exporter)?;
 
-    // Gives the broker time to read the first byte before the drain starts, and gives the
-    // drain time to reach the connection before the rest of the request arrives.
-    sleep(Duration::from_millis(100)).await;
-    broker.connection_drain.drain();
-    sleep(Duration::from_millis(200)).await;
+    let fetch = round_trip(
+        &mut client,
+        FetchRequest::KEY,
+        FETCH_VERSION,
+        CORRELATION_ID,
+        fetch_request(&topic).into(),
+    );
 
-    client.write_all(tail).await?;
+    let drain_during_the_fetch = async {
+        // The broker counts the bytes of a request once it has read all of it, and the Fetch
+        // is the only request sent since the count was read. So once the count grows the
+        // Fetch is in progress, and it stays so for `FETCH_MAX_WAIT_MS`.
+        while bytes_received(&provider, &exporter)? == read_before_the_fetch {
+            sleep(Duration::from_millis(10)).await;
+        }
 
-    let mut size = [0u8; 4];
-    _ = timeout(TEST_TIMEOUT, client.read_exact(&mut size)).await??;
-    let mut response = vec![0u8; usize::try_from(i32::from_be_bytes(size))?];
-    _ = timeout(TEST_TIMEOUT, client.read_exact(&mut response)).await??;
+        broker.connection_drain.drain();
 
-    // A response starts with the correlation id of its request.
-    assert_eq!(CORRELATION_ID.to_be_bytes(), response[..4]);
+        anyhow::Ok(())
+    };
+
+    let (frame, drained) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(fetch, drain_during_the_fetch)
+    })
+    .await?;
+    drained?;
+
+    let response = FetchResponse::try_from(frame?.body)?;
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(response.error_code.unwrap_or_default())?
+    );
 
     assert_end_of_stream(&mut client).await?;
 
