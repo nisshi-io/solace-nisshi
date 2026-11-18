@@ -64,6 +64,10 @@
 # and `stop`. Metadata still lists one broker, node 111, so the clients see a single broker. `sweep`
 # saves into results/sweep-nisshi-N/ and reports each broker's connections as <run>.broker-N.md.
 #
+# PROTOTYPE: NISSHI_PROTOTYPE_NODE_IDS=111,222,333 makes each broker list those node ids in Metadata, all at
+# the advertised address, with leaders spread over them in a fixed order. See the README. SWEEP_OUT
+# replaces the directory that `sweep` saves into.
+#
 # DRIVER is the benchmark driver file `run` uses, driver-nisshi.yaml by default. Copy that file to
 # change the producer or consumer settings, for example consumerConfig's fetch.max.wait.ms.
 set -euo pipefail
@@ -417,6 +421,7 @@ sweep() {
     local out="$results/sweep" partitions combo producers consumers name i suffix
     [[ ${BROKER:-nisshi} == kafka ]] && out="$results/sweep-kafka${KAFKA_BROKERS:+-$KAFKA_BROKERS}"
     [[ ${BROKER:-nisshi} == nisshi && $nisshi_brokers -gt 1 ]] && out="$results/sweep-nisshi-$nisshi_brokers"
+    [[ -n ${SWEEP_OUT:-} ]] && out=$SWEEP_OUT
     mkdir -p "$out"
     for partitions in 4 16; do
         for combo in "1 1" "4 1" "1 4" "8 8"; do

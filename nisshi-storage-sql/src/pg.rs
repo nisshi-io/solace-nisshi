@@ -4734,18 +4734,34 @@ impl Storage for Postgres {
 
         let c = self.connection().await.inspect_err(|err| error!(?err))?;
 
-        let brokers = vec![
-            MetadataResponseBroker::default()
-                .node_id(self.node)
-                .host(
-                    self.advertised_listener
-                        .host_str()
-                        .unwrap_or("0.0.0.0")
-                        .into(),
-                )
-                .port(self.advertised_listener.port().unwrap_or(9092).into())
-                .rack(None),
-        ];
+        // PROTOTYPE: NISSHI_PROTOTYPE_NODE_IDS="111,222,333" lists each id, all at the advertised
+        // listener, so that a client sees several brokers behind one load balancer
+        let mut node_ids: Vec<i32> = std::env::var("NISSHI_PROTOTYPE_NODE_IDS")
+            .ok()
+            .map(|ids| {
+                ids.split(',')
+                    .filter_map(|id| id.trim().parse().ok())
+                    .collect()
+            })
+            .filter(|ids: &Vec<i32>| !ids.is_empty())
+            .unwrap_or_else(|| vec![self.node]);
+        node_ids.sort_unstable();
+
+        let brokers: Vec<_> = node_ids
+            .iter()
+            .map(|node_id| {
+                MetadataResponseBroker::default()
+                    .node_id(*node_id)
+                    .host(
+                        self.advertised_listener
+                            .host_str()
+                            .unwrap_or("0.0.0.0")
+                            .into(),
+                    )
+                    .port(self.advertised_listener.port().unwrap_or(9092).into())
+                    .rack(None)
+            })
+            .collect();
 
         debug!(?brokers);
 
@@ -4799,10 +4815,8 @@ impl Storage for Postgres {
                                         ?replication_factor
                                     );
 
-                                    let mut rng = rng();
-                                    let mut broker_ids: Vec<_> =
+                                    let broker_ids: Vec<_> =
                                         brokers.iter().map(|broker| broker.node_id).collect();
-                                    broker_ids.shuffle(&mut rng);
 
                                     let partitions = Some(nisshi_storage::assign_replicas(
                                         &broker_ids,
@@ -4876,10 +4890,8 @@ impl Storage for Postgres {
                                         ?replication_factor
                                     );
 
-                                    let mut rng = rng();
-                                    let mut broker_ids: Vec<_> =
+                                    let broker_ids: Vec<_> =
                                         brokers.iter().map(|broker| broker.node_id).collect();
-                                    broker_ids.shuffle(&mut rng);
 
                                     let partitions = Some(nisshi_storage::assign_replicas(
                                         &broker_ids,
@@ -4959,10 +4971,8 @@ impl Storage for Postgres {
                                 ?replication_factor
                             );
 
-                            let mut rng = rng();
-                            let mut broker_ids: Vec<_> =
+                            let broker_ids: Vec<_> =
                                 brokers.iter().map(|broker| broker.node_id).collect();
-                            broker_ids.shuffle(&mut rng);
 
                             let partitions = Some(nisshi_storage::assign_replicas(
                                 &broker_ids,
