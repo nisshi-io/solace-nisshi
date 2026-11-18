@@ -556,9 +556,8 @@ async fn the_extra_writes_of_two_requests_share_the_storage_permits() -> Result<
     let permits = Arc::new(Semaphore::new(2));
     let storage = slow().with_produce_permits(Arc::clone(&permits));
     let service = service(&storage);
-    let started_at = Instant::now();
 
-    let timed = |partitions: &'static [i32]| {
+    let timed = |partitions: &'static [i32], started_at: Instant| {
         let service = &service;
 
         async move {
@@ -568,7 +567,20 @@ async fn the_extra_writes_of_two_requests_share_the_storage_permits() -> Result<
         }
     };
 
-    let (first, second) = tokio::join!(biased; timed(&[0, 1, 2, 3]), timed(&[4, 5, 6, 7]));
+    // The first request runs alone until its writes are in flight, so it takes the lane and both
+    // permits before the second request tries: the partitions inflate on the blocking pool and
+    // reach their writes in no fixed order across the two requests.
+    let first_started_at = Instant::now();
+    let mut first = std::pin::pin!(timed(&[0, 1, 2, 3], first_started_at));
+    tokio::select! {
+        biased;
+        _ = &mut first => panic!("the first request answered before its writes started"),
+        () = settle() => {}
+    }
+    assert_eq!(0, permits.available_permits());
+
+    let second_started_at = Instant::now();
+    let (first, second) = tokio::join!(first, timed(&[4, 5, 6, 7], second_started_at));
     let (first_codes, first_took) = first?;
     let (second_codes, second_took) = second?;
 
