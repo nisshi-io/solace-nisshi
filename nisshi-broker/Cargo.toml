@@ -30,6 +30,7 @@ features = ["dynostore", "libsql", "postgres", "slatedb"]
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -60,6 +61,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 rama.workspace = true
 rand.workspace = true
+regex.workspace = true
 rsasl.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -76,7 +78,6 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 crc-fast.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }

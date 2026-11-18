@@ -24,7 +24,8 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::Registry;
 use nisshi_service::{
-    FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, TransactionAbortableDowngradeLayer,
+    FetchStatsLayer, FrameRequestLayer, FrameRouteBuilder, MetadataTopicIdLayer, ProduceStatsLayer,
+    TransactionAbortableDowngradeLayer,
 };
 use nisshi_storage::{
     AlterUserScramCredentialsService, AutoCreateRefusals, ConsumerGroupDescribeService,
@@ -344,6 +345,7 @@ where
             (
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<FetchRequest>::new(),
+                FetchStatsLayer,
                 FetchValidationLayer::new(),
             )
                 .into_layer(FetchService { storage })
@@ -486,7 +488,8 @@ where
             // future of every layer of the produce path in one type, which overflows its query
             // depth limit in a crate that builds the route.
             Service::<RequestInput<ProduceRequest>>::boxed(
-                ProduceService::with_schemas(storage, schemas).with_validation(),
+                ProduceStatsLayer
+                    .into_layer(ProduceService::with_schemas(storage, schemas).with_validation()),
             ),
         )
         .map_err(Into::into)

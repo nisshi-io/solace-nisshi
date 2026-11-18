@@ -168,6 +168,13 @@ pub(super) struct Arg {
     #[arg(long, requires = "key")]
     key_passphrase_file: Option<PathBuf>,
 
+    /// How often to log the state of each open connection at the nisshi::connection target (for
+    /// example 30s). The state is the client id, the requests by API and the topic-partitions
+    /// produced to and fetched from. Off by default. Turn the events on with
+    /// RUST_LOG=warn,nisshi::connection=info
+    #[arg(long, env = "CONNECTION_SNAPSHOT_INTERVAL", value_parser = positive_duration)]
+    connection_snapshot_interval: Option<Duration>,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -601,6 +608,7 @@ impl Arg {
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
             .silent(self.silent)
+            .connection_snapshot_interval(self.connection_snapshot_interval)
             .group_coordinator(GroupCoordinatorConfig {
                 initial_rebalance_delay: self.group_initial_rebalance_delay,
                 poll_interval: self.group_poll_interval,
@@ -786,6 +794,30 @@ mod tests {
 
             assert!(arg.auto_create_topics_enable);
             assert_eq!(1, arg.num_partitions);
+        });
+    }
+
+    #[test]
+    fn connection_snapshots_are_off_by_default_and_take_a_positive_duration() {
+        temp_env::with_vars_unset(["CONNECTION_SNAPSHOT_INTERVAL"], || {
+            assert_eq!(
+                None,
+                parse(&[])
+                    .expect("defaults parse")
+                    .connection_snapshot_interval
+            );
+
+            assert_eq!(
+                Some(Duration::from_secs(30)),
+                parse(&["--connection-snapshot-interval=30s"])
+                    .expect("30s parses")
+                    .connection_snapshot_interval
+            );
+
+            let err = parse(&["--connection-snapshot-interval=0s"])
+                .expect_err("a zero interval would log in a loop");
+
+            assert_eq!(clap::error::ErrorKind::ValueValidation, err.kind());
         });
     }
 

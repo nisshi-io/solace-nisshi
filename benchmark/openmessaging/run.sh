@@ -11,6 +11,15 @@
 #   run.sh seed [var=value]   fill postgres with generated records, see seed.sql for the variables
 #   run.sh explain [topic [partition [offset]]]
 #                             EXPLAIN ANALYZE the fetch queries against the seeded topic
+#   run.sh connections [args] report the connections each client opened, from the broker log:
+#                             the clients, the requests they sent and the topic-partitions they
+#                             produced to and fetched from. Args go to the connections binary
+#                             (nisshi-broker/src/bin/connections), for example --connections or
+#                             --csv results/connections.csv
+#   run.sh sockets [seconds]  sample the sockets on the broker's port with lsof until interrupted
+#   run.sh sweep              run 1, 4 and 8 producers and 1, 4 and 8 consumers on 4 and 16
+#                             partitions, one broker each, and save the connection report and
+#                             socket samples of each run in results/sweep/
 #   run.sh stop               stop the broker and postgres
 #
 # By default postgres is a Homebrew postgres on 127.0.0.1, with all its files in .pg/ beside this
@@ -31,6 +40,30 @@
 # POSTGRES_ARGS adds arguments to the postgres server, for example
 # "-c shared_preload_libraries=auto_explain"
 #
+# The broker logs one `nisshi::connection` event per connection opened and closed, and every
+# CONNECTION_SNAPSHOT_INTERVAL (default 10s) the state of each open connection, which
+# `connections` reads. RUST_LOG replaces the default filter, so keep nisshi::connection=info in it
+# to keep those events. `run` also samples the established sockets on the broker's port with lsof
+# every SOCKET_SAMPLE_INTERVAL seconds (default 5, 0 turns it off) into results/sockets-*.csv:
+# the count the broker holds, and the count the benchmark JVM holds to it, as a check on the log.
+#
+# BROKER=kafka runs Apache Kafka (the apache/kafka image, KAFKA_IMAGE) in docker in place of nisshi
+# and postgres, to compare the clients' connections. KAFKA_BROKERS is the number of brokers
+# (default 1), on ports 9092, 9192 and so on, and KAFKA_REBALANCE_DELAY_MS the group.initial.rebalance.delay.ms (default 0).
+# KAFKA_REQUEST_LOG=1 turns on Kafka's request log (kafka.request.logger=DEBUG), one line per request
+# with its client id and connection, in /opt/kafka/logs/kafka-request.log of each broker
+# container (docker exec cat). The level is set after startup: the image's own
+# KAFKA_LOG4J_LOGGERS replaces the file appender, so the lines would go nowhere. Pass it to `broker`, `run`, `sweep` and
+# `stop`. The sampler then counts the broker's sockets with netstat inside the container, there is
+# no connection log, and `sweep` saves into results/sweep-kafka/ (results/sweep-kafka-N/ when
+# KAFKA_BROKERS is set) and skips the report.
+#
+# NISSHI_BROKERS=N (default 1) starts N nisshi brokers on the one postgres, each with a log of its own
+# (broker-1.log and so on) and each advertising localhost:9092, where balance.py listens and hands each
+# connection to the next broker in turn, like a layer 4 balancer. Pass it to `broker`, `run`, `sweep`
+# and `stop`. Metadata still lists one broker, node 111, so the clients see a single broker. `sweep`
+# saves into results/sweep-nisshi-N/ and reports each broker's connections as <run>.broker-N.md.
+#
 # DRIVER is the benchmark driver file `run` uses, driver-nisshi.yaml by default. Copy that file to
 # change the producer or consumer settings, for example consumerConfig's fetch.max.wait.ms.
 set -euo pipefail
@@ -45,6 +78,29 @@ postgres=${POSTGRES:-local}
 pg_bin=${PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}
 pg_dir="$here/.pg"
 pg_port=${POSTGRES_PORT:-5432}
+broker_port=9092
+nisshi_brokers=${NISSHI_BROKERS:-1}
+
+# The ports that the nisshi brokers listen on: $broker_port for one broker. For more, each listens
+# on its own port from $broker_port + 100, and the balancer takes $broker_port.
+nisshi_ports() {
+    local i
+    if ((nisshi_brokers == 1)); then
+        echo "$broker_port"
+        return
+    fi
+    for ((i = 1; i <= nisshi_brokers; i++)); do echo $((broker_port + 100 * i)); done
+}
+
+# The file for broker $1 (1 to NISSHI_BROKERS) with the extension $2
+broker_file() {
+    if ((nisshi_brokers == 1)); then echo "$here/broker.$2"; else echo "$here/broker-$1.$2"; fi
+}
+
+stop_balancer() {
+    [[ -f "$here/balance.pid" ]] && kill "$(cat "$here/balance.pid")" 2>/dev/null || true
+    rm -f "$here/balance.pid"
+}
 
 # The upstream commit that the patch and the build flags below were made for. Set OMB_COMMIT to
 # try another.
@@ -128,7 +184,88 @@ stop_local_postgres() {
     fi
 }
 
+kafka_prefix=nisshi-omb-kafka
+kafka_network=nisshi-omb-kafka-net
+kafka_brokers=${KAFKA_BROKERS:-1}
+
+# The host ports that the Kafka brokers advertise to clients: $broker_port, then 100 more for each
+# further broker
+kafka_ports() {
+    local i
+    for ((i = 0; i < kafka_brokers; i++)); do echo $((broker_port + 100 * i)); done
+}
+
+remove_kafka() {
+    local names
+    names=$(docker ps -a --format '{{.Names}}' | grep -E "^$kafka_prefix-[0-9]+\$" || true)
+    # shellcheck disable=SC2086
+    [[ -z $names ]] || docker rm -f $names >/dev/null 2>&1 || true
+    docker network rm "$kafka_network" >/dev/null 2>&1 || true
+}
+
+# Starts KAFKA_BROKERS (default 1) Apache Kafka brokers in KRaft mode, each also a controller.
+# Clients reach the broker on localhost:<port> (see kafka_ports) through the EXTERNAL listener, and
+# the brokers reach each other on the INTERNAL one, so replication stays off the client port.
+# The log directory is a tmpfs of KAFKA_TMPFS_SIZE (default 1g) per broker, so a run needs no disk
+# in the docker VM and starts empty. A run writes about 1 GB per 3 minutes at the sweep's rate.
+kafka_broker() {
+    remove_kafka
+    docker network create "$kafka_network" >/dev/null
+    local i voters='' port name
+    for ((i = 1; i <= kafka_brokers; i++)); do voters+="${voters:+,}$i@$kafka_prefix-$i:9093"; done
+    for ((i = 1; i <= kafka_brokers; i++)); do
+        port=$((broker_port + 100 * (i - 1)))
+        name=$kafka_prefix-$i
+        docker run -d --name "$name" --network "$kafka_network" -p "$port:9092" \
+            --tmpfs "/tmp/kafka-logs:rw,size=${KAFKA_TMPFS_SIZE:-1g}" \
+            -e KAFKA_NODE_ID="$i" -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_LISTENERS=EXTERNAL://:9092,INTERNAL://:19092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=EXTERNAL://localhost:$port,INTERNAL://$name:19092 \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS="$voters" \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR="$kafka_brokers" \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR="$kafka_brokers" \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS="${KAFKA_REBALANCE_DELAY_MS:-0}" \
+            "${KAFKA_IMAGE:-apache/kafka:3.9.2}" >/dev/null
+    done
+    # the port answers before the broker does, so wait for each startup message
+    local _
+    for ((i = 1; i <= kafka_brokers; i++)); do
+        for _ in $(seq 240); do
+            docker logs "$kafka_prefix-$i" 2>&1 | grep -q 'Kafka Server started' && continue 2
+            sleep 0.5
+        done
+        echo "run.sh: kafka broker $i did not start" >&2
+        return 1
+    done
+    if [[ -n ${KAFKA_REQUEST_LOG:-} ]]; then
+        for ((i = 1; i <= kafka_brokers; i++)); do
+            docker exec "$kafka_prefix-$i" /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:19092 \
+                --entity-type broker-loggers --entity-name "$i" --alter \
+                --add-config kafka.request.logger=DEBUG >/dev/null
+        done
+    fi
+}
+
+# Prints how many client connections the Kafka brokers hold in all: the ESTABLISHED sockets whose
+# local port is the clients' listener port in each container
+kafka_established() {
+    local i total=0 n
+    for ((i = 1; i <= kafka_brokers; i++)); do
+        n=$({ docker exec "$kafka_prefix-$i" netstat -tn 2>/dev/null || true; } | grep -c -E -e "^tcp.*:9092 .*ESTABLISHED" || true)
+        total=$((total + n))
+    done
+    echo "$total"
+}
+
 broker() {
+    if [[ ${BROKER:-nisshi} == kafka ]]; then
+        kafka_broker
+        return
+    fi
     cd "$root"
     local storage=postgres://postgres:postgres@localhost:$pg_port
     if [[ $postgres == local ]]; then
@@ -140,12 +277,95 @@ broker() {
     storage=$storage${STORAGE_QUERY:+?$STORAGE_QUERY}
     cargo build --release --bin nisshi --no-default-features --features postgres
     pkill -f 'target/release/nisshi broker' 2>/dev/null || true
-    RUST_LOG=${RUST_LOG:-warn} nohup target/release/nisshi broker \
-        --storage-engine="$storage" \
-        --advertised-listener-url=tcp://localhost:9092 \
-        >"$here/broker.log" 2>&1 &
-    echo $! >"$here/broker.pid"
-    echo "broker pid $(cat "$here/broker.pid"), log $here/broker.log"
+    stop_balancer
+    local i=0 port
+    for port in $(nisshi_ports); do
+        i=$((i + 1))
+        RUST_LOG=${RUST_LOG:-warn,nisshi::connection=info} \
+            CONNECTION_SNAPSHOT_INTERVAL=${CONNECTION_SNAPSHOT_INTERVAL:-10s} \
+            nohup target/release/nisshi broker \
+            --storage-engine="$storage" \
+            --listener-url="tcp://[::]:$port" \
+            --advertised-listener-url=tcp://localhost:$broker_port \
+            >"$(broker_file "$i" log)" 2>&1 &
+        echo $! >"$(broker_file "$i" pid)"
+        echo "broker $i pid $(cat "$(broker_file "$i" pid)"), port $port, log $(broker_file "$i" log)"
+    done
+    if ((nisshi_brokers > 1)); then
+        # the balancer starts when every broker listens, or it would refuse the first clients
+        for port in $(nisshi_ports); do wait_for_port "$port"; done
+        local backends
+        backends=$(nisshi_ports | tr '\n' ' ')
+        # shellcheck disable=SC2086 # backends is a list of ports, split on purpose
+        nohup python3 "$here/balance.py" "$broker_port" $backends >"$here/balance.log" 2>&1 &
+        echo $! >"$here/balance.pid"
+        echo "balancer pid $(cat "$here/balance.pid") on port $broker_port"
+    fi
+}
+
+# Prints how many ESTABLISHED TCP sockets of process $1 have a name that matches the extended
+# regular expression $2, or 0 when there is no such process. lsof's -F n output has one line
+# per socket: n<local address>-><remote address>.
+established() {
+    local pid=$1 pattern=$2
+    [[ -n $pid ]] || { echo 0; return; }
+    { lsof -nP -a -p "$pid" -iTCP -sTCP:ESTABLISHED -Fn 2>/dev/null || true; } | grep -c -E -e "$pattern" || true
+}
+
+# Appends a line to the CSV $1 every $2 seconds, until killed: the sockets the broker holds on its
+# port, and the sockets the benchmark JVM holds to that port. Each connection has one of each,
+# so the two columns agree except while a connection opens or closes, or when a client outside
+# the benchmark is connected.
+sample_sockets() {
+    local file=$1 interval=$2 pid_file jvm_pid broker_count client_ports ports_regex
+    client_ports=$(kafka_ports | paste -sd'|' -)
+    ports_regex=$(nisshi_ports | paste -sd'|' -)
+    echo "time,broker_established,benchmark_established" >"$file"
+    while true; do
+        if [[ ${BROKER:-nisshi} == kafka ]]; then
+            broker_count=$(kafka_established)
+        else
+            broker_count=0
+            for pid_file in "$here"/broker*.pid; do
+                [[ -f $pid_file ]] || continue
+                broker_count=$((broker_count + $(established "$(cat "$pid_file")" ":($ports_regex)->")))
+            done
+        fi
+        jvm_pid=$(pgrep -n -f io.openmessaging.benchmark.Benchmark || true)
+        echo "$(date +%Y-%m-%dT%H:%M:%S),$broker_count,$(established "$jvm_pid" "->.*:($client_ports)\$")" >>"$file"
+        sleep "$interval"
+    done
+}
+
+# Prints the most sockets that a sample file in $1 holds at once, for each column
+peak_sockets() {
+    awk -F, 'NR > 1 { if ($2 > b) b = $2; if ($3 > j) j = $3 } END { printf "peak sockets: broker %d, benchmark %d\n", b, j }' "$1"
+}
+
+sampler_pid=
+stop_sampler() {
+    if [[ -n $sampler_pid ]]; then
+        kill "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+        sampler_pid=
+    fi
+}
+
+sockets() {
+    local interval=${1:-${SOCKET_SAMPLE_INTERVAL:-5}}
+    mkdir -p "$results"
+    local file
+    file="$results/sockets-$(date +%Y%m%d-%H%M%S).csv"
+    echo "sampling every ${interval}s into $file, interrupt to stop" >&2
+    sample_sockets "$file" "$interval"
+}
+
+connections() {
+    local log=${CONNECTIONS_LOG:-$here/broker.log}
+    [[ -f "$log" ]] || { echo "run.sh: no $log, run.sh broker first" >&2; exit 1; }
+    cargo run --quiet --release --manifest-path "$root/Cargo.toml" -p nisshi-broker \
+        --no-default-features --features postgres --bin connections -- \
+        --filename "$log" "$@"
 }
 
 run() {
@@ -156,10 +376,82 @@ run() {
     # bin/benchmark resolves its classpath and the payload files relative to the working
     # directory, and writes result JSON there, so run in the distribution and move the results
     # out afterwards. Without HEAP_OPTS, bin/benchmark uses a 4 GB heap.
-    local status=0
+    local status=0 interval=${SOCKET_SAMPLE_INTERVAL:-5} sockets_file=
+    if [[ $interval != 0 ]]; then
+        sockets_file=${SOCKETS_CSV:-"$results/sockets-$(date +%Y%m%d-%H%M%S).csv"}
+        sample_sockets "$sockets_file" "$interval" &
+        sampler_pid=$!
+        trap stop_sampler EXIT
+    fi
     (cd "$dist" && bin/benchmark --drivers "${DRIVER:-$here/driver-nisshi.yaml}" "$workload") || status=$?
+    stop_sampler
     mv -f "$dist"/*.json "$results/" 2>/dev/null || true
+    if [[ -n $sockets_file ]]; then
+        echo "socket samples: $sockets_file, $(peak_sockets "$sockets_file")"
+    fi
     return "$status"
+}
+
+# Waits until the broker accepts connections. The probe is a connection of its own, which the
+# broker logs as a connection that sent no request.
+wait_for_port() {
+    local port=$1 _
+    for _ in $(seq 120); do
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return
+        sleep 0.5
+    done
+    echo "run.sh: nothing is listening on port $port" >&2
+    return 1
+}
+
+wait_for_broker() {
+    wait_for_port "$broker_port"
+}
+
+# Runs a workload for each number of partitions and each count of producers and consumers, on a
+# new broker each time so that its log holds the connections of that run only. The results are in
+# results/sweep/: for each run the workload, the connection report (.md and .csv) and the socket
+# samples. SWEEP_MINUTES is the test duration of each run (default 1) and SWEEP_RATE the producer
+# rate of each run in messages per second (default 5000).
+sweep() {
+    local out="$results/sweep" partitions combo producers consumers name i suffix
+    [[ ${BROKER:-nisshi} == kafka ]] && out="$results/sweep-kafka${KAFKA_BROKERS:+-$KAFKA_BROKERS}"
+    [[ ${BROKER:-nisshi} == nisshi && $nisshi_brokers -gt 1 ]] && out="$results/sweep-nisshi-$nisshi_brokers"
+    mkdir -p "$out"
+    for partitions in 4 16; do
+        for combo in "1 1" "4 1" "1 4" "8 8"; do
+            read -r producers consumers <<<"$combo"
+            name="${producers}p-${consumers}c-${partitions}partitions"
+            cat >"$out/$name.yaml" <<WORKLOAD
+name: nisshi sweep, $producers producers / $consumers consumers on 1 topic of $partitions partitions
+topics: 1
+partitionsPerTopic: $partitions
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: $consumers
+producersPerTopic: $producers
+producerRate: ${SWEEP_RATE:-5000}
+consumerBacklogSizeGB: 0
+testDurationMinutes: ${SWEEP_MINUTES:-1}
+WORKLOAD
+            echo "== $name"
+            broker
+            wait_for_broker
+            SOCKETS_CSV="$out/$name.sockets.csv" run "$out/$name.yaml"
+            # the benchmark's clients close their sockets as the JVM exits, and the broker
+            # logs each close a moment later
+            sleep 2
+            if [[ ${BROKER:-nisshi} != kafka ]]; then
+                for ((i = 1; i <= nisshi_brokers; i++)); do
+                    suffix=$([[ $nisshi_brokers -gt 1 ]] && echo ".broker-$i" || true)
+                    CONNECTIONS_LOG=$(broker_file "$i" log) \
+                        connections --connections --csv "$out/$name$suffix.csv" >"$out/$name$suffix.md"
+                done
+            fi
+        done
+    done
+    stop
 }
 
 psql() {
@@ -197,9 +489,14 @@ explain() {
 }
 
 stop() {
-    [[ -f "$here/broker.pid" ]] && kill "$(cat "$here/broker.pid")" 2>/dev/null || true
-    rm -f "$here/broker.pid"
+    local pid_file
+    for pid_file in "$here"/broker*.pid; do
+        [[ -f $pid_file ]] && kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    done
+    stop_balancer
     docker rm -f nisshi-omb-postgres >/dev/null 2>&1 || true
+    remove_kafka
     stop_local_postgres
 }
 
@@ -209,6 +506,9 @@ case "${1:-}" in
     run) shift; run "$@" ;;
     seed) shift; seed "$@" ;;
     explain) shift; explain "$@" ;;
+    connections) shift; connections "$@" ;;
+    sweep) sweep ;;
+    sockets) shift; sockets "$@" ;;
     stop) stop ;;
-    *) sed -n '2,25p' "$0"; exit 1 ;;
+    *) sed -n '2,32p' "$0"; exit 1 ;;
 esac

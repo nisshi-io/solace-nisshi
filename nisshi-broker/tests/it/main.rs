@@ -26,6 +26,7 @@ pub mod cg;
 pub mod cg_dynamic;
 pub mod cg_latency;
 pub mod cg_static;
+pub mod connection_events;
 pub mod consumer_group_describe;
 pub mod create_topics;
 pub mod create_topics_validate_only;
