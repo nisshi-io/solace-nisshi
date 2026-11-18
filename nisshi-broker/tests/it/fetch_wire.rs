@@ -43,7 +43,8 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Long enough that waiting it out would fail the elapsed check.
 const MAX_WAIT_MS: i32 = 10_000;
 
-async fn create_topic(stream: &mut TcpStream, name: &str) -> Result<()> {
+/// Creates the topic `name` with one partition, and fails unless the broker creates it.
+pub(crate) async fn create_topic(stream: &mut TcpStream, name: &str) -> Result<()> {
     let frame = round_trip(
         stream,
         CreateTopicsRequest::KEY,

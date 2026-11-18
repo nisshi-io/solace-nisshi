@@ -18,7 +18,11 @@
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Result, anyhow};
-use nisshi_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
+use nisshi_broker::{
+    NODE_ID,
+    broker::{Broker, ConnectionDrain},
+    coordinator::group::administrator::Controller,
+};
 use nisshi_sans_io::ErrorCode;
 use nisshi_storage::ArcDynStorage;
 use tokio::{
@@ -35,15 +39,16 @@ use crate::common::{init_tracing, wire::free_port};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct RunningBroker {
-    addr: SocketAddr,
-    token: CancellationToken,
-    run: JoinHandle<nisshi_broker::Result<ErrorCode>>,
+pub(crate) struct RunningBroker {
+    pub(crate) addr: SocketAddr,
+    pub(crate) token: CancellationToken,
+    pub(crate) connection_drain: ConnectionDrain,
+    pub(crate) run: JoinHandle<nisshi_broker::Result<ErrorCode>>,
 }
 
 /// Starts a memory-backed broker that shuts down when its token is cancelled, and waits until
 /// its listener accepts connections.
-async fn run_broker(shutdown_grace: Duration) -> Result<RunningBroker> {
+pub(crate) async fn run_broker(shutdown_grace: Duration) -> Result<RunningBroker> {
     run_broker_on(Url::parse("memory://")?, shutdown_grace).await
 }
 
@@ -66,6 +71,7 @@ async fn run_broker_on(storage: Url, shutdown_grace: Duration) -> Result<Running
         .with_cancellation(token.clone())
         .with_shutdown_grace(shutdown_grace);
 
+    let connection_drain = broker.connection_drain();
     let run = tokio::spawn(broker.run(Instant::now()));
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -78,7 +84,12 @@ async fn run_broker_on(storage: Url, shutdown_grace: Duration) -> Result<Running
         }
     }
 
-    Ok(RunningBroker { addr, token, run })
+    Ok(RunningBroker {
+        addr,
+        token,
+        connection_drain,
+        run,
+    })
 }
 
 /// Opens a connection that holds a request in progress: the client sends the first byte of a

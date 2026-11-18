@@ -1172,7 +1172,7 @@ where
                 .await?
                 == Exchange::Drained
             {
-                debug!("closing the connection: the broker is shutting down");
+                debug!("closing the connection: drained");
                 close_drained(&mut req).await;
                 return Ok(());
             }
