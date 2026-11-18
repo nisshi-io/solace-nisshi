@@ -241,6 +241,63 @@ partitions of one producer, so a single heavy producer loads one broker, where o
 leads one of its partitions. Spreading one producer's partitions over brokers takes distinct node ids in Metadata, which
 nisshi does not have, so the brokers behind the balancer do not give it.
 
+### Three node ids behind the balancer (prototype)
+
+This is a prototype, on the branch `prototype-node-ids`, and not a feature. With `NISSHI_PROTOTYPE_NODE_IDS=111,222,333`
+the Postgres `metadata` function lists each node id, all at the advertised address, which is the balancer's. It sorts the
+ids and does not shuffle them as it did, so every broker assigns the same leader to a partition on every call. Nothing
+else changes: `FindCoordinator` still answers node 111, so every consumer's coordinator is node 111, and `DescribeCluster`
+lists one broker. The brokers can serve any partition, so a request that the balancer sends to a broker that is not the
+node that the client meant is answered like any other.
+
+```shell
+NISSHI_BROKERS=3 NISSHI_PROTOTYPE_NODE_IDS=111,222,333 SWEEP_OUT="$PWD/results/sweep-nisshi-3-nodes" ./run.sh sweep
+```
+
+The Java client keeps a connection for each node id, and does not look at the address, so a client opens a connection to
+each node that it uses, even though they all lead to the same address. Each run of the sweep held its rate with no write
+errors. Peak connections, one run of each combination:
+
+| producers | consumers | partitions | nisshi, 1 broker | balancer, plain | balancer, 3 node ids | Kafka, 3 brokers (new cluster) |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 4 | 7 | 7 | 11 | 11 |
+| 4 | 1 | 4 | 13 | 13 | 23 | 23 |
+| 1 | 4 | 4 | 16 | 16 | 18 | 22 |
+| 8 | 8 | 4 | 38 | 38 | 54 | 61 |
+| 1 | 1 | 16 | 7 | 7 | 11 | 11 |
+| 4 | 1 | 16 | 13 | 13 | 23 | 23 |
+| 1 | 4 | 16 | 16 | 16 | 26 | 25 |
+| 8 | 8 | 16 | 42 | 42 | 66 | 67 |
+
+- A producer holds 4 connections, a bootstrap connection and one for each of the 3 node ids, where it held 2. A consumer
+  with a partition holds 3 and a consumer without one holds 2, as before: it fetches from the node that leads its
+  partition. These are the counts of a warm 3-broker Kafka cluster, which the 8 producer and 8 consumer run on 4
+  partitions matches exactly (54). The rows where Kafka has more (22 and 61) are its new cluster's retry of the first
+  `FindCoordinator`, which nisshi does not need.
+- The cost is 42% more connections for the 8 producer and 8 consumer run on 4 partitions (54, from 38) and 57% more on
+  16 (66, from 42).
+- The connections spread evenly over the brokers: 18, 18 and 18 for the first of those runs, and 22, 22 and 22 for the
+  second.
+
+What a producer gains is that its `Produce` requests spread over the brokers, which the plain balancer did not do. The
+table is the `Produce` requests of each broker, in thousands, and the producers that had a `Produce` connection on it:
+
+| producers | consumers | partitions | `Produce` per broker | producers with data on each |
+|---|---|---|---|---|
+| 1 | 1 | 4 | 48 / 109 / 53 | 1 / 1 / 1 |
+| 4 | 1 | 4 | 192 / 197 / 240 | 2 / 3 / 3 |
+| 8 | 8 | 4 | 233 / 315 / 206 | 5 / 7 / 3 |
+| 1 | 4 | 16 | 52 / 63 / 59 | 1 / 1 / 1 |
+| 8 | 8 | 16 | 371 / 335 / 255 | 6 / 4 / 6 |
+
+With the plain balancer one producer's traffic went to one broker (189 / 0 / 0). Now it goes to all three. In one run, 1
+producer and 4 consumers on 4 partitions, one broker had no `Produce` requests (91 / 0 / 87). The producer had its three
+data connections, so I think the balancer put two of them on one broker, but I did not check.
+
+Each combination ran once. A feature would also have to decide the coordinator (which broker `FindCoordinator` names),
+`DescribeCluster`, what happens to clients when the list of node ids changes, and the other storage engines' `metadata`,
+which this prototype does not touch.
+
 ## Checking queries against large volumes
 
 `seed.sql` fills a topic with generated records straight in postgres, far faster than producing
