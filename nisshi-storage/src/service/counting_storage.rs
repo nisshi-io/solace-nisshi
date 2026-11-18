@@ -133,6 +133,10 @@ pub(crate) struct CountingStorage {
     gated_partitions: Option<BTreeSet<i32>>,
     config_gate: Option<Arc<Semaphore>>,
     parked: Arc<AtomicUsize>,
+    produce_delay: Option<Duration>,
+    partition_failure: Option<(i32, Error)>,
+    produce_concurrency: Option<usize>,
+    produce_permits: Option<Arc<Semaphore>>,
 }
 
 impl CountingStorage {
@@ -251,6 +255,42 @@ impl CountingStorage {
         }
     }
 
+    /// Returns this storage, with each produce taking `delay` after the gate lets it through, as
+    /// an engine takes time for its write.
+    pub(crate) fn with_produce_delay(self, delay: Duration) -> Self {
+        Self {
+            produce_delay: Some(delay),
+            ..self
+        }
+    }
+
+    /// Returns this storage, with each produce to `partition` of any topic failing with `error`
+    /// after the gate lets it through. A produce to another partition succeeds.
+    pub(crate) fn with_produce_failure(self, partition: i32, error: Error) -> Self {
+        Self {
+            partition_failure: Some((partition, error)),
+            ..self
+        }
+    }
+
+    /// Returns this storage answering `concurrency` to [`Storage::produce_concurrency`], as an
+    /// engine that sets its own limit does.
+    pub(crate) fn with_produce_concurrency(self, concurrency: usize) -> Self {
+        Self {
+            produce_concurrency: Some(concurrency),
+            ..self
+        }
+    }
+
+    /// Returns this storage answering `permits` to [`Storage::produce_permits`], as an engine that
+    /// limits its writes across requests does.
+    pub(crate) fn with_produce_permits(self, permits: Arc<Semaphore>) -> Self {
+        Self {
+            produce_permits: Some(permits),
+            ..self
+        }
+    }
+
     /// The number of produces now waiting for the gate.
     pub(crate) fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
@@ -278,6 +318,16 @@ impl CountingStorage {
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
             permit?.forget();
+        }
+
+        if let Some(delay) = self.produce_delay {
+            tokio::time::sleep(delay).await;
+        }
+
+        if let Some((partition, error)) = &self.partition_failure
+            && *partition == topition.partition()
+        {
+            return Err(error.clone());
         }
 
         if let Some((failing, error)) = &self.produce_failure
@@ -490,6 +540,15 @@ impl Storage for CountingStorage {
         _ = self.produce_all_calls.fetch_add(1, Ordering::SeqCst);
 
         ProduceEntry::produce_each(self, transaction_id, entries).await
+    }
+
+    fn produce_concurrency(&self) -> usize {
+        self.produce_concurrency
+            .unwrap_or(crate::service::produce::PRODUCE_CONCURRENCY)
+    }
+
+    fn produce_permits(&self) -> Option<Arc<Semaphore>> {
+        self.produce_permits.clone()
     }
 
     async fn offset_commit(

@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use rama::{Layer, Service};
 use tracing::{instrument, warn};
 
-use super::{admission::Admission, deadline::Deadline, response};
+use super::{admission::Admission, deadline::Deadline, response, slots::Slots};
 use crate::{Error, Result};
 
 /// A [`ProduceRequest`] whose `acks` is valid.
@@ -34,16 +34,35 @@ pub struct ValidatedProduceRequest {
 }
 
 /// A topic of a [`ProduceRequest`], with the transaction that the request writes it in, if any.
-///
-/// [`ProduceTopicService`](super::ProduceTopicService) takes this, so that it needs nothing else
-/// from the request.
 #[derive(Clone, Debug)]
 pub struct ValidatedTopic {
     pub(super) name: String,
     pub(super) transaction_id: Option<String>,
     pub(super) partitions: Vec<PartitionProduceData>,
-    pub(super) admission: Admission,
     pub(super) deadline: Deadline,
+}
+
+/// A [`ValidatedTopic`] with what its request shares among its topics: the wait for the
+/// decoded-batch budget and the slots for the storage calls.
+///
+/// [`ProduceService`](super::ProduceService) builds both once for a request, so only it decides
+/// them. [`ProduceTopicService`](super::ProduceTopicService) takes this, so that it needs nothing
+/// else from the request.
+#[derive(Clone, Debug)]
+pub struct ProduceTopic {
+    pub(super) topic: ValidatedTopic,
+    pub(super) admission: Admission,
+    pub(super) slots: Slots,
+}
+
+impl ProduceTopic {
+    pub(super) fn new(topic: ValidatedTopic, admission: Admission, slots: Slots) -> Self {
+        Self {
+            topic,
+            admission,
+            slots,
+        }
+    }
 }
 
 /// A [`Layer`] that gives its inner [`Service`] a [`ValidatedProduceRequest`], and answers a
@@ -129,7 +148,6 @@ where
                         name: topic.name,
                         transaction_id: request.transactional_id.clone(),
                         partitions: topic.partition_data.unwrap_or_default(),
-                        admission: Admission::default(),
                         deadline,
                     })
                     .collect(),

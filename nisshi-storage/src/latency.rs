@@ -163,6 +163,14 @@ where
         self.storage.delete_records_concurrency()
     }
 
+    fn produce_concurrency(&self) -> usize {
+        self.storage.produce_concurrency()
+    }
+
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.storage.produce_permits()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.introduce_latency().await?;
 

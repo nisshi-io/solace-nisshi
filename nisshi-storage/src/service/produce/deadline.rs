@@ -43,8 +43,13 @@ use crate::METER;
 pub(super) const PRODUCE_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The message of a partition that the deadline stopped before its write started.
-const NOT_STARTED: &str =
+pub(super) const NOT_STARTED: &str =
     "the request's deadline passed before the broker started this partition's write, retry it";
+
+/// The message of a partition that the deadline stopped while it waited for a place among the
+/// writes of its request.
+pub(super) const SLOT_WAIT: &str = "the request's deadline passed while this partition waited for the broker's \
+     write slots, retry it";
 
 /// The message of a partition that the deadline stopped while it waited for the decoded-batch
 /// budget.
@@ -52,8 +57,8 @@ const BUDGET_WAIT: &str = "the request's deadline passed while this partition wa
                            broker's decoded-batch budget, retry it";
 
 /// The message of a partition whose write the deadline left running.
-const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the \
-                       write may still complete, retry it";
+pub(super) const WRITING: &str = "the request's deadline passed while the broker wrote this partition, the write may still \
+     complete, retry it";
 
 /// The message of a partition that the broker did not start because an earlier write to it runs.
 const IN_FLIGHT: &str = "the broker still runs an earlier write from this producer to this partition, retry the request";
@@ -72,6 +77,11 @@ static DEADLINE_EXCEEDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(super) enum Stage {
     /// No storage write had started for the partition.
     NotStarted,
+    /// The partition waited for a slot among the writes of its request, or for the request's
+    /// write lane after it found no permit of the pool that the storage shares across requests,
+    /// and the deadline ended the wait. The writes ahead of it were slow, and no write of the
+    /// partition had started.
+    SlotWait,
     /// The partition waited for the decoded-batch budget, and the deadline ended the wait before
     /// the budget's own wait did. No storage write had started.
     BudgetWait,
@@ -86,6 +96,7 @@ impl Stage {
     fn as_str(self) -> &'static str {
         match self {
             Self::NotStarted => "not_started",
+            Self::SlotWait => "slot_wait",
             Self::BudgetWait => "budget_wait",
             Self::Writing => "writing",
             Self::InFlight => "in_flight",
@@ -95,6 +106,7 @@ impl Stage {
     fn message(self) -> &'static str {
         match self {
             Self::NotStarted => NOT_STARTED,
+            Self::SlotWait => SLOT_WAIT,
             Self::BudgetWait => BUDGET_WAIT,
             Self::Writing => WRITING,
             Self::InFlight => IN_FLIGHT,
@@ -147,6 +159,13 @@ impl Deadline {
     /// Returns whether the deadline has passed.
     pub(super) fn has_passed(&self) -> bool {
         self.at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    /// Returns how long until the deadline, zero if it has passed, or `None` for a request that
+    /// has none.
+    pub(super) fn remaining(&self) -> Option<Duration> {
+        self.at
+            .map(|at| at.saturating_duration_since(Instant::now()))
     }
 
     /// Runs `future` until the deadline, and drops it then. Use this only for a future that is

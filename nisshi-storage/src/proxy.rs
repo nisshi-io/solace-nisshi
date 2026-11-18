@@ -211,6 +211,11 @@ where
         DeleteRecordsConcurrency::serial()
     }
 
+    /// One write at a time, as the proxy holds one permit for each call.
+    fn produce_concurrency(&self) -> usize {
+        1
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         let start = SystemTime::now();
         let _permit = self.semaphore.acquire().await.inspect(|_| {

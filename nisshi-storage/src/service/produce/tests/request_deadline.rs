@@ -224,7 +224,11 @@ fn offsets(responses: &[PartitionProduceResponse]) -> Vec<i64> {
 #[tokio::test(start_paused = true)]
 async fn a_partition_written_before_the_deadline_keeps_its_offset() -> Result<()> {
     let (storage, _gate) = stalled();
-    let storage = storage.with_gated_partitions(&[2, 3]);
+    // One write at a time, so that partition 3 waits for partition 2's write and the deadline
+    // reaches it before it starts.
+    let storage = storage
+        .with_gated_partitions(&[2, 3])
+        .with_produce_concurrency(1);
     let service = service(&storage);
 
     let responses = serve(&service, acked(&[1, 2, 3])?).await?;
@@ -433,15 +437,16 @@ async fn the_wait_for_the_budget_ends_at_the_deadline() -> Result<()> {
     assert_eq!(Duration::from_secs(3), started_at.elapsed());
     assert!(storage.produced().is_empty());
 
-    // The partition that waited names the budget, so that it does not read as a plain deadline.
-    // The one after it was never started, because the wait used up the time.
+    // Both partitions start at once and wait for the budget, so each names it, and neither reads
+    // as a plain deadline.
     let messages = responses
         .iter()
         .map(|response| response.error_message.as_deref().unwrap_or_default())
         .collect::<Vec<_>>();
-    assert!(messages[0].contains("decoded-batch budget"), "{messages:?}");
     assert!(
-        messages[1].contains("before the broker started"),
+        messages
+            .iter()
+            .all(|message| message.contains("decoded-batch budget")),
         "{messages:?}"
     );
 
@@ -617,6 +622,8 @@ fn stage(stage: &str) -> Vec<(String, String)> {
 async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     let (provider, exporter) = install_exporter();
     let (storage, gate) = stalled();
+    // One write at a time, so that the deadline stops partitions at every stage.
+    let storage = storage.with_produce_concurrency(1);
     let service = service(&storage);
 
     let responses = serve(&service, acked_by(7, &[0, 1, 2])?).await?;

@@ -4289,6 +4289,16 @@ impl Storage for DynoStore {
         ])
     }
 
+    /// One write at a time for a request, because every idempotent produce rewrites the cluster's
+    /// one `clusters/{cluster}/meta.json` in `advance_idempotent_sequence`, through an
+    /// `OptiCon::with_mut` that retries a failed precondition without a bound. More writers in a
+    /// request only add contention on that object for every idempotent producer of the cluster,
+    /// and a write that a deadline left running keeps retrying after its request answered. Raise
+    /// this only with measurements on S3 with idempotent producers.
+    fn produce_concurrency(&self) -> usize {
+        1
+    }
+
     /// Appends `deflated` to `topition`, decoding the batch here when the backend needs it.
     async fn produce(
         &self,

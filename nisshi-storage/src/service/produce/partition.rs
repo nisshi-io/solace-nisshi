@@ -14,7 +14,10 @@
 
 use std::sync::Arc;
 
-use super::{admission::Admission, deadline::Deadline, topic_configuration::TopicConfiguration};
+use super::{
+    admission::Admission, deadline::Deadline, slots::WritePool,
+    topic_configuration::TopicConfiguration,
+};
 use crate::decoded_budget::Reservation;
 
 /// A partition of a Produce request on its way to storage, with the configuration of its topic.
@@ -55,6 +58,12 @@ pub struct PartitionProduce<B> {
     /// write that runs on after its request answered keeps them until it ends.
     pub(crate) reservation: Option<Arc<Reservation>>,
 
+    /// How the write takes its place among the writes that every request on the storage shares,
+    /// if the storage limits them. The write takes it right before it starts, and a write that
+    /// runs on after its request answered keeps it until it ends, because it holds the engine's
+    /// connection until then.
+    pub(crate) pool: Option<WritePool>,
+
     pub batch: B,
 }
 
@@ -70,6 +79,7 @@ impl<B> PartitionProduce<B> {
                 admission: self.admission,
                 deadline: self.deadline,
                 reservation: self.reservation,
+                pool: self.pool,
                 batch: (),
             },
             self.batch,
@@ -88,6 +98,7 @@ impl PartitionProduce<()> {
             admission: self.admission,
             deadline: self.deadline,
             reservation: self.reservation,
+            pool: self.pool,
             batch,
         }
     }

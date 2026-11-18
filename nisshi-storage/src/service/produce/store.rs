@@ -31,6 +31,7 @@ use super::{
     detached::{Detached, Write},
     partition::PartitionProduce,
     response,
+    slots::{WritePermit, take_write},
     timestamps::NO_TIMESTAMP,
 };
 use crate::{Error, Result, Storage, Topition};
@@ -92,13 +93,17 @@ where
 {
     /// Writes the batch in a task of its own, and waits for its result until `at`.
     ///
-    /// The task owns the batch and the request's share of the decoded-bytes budget, so the budget
-    /// keeps counting the memory that the write holds after the request answered. The task runs
-    /// under the span of the request, and logs its own result when the request has left it.
+    /// The task owns the batch, the request's share of the decoded-bytes budget, and `permit`, the
+    /// place of the write among the writes that the storage shares across requests. The budget
+    /// keeps counting the memory that the write holds after the request answered, and the permit
+    /// keeps counting the connection.
+    /// The task runs under the span of the request, and logs its own result when the request has
+    /// left it.
     async fn write_until(
         &self,
         at: Instant,
         request: &PartitionProduce<()>,
+        permit: Option<WritePermit>,
         topition: Topition,
         batch: deflated::Batch,
         inflated: inflated::Batch,
@@ -113,7 +118,10 @@ where
             let write = Arc::clone(&write);
 
             async move {
+                // Both live as long as the write holds the engine's connection, not as long as
+                // its request. Dropping the task drops them, on a panic and on an abort too.
                 let _reservation = reservation;
+                let _permit = permit;
                 let _end = End(Arc::clone(&write));
 
                 let result = run(
@@ -241,8 +249,15 @@ where
 
         let stored = match request.deadline.at() {
             // A request that does not wait for an answer has no deadline, and its write is
-            // waited for as it always was.
+            // waited for as it always was. Its wait for the request's lane ends when the write
+            // that holds the lane ends, so it needs no bound of its own.
             None => {
+                // Without a deadline the wait cannot time out, so this is `Ok`.
+                let _permit = take_write(request.pool.as_ref(), &request.deadline)
+                    .await
+                    .ok()
+                    .flatten();
+
                 self.storage
                     .produce_inflated(
                         request.transaction_id.as_deref(),
@@ -262,8 +277,21 @@ where
                     return Ok(Deadline::timed_out(Stage::InFlight, request.index));
                 }
 
+                // After the checks above and the request's slot, so a partition that is not
+                // written holds no place, and the place is held as long as the write runs.
+                let Ok(permit) = take_write(request.pool.as_ref(), &request.deadline).await else {
+                    warn!(
+                        ?topition,
+                        remaining = ?request.deadline.remaining(),
+                        "produce partition waited for the write lane of its request until the \
+                         request's deadline"
+                    );
+
+                    return Ok(Deadline::timed_out(Stage::SlotWait, request.index));
+                };
+
                 match self
-                    .write_until(at, &request, topition, batch, inflated)
+                    .write_until(at, &request, permit, topition, batch, inflated)
                     .await
                 {
                     Waited::Ended(stored) => stored,

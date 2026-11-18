@@ -2097,6 +2097,10 @@ impl Storage for Engine {
         self.inner.delete_records_concurrency()
     }
 
+    fn produce_concurrency(&self) -> usize {
+        self.inner.produce_concurrency()
+    }
+
     #[instrument(skip_all)]
     async fn delete_records(
         &self,
@@ -3107,6 +3111,11 @@ impl Storage for Delegate {
     /// no proxy or channel serialises the calls.
     fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
         DeleteRecordsConcurrency::serial()
+    }
+
+    /// One write at a time, for the reason [`Storage::delete_records_concurrency`] gives above.
+    fn produce_concurrency(&self) -> usize {
+        1
     }
 
     async fn delete_records(

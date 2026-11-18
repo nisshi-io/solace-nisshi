@@ -276,15 +276,16 @@ pub use service::{
     FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, LIST_OFFSETS_CONCURRENCY, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MalformedCreateTopicsRequest, MalformedFetchRequest,
-    MetadataService, OutcomeSender, PartitionProduce, ProduceRequestValidationLayer,
-    ProduceRequestValidationService, ProduceService, ProduceTopicService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService, StillRunning,
-    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
-    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response, wait_for_detached_writes,
+    MetadataService, OutcomeSender, PRODUCE_CONCURRENCY, PartitionProduce,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService, ProduceTopic,
+    ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
+    RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
+    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions, TimestampLayer,
+    TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer, UnknownPartitionService,
+    ValidatedCreateTopicsRequest, ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic,
+    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    wait_for_detached_writes,
 };
 
 #[cfg(feature = "dynostore")]
@@ -2255,6 +2256,36 @@ pub trait Storage: Debug + Send + Sync + 'static {
         ProduceEntry::produce_each(self, transaction_id, entries).await
     }
 
+    /// Returns how many partitions of one Produce request the [`ProduceService`] writes at once.
+    ///
+    /// The service makes one produce call for each partition of a request. At the request's
+    /// deadline it answers each partition that it has not started with `REQUEST_TIMED_OUT`, and
+    /// writes nothing for it. The default is [`PRODUCE_CONCURRENCY`]. A storage that runs its
+    /// writes one at a time answers 1, so that a second call never queues inside the engine,
+    /// where the deadline leaves it running after the request answered. A storage that wraps
+    /// another answers what the storage it wraps answers, unless the wrapper changes how the
+    /// calls run. The service treats an answer below 1 as 1.
+    fn produce_concurrency(&self) -> usize {
+        PRODUCE_CONCURRENCY
+    }
+
+    /// Returns the permits that the writes of every Produce request on this storage share, if the
+    /// storage limits them. The default is `None`, no limit across requests.
+    ///
+    /// A request writes at most [`Storage::produce_concurrency`] partitions at once. Its first
+    /// write takes no permit, so a request never waits for another request's write. Each write
+    /// beyond the first tries for a permit from this pool, and holds it for as long as the write
+    /// runs, including after the request's deadline left it running and the request answered. A
+    /// write that finds no permit free waits for the request's own earlier write to end instead,
+    /// so the request writes one partition at a time, as it would without the pool. A pooled
+    /// engine whose writes each hold a connection uses it to keep the extra writes of all
+    /// requests together from taking the whole pool, as [`Storage::delete_records_concurrency`]
+    /// does for DeleteRecords. A storage that wraps another answers what the storage it wraps
+    /// answers.
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        None
+    }
+
     /// Reads the records of `topition` from `offset`, and sends them as it reads them through
     /// `fetched_sender`, the sending end of a channel that the caller reads.
     ///
@@ -2572,6 +2603,14 @@ where
         self.as_ref().delete_records_concurrency()
     }
 
+    fn produce_concurrency(&self) -> usize {
+        self.as_ref().produce_concurrency()
+    }
+
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.as_ref().produce_permits()
+    }
+
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         self.as_ref().delete_topic(topic).await
     }
@@ -2886,6 +2925,14 @@ where
 
     fn delete_records_concurrency(&self) -> DeleteRecordsConcurrency {
         self.as_ref().delete_records_concurrency()
+    }
+
+    fn produce_concurrency(&self) -> usize {
+        self.as_ref().produce_concurrency()
+    }
+
+    fn produce_permits(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.as_ref().produce_permits()
     }
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
