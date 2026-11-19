@@ -975,10 +975,15 @@ async fn a_retriable_failure_warns_once_in_each_interval() -> Result<()> {
 
     let log = Log::default();
     let writer = log.clone();
+
+    // Each line holds only the fields of its own event, not those of the request's span, so the
+    // ids that the test finds come from the event.
     let _guard = tracing::subscriber::set_default(
         tracing_subscriber::fmt()
+            .json()
+            .with_span_list(false)
+            .with_current_span(false)
             .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish(),
     );
@@ -992,16 +997,24 @@ async fn a_retriable_failure_warns_once_in_each_interval() -> Result<()> {
         );
     }
 
-    let failures = log.lines_with("the group request failed");
+    let failures = log.events_with_message("the group request failed")?;
     assert_eq!(3, failures.len(), "{failures:#?}");
 
     let warned = failures
         .iter()
-        .filter(|line| line.contains(" WARN "))
+        .filter(|event| event["level"] == "WARN")
         .collect::<Vec<_>>();
     assert_eq!(1, warned.len(), "{failures:#?}");
-    assert!(warned[0].contains(&formed.group), "{}", warned[0]);
-    assert!(warned[0].contains(&formed.member_id), "{}", warned[0]);
+    assert_eq!(
+        formed.group, warned[0]["fields"]["group_id"],
+        "{}",
+        warned[0]
+    );
+    assert_eq!(
+        formed.member_id, warned[0]["fields"]["member_id"],
+        "{}",
+        warned[0]
+    );
 
     Ok(())
 }
@@ -1011,13 +1024,18 @@ async fn a_retriable_failure_warns_once_in_each_interval() -> Result<()> {
 struct Log(Arc<Mutex<Vec<u8>>>);
 
 impl Log {
-    /// Returns each line of the log that contains `text`.
-    fn lines_with(&self, text: &str) -> Vec<String> {
+    /// Returns each event of the log, written as a line of JSON, whose message is `message`.
+    fn events_with_message(&self, message: &str) -> Result<Vec<serde_json::Value>> {
         String::from_utf8_lossy(&self.0.lock().expect("log"))
             .lines()
-            .filter(|line| line.contains(text))
-            .map(ToOwned::to_owned)
-            .collect()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .filter(|event| {
+                event
+                    .as_ref()
+                    .map_or(true, |event| event["fields"]["message"] == message)
+            })
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
     }
 }
 
