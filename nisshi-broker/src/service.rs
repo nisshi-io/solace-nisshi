@@ -27,26 +27,32 @@ use tracing::debug;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
+use self::extend_routes::ExtendRoutes;
+
 pub mod auth;
 pub mod coordinator;
+pub mod extend_routes;
 pub mod storage;
 pub mod txn_offset_commit;
 
-type TcpRouteFrame =
+pub(crate) type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<Error>>>>;
 
-/// Returns the broker's routes, before `build` adds `ApiVersions`.
+/// Returns the broker's routes, changed by `extend_routes`, before `build` adds `ApiVersions`.
 pub fn routes<C, S>(
     coordinator: C,
     storage: S,
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    extend_routes: Option<&ExtendRoutes<C, S>>,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
     C: Coordinator,
 {
+    let extend_storage = storage.clone();
+
     storage::services(
         FrameRouteService::<Error>::builder(),
         storage,
@@ -58,10 +64,17 @@ where
     .and_then(|builder| {
         coordinator::services(builder, coordinator.clone()).inspect(|builder| debug!(?builder))
     })
-    .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator))
     .and_then(auth::services)
+    .and_then(|builder| match extend_routes {
+        Some(extend_routes) => extend_routes.apply(builder, &coordinator, &extend_storage),
+        None => Ok(builder),
+    })
+    // The fence runs after the extension, so that it wraps the route that the extension
+    // leaves for TxnOffsetCommit, and a replacement of that route keeps the fence.
+    .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
@@ -69,6 +82,7 @@ pub fn services<C, S>(
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    extend_routes: Option<&ExtendRoutes<C, S>>,
     sasl_config: Option<Arc<SASLConfig>>,
 ) -> Result<TcpRouteFrame, Error>
 where
@@ -81,6 +95,7 @@ where
         schemas,
         topic_creation,
         auto_create_refusals,
+        extend_routes,
     )
     .and_then(|builder| builder.build().map_err(Into::into))
     .map(|route| {

@@ -22,17 +22,20 @@ use bytes::Bytes;
 use nisshi_broker::{
     Error, Result,
     coordinator::group::administrator::{Controller, GroupCoordinatorConfig},
-    service,
+    service::{self, extend_routes::ExtendRoutes},
 };
 use nisshi_sans_io::{
-    ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, TxnOffsetCommitRequest,
+    ApiKey as _, Body, ErrorCode, Frame, FrameInput, Header, RequestInput, TxnOffsetCommitRequest,
+    TxnOffsetCommitResponse,
     create_topics_request::CreatableTopic,
     sync_group_request::SyncGroupRequestAssignment,
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
-use nisshi_service::FrameRouteService;
+use nisshi_service::{FrameRequestLayer, FrameRouteService, ResponseService};
 use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig, Topition};
-use rama::{Service as _, extensions::Extensions};
+use rama::{
+    Layer as _, Service as _, extensions::Extensions, layer::MapErrLayer, service::BoxService,
+};
 use rand::{RngExt as _, rng};
 use url::Url;
 use uuid::Uuid;
@@ -69,6 +72,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(storage_type: StorageType) -> Result<Self> {
+        Self::with_extend_routes(storage_type, None).await
+    }
+
+    /// A fixture whose route table `extend_routes` changes, when there is one.
+    async fn with_extend_routes(
+        storage_type: StorageType,
+        extend_routes: Option<ExtendRoutes<Controller<ArcDynStorage>, ArcDynStorage>>,
+    ) -> Result<Self> {
         let cluster = Uuid::now_v7();
         let node = rng().random_range(0..i32::MAX);
 
@@ -125,6 +136,7 @@ impl Fixture {
             None,
             TopicCreationConfig::default(),
             AutoCreateRefusals::default(),
+            extend_routes.as_ref(),
         )
         .and_then(|builder| builder.build().map_err(Into::into))?;
 
@@ -375,6 +387,60 @@ async fn group_completing_rebalance(storage_type: StorageType) -> Result<()> {
     Ok(())
 }
 
+/// A service that answers every TxnOffsetCommit with no partition results.
+fn accepting_commit_service() -> BoxService<FrameInput, Frame, Error> {
+    (
+        MapErrLayer::new(Error::from),
+        FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
+    )
+        .into_layer(ResponseService::new(
+            |_: RequestInput<TxnOffsetCommitRequest>| -> Result<_, nisshi_service::Error> {
+                Ok(TxnOffsetCommitResponse::default()
+                    .throttle_time_ms(0)
+                    .topics(Some([].into())))
+            },
+        ))
+        .boxed()
+}
+
+/// A route that an extension puts in place of the TxnOffsetCommit route is still wrapped by the
+/// fence, so a member in the wrong generation is refused before the replacement runs.
+async fn replaced_route_keeps_the_fence(storage_type: StorageType) -> Result<()> {
+    let mut fixture = Fixture::with_extend_routes(
+        storage_type,
+        Some(ExtendRoutes::new(|builder, _, _| {
+            builder
+                .wrap_route(TxnOffsetCommitRequest::KEY, |_built_in| {
+                    accepting_commit_service()
+                })
+                .map_err(Into::into)
+        })),
+    )
+    .await?;
+    let member = fixture.form_group(None).await?;
+
+    assert_eq!(
+        vec![ErrorCode::IllegalGeneration],
+        fixture.commit(3, 9999, member.id(), None).await?
+    );
+
+    // The current member passes the fence, and only the replacement answers: it returns no
+    // partition results and stores nothing.
+    assert_eq!(
+        Vec::<ErrorCode>::new(),
+        fixture
+            .commit(3, member.generation(), member.id(), None)
+            .await?
+    );
+
+    assert_matches!(
+        fixture.committed_offset_after_commit().await?,
+        None | Some(-1)
+    );
+
+    Ok(())
+}
+
 macro_rules! engine_tests {
     ($engine:ident, $storage_type:expr) => {
         mod $engine {
@@ -414,6 +480,12 @@ macro_rules! engine_tests {
             async fn without_member_fields() -> Result<()> {
                 let _guard = crate::common::init_tracing()?;
                 super::without_member_fields($storage_type).await
+            }
+
+            #[tokio::test]
+            async fn replaced_route_keeps_the_fence() -> Result<()> {
+                let _guard = crate::common::init_tracing()?;
+                super::replaced_route_keeps_the_fence($storage_type).await
             }
         }
     };
