@@ -41,7 +41,7 @@ use tokio::{
 };
 
 use crate::{
-    Error, ProduceService, Result,
+    Error, ProduceService, Result, StillRunning,
     decoded_budget::{self, DecodedBytesBudget},
     service::{
         counting_storage::{CountingStorage, Listing},
@@ -186,10 +186,8 @@ pub(super) fn stalled() -> (CountingStorage, Arc<Semaphore>) {
     )
 }
 
-/// Lets the tasks that are ready run, so that a write that a test released has finished.
-async fn settle() {
-    sleep(Duration::from_millis(1)).await;
-}
+/// How long a test waits for the writes that it released to end.
+const GRACE: Duration = Duration::from_secs(5);
 
 /// A request for three partitions over a store that stalls every put answers before the client
 /// gives up, and each partition answers a code that the client retries.
@@ -258,11 +256,15 @@ async fn a_partition_written_before_the_deadline_keeps_its_offset() -> Result<()
 }
 
 /// The write that the deadline left behind runs to its end: the request answered before the gate
-/// opened, and the batch is stored once the gate does.
+/// opened, and the batch is stored once the gate does and the write has taken its time.
 #[tokio::test(start_paused = true)]
 async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()> {
     let (storage, gate) = stalled();
-    let service = service(&storage);
+    // The write takes a second after the gate opens, as an engine's write does, so the test must
+    // wait for the write to end, not only for the runtime to have no task ready.
+    let storage = storage.with_produce_delay(Duration::from_secs(1));
+    let detached = Detached::default();
+    let service = service_sharing(&storage, detached.clone());
 
     let responses = serve(&service, acked(&[0])?).await?;
 
@@ -271,7 +273,7 @@ async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()
     assert!(storage.produced().is_empty());
 
     gate.add_permits(1);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
     assert_eq!(0, storage.parked());
     assert_eq!(1, storage.produced().len());
@@ -305,14 +307,14 @@ async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() 
     assert_eq!(vec![ErrorCode::RequestTimedOut], codes(&other)?);
 
     gate.add_permits(3);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
     // One write for partition 0, and one for partition 1.
-    assert_eq!(vec![0, 1], produced_partitions(&storage));
+    assert_eq!(vec![0, 1], produced_partitions_sorted(&storage));
 
     let after = serve(&other_connection, acked_by(7, &[0])?).await?;
     assert_eq!(vec![ErrorCode::None], codes(&after)?);
-    assert_eq!(vec![0, 1, 0], produced_partitions(&storage));
+    assert_eq!(vec![0, 0, 1], produced_partitions_sorted(&storage));
 
     Ok(())
 }
@@ -349,20 +351,23 @@ async fn another_producer_and_a_non_idempotent_batch_are_not_refused_by_a_write_
     assert_eq!(3, storage.parked());
 
     gate.add_permits(3);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
-    assert_eq!(vec![0, 0, 0], produced_partitions(&storage));
+    assert_eq!(vec![0, 0, 0], produced_partitions_sorted(&storage));
 
     Ok(())
 }
 
-/// The partitions that storage got a produce for, in order.
-fn produced_partitions(storage: &CountingStorage) -> Vec<i32> {
-    storage
+/// The partitions that storage got a produce for, by index. The order of the calls is not a
+/// contract: writes that the gate releases together reach storage in no fixed order.
+fn produced_partitions_sorted(storage: &CountingStorage) -> Vec<i32> {
+    let mut partitions = storage
         .produced()
         .iter()
         .map(|produced| produced.topition.partition)
-        .collect()
+        .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    partitions
 }
 
 /// A `timeout_ms` under the deadline shortens it. A `timeout_ms` of zero or less leaves the
@@ -494,7 +499,8 @@ async fn the_read_of_the_topic_configuration_ends_at_the_deadline() -> Result<()
 async fn a_detached_write_holds_its_budget_until_it_ends() -> Result<()> {
     let (storage, gate) = stalled();
     let budget = Arc::new(DecodedBytesBudget::new(4 * MAX_DECODED_BATCH_BYTES));
-    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
+    let detached = Detached::default();
+    let service = ProduceService::new_sharing(storage.clone(), detached.clone())
         .with_decoded_budget(Arc::clone(&budget), Duration::from_secs(60))
         .with_validation();
 
@@ -505,7 +511,7 @@ async fn a_detached_write_holds_its_budget_until_it_ends() -> Result<()> {
     assert_ne!(0, budget.in_use_bytes());
 
     gate.add_permits(1);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
     assert_eq!(0, budget.in_use_bytes());
 
@@ -624,7 +630,8 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     let (storage, gate) = stalled();
     // One write at a time, so that the deadline stops partitions at every stage.
     let storage = storage.with_produce_concurrency(1);
-    let service = service(&storage);
+    let detached = Detached::default();
+    let service = service_sharing(&storage, detached.clone());
 
     let responses = serve(&service, acked_by(7, &[0, 1, 2])?).await?;
     assert_eq!(vec![ErrorCode::RequestTimedOut; 3], codes(&responses)?);
@@ -649,7 +656,7 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     );
 
     gate.add_permits(1);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
     assert_matches!(
         recorded(&provider, &exporter, "nisshi_produce_detached_writes").as_slice(),

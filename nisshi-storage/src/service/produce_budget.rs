@@ -178,12 +178,7 @@ async fn waiting_produces_hold_no_more_decoded_bytes_than_the_budget() -> Result
 
     // Wait until the budget is nearly full, then give the other produces time to take more if
     // they can.
-    for _ in 0..2_000 {
-        if storage.parked() >= 18 {
-            break;
-        }
-        sleep(Duration::from_millis(5)).await;
-    }
+    storage.until(|storage| storage.parked() >= 18).await;
     sleep(Duration::from_millis(300)).await;
 
     let parked = storage.parked();
@@ -233,12 +228,7 @@ async fn a_produce_that_cannot_get_its_bytes_in_time_is_told_to_retry() -> Resul
         async move { produce(&storage, &budget, Duration::from_secs(60), batch).await }
     });
 
-    for _ in 0..2_000 {
-        if storage.parked() == 1 {
-            break;
-        }
-        sleep(Duration::from_millis(5)).await;
-    }
+    storage.until(|storage| storage.parked() >= 1).await;
     assert_eq!(1, storage.parked());
 
     let late = produce(
@@ -284,12 +274,7 @@ async fn a_slow_earlier_partition_does_not_use_up_the_wait_of_a_later_one() -> R
     });
 
     // The first partition holds the budget and waits in storage.
-    for _ in 0..2_000 {
-        if storage.parked() == 1 {
-            break;
-        }
-        sleep(Duration::from_millis(5)).await;
-    }
+    storage.until(|storage| storage.parked() >= 1).await;
     assert_eq!(1, storage.parked());
 
     // Another request queues for the budget ahead of the second partition, and holds it a while
@@ -360,12 +345,7 @@ async fn small_uncompressed_batches_do_not_wait_for_each_other() -> Result<()> {
             .spawn(async move { produce(&storage, &budget, Duration::from_secs(60), batch).await });
     }
 
-    for _ in 0..2_000 {
-        if storage.parked() == PRODUCES {
-            break;
-        }
-        sleep(Duration::from_millis(5)).await;
-    }
+    storage.until(|storage| storage.parked() >= PRODUCES).await;
 
     assert_eq!(PRODUCES, storage.parked());
     assert!(

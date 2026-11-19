@@ -20,7 +20,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::SystemTime,
@@ -43,7 +43,10 @@ use nisshi_sans_io::{
     record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use tokio::{sync::Semaphore, time::Duration};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::{Duration, timeout},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -92,6 +95,12 @@ pub(crate) enum BrokerCall {
     AdvertisedListener,
 }
 
+/// How long [`CountingStorage::until`] waits for its condition. It is longer than any test needs
+/// for its produces to reach storage on a busy machine. It is shorter than a request's deadline,
+/// so that a test on a paused clock fails at the wait, with its own message, and not when the
+/// request answers.
+pub(crate) const UNTIL_LIMIT: Duration = Duration::from_secs(15);
+
 /// The node id that [`CountingStorage`] answers for `node` and lists in `brokers`.
 pub(crate) const NODE_ID: i32 = 111;
 
@@ -137,6 +146,14 @@ pub(crate) struct CountingStorage {
     partition_failure: Option<(i32, Error)>,
     produce_concurrency: Option<usize>,
     produce_permits: Option<Arc<Semaphore>>,
+    entered: Arc<AtomicUsize>,
+    /// The produces now running for each partition, from their start to their end.
+    running: Arc<Mutex<BTreeMap<Topition, usize>>>,
+    /// The partitions that got a produce while another produce to them still ran.
+    overlapped: Arc<Mutex<BTreeSet<Topition>>>,
+    /// Changes each time a produce starts, parks at the gate, leaves the gate, or is recorded, so
+    /// that [`CountingStorage::until`] checks its condition again.
+    changes: Arc<watch::Sender<()>>,
 }
 
 impl CountingStorage {
@@ -296,6 +313,42 @@ impl CountingStorage {
         self.parked.load(Ordering::SeqCst)
     }
 
+    /// The number of produces that have started, whether or not they have ended.
+    pub(crate) fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether `topition` got a produce while another produce to it still ran.
+    pub(crate) fn overlapped(&self, topition: &Topition) -> bool {
+        self.overlapped
+            .lock()
+            .expect("overlapped")
+            .contains(topition)
+    }
+
+    /// Waits until `condition` holds for this storage, and fails the test if it does not hold
+    /// within [`UNTIL_LIMIT`]. The storage checks it now, and again after each change to its
+    /// produces: a produce that starts, parks at the gate, leaves the gate, or ends. A condition
+    /// on other state, such as the topics that it created, is checked only at those changes.
+    ///
+    /// The check can miss a state that lasts only between two checks, so `condition` must stay
+    /// true once it holds, such as `entered() >= 2` rather than `entered() == 2`. `parked()`
+    /// falls when the gate lets a produce through, so a condition on it stays true only while the
+    /// gate holds its produces.
+    pub(crate) async fn until(&self, condition: impl Fn(&Self) -> bool) {
+        let mut changes = self.changes.subscribe();
+
+        // The storage holds the sender, so the channel stays open while `self` lives.
+        _ = timeout(UNTIL_LIMIT, changes.wait_for(|()| condition(self)))
+            .await
+            .expect("the storage reached the condition in time");
+    }
+
+    /// Wakes each [`CountingStorage::until`] that waits, to check its condition again.
+    fn changed(&self) {
+        self.changes.send_modify(|()| {});
+    }
+
     /// Records a produce of `deflated` and `inflated`, after the gate lets it through. Both
     /// produce methods call this, so that the gate holds each produce the same way.
     ///
@@ -313,10 +366,17 @@ impl CountingStorage {
             .as_ref()
             .is_none_or(|partitions| partitions.contains(&topition.partition()));
 
+        _ = self.entered.fetch_add(1, Ordering::SeqCst);
+        // The guard wakes each `until` when the produce ends, on every path out of this function.
+        let _running = Running::start(self, topition)?;
+        self.changed();
+
         if gated && let Some(gate) = &self.produce_gate {
             _ = self.parked.fetch_add(1, Ordering::SeqCst);
+            self.changed();
             let permit = gate.acquire().await;
             _ = self.parked.fetch_sub(1, Ordering::SeqCst);
+            self.changed();
             permit?.forget();
         }
 
@@ -418,6 +478,49 @@ impl CountingStorage {
                 }
             })
             .collect())
+    }
+}
+
+/// One produce to a partition of a [`CountingStorage`], from its start to its end, also when it
+/// fails or is dropped. Its end wakes each [`CountingStorage::until`] that waits.
+struct Running {
+    running: Arc<Mutex<BTreeMap<Topition, usize>>>,
+    changes: Arc<watch::Sender<()>>,
+    topition: Topition,
+}
+
+impl Running {
+    /// Counts a produce to `topition` as running, and records an overlap if another one runs.
+    fn start(storage: &CountingStorage, topition: &Topition) -> Result<Self> {
+        let mut running = storage.running.lock()?;
+        let count = running.entry(topition.clone()).or_default();
+
+        if *count > 0 {
+            _ = storage.overlapped.lock()?.insert(topition.clone());
+        }
+
+        *count += 1;
+
+        Ok(Self {
+            running: Arc::clone(&storage.running),
+            changes: Arc::clone(&storage.changes),
+            topition: topition.clone(),
+        })
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(count) = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&self.topition)
+        {
+            *count -= 1;
+        }
+
+        self.changes.send_modify(|()| {});
     }
 }
 
