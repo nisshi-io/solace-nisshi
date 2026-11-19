@@ -21,7 +21,9 @@ use nisshi_sans_io::{
     ErrorCode, MetadataRequest, MetadataResponse, RequestInput,
     metadata_request::MetadataRequestTopic,
 };
-use nisshi_storage::{AutoCreateRefusals, MetadataService, Storage, TopicCreationConfig};
+use nisshi_storage::{
+    AutoCreateRefusals, KnownTopics, MetadataService, Storage, TopicCreationConfig,
+};
 use rama::{Service as _, extensions::Extensions};
 
 /// Sends one `Metadata` request for `names`, with `allow_auto_topic_creation` as given.
@@ -74,6 +76,7 @@ async fn switched_off_creates_nothing(storage: impl Storage + Clone) -> Result<(
             ..TopicCreationConfig::default()
         },
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     for allow_auto_topic_creation in [Some(true), None] {
@@ -103,6 +106,7 @@ async fn over_the_cap_creates_nothing(storage: impl Storage + Clone) -> Result<(
             ..TopicCreationConfig::default()
         },
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let names = [
@@ -130,6 +134,7 @@ async fn at_the_cap_creates_each_topic(storage: impl Storage + Clone) -> Result<
             ..TopicCreationConfig::default()
         },
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let names = [alphanumeric_string(15), alphanumeric_string(15)];
@@ -155,6 +160,7 @@ async fn duplicate_name_counts_once(storage: impl Storage + Clone) -> Result<()>
             ..TopicCreationConfig::default()
         },
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let name = alphanumeric_string(15);
@@ -174,6 +180,7 @@ async fn num_partitions_sets_the_partition_count(storage: impl Storage + Clone) 
             ..TopicCreationConfig::default()
         },
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let name = alphanumeric_string(15);
@@ -199,6 +206,7 @@ async fn num_partitions_below_one_creates_nothing(storage: impl Storage + Clone)
                 ..TopicCreationConfig::default()
             },
             auto_create_refusals: AutoCreateRefusals::default(),
+            known_topics: KnownTopics::default(),
         };
 
         let name = alphanumeric_string(15);
@@ -220,6 +228,7 @@ async fn colliding_name_is_not_created(storage: impl Storage + Clone) -> Result<
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let suffix = alphanumeric_string(15);
@@ -272,6 +281,7 @@ mod in_memory {
             None,
             topic_creation,
             AutoCreateRefusals::default(),
+            KnownTopics::default(),
         )
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|frame_route| {

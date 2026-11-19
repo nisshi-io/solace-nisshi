@@ -33,7 +33,8 @@ use nisshi_service::{
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
 use nisshi_storage::{
-    AutoCreateRefusals, Storage, TopicCreationConfig, Topition, TxnAddPartitionsRequest,
+    AutoCreateRefusals, KnownTopics, Storage, TopicCreationConfig, Topition,
+    TxnAddPartitionsRequest,
 };
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -55,6 +56,7 @@ where
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )
     .and_then(|builder| builder.build().map_err(Into::into))
     .map(|frame_route| {

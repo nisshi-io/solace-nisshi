@@ -32,7 +32,9 @@ use nisshi_sans_io::{
     txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
 };
 use nisshi_service::{FrameRequestLayer, FrameRouteService, ResponseService};
-use nisshi_storage::{ArcDynStorage, AutoCreateRefusals, Storage, TopicCreationConfig, Topition};
+use nisshi_storage::{
+    ArcDynStorage, AutoCreateRefusals, KnownTopics, Storage, TopicCreationConfig, Topition,
+};
 use rama::{
     Layer as _, Service as _, extensions::Extensions, layer::MapErrLayer, service::BoxService,
 };
@@ -136,6 +138,7 @@ impl Fixture {
             None,
             TopicCreationConfig::default(),
             AutoCreateRefusals::default(),
+            KnownTopics::default(),
             extend_routes.as_ref(),
         )
         .and_then(|builder| builder.build().map_err(Into::into))?;

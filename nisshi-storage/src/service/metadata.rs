@@ -27,6 +27,7 @@ use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
 pub use auto_create_refusals::AutoCreateRefusals;
+pub use known_topics::KnownTopics;
 
 use super::{
     create_topics::validation::ValidatedCreateTopicsRequest, fetch::storage_failure_warns_now,
@@ -37,13 +38,15 @@ use crate::{
 };
 
 mod auto_create_refusals;
+mod known_topics;
 
 /// A [`Service`] using its [`Storage`] taking [`MetadataRequest`] returning [`MetadataResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::MetadataRequest;
 /// use nisshi_storage::{
-///     AutoCreateRefusals, Error, MetadataService, StorageContainer, TopicCreationConfig,
+///     AutoCreateRefusals, Error, KnownTopics, MetadataService, StorageContainer,
+///     TopicCreationConfig,
 /// };
 /// use url::Url;
 ///
@@ -65,6 +68,7 @@ mod auto_create_refusals;
 ///     storage,
 ///     topic_creation: TopicCreationConfig::default(),
 ///     auto_create_refusals: AutoCreateRefusals::default(),
+///     known_topics: KnownTopics::default(),
 /// };
 ///
 /// let response = service
@@ -94,52 +98,77 @@ pub struct MetadataService<G> {
     /// The names that auto-creation refused recently. Give each service of a broker a clone of
     /// one store, so that a refusal on one connection counts on every connection.
     pub auto_create_refusals: AutoCreateRefusals,
+
+    /// The partitions of the topics that a read last answered, which a failed read answers
+    /// without a leader. Give each service of a broker a clone of one store, so that a read on
+    /// one connection serves every connection.
+    pub known_topics: KnownTopics,
 }
 
 impl<G> MetadataService<G>
 where
     G: Storage,
 {
-    /// Reads the metadata of `topics` from storage. When the read fails and the request names
-    /// topics, it answers each named topic with the code of the error, and keeps the brokers.
+    /// Reads the metadata of `topics` from storage, and records the answer in `known_topics`.
     ///
-    /// A failed read does not close the connection, because the client sends its other requests
-    /// on it. A retriable code makes the Java client request the metadata again, as it does for
-    /// any `InvalidMetadataException`
-    /// ([`Metadata.handleMetadataResponse`]). The brokers come from a read of no topics, which
-    /// reads no topic rows. If that read fails too, this returns the original error.
+    /// When the read fails with an error that a retry may clear, and every topic that the
+    /// request names is in `known_topics`, this answers each of them from there, with the brokers
+    /// of a read of no topics, or of the last successful read. The client then keeps its
+    /// partitions and waits for a leader.
     ///
-    /// A request that names no topics asks for every topic, and this returns the original error
-    /// for it. An answer of the brokers with an empty topic list would tell the client that no
-    /// topic exists.
+    /// This returns the error, so the broker closes the connection, when the request names a
+    /// topic that `known_topics` does not hold, or names no topics. Every client retries a closed connection, and an answer of the brokers
+    /// without topics would tell the client that no topic exists.
     ///
-    /// [`Metadata.handleMetadataResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/Metadata.java#L530-L533
+    /// For an error that a retry does not clear, this answers each named topic with the code of
+    /// the error and no partitions, so the client reports it at once instead of waiting for a
+    /// leader forever.
     async fn read_metadata(&self, topics: Option<&[TopicId]>) -> Result<crate::MetadataResponse> {
         let error = match self.storage.metadata(topics).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                self.known_topics.record(topics, &response);
+                return Ok(response);
+            }
             Err(error) => error,
         };
 
         let named = topics.filter(|topics| !topics.is_empty());
 
-        let brokers = match named {
-            Some(_) => self.storage.metadata(Some(&[])).await,
+        let error_code = error.error_code(ErrorCode::KafkaStorageError);
+        let transient = may_clear_on_retry(&error);
+
+        let answered = match named {
+            Some(named) if transient => self.known_topics.without_leader(named),
+            Some(named) => Some(
+                named
+                    .iter()
+                    .map(|topic| without_partitions(topic, error_code))
+                    .collect(),
+            ),
+            None => None,
+        };
+
+        // A SQL engine reads the brokers through the connection that failed, so this answers
+        // the brokers of the last successful read when this read fails too.
+        let brokers = match answered {
+            Some(_) => match self.storage.metadata(Some(&[])).await {
+                Ok(response) => Ok(response),
+                Err(brokers_error) => self.known_topics.brokers().ok_or(brokers_error),
+            },
             None => Err(error.clone()),
         };
 
-        let (Some(named), Ok(mut response)) = (named, brokers) else {
-            error!(?error);
+        let (Some(named), Some(answered), Ok(mut response)) = (named, answered, brokers) else {
+            if transient {
+                log_transient_failure(named.map_or(0, <[TopicId]>::len), &error);
+            } else {
+                error!(?error);
+            }
             return Err(error);
         };
 
-        let error_code = error.error_code(ErrorCode::KafkaStorageError);
-
-        if error_code == ErrorCode::KafkaStorageError {
-            if storage_failure_warns_now(StorageOperation::Metadata) {
-                warn!(topics = named.len(), ?error, "metadata read failed");
-            } else {
-                debug!(topics = named.len(), ?error, "metadata read failed");
-            }
+        if transient {
+            log_transient_failure(named.len(), &error);
         } else {
             error!(
                 topics = named.len(),
@@ -149,26 +178,47 @@ where
             );
         }
 
-        response.topics = named
-            .iter()
-            .map(|topic| {
-                let (name, topic_id) = match topic {
-                    TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
-                    TopicId::Id(id) => ("", id.into_bytes()),
-                };
-
-                MetadataResponseTopic::default()
-                    .error_code(error_code.into())
-                    .name(Some(name.into()))
-                    .topic_id(Some(topic_id))
-                    .is_internal(Some(false))
-                    .partitions(Some([].into()))
-                    .topic_authorized_operations(Some(-2147483648))
-            })
-            .collect();
-
+        response.topics = answered;
         Ok(response)
     }
+}
+
+/// Returns whether a retry of a Metadata read that failed with `error` may succeed. A storage
+/// timeout that the engine answers as `REQUEST_TIMED_OUT`, such as a pool without a free
+/// connection, may clear on a retry too.
+fn may_clear_on_retry(error: &Error) -> bool {
+    error.is_transient()
+        || matches!(
+            error,
+            Error::Api(ErrorCode::KafkaStorageError | ErrorCode::RequestTimedOut)
+        )
+}
+
+/// Logs a failed Metadata read that a retry may clear, of `topics` named topics: at `warn` once
+/// per interval and at `debug` between, because a client retries Metadata many times during one
+/// outage.
+fn log_transient_failure(topics: usize, error: &Error) {
+    if storage_failure_warns_now(StorageOperation::Metadata) {
+        warn!(topics, ?error, "metadata read failed");
+    } else {
+        debug!(topics, ?error, "metadata read failed");
+    }
+}
+
+/// Returns the row of `topic` with `error_code` and no partitions.
+fn without_partitions(topic: &TopicId, error_code: ErrorCode) -> MetadataResponseTopic {
+    let (name, topic_id) = match topic {
+        TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
+        TopicId::Id(id) => ("", id.into_bytes()),
+    };
+
+    MetadataResponseTopic::default()
+        .error_code(error_code.into())
+        .name(Some(name.into()))
+        .topic_id(Some(topic_id))
+        .is_internal(Some(false))
+        .partitions(Some([].into()))
+        .topic_authorized_operations(Some(-2147483648))
 }
 
 impl<G> ApiKey for MetadataService<G> {

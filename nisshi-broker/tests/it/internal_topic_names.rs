@@ -25,8 +25,8 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic, metadata_response::MetadataResponseTopic,
 };
 use nisshi_storage::{
-    AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer, MetadataService, Storage,
-    TopicCreationConfig,
+    AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer, KnownTopics,
+    MetadataService, Storage, TopicCreationConfig,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 
@@ -85,6 +85,7 @@ async fn metadata(
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let response = service

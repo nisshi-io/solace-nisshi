@@ -34,7 +34,9 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig, TopicId, Topition};
+use nisshi_storage::{
+    AutoCreateRefusals, KnownTopics, Storage, TopicCreationConfig, TopicId, Topition,
+};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use tokio::time::sleep;
@@ -56,6 +58,7 @@ where
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )
     .inspect(|builder| debug!(?builder))
     .and_then(|builder| builder.build().map_err(Into::into))

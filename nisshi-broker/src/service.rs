@@ -20,7 +20,7 @@ use nisshi_service::{
     FrameRouteBuilder, FrameRouteService, TcpBytesLayer, TcpBytesService, TcpContext,
     TcpContextLayer, TcpContextService,
 };
-use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, KnownTopics, Storage, TopicCreationConfig};
 use rama::Layer;
 use rsasl::config::SASLConfig;
 use tracing::debug;
@@ -45,6 +45,7 @@ pub fn routes<C, S>(
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    known_topics: KnownTopics,
     extend_routes: Option<&ExtendRoutes<C, S>>,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
@@ -59,6 +60,7 @@ where
         schemas,
         topic_creation,
         auto_create_refusals,
+        known_topics,
     )
     .inspect(|builder| debug!(?builder))
     .and_then(|builder| {
@@ -82,6 +84,7 @@ pub fn services<C, S>(
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    known_topics: KnownTopics,
     extend_routes: Option<&ExtendRoutes<C, S>>,
     sasl_config: Option<Arc<SASLConfig>>,
 ) -> Result<TcpRouteFrame, Error>
@@ -95,6 +98,7 @@ where
         schemas,
         topic_creation,
         auto_create_refusals,
+        known_topics,
         extend_routes,
     )
     .and_then(|builder| builder.build().map_err(Into::into))

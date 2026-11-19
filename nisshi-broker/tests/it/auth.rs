@@ -44,7 +44,7 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
-    AutoCreateRefusals, BrokerRegistrationRequest, CommittedOffset, GroupDetail,
+    AutoCreateRefusals, BrokerRegistrationRequest, CommittedOffset, GroupDetail, KnownTopics,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
     ProducerIdResponse, ScramCredential, Storage, TopicCreationConfig, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
@@ -71,6 +71,7 @@ where
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )
     .and_then(auth::services)
     .and_then(|builder| builder.build().map_err(Into::into))

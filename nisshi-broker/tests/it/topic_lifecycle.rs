@@ -23,7 +23,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer,
-    DeleteTopicsService, MetadataService, Storage, TopicCreationConfig,
+    DeleteTopicsService, KnownTopics, MetadataService, Storage, TopicCreationConfig,
 };
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -44,6 +44,7 @@ async fn topic_lifecycle(storage: impl Storage + Clone) -> Result<()> {
         storage: storage.clone(),
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let name = &alphanumeric_string(15)[..];

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod known_topics;
+
 use std::{
     io,
     sync::{Arc, Mutex},
@@ -26,7 +28,8 @@ use tokio::time::advance;
 use tracing::Level;
 
 use super::{
-    AutoCreateRefusals, MetadataService, auto_create_refusals::REFUSAL_TTL, topic_exists_after,
+    AutoCreateRefusals, KnownTopics, MetadataService, auto_create_refusals::REFUSAL_TTL,
+    topic_exists_after,
 };
 use crate::{
     Result, TopicCreationConfig,
@@ -41,6 +44,7 @@ fn service(
         storage: storage.clone(),
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: refusals.clone(),
+        known_topics: KnownTopics::default(),
     }
 }
 

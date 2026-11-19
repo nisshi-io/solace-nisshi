@@ -16,9 +16,9 @@
 //! `Storage::metadata` as an error, so a Fetch answers `KAFKA_STORAGE_ERROR` in each partition at
 //! once, instead of `UNKNOWN_TOPIC_OR_PARTITION`, which tells the client the topic is gone. A
 //! topic that does not exist still answers `UNKNOWN_TOPIC_OR_PARTITION` in the response. The
-//! Metadata service answers each named topic with the code of the error and keeps the connection
-//! open, and the `validate_only` dry runs of CreateTopics and IncrementalAlterConfigs answer
-//! with the code of the error.
+//! Metadata handler answers a topic that it read before with its partitions and no leader, and
+//! the `validate_only` dry runs of CreateTopics and IncrementalAlterConfigs answer with the code
+//! of the error.
 
 use std::{
     assert_matches, fmt,
@@ -43,8 +43,8 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer, Error,
-    FetchService, FetchValidationLayer, IncrementalAlterConfigsService, MetadataService,
-    Storage as _, TopicCreationConfig, TopicId,
+    FetchService, FetchValidationLayer, IncrementalAlterConfigsService, KnownTopics,
+    MetadataService, Storage as _, TopicCreationConfig, TopicId,
 };
 use nisshi_storage_dynostore::DynoStore;
 use object_store::{
@@ -374,11 +374,15 @@ async fn storage_failing_meta_reads(permission_denied: bool) -> Result<ArcDynSto
     Ok(storage)
 }
 
-fn metadata_service(storage: ArcDynStorage) -> MetadataService<ArcDynStorage> {
+fn metadata_service(
+    storage: ArcDynStorage,
+    known_topics: &KnownTopics,
+) -> MetadataService<ArcDynStorage> {
     MetadataService {
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: known_topics.clone(),
     }
 }
 
@@ -400,7 +404,7 @@ async fn metadata_service_answers_a_missing_topic_as_unknown() -> Result<()> {
 
     let storage = storage_with_topic(Arc::new(FailMetaReadStore::new())).await?;
 
-    let response = metadata_service(storage)
+    let response = metadata_service(storage, &KnownTopics::default())
         .serve(metadata_request(Some(vec![
             MetadataRequestTopic::default().name(Some("absent".into())),
         ])))
@@ -419,40 +423,41 @@ async fn metadata_service_answers_a_missing_topic_as_unknown() -> Result<()> {
     Ok(())
 }
 
-/// A failed read answers each named topic with the code of the error, and still lists the broker.
-/// The service returns a response, so the broker keeps the connection open.
+/// A read error that a retry does not fix answers each named topic `UNKNOWN_SERVER_ERROR`, and
+/// still lists the broker, so the client reports the error at once.
 #[tokio::test]
-async fn metadata_service_answers_a_failed_read_in_each_named_topic() -> Result<()> {
+async fn metadata_service_answers_a_denied_read_in_each_named_topic() -> Result<()> {
     let _guard = init_tracing()?;
 
-    for (permission_denied, expected) in [
-        (false, ErrorCode::KafkaStorageError),
-        (true, ErrorCode::UnknownServerError),
-    ] {
-        let storage = storage_failing_meta_reads(permission_denied).await?;
+    let response = metadata_service(
+        storage_failing_meta_reads(true).await?,
+        &KnownTopics::default(),
+    )
+    .serve(metadata_request(Some(vec![
+        MetadataRequestTopic::default().name(Some(TOPIC.into())),
+        MetadataRequestTopic::default().name(Some("absent".into())),
+    ])))
+    .await?;
 
-        let response = metadata_service(storage)
-            .serve(metadata_request(Some(vec![
-                MetadataRequestTopic::default().name(Some(TOPIC.into())),
-                MetadataRequestTopic::default().name(Some("absent".into())),
-            ])))
-            .await?;
-
-        // The read of the first topic fails, so the whole request answers the error.
-        let topics = response.topics.unwrap_or_default();
-        assert_eq!(
-            vec![
-                (Some(TOPIC.to_owned()), i16::from(expected)),
-                (Some("absent".to_owned()), i16::from(expected))
-            ],
-            topics
-                .iter()
-                .map(|topic| (topic.name.clone(), topic.error_code))
-                .collect::<Vec<_>>(),
-            "permission_denied = {permission_denied}"
-        );
-        assert_eq!(1, response.brokers.unwrap_or_default().len());
-    }
+    // The read of the first topic fails, so the whole request answers the error.
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(
+        vec![
+            (
+                Some(TOPIC.to_owned()),
+                i16::from(ErrorCode::UnknownServerError)
+            ),
+            (
+                Some("absent".to_owned()),
+                i16::from(ErrorCode::UnknownServerError)
+            )
+        ],
+        topics
+            .iter()
+            .map(|topic| (topic.name.clone(), topic.error_code))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(1, response.brokers.unwrap_or_default().len());
 
     Ok(())
 }
@@ -465,19 +470,102 @@ async fn metadata_service_echoes_the_topic_id_of_a_failed_read() -> Result<()> {
 
     let id = uuid::Uuid::new_v4();
 
-    let response = metadata_service(storage_failing_meta_reads(false).await?)
-        .serve(metadata_request(Some(vec![
-            MetadataRequestTopic::default().topic_id(Some(id.into_bytes())),
-        ])))
-        .await?;
+    let response = metadata_service(
+        storage_failing_meta_reads(true).await?,
+        &KnownTopics::default(),
+    )
+    .serve(metadata_request(Some(vec![
+        MetadataRequestTopic::default().topic_id(Some(id.into_bytes())),
+    ])))
+    .await?;
 
     let topics = response.topics.unwrap_or_default();
     assert_eq!(1, topics.len());
     assert_eq!(Some(id.into_bytes()), topics[0].topic_id);
     assert_eq!(
-        i16::from(ErrorCode::KafkaStorageError),
+        i16::from(ErrorCode::UnknownServerError),
         topics[0].error_code
     );
+
+    Ok(())
+}
+
+/// A read error that a retry may fix, of a topic that the handler never read, returns the error,
+/// so the broker closes the connection and the client connects again.
+#[tokio::test]
+async fn metadata_service_returns_the_error_of_a_failed_read_of_a_topic_never_read() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    assert_matches!(
+        metadata_service(
+            storage_failing_meta_reads(false).await?,
+            &KnownTopics::default()
+        )
+        .serve(metadata_request(Some(vec![
+            MetadataRequestTopic::default().name(Some(TOPIC.into())),
+        ])))
+        .await,
+        Err(Error::ObjectStore(_))
+    );
+
+    Ok(())
+}
+
+/// A read error that a retry may fix answers a topic read before with each of its partitions
+/// `LEADER_NOT_AVAILABLE` and leader -1, whether the client names it or its ID, so the client
+/// keeps the partitions and waits for a leader.
+#[tokio::test]
+async fn metadata_service_answers_a_failed_read_of_a_topic_read_before_without_a_leader()
+-> Result<()> {
+    let _guard = init_tracing()?;
+
+    let object_store = Arc::new(FailMetaReadStore::new());
+    let known_topics = KnownTopics::default();
+
+    let read = metadata_service(
+        storage_with_topic(object_store.clone()).await?,
+        &known_topics,
+    )
+    .serve(metadata_request(Some(vec![
+        MetadataRequestTopic::default().name(Some(TOPIC.into())),
+    ])))
+    .await?;
+    let topic_id = read.topics.unwrap_or_default()[0].topic_id;
+
+    // A DynoStore answers a repeat read of `meta.json` from its cache, so the failing read goes
+    // through another DynoStore, as it would on a broker that started after the first read.
+    object_store.arm();
+    let failing = metadata_service(dyno_store(object_store)?, &known_topics);
+
+    for request in [
+        MetadataRequestTopic::default().name(Some(TOPIC.into())),
+        MetadataRequestTopic::default().topic_id(topic_id),
+    ] {
+        let response = failing.serve(metadata_request(Some(vec![request]))).await?;
+
+        let topics = response.topics.unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(Some(TOPIC), topics[0].name.as_deref());
+        assert_eq!(topic_id, topics[0].topic_id);
+        assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
+        assert_eq!(
+            vec![
+                (0, i16::from(ErrorCode::LeaderNotAvailable), -1),
+                (1, i16::from(ErrorCode::LeaderNotAvailable), -1)
+            ],
+            topics[0]
+                .partitions
+                .iter()
+                .flatten()
+                .map(|partition| (
+                    partition.partition_index,
+                    partition.error_code,
+                    partition.leader_id
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, response.brokers.unwrap_or_default().len());
+    }
 
     Ok(())
 }
@@ -488,9 +576,12 @@ async fn metadata_service_returns_the_error_of_a_failed_read_of_all_topics() -> 
     let _guard = init_tracing()?;
 
     assert_matches!(
-        metadata_service(storage_failing_meta_reads(false).await?)
-            .serve(metadata_request(None))
-            .await,
+        metadata_service(
+            storage_failing_meta_reads(false).await?,
+            &KnownTopics::default()
+        )
+        .serve(metadata_request(None))
+        .await,
         Err(Error::ObjectStore(_))
     );
 

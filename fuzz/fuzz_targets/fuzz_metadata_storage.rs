@@ -32,7 +32,9 @@ use libfuzzer_sys::fuzz_target;
 use nisshi_fuzz_harness::{api_version, check_request, check_response};
 use nisshi_sans_io::MetadataRequest;
 use nisshi_service::{all_topics_at_v0, refuse_topic_ids};
-use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
+use nisshi_storage::{
+    AutoCreateRefusals, KnownTopics, MetadataService, StorageContainer, TopicCreationConfig,
+};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use tokio::runtime::Runtime;
@@ -78,6 +80,7 @@ fuzz_target!(|input: (u16, MetadataRequest)| {
             storage,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
+            known_topics: KnownTopics::default(),
         };
 
         service
