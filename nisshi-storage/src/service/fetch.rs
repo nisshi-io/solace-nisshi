@@ -12,11 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    cmp::min,
-    collections::HashMap,
-    sync::{LazyLock, Mutex, PoisonError},
-};
+use std::{cmp::min, sync::LazyLock};
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
@@ -31,7 +27,8 @@ use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    Error, METER, OffsetStage, Result, Storage, StorageOperation, TopicId, Topition,
+    Error, METER, OffsetStage, Result, STORAGE_FAILURE_WARN_INTERVAL, Storage, StorageOperation,
+    TopicId, Topition, WarnLimit,
     fetched::FetchUntilDeadline as _,
     service::{
         read_deadline::{ReadDeadline, ReadWait, TimedOut},
@@ -81,35 +78,14 @@ static FETCH_STORAGE_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// series of the counter for each name.
 const UNRESOLVED_TOPIC: &str = "unresolved";
 
-/// The shortest time between two `warn` lines for failures of one storage operation that a retry
-/// may clear.
-pub(super) const STORAGE_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(10);
-
 /// When each storage operation last logged a `warn` line for a failure that a retry may clear.
-static STORAGE_FAILURE_LAST_WARNED: LazyLock<Mutex<HashMap<StorageOperation, Instant>>> =
-    LazyLock::new(Mutex::default);
+static STORAGE_FAILURE_WARNS: WarnLimit<StorageOperation> =
+    WarnLimit::new(STORAGE_FAILURE_WARN_INTERVAL);
 
 /// Returns whether a failure of `operation` that a retry may clear logs at `warn` now, which it
 /// does at most once in each [`STORAGE_FAILURE_WARN_INTERVAL`].
-///
-/// A client retries a failed request as often as it likes, so a `warn` line for each failure
-/// would flood the log while the store is down. The map has one entry for each operation, so its size
-/// is bounded.
 pub(super) fn storage_failure_warns_now(operation: StorageOperation) -> bool {
-    let now = Instant::now();
-    let mut last_warned = STORAGE_FAILURE_LAST_WARNED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-
-    if last_warned
-        .get(&operation)
-        .is_some_and(|last| now.duration_since(*last) < STORAGE_FAILURE_WARN_INTERVAL)
-    {
-        return false;
-    }
-
-    _ = last_warned.insert(operation, now);
-    true
+    STORAGE_FAILURE_WARNS.warns_now(operation)
 }
 
 static FETCH_AHEAD_OF_CACHED_HIGH_WATERMARK: LazyLock<Counter<u64>> = LazyLock::new(|| {

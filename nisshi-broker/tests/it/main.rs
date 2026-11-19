@@ -77,6 +77,7 @@ pub mod metadata_topic_ids;
 pub mod new_cg;
 pub mod offset_commit_fence;
 pub mod offset_commit_unknown_partition;
+pub mod offset_commit_v1_timestamp;
 pub mod offset_fetch_commit_metadata;
 pub mod offset_fetch_require_stable;
 pub mod offset_fetch_storage_error;

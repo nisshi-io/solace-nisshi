@@ -199,10 +199,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::service::{
-        counting_storage::{BrokerCall, CountingStorage, NODE_ID},
-        fetch::STORAGE_FAILURE_WARN_INTERVAL,
-    };
+    use crate::STORAGE_FAILURE_WARN_INTERVAL;
+    use crate::service::counting_storage::{BrokerCall, CountingStorage, NODE_ID};
 
     /// Collects what the `tracing` subscriber of a test writes.
     #[derive(Clone, Default)]

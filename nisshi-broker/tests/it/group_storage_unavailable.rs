@@ -34,9 +34,10 @@ use nisshi_broker::coordinator::group::{
     Coordinator as _, OffsetCommit, administrator::Controller,
 };
 use nisshi_sans_io::{
-    Body, ConfigResource, DeleteGroupsResponse, ErrorCode, HeartbeatResponse, IsolationLevel,
-    JoinGroupResponse, LeaveGroupResponse, ListOffset, OffsetCommitResponse, ScramMechanism,
-    SyncGroupResponse,
+    ApiKey as _, Body, ConfigResource, DeleteGroupsRequest, DeleteGroupsResponse, ErrorCode, Frame,
+    Header, HeartbeatRequest, HeartbeatResponse, IsolationLevel, JoinGroupRequest,
+    JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffset, OffsetCommitResponse,
+    ScramMechanism, SyncGroupRequest, SyncGroupResponse,
     create_topics_request::CreatableTopic,
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
@@ -51,8 +52,10 @@ use nisshi_sans_io::{
     leave_group_request::MemberIdentity,
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     record::deflated,
+    sync_group_request::SyncGroupRequestAssignment,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
+use nisshi_service::routable_range;
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
@@ -60,6 +63,7 @@ use nisshi_storage::{
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version,
 };
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::common::{
@@ -192,13 +196,14 @@ fn offset_commit_topics() -> Vec<OffsetCommitRequestTopic> {
     ]
 }
 
-async fn join_error_code(
+async fn join_body(
     controller: &Controller<OutageStorage>,
     group_id: &str,
-) -> Result<(ErrorCode, String)> {
+    member_id: &str,
+) -> Result<Body> {
     let protocols = protocols();
 
-    let body = controller
+    controller
         .join(
             JOIN_GROUP_VERSION,
             Some(CLIENT_ID),
@@ -206,14 +211,18 @@ async fn join_error_code(
             group_id,
             10_000,
             Some(30_000),
-            "",
+            member_id,
             None,
             PROTOCOL_TYPE,
             Some(&protocols),
             None,
         )
-        .await?;
+        .await
+        .map_err(Into::into)
+}
 
+/// Returns the error code and the member id of a `JoinGroup` response.
+fn join_error_code_and_member_id(body: Body) -> Result<(ErrorCode, String)> {
     let Body::JoinGroupResponse(JoinGroupResponse {
         error_code,
         member_id,
@@ -226,11 +235,24 @@ async fn join_error_code(
     Ok((ErrorCode::try_from(error_code)?, member_id))
 }
 
-async fn sync_error_code(
+async fn join_error_code(
     controller: &Controller<OutageStorage>,
-    formed: &Formed,
-) -> Result<ErrorCode> {
-    let body = controller
+    group_id: &str,
+    member_id: &str,
+) -> Result<(ErrorCode, String)> {
+    join_body(controller, group_id, member_id)
+        .await
+        .and_then(join_error_code_and_member_id)
+}
+
+/// Returns the body of a `SyncGroup` from the member of `formed`, with the assignment of each
+/// partition of [`TOPIC`] to that member.
+async fn sync_body(controller: &Controller<OutageStorage>, formed: &Formed) -> Result<Body> {
+    let assignments = [SyncGroupRequestAssignment::default()
+        .member_id(formed.member_id.clone())
+        .assignment(Bytes::new())];
+
+    controller
         .sync(
             &formed.group,
             formed.generation_id,
@@ -238,9 +260,17 @@ async fn sync_error_code(
             None,
             None,
             None,
-            Some(&[]),
+            Some(&assignments),
         )
-        .await?;
+        .await
+        .map_err(Into::into)
+}
+
+async fn sync_error_code(
+    controller: &Controller<OutageStorage>,
+    formed: &Formed,
+) -> Result<ErrorCode> {
+    let body = sync_body(controller, formed).await?;
 
     let Body::SyncGroupResponse(SyncGroupResponse { error_code, .. }) = body else {
         return Err(anyhow!("expected a sync group response: {body:?}"));
@@ -249,13 +279,18 @@ async fn sync_error_code(
     ErrorCode::try_from(error_code).map_err(Into::into)
 }
 
+async fn heartbeat_body(controller: &Controller<OutageStorage>, formed: &Formed) -> Result<Body> {
+    controller
+        .heartbeat(&formed.group, formed.generation_id, &formed.member_id, None)
+        .await
+        .map_err(Into::into)
+}
+
 async fn heartbeat_error_code(
     controller: &Controller<OutageStorage>,
     formed: &Formed,
 ) -> Result<ErrorCode> {
-    let body = controller
-        .heartbeat(&formed.group, formed.generation_id, &formed.member_id, None)
-        .await?;
+    let body = heartbeat_body(controller, formed).await?;
 
     let Body::HeartbeatResponse(HeartbeatResponse { error_code, .. }) = body else {
         return Err(anyhow!("expected a heartbeat response: {body:?}"));
@@ -264,18 +299,23 @@ async fn heartbeat_error_code(
     ErrorCode::try_from(error_code).map_err(Into::into)
 }
 
-async fn leave_error_code(
-    controller: &Controller<OutageStorage>,
-    formed: &Formed,
-) -> Result<ErrorCode> {
+async fn leave_body(controller: &Controller<OutageStorage>, formed: &Formed) -> Result<Body> {
     let members = [MemberIdentity::default()
         .member_id(formed.member_id.clone())
         .group_instance_id(None)
         .reason(None)];
 
-    let body = controller
+    controller
         .leave(&formed.group, None, Some(&members))
-        .await?;
+        .await
+        .map_err(Into::into)
+}
+
+async fn leave_error_code(
+    controller: &Controller<OutageStorage>,
+    formed: &Formed,
+) -> Result<ErrorCode> {
+    let body = leave_body(controller, formed).await?;
 
     let Body::LeaveGroupResponse(LeaveGroupResponse { error_code, .. }) = body else {
         return Err(anyhow!("expected a leave group response: {body:?}"));
@@ -284,14 +324,13 @@ async fn leave_error_code(
     ErrorCode::try_from(error_code).map_err(Into::into)
 }
 
-/// Returns the error code of each partition in an `OffsetCommit` from the member of `formed`.
-async fn offset_commit_error_codes(
+async fn offset_commit_body(
     controller: &Controller<OutageStorage>,
     formed: &Formed,
-) -> Result<Vec<(i32, ErrorCode)>> {
+) -> Result<Body> {
     let topics = offset_commit_topics();
 
-    let body = controller
+    controller
         .offset_commit(OffsetCommit {
             group_id: &formed.group,
             generation_id_or_member_epoch: Some(formed.generation_id),
@@ -301,7 +340,16 @@ async fn offset_commit_error_codes(
             topics: Some(&topics),
             is_transactional: false,
         })
-        .await?;
+        .await
+        .map_err(Into::into)
+}
+
+/// Returns the error code of each partition in an `OffsetCommit` from the member of `formed`.
+async fn offset_commit_error_codes(
+    controller: &Controller<OutageStorage>,
+    formed: &Formed,
+) -> Result<Vec<(i32, ErrorCode)>> {
+    let body = offset_commit_body(controller, formed).await?;
 
     let Body::OffsetCommitResponse(OffsetCommitResponse {
         topics: Some(topics),
@@ -347,6 +395,54 @@ async fn delete_groups_error_codes(
         .collect()
 }
 
+/// Encodes `body`, the response to a request of `api`, at each version of `api` that the broker
+/// serves, as the broker encodes a response before it writes it to the connection.
+fn encode_at_every_served_version(api: i16, body: &Body) -> Result<()> {
+    let versions = routable_range(api).ok_or_else(|| anyhow!("api key {api} is not served"))?;
+
+    for api_version in versions {
+        _ = Frame::response(
+            Header::Response { correlation_id: 0 },
+            body.clone(),
+            api,
+            api_version,
+        )
+        .map_err(|error| anyhow!("api key {api} v{api_version}: {error:?}"))?;
+    }
+
+    Ok(())
+}
+
+/// Returns the code at the top level of `body`, or the code of each partition or group that it
+/// answers, which are all the same for a request that failed.
+fn error_codes(body: &Body) -> Result<BTreeSet<ErrorCode>> {
+    let codes = match body {
+        Body::JoinGroupResponse(response) => vec![response.error_code],
+        Body::SyncGroupResponse(response) => vec![response.error_code],
+        Body::HeartbeatResponse(response) => vec![response.error_code],
+        Body::LeaveGroupResponse(response) => vec![response.error_code],
+        Body::OffsetCommitResponse(response) => response
+            .topics
+            .iter()
+            .flatten()
+            .flat_map(|topic| topic.partitions.iter().flatten())
+            .map(|partition| partition.error_code)
+            .collect(),
+        Body::DeleteGroupsResponse(response) => response
+            .results
+            .iter()
+            .flatten()
+            .map(|result| result.error_code)
+            .collect(),
+        otherwise => return Err(anyhow!("unexpected response: {otherwise:?}")),
+    };
+
+    codes
+        .into_iter()
+        .map(|code| ErrorCode::try_from(code).map_err(Into::into))
+        .collect()
+}
+
 #[tokio::test]
 async fn join_answers_coordinator_not_available_until_storage_answers() -> Result<()> {
     let _guard = init_tracing()?;
@@ -359,14 +455,14 @@ async fn join_answers_coordinator_not_available_until_storage_answers() -> Resul
 
     assert_eq!(
         (ErrorCode::CoordinatorNotAvailable, String::new()),
-        join_error_code(&controller, &group_id).await?
+        join_error_code(&controller, &group_id, "").await?
     );
 
     storage.end();
 
     // A member without a member id gets one with `MEMBER_ID_REQUIRED`, after the coordinator
     // has read the group from storage.
-    let (error_code, member_id) = join_error_code(&controller, &group_id).await?;
+    let (error_code, member_id) = join_error_code(&controller, &group_id, "").await?;
     assert_eq!(ErrorCode::MemberIdRequired, error_code);
     assert!(!member_id.is_empty());
 
@@ -423,8 +519,11 @@ async fn heartbeat_answers_coordinator_not_available_until_storage_answers() -> 
     Ok(())
 }
 
+/// Each request answers `UNKNOWN_SERVER_ERROR` for a failure that a retry can't clear, in a
+/// response that the broker can encode at every version that it serves. A response that leaves a
+/// field of a version unset fails to encode, and the broker then closes the connection.
 #[tokio::test]
-async fn heartbeat_answers_unknown_server_error_for_a_permanent_failure() -> Result<()> {
+async fn each_request_answers_unknown_server_error_for_a_permanent_failure() -> Result<()> {
     let _guard = init_tracing()?;
 
     let storage = OutageStorage::new().await?;
@@ -433,10 +532,103 @@ async fn heartbeat_answers_unknown_server_error_for_a_permanent_failure() -> Res
 
     storage.start(Failing::GroupsAndOffsets, permanent());
 
+    let join = join_body(&controller, &formed.group, &formed.member_id).await?;
+
+    // The response echoes the member id of the request.
     assert_eq!(
-        ErrorCode::UnknownServerError,
-        heartbeat_error_code(&controller, &formed).await?
+        (ErrorCode::UnknownServerError, formed.member_id.clone()),
+        join_error_code_and_member_id(join.clone())?
     );
+
+    let answered = [
+        (JoinGroupRequest::KEY, join),
+        (
+            SyncGroupRequest::KEY,
+            sync_body(&controller, &formed).await?,
+        ),
+        (
+            HeartbeatRequest::KEY,
+            heartbeat_body(&controller, &formed).await?,
+        ),
+        (
+            LeaveGroupRequest::KEY,
+            leave_body(&controller, &formed).await?,
+        ),
+        (
+            nisshi_sans_io::OffsetCommitRequest::KEY,
+            offset_commit_body(&controller, &formed).await?,
+        ),
+        (
+            DeleteGroupsRequest::KEY,
+            controller
+                .delete_groups(std::slice::from_ref(&formed.group))
+                .await?,
+        ),
+    ];
+
+    for (api, body) in &answered {
+        assert_eq!(
+            BTreeSet::from([ErrorCode::UnknownServerError]),
+            error_codes(body)?,
+            "api key {api}"
+        );
+
+        encode_at_every_served_version(*api, body)?;
+    }
+
+    Ok(())
+}
+
+/// The responses that answer `COORDINATOR_NOT_AVAILABLE` encode at every version that the broker
+/// serves, as those for a permanent failure do.
+#[tokio::test]
+async fn each_request_encodes_coordinator_not_available_at_every_served_version() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let formed = form_group(&controller).await?;
+
+    storage.start(Failing::GroupsAndOffsets, transient());
+
+    let answered = [
+        (
+            JoinGroupRequest::KEY,
+            join_body(&controller, &formed.group, &formed.member_id).await?,
+        ),
+        (
+            SyncGroupRequest::KEY,
+            sync_body(&controller, &formed).await?,
+        ),
+        (
+            HeartbeatRequest::KEY,
+            heartbeat_body(&controller, &formed).await?,
+        ),
+        (
+            LeaveGroupRequest::KEY,
+            leave_body(&controller, &formed).await?,
+        ),
+        (
+            nisshi_sans_io::OffsetCommitRequest::KEY,
+            offset_commit_body(&controller, &formed).await?,
+        ),
+        (
+            DeleteGroupsRequest::KEY,
+            controller
+                .delete_groups(std::slice::from_ref(&formed.group))
+                .await?,
+        ),
+    ];
+
+    for (api, body) in &answered {
+        assert_eq!(
+            BTreeSet::from([ErrorCode::CoordinatorNotAvailable]),
+            error_codes(body)?,
+            "api key {api}"
+        );
+
+        encode_at_every_served_version(*api, body)?;
+    }
 
     Ok(())
 }
@@ -615,6 +807,229 @@ async fn delete_groups_answers_coordinator_not_available_when_the_delete_fails()
     );
 
     Ok(())
+}
+
+/// A `JoinGroup` held for the end of the join phase answers `COORDINATOR_NOT_AVAILABLE` when a
+/// later read of the group fails, and echoes the member id of the request.
+#[tokio::test]
+async fn held_join_answers_coordinator_not_available_with_its_member_id() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let group_id = alphanumeric_string(15);
+
+    let (error_code, member_id) = join_error_code(&controller, &group_id, "").await?;
+    assert_eq!(ErrorCode::MemberIdRequired, error_code);
+
+    // The first join of a new group waits for the end of the initial rebalance delay.
+    let held = tokio::spawn({
+        let controller = controller.clone();
+        let group_id = group_id.clone();
+        let member_id = member_id.clone();
+        async move { join_error_code(&controller, &group_id, &member_id).await }
+    });
+
+    // The join has stored the member in the group, and waits. The `MEMBER_ID_REQUIRED` answer
+    // stored the group with the member pending, not in its members.
+    timeout(Duration::from_secs(10), async {
+        while !storage
+            .inner
+            .group_with_version(&group_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|(detail, _)| detail.members.contains_key(&member_id))
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert!(!held.is_finished());
+
+    storage.start(Failing::GroupsAndOffsets, transient());
+
+    assert_eq!(
+        (ErrorCode::CoordinatorNotAvailable, member_id),
+        held.await??
+    );
+
+    Ok(())
+}
+
+/// A `SyncGroup` from the leader answers `COORDINATOR_NOT_AVAILABLE` when it reads the group and
+/// then fails to store the leader's assignment.
+#[tokio::test]
+async fn sync_answers_coordinator_not_available_when_the_group_write_fails() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let group_id = alphanumeric_string(15);
+
+    let (_, member_id) = join_error_code(&controller, &group_id, "").await?;
+
+    let Body::JoinGroupResponse(JoinGroupResponse {
+        error_code,
+        generation_id,
+        leader,
+        ..
+    }) = join_body(&controller, &group_id, &member_id).await?
+    else {
+        return Err(anyhow!("expected a join group response"));
+    };
+
+    // The only member leads the group, which waits for its assignment.
+    assert_eq!(i16::from(ErrorCode::None), error_code);
+    assert_eq!(member_id, leader);
+
+    let formed = Formed {
+        group: group_id,
+        generation_id,
+        member_id,
+    };
+
+    storage.start(Failing::Writes, transient());
+
+    assert_eq!(
+        ErrorCode::CoordinatorNotAvailable,
+        sync_error_code(&controller, &formed).await?
+    );
+
+    storage.end();
+
+    assert_eq!(
+        ErrorCode::None,
+        sync_error_code(&controller, &formed).await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_answers_coordinator_not_available_when_the_group_write_fails() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let formed = form_group(&controller).await?;
+
+    // The heartbeat reads the group, and then fails to store the member's contact.
+    storage.start(Failing::Writes, transient());
+
+    assert_eq!(
+        ErrorCode::CoordinatorNotAvailable,
+        heartbeat_error_code(&controller, &formed).await?
+    );
+
+    storage.end();
+
+    assert_eq!(
+        ErrorCode::None,
+        heartbeat_error_code(&controller, &formed).await?
+    );
+
+    Ok(())
+}
+
+/// A `DeleteGroups` whose delete fails keeps the answer that it decided for a group before the
+/// delete, and answers `COORDINATOR_NOT_AVAILABLE` only for each group that it tried to delete.
+#[tokio::test]
+async fn delete_groups_keeps_its_refusals_when_the_delete_fails() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let with_member = form_group(&controller).await?;
+    let empty = form_group(&controller).await?;
+
+    assert_eq!(
+        ErrorCode::None,
+        leave_error_code(&controller, &empty).await?
+    );
+
+    storage.start(Failing::Writes, transient());
+
+    assert_eq!(
+        vec![
+            (with_member.group.clone(), ErrorCode::NonEmptyGroup),
+            (empty.group.clone(), ErrorCode::CoordinatorNotAvailable),
+        ],
+        delete_groups_error_codes(
+            &controller,
+            &[with_member.group.clone(), empty.group.clone()]
+        )
+        .await?
+    );
+
+    Ok(())
+}
+
+/// A failure that a retry may clear logs at `warn` once in each interval for each request, with
+/// the group id and the member id, and at debug after that.
+#[tokio::test]
+async fn a_retriable_failure_warns_once_in_each_interval() -> Result<()> {
+    let storage = OutageStorage::new().await?;
+    let controller = Controller::with_storage(storage.clone())?;
+    let formed = form_group(&controller).await?;
+
+    let log = Log::default();
+    let writer = log.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    storage.start(Failing::GroupsAndOffsets, transient());
+
+    for _ in 0..3 {
+        assert_eq!(
+            ErrorCode::CoordinatorNotAvailable,
+            heartbeat_error_code(&controller, &formed).await?
+        );
+    }
+
+    let failures = log.lines_with("the group request failed");
+    assert_eq!(3, failures.len(), "{failures:#?}");
+
+    let warned = failures
+        .iter()
+        .filter(|line| line.contains(" WARN "))
+        .collect::<Vec<_>>();
+    assert_eq!(1, warned.len(), "{failures:#?}");
+    assert!(warned[0].contains(&formed.group), "{}", warned[0]);
+    assert!(warned[0].contains(&formed.member_id), "{}", warned[0]);
+
+    Ok(())
+}
+
+/// Collects what the `tracing` subscriber of a test writes.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl Log {
+    /// Returns each line of the log that contains `text`.
+    fn lines_with(&self, text: &str) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().expect("log"))
+            .lines()
+            .filter(|line| line.contains(text))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+}
+
+impl std::io::Write for Log {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

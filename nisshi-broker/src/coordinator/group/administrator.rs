@@ -62,8 +62,9 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     CommittedOffset, GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState,
-    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition,
-    UpdateError, Version, describe_groups_response, list_groups_response, offset_metadata,
+    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync,
+    STORAGE_FAILURE_WARN_INTERVAL, Storage, Topition, UpdateError, Version, WarnLimit,
+    describe_groups_response, list_groups_response, offset_metadata,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::{
@@ -1130,7 +1131,7 @@ where
         answered.or_else(|error| {
             Ok(join_error_response(
                 member_id,
-                failed_request_error_code("join", &error),
+                failed_request_error_code("join", group_id, Some(member_id), &error),
             ))
         })
     }
@@ -1270,7 +1271,10 @@ where
 
         answered.or_else(|error| {
             Ok(sync_error_response(failed_request_error_code(
-                "sync", &error,
+                "sync",
+                group_id,
+                Some(member_id),
+                &error,
             )))
         })
     }
@@ -1327,7 +1331,7 @@ where
         answered.or_else(|error| {
             Ok(LeaveGroupResponse::default()
                 .throttle_time_ms(Some(0))
-                .error_code(failed_request_error_code("leave", &error).into())
+                .error_code(failed_request_error_code("leave", group_id, member_id, &error).into())
                 .members(Some([].into()))
                 .into())
         })
@@ -1381,7 +1385,12 @@ where
         answered.or_else(|error| {
             Ok(offset_commit_response(
                 &offset_commit,
-                failed_request_error_code("offset_commit", &error),
+                failed_request_error_code(
+                    "offset_commit",
+                    group_id,
+                    offset_commit.member_id,
+                    &error,
+                ),
             ))
         })
     }
@@ -1502,6 +1511,8 @@ where
         answered.or_else(|error| {
             Ok(heartbeat_response(failed_request_error_code(
                 "heartbeat",
+                group_id,
+                Some(member_id),
                 &error,
             )))
         })
@@ -1532,7 +1543,9 @@ where
             .cloned()
             .collect::<Vec<_>>();
 
-        let answered: Result<Body> = async {
+        let mut results = Vec::with_capacity(group_ids.len());
+
+        let decided: Result<()> = async {
             let mut described = self
                 .storage
                 .describe_groups(Some(&group_ids), false)
@@ -1542,7 +1555,6 @@ where
                 .collect::<BTreeMap<_, _>>();
 
             let now = SystemTime::now();
-            let mut results = Vec::with_capacity(group_ids.len());
             let mut deletable = Vec::with_capacity(group_ids.len());
 
             for group_id in group_ids.iter().cloned() {
@@ -1594,43 +1606,47 @@ where
             if !deletable.is_empty() {
                 let deleted = self.storage.delete_groups(Some(&deletable)).await?;
 
-                _ = self.wrappers.lock().map(|mut wrappers| {
+                let forgotten = self.wrappers.lock().map(|mut wrappers| {
                     for result in &deleted {
                         if result.error_code == i16::from(ErrorCode::None) {
                             _ = wrappers.remove(&result.group_id);
                         }
                     }
-                })?;
+                });
 
+                // The response reports each deleted group as deleted, also when this broker
+                // fails to forget its cached state of the group.
                 results.extend(deleted);
+                forgotten?;
             }
 
-            Ok(Body::DeleteGroupsResponse(
-                DeleteGroupsResponse::default()
-                    .throttle_time_ms(0)
-                    .results(Some(results)),
-            ))
+            Ok(())
         }
         .await;
 
-        answered.or_else(|error| {
-            let error_code = failed_request_error_code("delete_groups", &error);
+        // A failure answers each group that the request had not decided with the failure's
+        // code, and keeps the answer of each group that it had decided.
+        if let Err(error) = decided {
+            let undecided = group_ids
+                .into_iter()
+                .filter(|group_id| !results.iter().any(|result| result.group_id == *group_id))
+                .collect::<Vec<_>>();
 
-            Ok(Body::DeleteGroupsResponse(
-                DeleteGroupsResponse::default()
-                    .throttle_time_ms(0)
-                    .results(Some(
-                        group_ids
-                            .into_iter()
-                            .map(|group_id| {
-                                DeletableGroupResult::default()
-                                    .group_id(group_id)
-                                    .error_code(error_code.into())
-                            })
-                            .collect(),
-                    )),
-            ))
-        })
+            let error_code =
+                failed_request_error_code("delete_groups", &undecided.join(","), None, &error);
+
+            results.extend(undecided.into_iter().map(|group_id| {
+                DeletableGroupResult::default()
+                    .group_id(group_id)
+                    .error_code(error_code.into())
+            }));
+        }
+
+        Ok(Body::DeleteGroupsResponse(
+            DeleteGroupsResponse::default()
+                .throttle_time_ms(0)
+                .results(Some(results)),
+        ))
     }
 
     /// Lists each group with its state at the current time, after the changes that the passing
@@ -4002,29 +4018,63 @@ fn group_error_code(error: &Error) -> ErrorCode {
     }
 }
 
-/// Returns the error code that the group request `method` answers when it fails
-/// with `error`, counts the failure as `<method>_failed` in
-/// `nisshi_group_coordinator_requests`, and logs it.
+/// When each group request last logged a `warn` line for a failure that a retry
+/// may clear.
+static GROUP_REQUEST_FAILURE_WARNS: WarnLimit<&str> = WarnLimit::new(STORAGE_FAILURE_WARN_INTERVAL);
+
+/// Returns the error code that the group request `method` for `group_id` answers
+/// when it fails with `error`, counts the failure as `<method>_failed` in
+/// `nisshi_group_coordinator_requests`, and logs it with the group id and the
+/// member id.
 ///
 /// The coordinator answers the code in the request's response instead of
 /// returning `error`, because the broker closes the connection of a request
 /// that returns an error. Kafka's group coordinator answers every failure with
 /// a code and keeps the connection open ([`handleOperationException`]).
 ///
-/// A failure that a retry may clear logs at `warn`. Any other failure answers
-/// `UNKNOWN_SERVER_ERROR`, which a client reports at once, so it logs at
-/// `error`, as Kafka does.
+/// A failure that a retry may clear logs at `warn` at most once in each
+/// [`STORAGE_FAILURE_WARN_INTERVAL`] for each request, and at debug after that,
+/// because a client retries the request as often as it likes. Any other failure
+/// answers `UNKNOWN_SERVER_ERROR`, which a client reports at once, so it logs
+/// at `error` each time, as Kafka does.
 ///
 /// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1178
-fn failed_request_error_code(method: &'static str, error: &Error) -> ErrorCode {
+fn failed_request_error_code(
+    method: &'static str,
+    group_id: &str,
+    member_id: Option<&str>,
+    error: &Error,
+) -> ErrorCode {
     let error_code = group_error_code(error);
 
     COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", format!("{method}_failed"))]);
 
     if error_code == ErrorCode::UnknownServerError {
-        error!(method, ?error, "the group request failed");
+        error!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            "the group request failed"
+        );
+    } else if GROUP_REQUEST_FAILURE_WARNS.warns_now(method) {
+        warn!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            ?error_code,
+            "the group request failed"
+        );
     } else {
-        warn!(method, ?error, ?error_code, "the group request failed");
+        debug!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            ?error_code,
+            "the group request failed"
+        );
     }
 
     error_code
