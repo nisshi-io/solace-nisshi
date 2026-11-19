@@ -6009,6 +6009,7 @@ dependencies = [
  "nisshi-service",
  "nisshi-storage",
  "nisshi-storage-dynostore",
+ "nisshi-storage-integration-test",
  "nisshi-storage-null",
  "nisshi-storage-slatedb",
  "nisshi-storage-sql",
@@ -6471,6 +6472,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-integration-test"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "nisshi-broker",
+ "nisshi-sans-io",
+ "nisshi-service",
+ "nisshi-storage",
+ "rama",
+ "rand 0.10.3",
  "uuid",
 ]
 

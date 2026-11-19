@@ -1,0 +1,9 @@
+# A case runs on the engine that its caller passes in. A case that builds its own engine would
+# test that engine instead, also on a caller with an engine of its own, so the crate's code may
+# not build one. `nisshi-broker`'s broker builder builds an engine from a URL with every engine
+# feature that the build turns on.
+disallowed-methods = [
+    { path = "nisshi_storage::StorageContainer::builder", reason = "a case uses the storage that its caller passes in; it never builds an engine" },
+    { path = "nisshi_broker::broker::Broker::builder", reason = "the broker builder builds an engine from a URL; a case uses the storage that its caller passes in" },
+    { path = "nisshi_broker::broker::Builder::build", reason = "the broker builder builds an engine from a URL; a case uses the storage that its caller passes in" },
+]

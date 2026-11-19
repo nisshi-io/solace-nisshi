@@ -1,0 +1,29 @@
+[package]
+name = "nisshi-storage-integration-test"
+description = "Tests of Nisshi's broker running on top of a storage engine that the caller supplies"
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+authors.workspace = true
+include.workspace = true
+rust-version.workspace = true
+
+# A case runs on the engine that its caller passes in, so the crate does not depend on an engine
+# crate or on an engine feature of `nisshi-broker`. `tests/it/dependencies.rs` checks it.
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+nisshi-broker.workspace = true
+nisshi-sans-io.workspace = true
+nisshi-service.workspace = true
+nisshi-storage.workspace = true
+rama.workspace = true
+rand.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

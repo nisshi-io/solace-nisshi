@@ -80,6 +80,8 @@ anyhow.workspace = true
 crc-fast.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+# Path only, so that `cargo publish` leaves it out: the crate is not published.
+nisshi-storage-integration-test = { path = "../nisshi-storage-integration-test" }
 nisshi-storage-sql = { workspace = true, features = ["test-support"] }
 nisshi-storage.workspace = true
 object_store.workspace = true

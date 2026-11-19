@@ -22,6 +22,7 @@ members = [
     "nisshi-smoke-test",
     "nisshi-storage",
     "nisshi-storage-dynostore",
+    "nisshi-storage-integration-test",
     "nisshi-storage-null",
     "nisshi-storage-slatedb",
     "nisshi-storage-sql",
