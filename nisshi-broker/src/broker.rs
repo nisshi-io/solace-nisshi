@@ -590,6 +590,10 @@ where
     }
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
+        // A route table that cannot build fails here, before the broker registers itself in
+        // storage, and not on the first connection.
+        drop(self.connection_service()?);
+
         let cancellation = self.cancellation.clone();
 
         tokio::select! {
@@ -614,10 +618,6 @@ where
 
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
-
-        // A route table that cannot build fails here, before the listener opens, and not on the
-        // first connection.
-        drop(self.connection_service()?);
 
         let addr = listener_addr(&self.listener).await?;
 

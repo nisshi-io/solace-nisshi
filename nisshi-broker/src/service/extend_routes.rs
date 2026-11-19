@@ -36,9 +36,9 @@ type Extend<G, S> =
 ///
 /// # Calls
 ///
-/// The broker calls the function once before it opens its listener, so that a route table that
-/// cannot build fails the start of the broker. It then calls the function for each connection that
-/// it accepts. If a call for a connection fails, the broker logs the error and drops that
+/// The broker calls the function once when it starts serving, before it registers itself in
+/// storage, so that a route table that cannot build fails the start of the broker. It then calls
+/// the function for each connection that it accepts. If a call for a connection fails, the broker logs the error and drops that
 /// connection. The broker calls the function on the task that accepts connections, so the function
 /// must be quick and must not block. A panic in the function ends the broker.
 ///
