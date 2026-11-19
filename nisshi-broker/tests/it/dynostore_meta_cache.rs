@@ -40,8 +40,8 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ArcDynStorage, AutoCreateRefusals, CreateTopicsService, CreateTopicsValidationLayer,
-    InitProducerIdService, MetadataService, ProduceService, Storage as _, TopicCreationConfig,
-    Topition,
+    InitProducerIdService, KnownTopics, MetadataService, ProduceService, Storage as _,
+    TopicCreationConfig, Topition,
 };
 use nisshi_storage_dynostore::DynoStore;
 use object_store::{
@@ -195,6 +195,7 @@ async fn metadata(storage: ArcDynStorage) -> Result<()> {
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     }
     .serve(RequestInput {
         request: MetadataRequest::default()

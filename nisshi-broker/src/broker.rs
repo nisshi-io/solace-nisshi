@@ -41,8 +41,8 @@ use nisshi_schema::{
 };
 use nisshi_service::{PeerAddressExtension, ProgressBarExtension, ShutdownExtension};
 use nisshi_storage::{
-    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
-    TopicCreationConfig, wait_for_detached_writes,
+    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, KnownTopics, Storage,
+    StorageContainer, TopicCreationConfig, wait_for_detached_writes,
 };
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use rama::{Service, ServiceInput, extensions::Extensions, tcp::TcpStream};
@@ -295,6 +295,7 @@ pub struct Broker<G, S> {
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    known_topics: KnownTopics,
     extend_routes: Option<ExtendRoutes<G, S>>,
 
     sasl_config: Option<Arc<SASLConfig>>,
@@ -357,6 +358,7 @@ where
             schemas: None,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
+            known_topics: KnownTopics::default(),
             extend_routes: None,
 
             sasl_config: None,
@@ -409,6 +411,7 @@ where
             self.schemas.clone(),
             self.topic_creation,
             self.auto_create_refusals.clone(),
+            self.known_topics.clone(),
             self.extend_routes.as_ref(),
             self.sasl_config.clone(),
         )
@@ -1338,6 +1341,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             schemas: self.schema_registry,
             topic_creation: self.topic_creation,
             auto_create_refusals: AutoCreateRefusals::default(),
+            known_topics: KnownTopics::default(),
             extend_routes: self.extend_routes,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),

@@ -93,7 +93,7 @@ pub use init_producer_id::InitProducerIdService;
 pub use list_groups::{ListGroupsService, list_groups_response};
 pub use list_offsets::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
-pub use metadata::{AutoCreateRefusals, MetadataService};
+pub use metadata::{AutoCreateRefusals, KnownTopics, MetadataService};
 use nisshi_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
     create_topics_request::CreatableTopic,

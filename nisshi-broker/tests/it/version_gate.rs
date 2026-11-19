@@ -30,7 +30,7 @@ use nisshi_sans_io::{
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
 };
 use nisshi_service::{BytesFrameLayer, CAPPED_API_VERSIONS, FrameRouteService};
-use nisshi_storage::{AutoCreateRefusals, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, KnownTopics, TopicCreationConfig};
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use uuid::Uuid;
 
@@ -55,6 +55,7 @@ async fn route_table() -> Result<FrameRouteService<Error>> {
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )?;
     let builder = coordinator::services(builder, coordinator)?;
     let builder = auth::services(builder)?;
@@ -151,6 +152,7 @@ async fn full_route_table_has_the_expected_route_count() -> Result<()> {
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )?;
     // The broker does not register a route for GetTelemetrySubscriptions, so it does not
     // advertise the client telemetry APIs.

@@ -32,7 +32,7 @@ use nisshi_service::{
     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
 };
-use nisshi_storage::{AutoCreateRefusals, Storage, TopicCreationConfig};
+use nisshi_storage::{AutoCreateRefusals, KnownTopics, Storage, TopicCreationConfig};
 use rama::{Layer as _, Service, extensions::Extensions};
 use rand::{prelude::*, rng};
 use url::Url;
@@ -52,6 +52,7 @@ where
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
     )
     .and_then(|builder| builder.build().map_err(Into::into))
     .map(|frame_route| {

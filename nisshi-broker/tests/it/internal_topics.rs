@@ -29,8 +29,8 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, AutoCreateRefusals, DescribeTopicPartitionsService, MetadataService, Storage,
-    TopicCreationConfig,
+    ArcDynStorage, AutoCreateRefusals, DescribeTopicPartitionsService, KnownTopics,
+    MetadataService, Storage, TopicCreationConfig,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -103,6 +103,7 @@ async fn metadata_answers_is_internal_from_the_name(storage: ArcDynStorage) -> R
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let by_name = |name: &str| MetadataRequestTopic::default().name(Some(name.into()));
@@ -171,6 +172,7 @@ async fn metadata_by_id_answers_is_internal_from_the_name(storage: ArcDynStorage
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let by_id = |id: Uuid| MetadataRequestTopic::default().topic_id(Some(id.into_bytes()));

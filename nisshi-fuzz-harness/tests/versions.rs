@@ -37,7 +37,9 @@ use nisshi_sans_io::{
     ProduceRequest, Request, metadata_request::MetadataRequestTopic,
 };
 use nisshi_service::{CAPPED_API_VERSIONS, all_topics_at_v0, refuse_topic_ids, routable_range};
-use nisshi_storage::{AutoCreateRefusals, MetadataService, StorageContainer, TopicCreationConfig};
+use nisshi_storage::{
+    AutoCreateRefusals, KnownTopics, MetadataService, StorageContainer, TopicCreationConfig,
+};
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
 use url::Url;
@@ -159,6 +161,7 @@ async fn serve_metadata(
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     }
     .serve(request)
     .await

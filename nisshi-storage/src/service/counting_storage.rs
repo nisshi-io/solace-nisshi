@@ -39,7 +39,7 @@ use nisshi_sans_io::{
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
     incremental_alter_configs_response::AlterConfigsResourceResponse,
-    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
+    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     record::{deflated, inflated},
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
@@ -129,6 +129,8 @@ pub(crate) struct CountingStorage {
     created: Arc<Mutex<Vec<String>>>,
     listings: Arc<Mutex<usize>>,
     lookups: Arc<Mutex<usize>>,
+    named_lookup_failure: Arc<Mutex<Option<Error>>>,
+    lookup_failure: Arc<Mutex<Option<Error>>>,
     init_producer_error: Option<Error>,
     create_topic_failure: Option<(String, Error)>,
     delete_topic_failure: Option<(TopicId, Error)>,
@@ -223,6 +225,22 @@ impl CountingStorage {
             Some((failing, error)) if *failing == call => Err(error.clone()),
             _ => Ok(()),
         }
+    }
+
+    /// Makes each lookup that names a topic fail with `error` from now on, or answer again when
+    /// `error` is `None`. Clones share the setting. A lookup of no topics, which reads only the
+    /// brokers, still answers.
+    pub(crate) fn fail_named_lookups(&self, error: Option<Error>) {
+        *self
+            .named_lookup_failure
+            .lock()
+            .expect("named lookup failure") = error;
+    }
+
+    /// Makes every lookup fail with `error` from now on, also a lookup of no topics, or answer
+    /// again when `error` is `None`. Clones share the setting.
+    pub(crate) fn fail_lookups(&self, error: Option<Error>) {
+        *self.lookup_failure.lock().expect("lookup failure") = error;
     }
 
     /// Returns this storage, with the lookup of named topics answering as `lookup`.
@@ -524,13 +542,20 @@ impl Drop for Running {
     }
 }
 
-/// The metadata of the existing topic `name`.
+/// The metadata of the existing topic `name`: one partition, led by [`NODE_ID`] at epoch 0.
 fn existing(name: &str) -> MetadataResponseTopic {
     MetadataResponseTopic::default()
         .error_code(ErrorCode::None.into())
         .name(Some(name.to_owned()))
         .partitions(Some(
-            [MetadataResponsePartition::default().partition_index(0)].into(),
+            [MetadataResponsePartition::default()
+                .partition_index(0)
+                .leader_id(NODE_ID)
+                .leader_epoch(Some(0))
+                .replica_nodes(Some(vec![NODE_ID]))
+                .isr_nodes(Some(vec![NODE_ID]))
+                .offline_replicas(Some(vec![]))]
+            .into(),
         ))
 }
 
@@ -687,6 +712,17 @@ impl Storage for CountingStorage {
         let topics = match topics {
             Some(topics) => {
                 *self.lookups.lock()? += 1;
+
+                if let Some(error) = self.lookup_failure.lock()?.clone() {
+                    return Err(error);
+                }
+
+                if !topics.is_empty()
+                    && let Some(error) = self.named_lookup_failure.lock()?.clone()
+                {
+                    return Err(error);
+                }
+
                 self.lookup(topics)?
             }
 
@@ -699,7 +735,13 @@ impl Storage for CountingStorage {
         Ok(MetadataResponse {
             cluster: None,
             controller: None,
-            brokers: vec![],
+            brokers: vec![
+                MetadataResponseBroker::default()
+                    .node_id(NODE_ID)
+                    .host(HOST.into())
+                    .port(PORT)
+                    .rack(None),
+            ],
             topics,
         })
     }

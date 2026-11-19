@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::LazyLock};
 
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
@@ -23,27 +23,45 @@ use nisshi_sans_io::{
     metadata_response::MetadataResponseTopic,
     topic::{is_internal, is_valid_topic_name},
 };
+use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
 pub use auto_create_refusals::AutoCreateRefusals;
+pub use known_topics::KnownTopics;
 
 use super::{
     create_topics::validation::ValidatedCreateTopicsRequest, fetch::storage_failure_warns_now,
 };
 use crate::{
-    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, StorageOperation,
-    TopicCreationConfig, TopicId, authorized_operations, topic_creation,
+    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, METER, Result, Storage,
+    StorageOperation, TopicCreationConfig, TopicId, authorized_operations, topic_creation,
 };
 
 mod auto_create_refusals;
+mod known_topics;
+
+/// Topics that a Metadata request answered with their partitions and no leader, because a
+/// storage read failed with an error that a retry may clear, by `topic`. A request that names a
+/// topic never read returns the error instead, and is not counted.
+static METADATA_WITHOUT_LEADER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_metadata_without_leader")
+        .with_description(
+            "Topics that a Metadata request answered with their last known partitions and no \
+             leader, because a storage read failed with an error that a retry may clear. \
+             Attribute: topic",
+        )
+        .build()
+});
 
 /// A [`Service`] using its [`Storage`] taking [`MetadataRequest`] returning [`MetadataResponse`].
 /// ```no_run
 /// use rama::Service;
 /// use nisshi_sans_io::MetadataRequest;
 /// use nisshi_storage::{
-///     AutoCreateRefusals, Error, MetadataService, StorageContainer, TopicCreationConfig,
+///     AutoCreateRefusals, Error, KnownTopics, MetadataService, StorageContainer,
+///     TopicCreationConfig,
 /// };
 /// use url::Url;
 ///
@@ -65,6 +83,7 @@ mod auto_create_refusals;
 ///     storage,
 ///     topic_creation: TopicCreationConfig::default(),
 ///     auto_create_refusals: AutoCreateRefusals::default(),
+///     known_topics: KnownTopics::default(),
 /// };
 ///
 /// let response = service
@@ -94,81 +113,139 @@ pub struct MetadataService<G> {
     /// The names that auto-creation refused recently. Give each service of a broker a clone of
     /// one store, so that a refusal on one connection counts on every connection.
     pub auto_create_refusals: AutoCreateRefusals,
+
+    /// The partitions of the topics that a read last answered, which a failed read answers
+    /// without a leader. Give each service of a broker a clone of one store, so that a read on
+    /// one connection serves every connection.
+    pub known_topics: KnownTopics,
 }
 
 impl<G> MetadataService<G>
 where
     G: Storage,
 {
-    /// Reads the metadata of `topics` from storage. When the read fails and the request names
-    /// topics, it answers each named topic with the code of the error, and keeps the brokers.
+    /// Reads the metadata of `topics` from storage, and records the answer in `known_topics`.
     ///
-    /// A failed read does not close the connection, because the client sends its other requests
-    /// on it. A retriable code makes the Java client request the metadata again, as it does for
-    /// any `InvalidMetadataException`
-    /// ([`Metadata.handleMetadataResponse`]). The brokers come from a read of no topics, which
-    /// reads no topic rows. If that read fails too, this returns the original error.
+    /// When the read fails with an error that a retry may clear, and every topic that the
+    /// request names is in `known_topics`, this answers each of them from there, with the brokers
+    /// of the last successful read. The client then keeps its partitions and waits for a leader.
     ///
-    /// A request that names no topics asks for every topic, and this returns the original error
-    /// for it. An answer of the brokers with an empty topic list would tell the client that no
-    /// topic exists.
+    /// This returns the error, so the broker closes the connection, when the request names a
+    /// topic that `known_topics` does not hold, or names no topics. Every client retries a
+    /// closed connection, and an answer of the brokers without topics would tell the client that
+    /// no topic exists.
     ///
-    /// [`Metadata.handleMetadataResponse`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/Metadata.java#L530-L533
+    /// For an error that a retry does not clear, this answers each named topic with the code of
+    /// the error and no partitions, so the client reports it at once instead of waiting for a
+    /// leader forever.
     async fn read_metadata(&self, topics: Option<&[TopicId]>) -> Result<crate::MetadataResponse> {
         let error = match self.storage.metadata(topics).await {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                self.known_topics.record(topics, &response);
+                return Ok(response);
+            }
             Err(error) => error,
         };
 
         let named = topics.filter(|topics| !topics.is_empty());
 
-        let brokers = match named {
-            Some(_) => self.storage.metadata(Some(&[])).await,
+        let error_code = error.error_code(ErrorCode::KafkaStorageError);
+        let transient = may_clear_on_retry(&error);
+
+        let answered = match named {
+            Some(named) if transient => self.known_topics.without_leader(named),
+            Some(named) => Some(
+                named
+                    .iter()
+                    .map(|topic| without_partitions(topic, error_code))
+                    .collect(),
+            ),
+            None => None,
+        };
+
+        // The brokers of a node do not change while it runs, so this answers the brokers of the
+        // last read instead of reading them again. A second read would wait again on the
+        // storage that failed, and on a SQL engine it needs a connection to the database that
+        // failed.
+        let brokers = match answered {
+            Some(_) => match self.known_topics.brokers() {
+                Some(brokers) => Ok(brokers),
+                None => self.storage.metadata(Some(&[])).await,
+            },
             None => Err(error.clone()),
         };
 
-        let (Some(named), Ok(mut response)) = (named, brokers) else {
-            error!(?error);
+        let (Some(named), Some(answered), Ok(mut response)) = (named, answered, brokers) else {
+            let topics = named.map_or(0, <[TopicId]>::len);
+
+            if !transient {
+                error!(topics, ?error, "metadata read failed, returning the error");
+            } else if storage_failure_warns_now(StorageOperation::Metadata) {
+                warn!(topics, ?error, "metadata read failed, returning the error");
+            } else {
+                debug!(topics, ?error, "metadata read failed, returning the error");
+            }
+
             return Err(error);
         };
 
-        let error_code = error.error_code(ErrorCode::KafkaStorageError);
+        if transient {
+            for topic in answered.iter().filter_map(|topic| topic.name.as_deref()) {
+                METADATA_WITHOUT_LEADER.add(1, &[KeyValue::new("topic", topic.to_owned())]);
+            }
 
-        if error_code == ErrorCode::KafkaStorageError {
             if storage_failure_warns_now(StorageOperation::Metadata) {
-                warn!(topics = named.len(), ?error, "metadata read failed");
+                warn!(
+                    topics = named.len(),
+                    ?error,
+                    "metadata read failed, answering known topics without a leader"
+                );
             } else {
-                debug!(topics = named.len(), ?error, "metadata read failed");
+                debug!(
+                    topics = named.len(),
+                    ?error,
+                    "metadata read failed, answering known topics without a leader"
+                );
             }
         } else {
             error!(
                 topics = named.len(),
                 ?error,
                 ?error_code,
-                "metadata read failed"
+                "metadata read failed, answering each topic with the error code"
             );
         }
 
-        response.topics = named
-            .iter()
-            .map(|topic| {
-                let (name, topic_id) = match topic {
-                    TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
-                    TopicId::Id(id) => ("", id.into_bytes()),
-                };
-
-                MetadataResponseTopic::default()
-                    .error_code(error_code.into())
-                    .name(Some(name.into()))
-                    .topic_id(Some(topic_id))
-                    .is_internal(Some(false))
-                    .partitions(Some([].into()))
-                    .topic_authorized_operations(Some(-2147483648))
-            })
-            .collect();
-
+        response.topics = answered;
         Ok(response)
     }
+}
+
+/// Returns whether a retry of a Metadata read that failed with `error` may succeed. A storage
+/// timeout that the engine answers as `REQUEST_TIMED_OUT`, such as a pool without a free
+/// connection, may clear on a retry too.
+fn may_clear_on_retry(error: &Error) -> bool {
+    error.is_transient()
+        || matches!(
+            error,
+            Error::Api(ErrorCode::KafkaStorageError | ErrorCode::RequestTimedOut)
+        )
+}
+
+/// Returns the row of `topic` with `error_code` and no partitions.
+fn without_partitions(topic: &TopicId, error_code: ErrorCode) -> MetadataResponseTopic {
+    let (name, topic_id) = match topic {
+        TopicId::Name(name) => (name.as_str(), NULL_TOPIC_ID),
+        TopicId::Id(id) => ("", id.into_bytes()),
+    };
+
+    MetadataResponseTopic::default()
+        .error_code(error_code.into())
+        .name(Some(name.into()))
+        .topic_id(Some(topic_id))
+        .is_internal(Some(false))
+        .partitions(Some([].into()))
+        .topic_authorized_operations(Some(-2147483648))
 }
 
 impl<G> ApiKey for MetadataService<G> {
@@ -447,302 +524,4 @@ fn topic_exists_after(result: &CreatableTopicResult) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        io,
-        sync::{Arc, Mutex},
-    };
-
-    use nisshi_sans_io::{
-        ErrorCode, MetadataRequest, create_topics_response::CreatableTopicResult,
-        metadata_request::MetadataRequestTopic,
-    };
-    use rama::Service as _;
-    use tokio::time::advance;
-    use tracing::Level;
-
-    use super::{
-        AutoCreateRefusals, MetadataService, auto_create_refusals::REFUSAL_TTL, topic_exists_after,
-    };
-    use crate::{
-        Result, TopicCreationConfig,
-        service::counting_storage::{CountingStorage, Listing, Lookup},
-    };
-
-    fn service(
-        storage: &CountingStorage,
-        refusals: &AutoCreateRefusals,
-    ) -> MetadataService<CountingStorage> {
-        MetadataService {
-            storage: storage.clone(),
-            topic_creation: TopicCreationConfig::default(),
-            auto_create_refusals: refusals.clone(),
-        }
-    }
-
-    /// Sends a Metadata request that allows auto-creation for `names`, and returns the error
-    /// code of each topic in the response.
-    async fn metadata(
-        service: &MetadataService<CountingStorage>,
-        names: &[&str],
-    ) -> Result<Vec<(String, ErrorCode)>> {
-        let response = service
-            .serve(
-                MetadataRequest::default()
-                    .allow_auto_topic_creation(Some(true))
-                    .topics(Some(
-                        names
-                            .iter()
-                            .map(|name| MetadataRequestTopic::default().name(Some((*name).into())))
-                            .collect(),
-                    )),
-            )
-            .await?;
-
-        response
-            .topics
-            .unwrap_or_default()
-            .into_iter()
-            .map(|topic| {
-                Ok((
-                    topic.name.unwrap_or_default(),
-                    ErrorCode::try_from(topic.error_code)?,
-                ))
-            })
-            .collect()
-    }
-
-    fn unknown(name: &str) -> (String, ErrorCode) {
-        (name.to_owned(), ErrorCode::UnknownTopicOrPartition)
-    }
-
-    /// An empty list asks for no topics, so the response has none and the storage lists none,
-    /// where a null list asks for all of them.
-    #[tokio::test(start_paused = true)]
-    async fn an_empty_list_answers_no_topics() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &["a.b", "c.d"]);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        assert_eq!(
-            Vec::<(String, ErrorCode)>::new(),
-            metadata(&service, &[]).await?
-        );
-        assert_eq!(0, storage.listings());
-        assert!(storage.created().is_empty());
-
-        let all = service
-            .serve(MetadataRequest::default().topics(None))
-            .await?;
-
-        assert_eq!(2, all.topics.unwrap_or_default().len());
-        assert_eq!(1, storage.listings());
-        Ok(())
-    }
-
-    /// The deprecated slatedb engine lists every topic for an empty slice, so the service itself
-    /// keeps an empty list from answering topics. [`Lookup::Listed`] stands in for it, since it
-    /// lists the topics whatever the lookup names.
-    #[tokio::test(start_paused = true)]
-    async fn an_empty_list_answers_no_topics_from_a_storage_that_lists_every_topic() -> Result<()> {
-        let storage =
-            CountingStorage::new(Listing::Topics, &["a.b", "c.d"]).with_lookup(Lookup::Listed);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        assert_eq!(
-            Vec::<(String, ErrorCode)>::new(),
-            metadata(&service, &[]).await?
-        );
-        assert_eq!(1, storage.lookups());
-        assert!(storage.created().is_empty());
-        Ok(())
-    }
-
-    /// A producer retries Metadata for a name that collides with an existing topic. Only the
-    /// first request lists every topic for the collision check. Each request still looks up its
-    /// names once.
-    #[tokio::test(start_paused = true)]
-    async fn a_retried_colliding_name_lists_topics_once() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        for _ in 0..5 {
-            assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-        }
-
-        assert_eq!(1, storage.listings());
-        assert_eq!(5, storage.lookups());
-        assert!(storage.created().is_empty());
-        Ok(())
-    }
-
-    /// The broker gives the service of each connection a clone of one store, so a refusal on
-    /// one connection saves the listing on another.
-    #[tokio::test(start_paused = true)]
-    async fn a_refusal_is_shared_by_clones() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
-        let refusals = AutoCreateRefusals::default();
-
-        for service in [service(&storage, &refusals), service(&storage, &refusals)] {
-            assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-        }
-
-        assert_eq!(1, storage.listings());
-        Ok(())
-    }
-
-    /// Once the colliding topic is deleted, the name is created when its refusal expires, and
-    /// not before.
-    #[tokio::test(start_paused = true)]
-    async fn a_refused_name_is_created_once_its_refusal_expires() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-        storage.delete("a.b");
-
-        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-        assert!(storage.created().is_empty());
-        assert_eq!(1, storage.listings());
-
-        advance(REFUSAL_TTL).await;
-
-        assert_eq!(
-            vec![(String::from("a_b"), ErrorCode::None)],
-            metadata(&service, &["a_b"]).await?
-        );
-        assert_eq!(vec![String::from("a_b")], storage.created());
-        assert_eq!(2, storage.listings());
-        Ok(())
-    }
-
-    /// A failed listing is the broker's failure, not a refusal, so the next request tries again.
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_listing_is_not_remembered() -> Result<()> {
-        for listing in [Listing::Error, Listing::NamelessTopic] {
-            let storage = CountingStorage::new(listing, &[]);
-            let service = service(&storage, &AutoCreateRefusals::default());
-
-            for _ in 0..2 {
-                assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-            }
-
-            assert_eq!(2, storage.listings(), "{listing:?}");
-        }
-
-        Ok(())
-    }
-
-    /// `__cluster_metadata` and the internal names get no `CreateTopics`, so the storage lists
-    /// nothing for a collision check, and the other name of the request is still created.
-    #[tokio::test(start_paused = true)]
-    async fn cluster_metadata_and_the_internal_names_are_not_auto_created() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &[]);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        let names = [
-            "__cluster_metadata",
-            "__consumer_offsets",
-            "__transaction_state",
-            "__share_group_state",
-            "ab",
-        ];
-
-        let expected = names
-            .iter()
-            .map(|name| match *name {
-                "ab" => (String::from("ab"), ErrorCode::None),
-                other => unknown(other),
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(expected, metadata(&service, &names).await?);
-        assert_eq!(vec![String::from("ab")], storage.created());
-        assert_eq!(0, storage.listings());
-        Ok(())
-    }
-
-    /// A refused name is left out of auto-creation, and the other names of the request are
-    /// still created.
-    #[tokio::test(start_paused = true)]
-    async fn a_refused_name_does_not_block_others() -> Result<()> {
-        let storage = CountingStorage::new(Listing::Topics, &["a.b"]);
-        let service = service(&storage, &AutoCreateRefusals::default());
-
-        assert_eq!(vec![unknown("a_b")], metadata(&service, &["a_b"]).await?);
-
-        assert_eq!(
-            vec![unknown("a_b"), (String::from("c_d"), ErrorCode::None)],
-            metadata(&service, &["a_b", "c_d"]).await?
-        );
-        assert_eq!(vec![String::from("c_d")], storage.created());
-        Ok(())
-    }
-
-    /// The log lines written at `warn` or above.
-    #[derive(Clone, Default)]
-    struct WarnLog(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for WarnLog {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("log").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Returns whether the topic exists after `error_code`, and what was logged at `warn` or
-    /// above.
-    fn outcome(error_code: ErrorCode) -> (bool, String) {
-        let log = WarnLog::default();
-        let writer = log.clone();
-
-        let exists = tracing::subscriber::with_default(
-            tracing_subscriber::fmt()
-                .with_max_level(Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish(),
-            || {
-                topic_exists_after(
-                    &CreatableTopicResult::default()
-                        .name("orders".into())
-                        .error_code(error_code.into()),
-                )
-            },
-        );
-
-        let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
-        (exists, text)
-    }
-
-    /// A storage failure is the broker's problem, not the client's, so the operator sees it at
-    /// the default log level. The producer only sees `UNKNOWN_TOPIC_OR_PARTITION`.
-    #[test]
-    fn a_storage_failure_is_logged_at_warn() {
-        for error_code in [ErrorCode::UnknownServerError, ErrorCode::KafkaStorageError] {
-            let (exists, log) = outcome(error_code);
-
-            assert!(!exists, "{error_code:?}");
-            assert!(log.contains("orders"), "{error_code:?}: {log:?}");
-        }
-    }
-
-    /// A client sends a colliding name again on each retry, so the refusal stays below `warn`.
-    #[test]
-    fn a_refused_name_is_not_logged_at_warn() {
-        let (exists, log) = outcome(ErrorCode::InvalidTopicException);
-
-        assert!(!exists);
-        assert_eq!("", log);
-    }
-
-    #[test]
-    fn a_created_or_existing_topic_exists() {
-        for error_code in [ErrorCode::None, ErrorCode::TopicAlreadyExists] {
-            assert!(outcome(error_code).0, "{error_code:?}");
-        }
-    }
-}
+mod tests;

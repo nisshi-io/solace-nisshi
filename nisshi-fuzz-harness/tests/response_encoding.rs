@@ -74,8 +74,8 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{FrameRouteService, routable_range};
 use nisshi_storage::{
-    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, Storage, StorageContainer,
-    TopicCreationConfig,
+    ArcDynStorage, AutoCreateRefusals, BrokerRegistrationRequest, KnownTopics, Storage,
+    StorageContainer, TopicCreationConfig,
 };
 use nisshi_storage_dynostore::MemoryEngineFactory;
 use rama::Service as _;
@@ -213,6 +213,7 @@ fn broker_route(storage: ArcDynStorage) -> FrameRouteService<nisshi_broker::Erro
         None,
         TopicCreationConfig::default(),
         AutoCreateRefusals::default(),
+        KnownTopics::default(),
         None,
     )
     .expect("the broker's routes build")

@@ -27,7 +27,8 @@ use nisshi_sans_io::{
     metadata_request::MetadataRequestTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, AutoCreateRefusals, MetadataService, Storage, TopicCreationConfig, TopicId,
+    ArcDynStorage, AutoCreateRefusals, KnownTopics, MetadataService, Storage, TopicCreationConfig,
+    TopicId,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
@@ -60,6 +61,7 @@ async fn metadata(
         storage,
         topic_creation: TopicCreationConfig::default(),
         auto_create_refusals: AutoCreateRefusals::default(),
+        known_topics: KnownTopics::default(),
     };
 
     let response = service

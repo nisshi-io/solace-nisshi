@@ -32,9 +32,9 @@ use nisshi_storage::{
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
     FetchService, FetchValidationLayer, FindCoordinatorService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService,
+    InitProducerIdService, KnownTopics, ListOffsetsService, ListPartitionReassignmentsService,
+    MetadataService, ProduceService, Storage, TopicCreationConfig, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 use rama::{Layer as _, Service, layer::MapErrLayer};
 
@@ -46,6 +46,7 @@ pub fn services<S>(
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    known_topics: KnownTopics,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -84,6 +85,7 @@ where
             storage.clone(),
             topic_creation,
             auto_create_refusals,
+            known_topics,
         )
     })
     .and_then(|builder| create_topics(builder, storage, topic_creation))
@@ -449,6 +451,7 @@ pub fn metadata<S>(
     storage: S,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
+    known_topics: KnownTopics,
 ) -> Result<FrameRouteBuilder<Error>, Error>
 where
     S: Storage + Clone,
@@ -465,6 +468,7 @@ where
                     storage,
                     topic_creation,
                     auto_create_refusals,
+                    known_topics,
                 })
                 .boxed(),
         )
