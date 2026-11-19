@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::{collections::BTreeMap, fmt, marker::PhantomData, ops::RangeInclusive, sync::Arc};
 
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, ApiVersionsResponse, Body, BodyInput, ErrorCode, Frame, FrameInput,
     Header, RequestInput, RootMessageMeta, api_versions_response::ApiVersion,
 };
-use rama::{Service, extensions::Extensions, service::BoxService};
+use rama::{Layer, Service, extensions::Extensions, service::BoxService};
 use tracing::warn;
 
-use crate::Error;
+use crate::{
+    Error,
+    version_gate::{protocol_range, validate_versions},
+};
 
-/// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from
-/// [`RootMessageMeta`], narrowed by `capped` for a route registered through
-/// [`FrameRouteBuilder::with_capped_route`].
+/// An [`ApiVersionsResponse`] [`Service`] that advertises, for each API key, the version range
+/// that its route serves.
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApiVersionsService<E> {
-    supported: Vec<i16>,
-    capped: BTreeMap<i16, (i16, i16)>,
+    versions: BTreeMap<i16, (i16, i16)>,
     error: PhantomData<E>,
 }
 
@@ -52,21 +53,13 @@ where
                 .zk_migration_ready(Some(false))
                 .error_code(ErrorCode::None.into())
                 .api_keys(Some(
-                    RootMessageMeta::messages()
-                        .requests()
+                    self.versions
                         .iter()
-                        .filter(|(api_key, _)| self.supported.contains(api_key))
-                        .map(|(api_key, meta)| {
-                            let (min_version, max_version) = self
-                                .capped
-                                .get(api_key)
-                                .copied()
-                                .unwrap_or((meta.version.valid.start, meta.version.valid.end));
-
+                        .map(|(api_key, (min_version, max_version))| {
                             ApiVersion::default()
-                                .api_key(meta.api_key)
-                                .min_version(min_version)
-                                .max_version(max_version)
+                                .api_key(*api_key)
+                                .min_version(*min_version)
+                                .max_version(*max_version)
                         })
                         .collect(),
                 ))
@@ -155,15 +148,42 @@ where
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct FrameRouteService<E = Error> {
-    routes: Arc<BTreeMap<i16, BoxService<FrameInput, Frame, E>>>,
+    routes: Arc<BTreeMap<i16, ServedRoute<E>>>,
+}
+
+/// A route as [`FrameRouteService`] serves it: its service, with the guards of the route applied,
+/// and the version range that the service accepts.
+#[derive(Clone, Debug)]
+struct ServedRoute<E> {
+    service: BoxService<FrameInput, Frame, E>,
+
+    /// `None` when this build has no protocol metadata for the route's API key, so no version
+    /// is served.
+    versions: Option<RangeInclusive<i16>>,
 }
 
 impl<E> FrameRouteService<E>
 where
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
+    /// Returns a router for `routes`, each serving the protocol's own version range for its API.
     pub fn new(routes: Arc<BTreeMap<i16, BoxService<FrameInput, Frame, E>>>) -> Self {
-        Self { routes }
+        Self {
+            routes: Arc::new(
+                routes
+                    .iter()
+                    .map(|(api_key, service)| {
+                        (
+                            *api_key,
+                            ServedRoute {
+                                service: service.clone(),
+                                versions: protocol_range(*api_key),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        }
     }
 
     pub fn builder() -> FrameRouteBuilder<E> {
@@ -227,7 +247,7 @@ where
     async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
         let api_key = req.frame.api_key()?;
 
-        let Some(service) = self.routes.get(&api_key) else {
+        let Some(route) = self.routes.get(&api_key) else {
             return Err(E::from(Error::UnknownServiceFrame {
                 api_key,
                 api_name: req.frame.api_name(),
@@ -239,16 +259,26 @@ where
 
         let api_version = req.frame.api_version()?;
 
-        if is_within_protocol_range(api_key, api_version) {
-            return service.serve(req).await;
+        if route
+            .versions
+            .as_ref()
+            .is_some_and(|versions| versions.contains(&api_version))
+        {
+            return route.service.serve(req).await;
         }
 
+        // The broker closes the connection, as Kafka 3.9.1 does for a version it has not
+        // enabled ([SocketServer.scala#L1119-L1125]). `ApiVersions` advertises this range, so
+        // only a client that skips the negotiation sends such a version.
+        //
+        // [SocketServer.scala#L1119-L1125]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1119-L1125
         warn!(
             api_key,
             api_name = req.frame.api_name(),
             api_version,
             client_id = req.frame.client_id().ok().flatten(),
-            "request version outside the protocol range"
+            supported = ?route.versions,
+            "request version outside the supported range"
         );
 
         Err(E::from(Error::UnsupportedVersion {
@@ -280,11 +310,51 @@ where
     }
 }
 
+/// A function that wraps the service of a route in a guard.
+type Guard<E> =
+    Arc<dyn Fn(BoxService<FrameInput, Frame, E>) -> BoxService<FrameInput, Frame, E> + Send + Sync>;
+
+/// A route in a [`FrameRouteBuilder`]: its handler, the guards that wrap the handler when the
+/// builder builds, and the version range that it serves.
+struct Route<E> {
+    handler: BoxService<FrameInput, Frame, E>,
+
+    /// In registration order. The first guard is the outermost.
+    guards: Vec<Guard<E>>,
+
+    /// `None` when this build has no protocol metadata for the route's API key.
+    versions: Option<RangeInclusive<i16>>,
+}
+
+impl<E> Route<E> {
+    /// Returns the handler with each guard around it.
+    fn guarded(&self) -> BoxService<FrameInput, Frame, E> {
+        self.guards
+            .iter()
+            .rev()
+            .fold(self.handler.clone(), |inner, guard| guard(inner))
+    }
+}
+
+impl<E> fmt::Debug for Route<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Route")
+            .field("guards", &self.guards.len())
+            .field("versions", &self.versions)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A [`Frame`] route builder providing an [`ApiVersionsResponse`] for all available routes
+///
+/// A route has a handler, guards and a version range. A guard keeps a promise that the broker
+/// makes to every client, so [`FrameRouteBuilder::wrap_route`] changes only the handler, and
+/// [`FrameRouteBuilder::build`] puts each guard around whatever handler the route has. The route
+/// serves the version range that [`FrameRouteBuilder::with_versions`] sets, or the protocol's
+/// own range for its API, and `ApiVersions` advertises that range.
 #[derive(Debug)]
 pub struct FrameRouteBuilder<E> {
-    routes: BTreeMap<i16, BoxService<FrameInput, Frame, E>>,
-    capped: BTreeMap<i16, (i16, i16)>,
+    routes: BTreeMap<i16, Route<E>>,
 }
 
 impl<E> FrameRouteBuilder<E>
@@ -294,23 +364,7 @@ where
     fn new() -> Self {
         Self {
             routes: BTreeMap::new(),
-            capped: BTreeMap::new(),
         }
-    }
-
-    /// Records that `api_key`'s route advertises `(min_version, max_version)` in
-    /// [`ApiVersionsResponse`] rather than the protocol's own range for it, for
-    /// [`FrameRouteBuilder::with_capped_route`] to call: a client negotiates against what
-    /// `ApiVersions` advertises, so a capped route's handler must never reject a version
-    /// `ApiVersions` itself told the client was fine to send.
-    pub(crate) fn with_capped_range(
-        mut self,
-        api_key: i16,
-        min_version: i16,
-        max_version: i16,
-    ) -> Self {
-        _ = self.capped.insert(api_key, (min_version, max_version));
-        self
     }
 
     pub fn with_service<S>(self, service: S) -> Result<Self, Error>
@@ -320,17 +374,33 @@ where
         self.with_route(S::KEY, service.into())
     }
 
+    /// Registers `service` as the handler of `api_key`, with no guards and with the protocol's
+    /// own version range for that API.
+    ///
+    /// Fails with [`Error::DuplicateRoute`] when `api_key` already has a route.
     pub fn with_route(
         mut self,
         api_key: i16,
         service: BoxService<FrameInput, Frame, E>,
     ) -> Result<Self, Error> {
-        self.routes
-            .insert(api_key, service)
-            .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
+        if self.routes.contains_key(&api_key) {
+            return Err(Error::DuplicateRoute(api_key));
+        }
+
+        _ = self.routes.insert(
+            api_key,
+            Route {
+                handler: service,
+                guards: Vec::new(),
+                versions: protocol_range(api_key),
+            },
+        );
+
+        Ok(self)
     }
 
-    /// Replaces the registered route of `api_key` with the service that `wrap` builds from it.
+    /// Replaces the handler of `api_key` with the service that `wrap` builds from it. The
+    /// guards and the version range of the route stay as they are.
     /// Returns [`Error::NoRouteToWrap`] when no route of `api_key` is registered, so that a
     /// route table that registers it after this call, or not at all, does not build without
     /// what the wrapper adds.
@@ -340,10 +410,52 @@ where
     {
         let route = self
             .routes
-            .remove(&api_key)
+            .get_mut(&api_key)
             .ok_or(Error::NoRouteToWrap(api_key))?;
 
-        _ = self.routes.insert(api_key, wrap(route));
+        route.handler = wrap(route.handler.clone());
+
+        Ok(self)
+    }
+
+    /// Adds `guard` around the route of `api_key`, inside the guards that the route already
+    /// has. A guard stays around the route when [`Self::wrap_route`] replaces its handler.
+    ///
+    /// Returns [`Error::NoRouteToGuard`] when no route of `api_key` is registered.
+    pub fn with_guard<L>(mut self, api_key: i16, guard: L) -> Result<Self, Error>
+    where
+        L: Layer<BoxService<FrameInput, Frame, E>> + Send + Sync + 'static,
+        L::Service: Service<FrameInput, Output = Frame, Error = E> + Send + Sync + 'static,
+    {
+        let route = self
+            .routes
+            .get_mut(&api_key)
+            .ok_or(Error::NoRouteToGuard(api_key))?;
+
+        route
+            .guards
+            .push(Arc::new(move |inner| guard.layer(inner).boxed()));
+
+        Ok(self)
+    }
+
+    /// Sets the version range that the route of `api_key` serves and `ApiVersions` advertises.
+    ///
+    /// Returns [`Error::NoRouteForVersions`] when no route of `api_key` is registered, and
+    /// [`Error::CapRangeExceedsProtocolRange`] when `versions` is not a subset of the protocol's
+    /// own range for that API.
+    pub fn with_versions(
+        mut self,
+        api_key: i16,
+        versions: RangeInclusive<i16>,
+    ) -> Result<Self, Error> {
+        let route = self
+            .routes
+            .get_mut(&api_key)
+            .ok_or(Error::NoRouteForVersions(api_key))?;
+
+        validate_versions(api_key, versions.clone())?;
+        route.versions = Some(versions);
 
         Ok(self)
     }
@@ -367,21 +479,46 @@ where
 
     pub fn build(self) -> Result<FrameRouteService<E>, Error> {
         let api_key = ApiVersionsRequest::KEY;
-        let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
-        supported.push(api_key);
-        let capped = self.capped.clone();
+
+        let mut versions = self
+            .routes
+            .iter()
+            .filter_map(|(api_key, route)| {
+                route
+                    .versions
+                    .as_ref()
+                    .map(|versions| (*api_key, (*versions.start(), *versions.end())))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        if let Some(protocol) = protocol_range(api_key) {
+            _ = versions.insert(api_key, (*protocol.start(), *protocol.end()));
+        }
 
         self.with_route(
             api_key,
             ApiVersionsService {
-                supported,
-                capped,
+                versions,
                 error: PhantomData,
             }
             .boxed(),
         )
         .map(|builder| FrameRouteService {
-            routes: Arc::new(builder.routes),
+            routes: Arc::new(
+                builder
+                    .routes
+                    .iter()
+                    .map(|(api_key, route)| {
+                        (
+                            *api_key,
+                            ServedRoute {
+                                service: route.guarded(),
+                                versions: route.versions.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
         })
     }
 }
@@ -394,14 +531,13 @@ mod tests {
 
     use super::*;
 
-    // A client negotiates a version from what `ApiVersions` advertises, so a capped route
-    // advertises its cap, not the protocol's wider range, or the client picks a version that
-    // `VersionGateLayer` rejects.
+    // A client negotiates a version from what `ApiVersions` advertises, so a route advertises
+    // the range that it serves, not the protocol's wider range, or the client picks a version
+    // that the router rejects.
     #[tokio::test]
-    async fn api_versions_response_uses_capped_range_for_a_capped_api() {
+    async fn api_versions_response_uses_the_range_of_the_route() {
         let service = ApiVersionsService::<Error> {
-            supported: vec![ProduceRequest::KEY],
-            capped: BTreeMap::from([(ProduceRequest::KEY, (3, 11))]),
+            versions: BTreeMap::from([(ProduceRequest::KEY, (3, 11))]),
             error: PhantomData,
         };
 
