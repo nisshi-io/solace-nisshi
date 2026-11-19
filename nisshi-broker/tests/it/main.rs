@@ -41,6 +41,7 @@ pub mod describe_groups;
 pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
 pub mod dynostore_meta_cache;
+pub mod extend_routes;
 pub mod fetch;
 pub mod fetch_after_delete_records;
 pub mod fetch_deadline;
@@ -106,7 +107,6 @@ pub mod rebalance_timing;
 pub mod replication_factor;
 pub mod retention_bytes;
 pub mod retention_ms;
-pub mod route_extension;
 #[cfg(feature = "libsql")]
 pub mod sasl_handshake;
 pub mod sasl_scram_enforcement;

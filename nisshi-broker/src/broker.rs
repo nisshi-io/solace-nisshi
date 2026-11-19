@@ -27,7 +27,7 @@ use crate::{
         administrator::{Controller, GroupCoordinatorConfig},
     },
     otel,
-    service::{route_extension::RouteExtension, services},
+    service::{TcpRouteFrame, extend_routes::ExtendRoutes, services},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -291,7 +291,7 @@ pub struct Broker<G, S> {
     schemas: Option<Registry>,
     topic_creation: TopicCreationConfig,
     auto_create_refusals: AutoCreateRefusals,
-    routes: Option<RouteExtension<G, S>>,
+    extend_routes: Option<ExtendRoutes<G, S>>,
 
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
@@ -351,7 +351,7 @@ where
             schemas: None,
             topic_creation: TopicCreationConfig::default(),
             auto_create_refusals: AutoCreateRefusals::default(),
-            routes: None,
+            extend_routes: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -384,16 +384,27 @@ where
         Builder::default()
     }
 
-    /// Returns this broker with `routes` as the extension that changes the routes of each
-    /// connection's service, after the broker has registered its own.
-    ///
-    /// See [`RouteExtension`] for what an extension may do, and for the versions that a
-    /// replacement of a built-in route has to serve.
-    pub fn with_routes(self, routes: RouteExtension<G, S>) -> Self {
+    /// Returns this broker with the given [`ExtendRoutes`], which changes the routes of the
+    /// service that the broker builds for each connection.
+    pub fn extend_routes(self, extend_routes: ExtendRoutes<G, S>) -> Self {
         Self {
-            routes: Some(routes),
+            extend_routes: Some(extend_routes),
             ..self
         }
+    }
+
+    /// Builds the service for one connection from the broker's routes.
+    fn connection_service(&self) -> Result<TcpRouteFrame> {
+        services(
+            self.cluster_id.as_str(),
+            self.groups.clone(),
+            self.storage.clone(),
+            self.schemas.clone(),
+            self.topic_creation,
+            self.auto_create_refusals.clone(),
+            self.extend_routes.as_ref(),
+            self.sasl_config.clone(),
+        )
     }
 
     /// Returns the broker with the given cancellation token: cancelling it starts the broker's
@@ -604,6 +615,10 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
+        // A route table that cannot build fails here, before the listener opens, and not on the
+        // first connection.
+        drop(self.connection_service()?);
+
         let addr = listener_addr(&self.listener).await?;
 
         let listener = bind(addr)
@@ -732,6 +747,14 @@ where
                         continue;
                     }
 
+                    let service = match self.connection_service() {
+                        Ok(service) => service,
+                        Err(err) => {
+                            error!(?err, %addr, "failed to build the connection service; dropping connection");
+                            continue;
+                        }
+                    };
+
                     let extensions = Extensions::default();
                     _ = extensions.insert(PeerAddressExtension::new(addr));
                     _ = extensions.insert(ShutdownExtension::new(self.cancellation.clone()));
@@ -748,17 +771,6 @@ where
                         _ = extensions.insert(ProgressBarExtension::new(pb.clone()));
                         Some(pb)
                     };
-
-                    let service = services(
-                        self.cluster_id.as_str(),
-                        self.groups.clone(),
-                        self.storage.clone(),
-                        self.schemas.clone(),
-                        self.topic_creation,
-                        self.auto_create_refusals.clone(),
-                        self.routes.as_ref(),
-                        self.sasl_config.clone()
-                    )?;
 
                     let acceptor = acceptor.clone();
 
@@ -961,7 +973,7 @@ pub struct Builder<N, C, I, A, S, L> {
     banner: Option<String>,
     group_coordinator: GroupCoordinatorConfig,
     topic_creation: TopicCreationConfig,
-    routes: Option<RouteExtension<Controller<ArcDynStorage>, ArcDynStorage>>,
+    extend_routes: Option<ExtendRoutes<Controller<ArcDynStorage>, ArcDynStorage>>,
 
     cancellation: CancellationToken,
 }
@@ -993,7 +1005,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             banner: self.banner,
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1016,7 +1028,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1039,7 +1051,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1065,7 +1077,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1090,7 +1102,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1115,7 +1127,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             group_coordinator: self.group_coordinator,
             topic_creation: self.topic_creation,
 
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             cancellation: self.cancellation,
         }
     }
@@ -1179,14 +1191,14 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
         }
     }
 
-    /// Returns this builder with `routes` as the extension that changes the routes of each
-    /// connection's service, after the broker has registered its own.
-    ///
-    /// See [`RouteExtension`] for what an extension may do, and for the versions that a
-    /// replacement of a built-in route has to serve.
-    pub fn routes(self, routes: RouteExtension<Controller<ArcDynStorage>, ArcDynStorage>) -> Self {
+    /// Returns this builder with the given [`ExtendRoutes`], which changes the routes of the
+    /// service that the broker builds for each connection.
+    pub fn extend_routes(
+        self,
+        extend_routes: ExtendRoutes<Controller<ArcDynStorage>, ArcDynStorage>,
+    ) -> Self {
         Self {
-            routes: Some(routes),
+            extend_routes: Some(extend_routes),
             ..self
         }
     }
@@ -1274,7 +1286,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             schemas: self.schema_registry,
             topic_creation: self.topic_creation,
             auto_create_refusals: AutoCreateRefusals::default(),
-            routes: self.routes,
+            extend_routes: self.extend_routes,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
