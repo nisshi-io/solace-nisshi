@@ -525,11 +525,108 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
+    use std::{assert_matches, sync::Mutex};
 
-    use nisshi_sans_io::{ApiVersionsRequest, ProduceRequest};
+    use nisshi_sans_io::{ApiVersionsRequest, ProduceRequest, ProduceResponse};
+    use rama::service::service_fn;
 
     use super::*;
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    fn logged(log: &Log) -> Vec<&'static str> {
+        log.lock().expect("the log is not poisoned").clone()
+    }
+
+    /// A handler that records `name` in `log` when it serves a request.
+    fn handler(name: &'static str, log: &Log) -> BoxService<FrameInput, Frame, Error> {
+        let log = log.clone();
+
+        service_fn(move |request: FrameInput| {
+            let log = log.clone();
+
+            async move {
+                log.lock().expect("the log is not poisoned").push(name);
+
+                Ok::<_, Error>(Frame {
+                    size: 0,
+                    header: Header::Response {
+                        correlation_id: request.frame.correlation_id()?,
+                    },
+                    body: ProduceResponse::default().into(),
+                })
+            }
+        })
+        .boxed()
+    }
+
+    /// A guard that records `name` in `log` before it passes a request on.
+    #[derive(Clone)]
+    struct RecordingGuard {
+        name: &'static str,
+        log: Log,
+    }
+
+    struct RecordingGuardService {
+        name: &'static str,
+        log: Log,
+        inner: BoxService<FrameInput, Frame, Error>,
+    }
+
+    impl Layer<BoxService<FrameInput, Frame, Error>> for RecordingGuard {
+        type Service = RecordingGuardService;
+
+        fn layer(&self, inner: BoxService<FrameInput, Frame, Error>) -> Self::Service {
+            RecordingGuardService {
+                name: self.name,
+                log: self.log.clone(),
+                inner,
+            }
+        }
+    }
+
+    impl Service<FrameInput> for RecordingGuardService {
+        type Output = Frame;
+        type Error = Error;
+
+        async fn serve(&self, request: FrameInput) -> Result<Frame, Error> {
+            self.log
+                .lock()
+                .expect("the log is not poisoned")
+                .push(self.name);
+
+            self.inner.serve(request).await
+        }
+    }
+
+    fn produce_frame(api_version: i16) -> Frame {
+        Frame {
+            size: 0,
+            header: Header::Request {
+                api_key: ProduceRequest::KEY,
+                api_version,
+                correlation_id: 1,
+                client_id: None,
+            },
+            body: ProduceRequest::default().into(),
+        }
+    }
+
+    /// The version range that `ApiVersions` of `route` advertises for Produce.
+    async fn advertised_produce_versions(route: &FrameRouteService<Error>) -> Option<(i16, i16)> {
+        let response = route
+            .serve(api_versions_frame(4))
+            .await
+            .expect("an ApiVersions request within the protocol range");
+
+        ApiVersionsResponse::try_from(response.body)
+            .expect("an ApiVersions response")
+            .api_keys
+            .unwrap_or_default()
+            .into_iter()
+            .find(|version| version.api_key == ProduceRequest::KEY)
+            .map(|version| (version.min_version, version.max_version))
+    }
 
     // A client negotiates a version from what `ApiVersions` advertises, so a route advertises
     // the range that it serves, not the protocol's wider range, or the client picks a version
@@ -590,13 +687,25 @@ mod tests {
     }
 
     fn assert_unsupported_version(result: Result<Frame, Error>, expected_version: i16) {
-        assert!(matches!(
+        assert_unsupported_version_for(result, ApiVersionsRequest::KEY, expected_version);
+    }
+
+    fn assert_unsupported_version_of(result: Result<Frame, Error>, expected_version: i16) {
+        assert_unsupported_version_for(result, ProduceRequest::KEY, expected_version);
+    }
+
+    fn assert_unsupported_version_for(
+        result: Result<Frame, Error>,
+        expected_api_key: i16,
+        expected_version: i16,
+    ) {
+        assert_matches!(
             result,
             Err(Error::UnsupportedVersion {
                 api_key,
                 api_version,
-            }) if api_key == ApiVersionsRequest::KEY && api_version == expected_version
-        ));
+            }) if api_key == expected_api_key && api_version == expected_version
+        );
     }
 
     // The `ApiVersions` route answers any request it is given, so a frame outside the protocol
@@ -648,5 +757,171 @@ mod tests {
             .map(|builder| builder.len());
 
         assert_matches!(result, Err(Error::NoRouteToWrap(api_key)) if api_key == ProduceRequest::KEY);
+    }
+
+    #[tokio::test]
+    async fn wrapped_route_keeps_its_guards() {
+        let log = Log::default();
+
+        let route = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("built-in", &log))
+            .and_then(|builder| {
+                builder.with_guard(
+                    ProduceRequest::KEY,
+                    RecordingGuard {
+                        name: "guard",
+                        log: log.clone(),
+                    },
+                )
+            })
+            .and_then(|builder| {
+                builder.wrap_route(ProduceRequest::KEY, |_built_in| {
+                    handler("replacement", &log)
+                })
+            })
+            .and_then(FrameRouteBuilder::build)
+            .expect("a route table with a guarded Produce route");
+
+        _ = route
+            .serve(produce_frame(3))
+            .await
+            .expect("Produce v3 is within the protocol range");
+
+        assert_eq!(vec!["guard", "replacement"], logged(&log));
+    }
+
+    #[tokio::test]
+    async fn the_first_guard_of_a_route_is_the_outermost() {
+        let log = Log::default();
+
+        let route = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("handler", &log))
+            .and_then(|builder| {
+                ["first", "second"]
+                    .into_iter()
+                    .try_fold(builder, |builder, name| {
+                        builder.with_guard(
+                            ProduceRequest::KEY,
+                            RecordingGuard {
+                                name,
+                                log: log.clone(),
+                            },
+                        )
+                    })
+            })
+            .and_then(FrameRouteBuilder::build)
+            .expect("a route table with a Produce route and two guards");
+
+        _ = route
+            .serve(produce_frame(3))
+            .await
+            .expect("Produce v3 is within the protocol range");
+
+        assert_eq!(vec!["first", "second", "handler"], logged(&log));
+    }
+
+    #[tokio::test]
+    async fn route_serves_and_advertises_the_protocol_range_until_versions_are_set() {
+        let log = Log::default();
+
+        let route = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("handler", &log))
+            .and_then(FrameRouteBuilder::build)
+            .expect("a route table with a Produce route");
+
+        // Produce's protocol range is 0-11.
+        assert_eq!(Some((0, 11)), advertised_produce_versions(&route).await);
+
+        _ = route
+            .serve(produce_frame(0))
+            .await
+            .expect("Produce v0 is within the protocol range");
+
+        assert_unsupported_version_of(route.serve(produce_frame(12)).await, 12);
+    }
+
+    #[tokio::test]
+    async fn versions_set_for_a_route_are_served_and_advertised() {
+        let log = Log::default();
+
+        let route = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("handler", &log))
+            .and_then(|builder| builder.with_versions(ProduceRequest::KEY, 3..=10))
+            .and_then(FrameRouteBuilder::build)
+            .expect("a route table with a Produce route that serves v3 to v10");
+
+        assert_eq!(Some((3, 10)), advertised_produce_versions(&route).await);
+
+        for api_version in [3, 10] {
+            _ = route
+                .serve(produce_frame(api_version))
+                .await
+                .expect("a version in the range of the route");
+        }
+
+        for api_version in [2, 11] {
+            assert_unsupported_version_of(
+                route.serve(produce_frame(api_version)).await,
+                api_version,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_route_keeps_its_versions() {
+        let log = Log::default();
+
+        let route = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("built-in", &log))
+            .and_then(|builder| builder.with_versions(ProduceRequest::KEY, 3..=11))
+            .and_then(|builder| {
+                builder.wrap_route(ProduceRequest::KEY, |_built_in| {
+                    handler("replacement", &log)
+                })
+            })
+            .and_then(FrameRouteBuilder::build)
+            .expect("a route table with a replaced Produce route");
+
+        assert_eq!(Some((3, 11)), advertised_produce_versions(&route).await);
+        assert_unsupported_version_of(route.serve(produce_frame(2)).await, 2);
+        assert!(logged(&log).is_empty());
+    }
+
+    #[test]
+    fn versions_wider_than_the_protocol_range_are_an_error() {
+        let log = Log::default();
+
+        let result = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("handler", &log))
+            .and_then(|builder| builder.with_versions(ProduceRequest::KEY, 0..=12))
+            .map(|builder| builder.len());
+
+        assert_matches!(
+            result,
+            Err(Error::CapRangeExceedsProtocolRange { api_key, .. }) if api_key == ProduceRequest::KEY
+        );
+    }
+
+    #[test]
+    fn guarding_an_unregistered_route_is_an_error() {
+        let log = Log::default();
+
+        let result = FrameRouteService::<Error>::builder()
+            .with_guard(ProduceRequest::KEY, RecordingGuard { name: "guard", log })
+            .map(|builder| builder.len());
+
+        assert_matches!(result, Err(Error::NoRouteToGuard(api_key)) if api_key == ProduceRequest::KEY);
+    }
+
+    #[test]
+    fn setting_versions_of_an_unregistered_route_is_an_error() {
+        let result = FrameRouteService::<Error>::builder()
+            .with_versions(ProduceRequest::KEY, 3..=11)
+            .map(|builder| builder.len());
+
+        assert_matches!(
+            result,
+            Err(Error::NoRouteForVersions(api_key)) if api_key == ProduceRequest::KEY
+        );
     }
 }
