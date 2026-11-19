@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::LazyLock};
 
 use nisshi_sans_io::{
     ApiKey, CreateTopicsRequest, ErrorCode, MetadataRequest, MetadataResponse, NULL_TOPIC_ID,
@@ -23,6 +23,7 @@ use nisshi_sans_io::{
     metadata_response::MetadataResponseTopic,
     topic::{is_internal, is_valid_topic_name},
 };
+use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -33,12 +34,26 @@ use super::{
     create_topics::validation::ValidatedCreateTopicsRequest, fetch::storage_failure_warns_now,
 };
 use crate::{
-    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, Result, Storage, StorageOperation,
-    TopicCreationConfig, TopicId, authorized_operations, topic_creation,
+    CreateTopicsService, Error, MAX_PARTITIONS_PER_REQUEST, METER, Result, Storage,
+    StorageOperation, TopicCreationConfig, TopicId, authorized_operations, topic_creation,
 };
 
 mod auto_create_refusals;
 mod known_topics;
+
+/// Topics that a Metadata request answered with their partitions and no leader, because a
+/// storage read failed with an error that a retry may clear, by `topic`. A request that names a
+/// topic never read returns the error instead, and is not counted.
+static METADATA_WITHOUT_LEADER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("nisshi_metadata_without_leader")
+        .with_description(
+            "Topics that a Metadata request answered with their last known partitions and no \
+             leader, because a storage read failed with an error that a retry may clear. \
+             Attribute: topic",
+        )
+        .build()
+});
 
 /// A [`Service`] using its [`Storage`] taking [`MetadataRequest`] returning [`MetadataResponse`].
 /// ```no_run
@@ -113,12 +128,12 @@ where
     ///
     /// When the read fails with an error that a retry may clear, and every topic that the
     /// request names is in `known_topics`, this answers each of them from there, with the brokers
-    /// of a read of no topics, or of the last successful read. The client then keeps its
-    /// partitions and waits for a leader.
+    /// of the last successful read. The client then keeps its partitions and waits for a leader.
     ///
     /// This returns the error, so the broker closes the connection, when the request names a
-    /// topic that `known_topics` does not hold, or names no topics. Every client retries a closed connection, and an answer of the brokers
-    /// without topics would tell the client that no topic exists.
+    /// topic that `known_topics` does not hold, or names no topics. Every client retries a
+    /// closed connection, and an answer of the brokers without topics would tell the client that
+    /// no topic exists.
     ///
     /// For an error that a retry does not clear, this answers each named topic with the code of
     /// the error and no partitions, so the client reports it at once instead of waiting for a
@@ -148,33 +163,56 @@ where
             None => None,
         };
 
-        // A SQL engine reads the brokers through the connection that failed, so this answers
-        // the brokers of the last successful read when this read fails too.
+        // The brokers of a node do not change while it runs, so this answers the brokers of the
+        // last read instead of reading them again. A second read would wait again on the
+        // storage that failed, and on a SQL engine it needs a connection to the database that
+        // failed.
         let brokers = match answered {
-            Some(_) => match self.storage.metadata(Some(&[])).await {
-                Ok(response) => Ok(response),
-                Err(brokers_error) => self.known_topics.brokers().ok_or(brokers_error),
+            Some(_) => match self.known_topics.brokers() {
+                Some(brokers) => Ok(brokers),
+                None => self.storage.metadata(Some(&[])).await,
             },
             None => Err(error.clone()),
         };
 
         let (Some(named), Some(answered), Ok(mut response)) = (named, answered, brokers) else {
-            if transient {
-                log_transient_failure(named.map_or(0, <[TopicId]>::len), &error);
+            let topics = named.map_or(0, <[TopicId]>::len);
+
+            if !transient {
+                error!(topics, ?error, "metadata read failed, returning the error");
+            } else if storage_failure_warns_now(StorageOperation::Metadata) {
+                warn!(topics, ?error, "metadata read failed, returning the error");
             } else {
-                error!(?error);
+                debug!(topics, ?error, "metadata read failed, returning the error");
             }
+
             return Err(error);
         };
 
         if transient {
-            log_transient_failure(named.len(), &error);
+            for topic in answered.iter().filter_map(|topic| topic.name.as_deref()) {
+                METADATA_WITHOUT_LEADER.add(1, &[KeyValue::new("topic", topic.to_owned())]);
+            }
+
+            if storage_failure_warns_now(StorageOperation::Metadata) {
+                warn!(
+                    topics = named.len(),
+                    ?error,
+                    "metadata read failed, answering known topics without a leader"
+                );
+            } else {
+                debug!(
+                    topics = named.len(),
+                    ?error,
+                    "metadata read failed, answering known topics without a leader"
+                );
+            }
         } else {
             error!(
                 topics = named.len(),
                 ?error,
                 ?error_code,
-                "metadata read failed"
+                "metadata read failed, answering each topic with the error code"
             );
         }
 
@@ -192,17 +230,6 @@ fn may_clear_on_retry(error: &Error) -> bool {
             error,
             Error::Api(ErrorCode::KafkaStorageError | ErrorCode::RequestTimedOut)
         )
-}
-
-/// Logs a failed Metadata read that a retry may clear, of `topics` named topics: at `warn` once
-/// per interval and at `debug` between, because a client retries Metadata many times during one
-/// outage.
-fn log_transient_failure(topics: usize, error: &Error) {
-    if storage_failure_warns_now(StorageOperation::Metadata) {
-        warn!(topics, ?error, "metadata read failed");
-    } else {
-        debug!(topics, ?error, "metadata read failed");
-    }
 }
 
 /// Returns the row of `topic` with `error_code` and no partitions.

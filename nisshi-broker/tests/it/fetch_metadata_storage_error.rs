@@ -62,14 +62,14 @@ const MAX_WAIT: Duration = Duration::from_secs(10);
 
 /// Fails every read of the cluster's `meta.json` while armed, and passes everything else through.
 #[derive(Debug)]
-struct FailMetaReadStore {
+pub(crate) struct FailMetaReadStore {
     inner: InMemory,
     armed: AtomicBool,
     permission_denied: AtomicBool,
 }
 
 impl FailMetaReadStore {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: InMemory::new(),
             armed: AtomicBool::new(false),
@@ -77,7 +77,7 @@ impl FailMetaReadStore {
         }
     }
 
-    fn arm(&self) {
+    pub(crate) fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
 

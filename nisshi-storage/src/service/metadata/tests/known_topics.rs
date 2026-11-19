@@ -16,15 +16,27 @@
 //! that the service answered before with its partitions and no leader, and returns the error
 //! for a topic that it never answered.
 
-use std::{assert_matches, io};
+use std::{
+    assert_matches,
+    collections::BTreeMap,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use nisshi_sans_io::{
     ErrorCode, MetadataRequest, MetadataResponse,
     metadata_request::MetadataRequestTopic,
     metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
 };
+use opentelemetry::global;
+use opentelemetry_sdk::metrics::{
+    InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+    data::{AggregatedMetrics, MetricData},
+};
 use rama::Service as _;
+use tracing::Level;
 
+use super::super::may_clear_on_retry;
 use crate::{
     AutoCreateRefusals, Error, KnownTopics, MetadataService, Result, TopicCreationConfig,
     service::counting_storage::{CountingStorage, Listing, NODE_ID},
@@ -256,6 +268,152 @@ async fn a_read_that_works_again_answers_the_leader() -> Result<()> {
             .iter()
             .map(|partition| (partition.error_code, partition.leader_id))
             .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// An engine answers some failures with the code of a Kafka error, and a retry may clear
+/// `KAFKA_STORAGE_ERROR` and `REQUEST_TIMED_OUT`.
+#[test]
+fn a_retriable_api_code_may_clear_on_retry() {
+    for error_code in [ErrorCode::KafkaStorageError, ErrorCode::RequestTimedOut] {
+        assert!(
+            may_clear_on_retry(&Error::Api(error_code)),
+            "{error_code:?}"
+        );
+    }
+}
+
+/// A topic that a retry does not create, or a request that a retry does not change, answers its
+/// code at once.
+#[test]
+fn a_code_that_a_retry_does_not_clear_does_not_clear_on_retry() {
+    for error_code in [
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::InvalidTopicException,
+        ErrorCode::UnknownServerError,
+    ] {
+        assert!(
+            !may_clear_on_retry(&Error::Api(error_code)),
+            "{error_code:?}"
+        );
+    }
+
+    assert!(!may_clear_on_retry(&Error::Message("permanent".into())));
+}
+
+/// The brokers of a node do not change while it runs, so a failed read answers the brokers of
+/// the last read, and does not wait on the storage a second time for them.
+#[tokio::test]
+async fn a_failed_read_answers_the_brokers_last_read_without_reading_them() -> Result<()> {
+    let storage = CountingStorage::new(Listing::Topics, &[TOPIC]);
+    let service = service(&storage, &KnownTopics::default());
+
+    let read = metadata(&service, &[TOPIC]).await?;
+    storage.fail_named_lookups(Some(transient()));
+
+    let response = metadata(&service, &[TOPIC]).await?;
+
+    assert_eq!(read.brokers, response.brokers);
+    assert_eq!(2, storage.lookups());
+    Ok(())
+}
+
+/// The log lines written at `debug` or above.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Log {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The value of each data point of the counter `nisshi_metadata_without_leader`, by its `topic`
+/// attribute.
+fn counted_without_leader(
+    exporter: &InMemoryMetricExporter,
+    provider: &SdkMeterProvider,
+) -> BTreeMap<String, u64> {
+    provider.force_flush().expect("flush");
+
+    exporter
+        .get_finished_metrics()
+        .expect("finished metrics")
+        .iter()
+        .flat_map(|resource| resource.scope_metrics())
+        .flat_map(|scope| scope.metrics())
+        .filter(|metric| metric.name() == "nisshi_metadata_without_leader")
+        .filter_map(|metric| match metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+            _ => None,
+        })
+        .flat_map(|sum| sum.data_points())
+        .map(|point| {
+            let topic = point
+                .attributes()
+                .find(|attribute| attribute.key.as_str() == "topic")
+                .map(|attribute| attribute.value.to_string())
+                .unwrap_or_default();
+            (topic, point.value())
+        })
+        .collect()
+}
+
+/// An operator tells a failed read that answers topics without a leader from one that closes
+/// the connection: each topic answered without a leader counts once, and its log line says so.
+#[tokio::test]
+async fn a_topic_answered_without_a_leader_is_counted_and_logged() -> Result<()> {
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    global::set_meter_provider(provider.clone());
+
+    let log = Log::default();
+    let writer = log.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    let storage = CountingStorage::new(Listing::Topics, &[TOPIC, "payments"]);
+    let service = service(&storage, &KnownTopics::default());
+
+    _ = metadata(&service, &[TOPIC]).await?;
+    storage.fail_named_lookups(Some(transient()));
+
+    _ = metadata(&service, &[TOPIC]).await?;
+    _ = metadata(&service, &[TOPIC]).await?;
+
+    // A topic never read closes the connection, and is not counted.
+    assert_matches!(metadata(&service, &["payments"]).await, Err(Error::Io(_)));
+
+    assert_eq!(
+        BTreeMap::from([(TOPIC.to_owned(), 2)]),
+        counted_without_leader(&exporter, &provider)
+    );
+
+    let text = String::from_utf8(log.0.lock().expect("log").clone()).expect("utf-8");
+    assert_eq!(
+        2,
+        text.matches("metadata read failed, answering known topics without a leader")
+            .count(),
+        "{text}"
+    );
+    assert_eq!(
+        1,
+        text.matches("metadata read failed, returning the error")
+            .count(),
+        "{text}"
     );
     Ok(())
 }
