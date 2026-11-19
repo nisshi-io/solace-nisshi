@@ -457,7 +457,6 @@ where
         .with_route(
             MetadataRequest::KEY,
             (
-                MetadataTopicIdLayer,
                 MapErrLayer::new(Error::from),
                 FrameRequestLayer::<MetadataRequest>::new(),
             )
@@ -468,6 +467,7 @@ where
                 })
                 .boxed(),
         )
+        .and_then(|builder| builder.with_guard(MetadataRequest::KEY, MetadataTopicIdLayer))
         .map_err(Into::into)
 }
 
