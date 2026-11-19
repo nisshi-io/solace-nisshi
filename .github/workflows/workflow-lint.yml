@@ -73,6 +73,10 @@ jobs:
       # ci.yml runs check-rust-version.sh only on the workspace's real
       # manifests, which should pass, so its failure paths are tested here.
       - run: bash .github/scripts/check-rust-version.test.sh
+      # This job runs on every pull request, also on one that changes only
+      # AGENTS.md, so it runs the check itself as well as its self-test.
+      - run: bash .github/scripts/check-agent-instructions.test.sh
+      - run: bash .github/scripts/check-agent-instructions.sh .
 
   zizmor:
     runs-on: ubuntu-latest

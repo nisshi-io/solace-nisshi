@@ -1,0 +1,6 @@
+# Codex loads at most 32 KiB from all AGENTS.md files together, and skips each
+# file after the one that reaches the limit. The root AGENTS.md and
+# nisshi-sans-io/AGENTS.md together are larger than that, so this limit lets a
+# session in nisshi-sans-io/ load both. Codex reads this file only for a
+# project that the user trusts.
+project_doc_max_bytes = 98304

@@ -118,6 +118,12 @@ check-rust-version:
       | jq -r '.packages[] | "\(.name) \(.rust_version // "")"' \
       | bash .github/scripts/check-rust-version.sh rust-toolchain.toml
 
+# Fails if the rule table in AGENTS.md misses a file in .claude/rules/, if
+# AGENTS.md is larger than 32 KiB, or if a CLAUDE.md exists. workflow-lint.yml
+# runs the same check.
+check-agent-instructions:
+    bash .github/scripts/check-agent-instructions.sh .
+
 [private]
 storage-deps feature:
     #!/usr/bin/env bash
