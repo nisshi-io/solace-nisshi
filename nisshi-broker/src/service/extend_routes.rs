@@ -26,32 +26,41 @@ type Extend<G, S> =
 ///
 /// The broker calls the function after it has registered its own routes, and before it adds
 /// `ApiVersions`. The function receives the route builder, and the coordinator and the storage of
-/// the broker. It changes the route table in one of three ways:
+/// the broker. A route has a handler, guards and a version range, and the function changes them
+/// with these methods:
 ///
 /// - [`FrameRouteBuilder::with_route`] adds a route. If the API key already has a route, this
 ///   fails with [`nisshi_service::Error::DuplicateRoute`].
-/// - [`FrameRouteBuilder::wrap_route`] decorates the route of an API key. If the API key has no
-///   route, this fails with [`nisshi_service::Error::NoRouteToWrap`].
-/// - `wrap_route(api_key, |_built_in| replacement)` replaces the route of an API key.
+/// - [`FrameRouteBuilder::wrap_route`] changes the handler of a route. This fails with
+///   [`nisshi_service::Error::NoRouteToWrap`] if the API key has no route.
+///   `wrap_route(api_key, |_built_in| replacement)` replaces the handler.
+/// - [`FrameRouteBuilder::with_guard`] adds a guard around a route.
+/// - [`FrameRouteBuilder::with_versions`] sets the version range that a route serves and that
+///   `ApiVersions` advertises.
 ///
 /// # Calls
 ///
 /// The broker calls the function once when it starts serving, before it registers itself in
 /// storage, so that a route table that cannot build fails the start of the broker. It then calls
-/// the function for each connection that it accepts. If a call for a connection fails, the broker logs the error and drops that
-/// connection. The broker calls the function on the task that accepts connections, so the function
-/// must be quick and must not block. A panic in the function ends the broker.
+/// the function for each connection that it accepts. If a call for a connection fails, the broker
+/// logs the error and drops that connection. The broker calls the function on the task that
+/// accepts connections, so the function must be quick and must not block. A panic in the function
+/// ends the broker.
 ///
-/// # Replacing a route
+/// # Replacing a handler
 ///
-/// A replacement skips what the built-in route does for its API key, such as the schema validation
-/// of Produce. The group coordinator's fence of TxnOffsetCommit still wraps a replacement.
+/// A replacement of a handler keeps the guards and the version range of its route. These are
+/// the fence of TxnOffsetCommit, the translation of an abortable-transaction error for a Produce
+/// below v11, the topic ID handling of Metadata, and the version range. The route table closes the
+/// connection of a request for a version outside that range, before the handler sees the
+/// request.
 ///
-/// The layers that the broker builds into a route when it registers the route are lost with the
-/// route. These are the version gate of Produce, ListOffsets and AddPartitionsToTxn, the
-/// translation of an abortable-transaction error for a Produce below v11, and the topic ID
-/// handling of Metadata. `ApiVersions` still advertises the version range of the built-in route,
-/// so a replacement serves every version in that range and rejects every version outside it.
+/// A replacement loses what the built-in handler does, such as the request validation of
+/// CreateTopics and Fetch, the schema validation of Produce, and the work on the storage.
+///
+/// The version range stays the range of the built-in route, and `ApiVersions` advertises it. A
+/// replacement that serves another range sets it with `with_versions`. The range has to be a
+/// subset of the protocol's own range for the API.
 ///
 /// # Authentication
 ///
