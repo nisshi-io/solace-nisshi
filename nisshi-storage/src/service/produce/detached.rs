@@ -81,22 +81,26 @@ pub struct StillRunning {
 /// still runs when the wait ends is left running. The writes are tracked for the whole process,
 /// so the wait covers the writes of every broker in it.
 pub async fn wait_for_detached_writes(remaining_grace: Duration) -> StillRunning {
-    let tasks = &PROCESS.tasks;
-
-    // The tracker completes its wait only once it is closed. A closed tracker still accepts a
-    // task, so a write that starts after this point is tracked too.
-    _ = tasks.close();
-
-    match timeout(remaining_grace, tasks.wait()).await {
-        Ok(()) => StillRunning::default(),
-        Err(_) => StillRunning {
-            writes: tasks.len(),
-            detached_partitions: PROCESS.partitions(),
-        },
-    }
+    PROCESS.wait(remaining_grace).await
 }
 
 impl Detached {
+    /// Waits until every write of this set has ended, for at most `remaining_grace`, as
+    /// [`wait_for_detached_writes`] does for the set of the process.
+    pub(super) async fn wait(&self, remaining_grace: Duration) -> StillRunning {
+        // The tracker completes its wait only once it is closed. A closed tracker still accepts a
+        // task, so a write that starts after this point is tracked too.
+        _ = self.tasks.close();
+
+        match timeout(remaining_grace, self.tasks.wait()).await {
+            Ok(()) => StillRunning::default(),
+            Err(_) => StillRunning {
+                writes: self.tasks.len(),
+                detached_partitions: self.partitions(),
+            },
+        }
+    }
+
     /// Returns the set that all services of this process share.
     pub(super) fn process() -> Self {
         PROCESS.clone()

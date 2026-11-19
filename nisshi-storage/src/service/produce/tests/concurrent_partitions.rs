@@ -37,13 +37,13 @@ use tokio::{
 
 use super::super::{
     PRODUCE_CONCURRENCY,
-    deadline::{NOT_STARTED, SLOT_WAIT, WRITING},
+    deadline::{NOT_STARTED, PRODUCE_REQUEST_DEADLINE, SLOT_WAIT, WRITING},
     detached::Detached,
 };
 use crate::{
-    Error, ProduceService, Result,
+    Error, ProduceService, Result, StillRunning, Topition,
     decoded_budget::DecodedBytesBudget,
-    service::counting_storage::{CountingStorage, Listing},
+    service::counting_storage::{CountingStorage, Listing, UNTIL_LIMIT},
 };
 
 const TOPIC: &str = "abc";
@@ -200,10 +200,12 @@ fn produced_partitions_sorted(storage: &CountingStorage) -> Vec<i32> {
     partitions
 }
 
-/// Lets the tasks that are ready run, so that a write that a test released has finished.
-async fn settle() {
-    sleep(Duration::from_millis(1)).await;
-}
+/// How long a test waits for the writes that it released to end.
+const GRACE: Duration = Duration::from_secs(5);
+
+// A wait for storage that does not end fails at the wait, before the request answers at its
+// deadline and the `select!` of a test reports that instead.
+const _: () = assert!(UNTIL_LIMIT.as_secs() < PRODUCE_REQUEST_DEADLINE.as_secs());
 
 /// A request for twice [`PRODUCE_CONCURRENCY`] partitions, each of which takes [`WRITE`], answers
 /// in two writes' time, and every partition has its offset.
@@ -339,6 +341,10 @@ fn produced_values(storage: &CountingStorage, partition: i32) -> Vec<Option<Byte
 #[tokio::test(start_paused = true)]
 async fn writes_to_one_partition_stay_in_request_order() -> Result<()> {
     let (storage, gate) = stalled();
+    // Each write takes a second after the gate opens. The paused clock does not move while the
+    // second entry still runs, so a second entry that did not wait for the first would reach
+    // storage while the first one writes.
+    let storage = storage.with_produce_delay(WRITE);
     let service = service(&storage);
     let request = request(
         vec![topic(
@@ -353,16 +359,15 @@ async fn writes_to_one_partition_stay_in_request_order() -> Result<()> {
     tokio::select! {
         biased;
         _ = &mut produce => panic!("the request answered before storage did"),
-        () = settle() => {}
+        () = storage.until(|storage| storage.parked() >= 2) => {}
     }
-
-    assert_eq!(2, storage.parked());
 
     gate.add_permits(3);
     let responses = produce.await?;
 
     assert_eq!(vec![ErrorCode::None; 3], codes(&responses)?);
     assert_eq!(vec![0, 1, 0], indexes(&responses));
+    assert!(!storage.overlapped(&Topition::new(TOPIC, 0)));
     assert_eq!(
         vec![
             Some(Bytes::from_static(b"first")),
@@ -380,6 +385,10 @@ async fn writes_to_one_partition_stay_in_request_order() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn the_entries_of_one_topic_are_written_in_request_order() -> Result<()> {
     let (storage, gate) = stalled();
+    // Each write takes a second after the gate opens. The paused clock does not move while the
+    // second entry still runs, so a second entry that did not wait for the first would reach
+    // storage while the first one writes.
+    let storage = storage.with_produce_delay(WRITE);
     let service = service(&storage);
     let request = request(
         vec![
@@ -394,15 +403,14 @@ async fn the_entries_of_one_topic_are_written_in_request_order() -> Result<()> {
     tokio::select! {
         biased;
         _ = &mut produce => panic!("the request answered before storage did"),
-        () = settle() => {}
+        () = storage.until(|storage| storage.parked() >= 1) => {}
     }
-
-    assert_eq!(1, storage.parked());
 
     gate.add_permits(2);
     let responses = produce.await?;
 
     assert_eq!(vec![ErrorCode::None; 2], codes(&responses)?);
+    assert!(!storage.overlapped(&Topition::new(TOPIC, 0)));
     assert_eq!(
         vec![
             Some(Bytes::from_static(b"first")),
@@ -428,7 +436,7 @@ async fn the_partitions_answer_in_request_order_with_their_own_offsets() -> Resu
     tokio::select! {
         biased;
         _ = &mut produce => panic!("the request answered before storage did"),
-        () = settle() => {}
+        () = storage.until(|storage| storage.produced().len() >= 2) => {}
     }
 
     assert_eq!(vec![0, 1], produced_partitions_sorted(&storage));
@@ -541,7 +549,7 @@ async fn a_storage_that_answers_zero_concurrency_is_served_as_one() -> Result<()
     let responses = serve(&service, acked(&[0, 1])?).await?;
 
     assert_eq!(vec![ErrorCode::None; 2], codes(&responses)?);
-    assert_eq!(vec![0, 1], produced_partitions(&storage));
+    assert_eq!(vec![0, 1], produced_partitions_sorted(&storage));
 
     Ok(())
 }
@@ -575,7 +583,7 @@ async fn the_extra_writes_of_two_requests_share_the_storage_permits() -> Result<
     tokio::select! {
         biased;
         _ = &mut first => panic!("the first request answered before its writes started"),
-        () = settle() => {}
+        () = storage.until(|storage| storage.entered() >= 3) => {}
     }
     assert_eq!(0, permits.available_permits());
 
@@ -696,14 +704,15 @@ async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -
     let permits = Arc::new(Semaphore::new(1));
     let (storage, gate) = stalled();
     let storage = storage.with_produce_permits(Arc::clone(&permits));
-    let service = service(&storage);
+    let detached = Detached::default();
+    let service = ProduceService::new_sharing(storage.clone(), detached.clone()).with_validation();
 
     _ = serve(&service, acked(&[0, 1])?).await?;
 
     assert_eq!(0, permits.available_permits());
 
     gate.add_permits(2);
-    settle().await;
+    assert_eq!(StillRunning::default(), detached.wait(GRACE).await);
 
     assert_eq!(1, permits.available_permits());
 
