@@ -44,6 +44,7 @@ pub mod describe_groups_round_trip;
 pub mod describe_topic_partitions;
 pub mod describe_topic_partitions_invalid_name;
 pub mod dynostore_meta_cache;
+pub mod engine_building_files;
 pub mod extend_routes;
 pub mod fetch;
 pub mod fetch_after_delete_records;
