@@ -58,9 +58,18 @@ type Extend<G, S> =
 /// A replacement loses what the built-in handler does, such as the request validation of
 /// CreateTopics and Fetch, the schema validation of Produce, and the work on the storage.
 ///
-/// The version range stays the range of the built-in route, and `ApiVersions` advertises it. A
-/// replacement that serves another range sets it with `with_versions`. The range has to be a
-/// subset of the protocol's own range for the API.
+/// The version range stays the range of the built-in route, and `ApiVersions` advertises it.
+/// [`FrameRouteBuilder::with_versions`] sets another range. For Produce, ListOffsets and
+/// AddPartitionsToTxn, the built-in handler implements fewer versions than the protocol has, so
+/// `with_versions` accepts only a range within the built-in range until `wrap_route` changes the
+/// handler. After that, it accepts any range within the protocol's own range for the API.
+///
+/// # Guards
+///
+/// A guard that the function adds with `with_guard` runs inside the guards of the broker. It runs
+/// after the route table has checked the version, and after the fence of TxnOffsetCommit, the
+/// translation for Produce and the topic ID handling of Metadata, so it does not see a request
+/// that one of them refuses.
 ///
 /// # Authentication
 ///

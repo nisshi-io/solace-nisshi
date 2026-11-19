@@ -166,26 +166,6 @@ impl<E> FrameRouteService<E>
 where
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
-    /// Returns a router for `routes`, each serving the protocol's own version range for its API.
-    pub fn new(routes: Arc<BTreeMap<i16, BoxService<FrameInput, Frame, E>>>) -> Self {
-        Self {
-            routes: Arc::new(
-                routes
-                    .iter()
-                    .map(|(api_key, service)| {
-                        (
-                            *api_key,
-                            ServedRoute {
-                                service: service.clone(),
-                                versions: protocol_range(*api_key),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
     pub fn builder() -> FrameRouteBuilder<E> {
         FrameRouteBuilder::<E>::new()
     }
@@ -324,6 +304,11 @@ struct Route<E> {
 
     /// `None` when this build has no protocol metadata for the route's API key.
     versions: Option<RangeInclusive<i16>>,
+
+    /// The versions that the handler implements, when that is fewer than the protocol's.
+    /// [`FrameRouteBuilder::wrap_route`] clears it, because the wrapper then takes over the
+    /// versions that the handler receives.
+    implemented: Option<RangeInclusive<i16>>,
 }
 
 impl<E> Route<E> {
@@ -393,6 +378,7 @@ where
                 handler: service,
                 guards: Vec::new(),
                 versions: protocol_range(api_key),
+                implemented: None,
             },
         );
 
@@ -401,6 +387,11 @@ where
 
     /// Replaces the handler of `api_key` with the service that `wrap` builds from it. The
     /// guards and the version range of the route stay as they are.
+    ///
+    /// The wrapper takes over the versions that the handler receives, so
+    /// [`Self::with_versions`] then accepts any range within the protocol's own range, also for a
+    /// capped API.
+    ///
     /// Returns [`Error::NoRouteToWrap`] when no route of `api_key` is registered, so that a
     /// route table that registers it after this call, or not at all, does not build without
     /// what the wrapper adds.
@@ -414,6 +405,7 @@ where
             .ok_or(Error::NoRouteToWrap(api_key))?;
 
         route.handler = wrap(route.handler.clone());
+        route.implemented = None;
 
         Ok(self)
     }
@@ -441,9 +433,14 @@ where
 
     /// Sets the version range that the route of `api_key` serves and `ApiVersions` advertises.
     ///
-    /// Returns [`Error::NoRouteForVersions`] when no route of `api_key` is registered, and
-    /// [`Error::CapRangeExceedsProtocolRange`] when `versions` is not a subset of the protocol's
-    /// own range for that API.
+    /// A route that [`FrameRouteBuilder::with_capped_route`] registered accepts only a range within
+    /// the versions that its handler implements, until [`Self::wrap_route`] changes the handler.
+    /// Any other route accepts a range within the protocol's own range for its API.
+    ///
+    /// Returns [`Error::NoRouteForVersions`] when no route of `api_key` is registered,
+    /// [`Error::EmptyVersionRange`] when `versions` has no version, and
+    /// [`Error::VersionRangeNotAllowed`] when `versions` is outside the range that the route
+    /// accepts.
     pub fn with_versions(
         mut self,
         api_key: i16,
@@ -454,8 +451,34 @@ where
             .get_mut(&api_key)
             .ok_or(Error::NoRouteForVersions(api_key))?;
 
-        validate_versions(api_key, versions.clone())?;
+        validate_versions(
+            api_key,
+            versions.clone(),
+            route
+                .implemented
+                .clone()
+                .or_else(|| protocol_range(api_key)),
+        )?;
         route.versions = Some(versions);
+
+        Ok(self)
+    }
+
+    /// Sets the version range that the route of `api_key` serves to `cap`, which is also the
+    /// range that its handler implements.
+    pub(crate) fn with_capped_versions(
+        mut self,
+        api_key: i16,
+        cap: RangeInclusive<i16>,
+    ) -> Result<Self, Error> {
+        let route = self
+            .routes
+            .get_mut(&api_key)
+            .ok_or(Error::NoRouteForVersions(api_key))?;
+
+        validate_versions(api_key, cap.clone(), protocol_range(api_key))?;
+        route.versions = Some(cap.clone());
+        route.implemented = Some(cap);
 
         Ok(self)
     }
@@ -529,6 +552,8 @@ mod tests {
 
     use nisshi_sans_io::{ApiVersionsRequest, ProduceRequest, ProduceResponse};
     use rama::service::service_fn;
+
+    use crate::ResponseService;
 
     use super::*;
 
@@ -610,6 +635,16 @@ mod tests {
             },
             body: ProduceRequest::default().into(),
         }
+    }
+
+    /// A builder with a Produce route that `with_capped_route` registered, which implements the
+    /// versions in `CAPPED_API_VERSIONS`.
+    fn capped_produce_builder() -> FrameRouteBuilder<Error> {
+        FrameRouteService::<Error>::builder()
+            .with_capped_route::<ProduceRequest, _>(ResponseService::new(
+                |_: RequestInput<ProduceRequest>| Ok::<_, Error>(ProduceResponse::default()),
+            ))
+            .expect("a capped Produce route")
     }
 
     /// The version range that `ApiVersions` of `route` advertises for Produce.
@@ -898,7 +933,7 @@ mod tests {
 
         assert_matches!(
             result,
-            Err(Error::CapRangeExceedsProtocolRange { api_key, .. }) if api_key == ProduceRequest::KEY
+            Err(Error::VersionRangeNotAllowed { api_key, .. }) if api_key == ProduceRequest::KEY
         );
     }
 
@@ -922,6 +957,68 @@ mod tests {
         assert_matches!(
             result,
             Err(Error::NoRouteForVersions(api_key)) if api_key == ProduceRequest::KEY
+        );
+    }
+
+    #[test]
+    fn widening_a_capped_route_past_its_handler_is_an_error() {
+        let result = capped_produce_builder()
+            .with_versions(ProduceRequest::KEY, 0..=11)
+            .map(|builder| builder.len());
+
+        assert_matches!(
+            result,
+            Err(Error::VersionRangeNotAllowed { api_key, allowed: Some(allowed), .. })
+                if api_key == ProduceRequest::KEY && allowed == (3..=11)
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_a_capped_route_is_allowed() {
+        let route = capped_produce_builder()
+            .with_versions(ProduceRequest::KEY, 4..=10)
+            .and_then(FrameRouteBuilder::build)
+            .expect("a Produce route that serves v4 to v10");
+
+        assert_eq!(Some((4, 10)), advertised_produce_versions(&route).await);
+    }
+
+    #[tokio::test]
+    async fn wrapping_a_capped_route_lifts_the_limit_of_its_handler() {
+        let log = Log::default();
+
+        let route = capped_produce_builder()
+            .wrap_route(ProduceRequest::KEY, |_built_in| {
+                handler("replacement", &log)
+            })
+            .and_then(|builder| builder.with_versions(ProduceRequest::KEY, 0..=11))
+            .and_then(FrameRouteBuilder::build)
+            .expect("a replaced Produce route that serves the protocol range");
+
+        assert_eq!(Some((0, 11)), advertised_produce_versions(&route).await);
+
+        _ = route
+            .serve(produce_frame(0))
+            .await
+            .expect("Produce v0 is within the range that the replacement sets");
+
+        assert_eq!(vec!["replacement"], logged(&log));
+    }
+
+    #[test]
+    fn versions_that_start_above_their_end_are_an_error() {
+        let log = Log::default();
+
+        let result = FrameRouteService::<Error>::builder()
+            .with_route(ProduceRequest::KEY, handler("handler", &log))
+            .and_then(|builder| {
+                builder.with_versions(ProduceRequest::KEY, RangeInclusive::new(5, 3))
+            })
+            .map(|builder| builder.len());
+
+        assert_matches!(
+            result,
+            Err(Error::EmptyVersionRange { api_key, .. }) if api_key == ProduceRequest::KEY
         );
     }
 }

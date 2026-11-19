@@ -65,7 +65,8 @@ pub fn capped_range(api_key: i16) -> Option<RangeInclusive<i16>> {
 ///
 /// This is the range in [`CAPPED_API_VERSIONS`] for a capped API, because
 /// [`FrameRouteService`](crate::FrameRouteService) rejects every other version before a handler
-/// sees the request, and the protocol's own range for every other API.
+/// sees the request, and the protocol's own range for every other API. It describes the built-in
+/// handlers: [`FrameRouteBuilder::with_versions`] changes the range of a route in a route table.
 #[must_use]
 pub fn routable_range(api_key: i16) -> Option<RangeInclusive<i16>> {
     capped_range(api_key).or_else(|| protocol_range(api_key))
@@ -89,19 +90,25 @@ pub(crate) fn protocol_range(api_key: i16) -> Option<RangeInclusive<i16>> {
         .map(|meta| meta.version.valid.start..=meta.version.valid.end)
 }
 
-/// Fails unless `declared` is a subset of the protocol's own valid range for `api_key`.
-pub(crate) fn validate_versions(api_key: i16, declared: RangeInclusive<i16>) -> Result<(), Error> {
-    let protocol = protocol_range(api_key);
+/// Fails unless `declared` has a version and is a subset of `allowed`.
+pub(crate) fn validate_versions(
+    api_key: i16,
+    declared: RangeInclusive<i16>,
+    allowed: Option<RangeInclusive<i16>>,
+) -> Result<(), Error> {
+    if declared.is_empty() {
+        return Err(Error::EmptyVersionRange { api_key, declared });
+    }
 
-    if protocol.as_ref().is_some_and(|protocol| {
-        declared.start() >= protocol.start() && declared.end() <= protocol.end()
+    if allowed.as_ref().is_some_and(|allowed| {
+        declared.start() >= allowed.start() && declared.end() <= allowed.end()
     }) {
         Ok(())
     } else {
-        Err(Error::CapRangeExceedsProtocolRange {
+        Err(Error::VersionRangeNotAllowed {
             api_key,
             declared,
-            protocol,
+            allowed,
         })
     }
 }
@@ -117,8 +124,12 @@ where
     /// # Errors
     ///
     /// Fails with [`Error::UncappedApi`] when [`CAPPED_API_VERSIONS`] has no entry for `Q`, and
-    /// with [`Error::CapRangeExceedsProtocolRange`] when that entry is not a subset of the
-    /// protocol's own valid range.
+    /// with [`Error::VersionRangeNotAllowed`] when that entry is not a subset of the protocol's
+    /// own valid range.
+    ///
+    /// The route keeps that range as the versions that its handler implements: until
+    /// [`FrameRouteBuilder::wrap_route`] changes the handler, [`FrameRouteBuilder::with_versions`]
+    /// accepts only a range within it.
     pub fn with_capped_route<Q, S>(self, handler: S) -> Result<Self, Error>
     where
         Q: Request + TryFrom<Body>,
@@ -134,7 +145,7 @@ where
             .boxed();
 
         self.with_route(Q::KEY, route)?
-            .with_versions(Q::KEY, supported)
+            .with_capped_versions(Q::KEY, supported)
     }
 
     /// As [`Self::with_capped_route`], with `guard` around the route, so that `guard` sees the
@@ -167,18 +178,41 @@ mod tests {
     #[test]
     fn every_capped_range_is_within_its_protocol_range() {
         for (api_key, range) in CAPPED_API_VERSIONS {
-            validate_versions(api_key, range).expect("a cap within the protocol range");
+            validate_versions(api_key, range, protocol_range(api_key))
+                .expect("a cap within the protocol range");
         }
     }
 
     #[test]
     fn declared_range_wider_than_protocol_range_fails_validation() {
-        let err = validate_versions(MetadataRequest::KEY, 0..=999)
-            .expect_err("0..=999 exceeds MetadataRequest's protocol range");
+        let err = validate_versions(
+            MetadataRequest::KEY,
+            0..=999,
+            protocol_range(MetadataRequest::KEY),
+        )
+        .expect_err("0..=999 exceeds MetadataRequest's protocol range");
 
         assert!(matches!(
             err,
-            Error::CapRangeExceedsProtocolRange {
+            Error::VersionRangeNotAllowed {
+                api_key,
+                ..
+            } if api_key == MetadataRequest::KEY
+        ));
+    }
+
+    #[test]
+    fn empty_declared_range_fails_validation() {
+        let err = validate_versions(
+            MetadataRequest::KEY,
+            RangeInclusive::new(5, 3),
+            protocol_range(MetadataRequest::KEY),
+        )
+        .expect_err("a range that starts at 5 and ends at 3 has no version");
+
+        assert!(matches!(
+            err,
+            Error::EmptyVersionRange {
                 api_key,
                 ..
             } if api_key == MetadataRequest::KEY

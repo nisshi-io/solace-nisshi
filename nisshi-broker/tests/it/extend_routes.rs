@@ -467,6 +467,29 @@ async fn extension_serves_and_advertises_the_versions_that_it_sets() -> Result<(
 }
 
 #[tokio::test]
+async fn extension_cannot_widen_a_capped_route_without_changing_its_handler() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    timeout(TEST_TIMEOUT, async {
+        let mut built = build_broker(Some(ExtendRoutes::new(|builder, _, _| {
+            builder
+                .with_versions(ProduceRequest::KEY, 0..=11)
+                .map_err(Into::into)
+        })))
+        .await?;
+
+        assert_matches!(
+            built.broker.serve(Instant::now()).await,
+            Err(Error::Service(nisshi_service::Error::VersionRangeNotAllowed { api_key, .. }))
+                if api_key == ProduceRequest::KEY
+        );
+
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn replaced_metadata_route_keeps_the_topic_id_layer() -> Result<()> {
     let _guard = init_tracing()?;
 
