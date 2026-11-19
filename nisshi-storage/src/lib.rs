@@ -229,6 +229,7 @@ mod service;
 mod storage_double;
 mod topic_creation;
 mod topic_defaults;
+mod warn_limit;
 
 /// Returns the error code that a storage engine answers for a topic ID when the query that
 /// looks the topic up fails with `error`, as opposed to finding no topic.
@@ -263,6 +264,7 @@ pub use request_timer::RequestTimer;
 pub use service::read_deadline;
 pub use service::read_share;
 pub use topic_creation::{DEFAULT_NUM_PARTITIONS, MAX_PARTITIONS_PER_REQUEST, TopicCreationConfig};
+pub use warn_limit::{STORAGE_FAILURE_WARN_INTERVAL, WarnLimit};
 
 pub use service::{
     AcksZeroLayer, AcksZeroService, Admission, AlterUserScramCredentialsService,
@@ -1120,9 +1122,15 @@ impl OffsetCommitRequest {
 impl TryFrom<&OffsetCommitRequestPartition> for OffsetCommitRequest {
     type Error = Error;
 
+    /// Converts a partition of an `OffsetCommit`. A negative `CommitTimestamp`, such as the
+    /// default of -1 that version 1 sends, is no timestamp, as for version 2 or later, which has
+    /// none. Kafka reads -1 as the time of the commit ([`OffsetAndMetadata.fromRequest`]).
+    ///
+    /// [`OffsetAndMetadata.fromRequest`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetAndMetadata.java#L159-L172
     fn try_from(value: &OffsetCommitRequestPartition) -> Result<Self, Self::Error> {
         value
             .commit_timestamp
+            .filter(|commit_timestamp| !commit_timestamp.is_negative())
             .map_or(Ok(None), |commit_timestamp| {
                 to_system_time(commit_timestamp)
                     .map(Some)
@@ -3640,6 +3648,33 @@ mod tests {
         assert!(!stage.covers(11, IsolationLevel::ReadUncommitted));
         assert!(stage.covers(5, IsolationLevel::ReadCommitted));
         assert!(!stage.covers(6, IsolationLevel::ReadCommitted));
+    }
+
+    /// A negative `CommitTimestamp`, such as the default of -1 that an `OffsetCommit` v1 sends,
+    /// is no timestamp, as an `OffsetCommit` v2 or later has none. A timestamp of 0 or more is
+    /// kept.
+    #[test]
+    fn offset_commit_without_a_timestamp() -> Result<()> {
+        for commit_timestamp in [-1, i64::MIN] {
+            let offset = OffsetCommitRequest::try_from(
+                &OffsetCommitRequestPartition::default()
+                    .committed_offset(42)
+                    .commit_timestamp(Some(commit_timestamp)),
+            )?;
+
+            assert_eq!(None, offset.timestamp, "{commit_timestamp}");
+            assert_eq!(42, offset.offset);
+        }
+
+        let offset = OffsetCommitRequest::try_from(
+            &OffsetCommitRequestPartition::default().commit_timestamp(Some(1_000)),
+        )?;
+        assert_eq!(
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            offset.timestamp
+        );
+
+        Ok(())
     }
 
     /// Raising the high watermark leaves the last stable offset and the log start as they are.

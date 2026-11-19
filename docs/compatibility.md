@@ -82,7 +82,7 @@ with an example and the limits of this build.
 
 | API | Key | Versions | PostgreSQL | SQLite | In-memory | S3 | Notes |
 | --- | --: | --- | --- | --- | --- | --- | --- |
-| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. |
+| OffsetCommit | 8 | 0-9 | Yes | Yes | Yes | Yes | Answers OFFSET_METADATA_TOO_LARGE for a partition whose metadata is longer than 4096 characters, the default of Kafka's `offset.metadata.max.bytes`. Nisshi does not make the limit configurable. A version 1 commit with a negative `CommitTimestamp`, such as the default of -1, stores no commit time, as a version 2 or later commit does. Kafka stores the time of the commit for -1. |
 | OffsetFetch | 9 | 0-9 | Yes | Yes | Yes | Yes | |
 | FindCoordinator | 10 | 0-6 | Yes | Yes | Yes | Yes | Answers with the broker that receives the request. A storage failure answers `COORDINATOR_NOT_AVAILABLE` (it may clear on a retry, and clients retry it) or `UNKNOWN_SERVER_ERROR`, with no node, and the connection stays open. |
 | JoinGroup | 11 | 0-9 | Partial | Partial | Partial | Partial | A consumer group cannot change to the `cooperative-sticky` assignor with a rolling restart ([#1051]). |
@@ -95,6 +95,17 @@ with an example and the limits of this build.
 | OffsetDelete | 47 | – | No | No | No | No | [#964] |
 | ConsumerGroupHeartbeat | 68 | – | No | No | No | No | Nisshi does not support the KIP-848 consumer group protocol. Consumers use the classic protocol. |
 | ConsumerGroupDescribe | 69 | 0 | Yes | Yes | Yes | Yes | Answers GROUP_ID_NOT_FOUND for each group, as Kafka does for a classic group, because every Nisshi group uses the classic protocol. Clients then describe the group with DescribeGroups. |
+
+A storage failure in JoinGroup, SyncGroup, Heartbeat, LeaveGroup, OffsetCommit or DeleteGroups
+answers an error code in the response, and the connection stays open, as in Kafka.
+`COORDINATOR_NOT_AVAILABLE` answers a failure that may clear on a retry, which clients retry
+after they look up the coordinator again. `UNKNOWN_SERVER_ERROR` answers any other failure,
+which clients report to the application. OffsetCommit puts the code on each partition, and
+DeleteGroups on each group that it had not answered when the failure happened. Kafka answers
+`NOT_COORDINATOR` when the log that holds the group fails. Nisshi answers
+`COORDINATOR_NOT_AVAILABLE` instead, because its FindCoordinator names the same broker for every
+group, and the Java consumer handles the two codes alike for these requests. OffsetFetch,
+DescribeGroups and ListGroups answer a storage failure with the same codes.
 
 ### Transactions
 

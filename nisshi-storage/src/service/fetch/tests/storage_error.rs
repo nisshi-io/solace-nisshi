@@ -35,8 +35,8 @@ use super::{
     capture_metrics, fetch_partition_at, fetch_topics,
 };
 use crate::{
-    Error, FetchService, Result, StorageOperation,
-    service::fetch::{STORAGE_FAILURE_WARN_INTERVAL, storage_failure_warns_now},
+    Error, FetchService, Result, STORAGE_FAILURE_WARN_INTERVAL, StorageOperation,
+    service::fetch::storage_failure_warns_now,
 };
 
 /// Fetches an offset above the cached high watermark, which makes the service read the current

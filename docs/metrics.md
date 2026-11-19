@@ -53,3 +53,26 @@ A Produce request that waits for an answer has a deadline, see the Produce row o
   answered their request at the deadline. One request can leave up to 4 of them. A value that stays above zero means a
   storage backend call that does not end, and that broker takes no idempotent write
   from the same producer to the partition until it does.
+
+## Group coordinator
+
+`nisshi_group_coordinator_requests` counts the work of the consumer group coordinator, by the
+`method` attribute:
+
+- The name of a request counts each request: `join`, `sync`, `heartbeat`, `leave`,
+  `offset_commit`, `offset_fetch`, `delete_groups`, `list_groups`, `describe_groups`, and
+  `txn_offset_commit_fence` for the group check of a `TxnOffsetCommit`.
+- `<request>_loop` counts each read of the group by `join`, `sync`, `heartbeat`, `leave` and
+  `offset_commit`. A request reads the group again after a lost write, and a held `JoinGroup` or
+  `SyncGroup` reads it again while it waits.
+- `join_held` and `sync_held` count each wait of a held `JoinGroup` or `SyncGroup`.
+- `<request>_outdated` counts each write of the group that lost to a change by another request
+  or another broker.
+- `join_invalid_session_timeout` counts each `JoinGroup` that answered `INVALID_SESSION_TIMEOUT`.
+- `<request>_failed` counts each `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`,
+  `OffsetCommit` or `DeleteGroups` that answered an error code because storage or the broker
+  failed: `join_failed`, `sync_failed`, `heartbeat_failed`, `leave_failed`,
+  `offset_commit_failed` and `delete_groups_failed`. A count that keeps rising points at
+  storage that the broker cannot reach. The log has the line `the group request failed`, with the
+  request, the group id, the member id and the error: at `warn` at most once in each 10 seconds
+  for each request when a retry may clear the failure, and at `error` each time when it cannot.

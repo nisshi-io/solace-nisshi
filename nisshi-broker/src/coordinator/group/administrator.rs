@@ -62,8 +62,9 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     CommittedOffset, GroupDetail, GroupDetailResponse, GroupMember, GroupRebalance, GroupState,
-    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync, Storage, Topition,
-    UpdateError, Version, describe_groups_response, list_groups_response, offset_metadata,
+    InitialDelay, JoinPhase, NamedGroupDetail, OffsetCommitRequest, PendingSync,
+    STORAGE_FAILURE_WARN_INTERVAL, Storage, Topition, UpdateError, Version, WarnLimit,
+    describe_groups_response, list_groups_response, offset_metadata,
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use tokio::{
@@ -1042,87 +1043,97 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
 
-        let mut member_id = member_id.to_owned();
-        let mut held_since = None;
-        let subscription = self.subscribe(group_id)?;
-        let mut max_age = Duration::ZERO;
+        let answered: Result<Body> = async {
+            let mut member_id = member_id.to_owned();
+            let mut held_since = None;
+            let subscription = self.subscribe(group_id)?;
+            let mut max_age = Duration::ZERO;
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
+            loop {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
 
-            // The request registers for a wake-up before it reads the group, so that it can't
-            // miss a change stored between the read and the wait.
-            let changed = subscription.notified();
-            tokio::pin!(changed);
-            _ = changed.as_mut().enable();
+                // The request registers for a wake-up before it reads the group, so that it can't
+                // miss a change stored between the read and the wait.
+                let changed = subscription.notified();
+                tokio::pin!(changed);
+                _ = changed.as_mut().enable();
 
-            let (stored, version, _) = self.recent_group(group_id, max_age).await?;
-            let now = SystemTime::now();
+                let (stored, version, _) = self.recent_group(group_id, max_age).await?;
+                let now = SystemTime::now();
 
-            let request = JoinRequest {
-                api_version,
-                client_id,
-                client_host,
-                group_id,
-                session_timeout_ms,
-                rebalance_timeout_ms: rebalance_timeout_ms.unwrap_or(session_timeout_ms),
-                member_id: &member_id,
-                group_instance_id,
-                protocol_type,
-                protocols,
-                reason,
-            };
+                let request = JoinRequest {
+                    api_version,
+                    client_id,
+                    client_host,
+                    group_id,
+                    session_timeout_ms,
+                    rebalance_timeout_ms: rebalance_timeout_ms.unwrap_or(session_timeout_ms),
+                    member_id: &member_id,
+                    group_instance_id,
+                    protocol_type,
+                    protocols,
+                    reason,
+                };
 
-            let (updated, reply) = stored
-                .clone()
-                .settle(group_id, now)
-                .join(now, &request, self.config.initial_rebalance_delay)
-                .await;
+                let (updated, reply) = stored
+                    .clone()
+                    .settle(group_id, now)
+                    .join(now, &request, self.config.initial_rebalance_delay)
+                    .await;
 
-            debug!(%updated, ?version, ?reply);
+                debug!(%updated, ?version, ?reply);
 
-            if updated != stored
-                && !self
-                    .store_group(group_id, &updated, version, "join")
-                    .await?
-            {
-                max_age = self.config.poll_interval;
-                continue;
-            }
-
-            match reply {
-                Reply::Ready(body) => return Ok(body),
-
-                Reply::Held { member_id: held } => {
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_held")]);
-
-                    if member_id != held || held_since.is_none() {
-                        info!(
-                            group_id,
-                            member_id = held,
-                            waiting_for = ?updated.waiting_for(),
-                            deadline = ?updated.join_phase().map(|join_phase| join_phase.deadline),
-                            "holding the join until the join phase ends"
-                        );
-                    }
-
-                    let held_since = *held_since.get_or_insert_with(Instant::now);
-
-                    if held_since.elapsed() > updated.hold_limit(rebalance_timeout_ms) {
-                        warn!(
-                            group_id,
-                            member_id = held,
-                            "the join phase didn't end in time"
-                        );
-                        return Ok(rebalance_in_progress_join(&held));
-                    }
-
-                    member_id = held;
-                    self.wait_for_change(changed, &updated).await;
+                if updated != stored
+                    && !self
+                        .store_group(group_id, &updated, version, "join")
+                        .await?
+                {
                     max_age = self.config.poll_interval;
+                    continue;
+                }
+
+                match reply {
+                    Reply::Ready(body) => return Ok(body),
+
+                    Reply::Held { member_id: held } => {
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_held")]);
+
+                        if member_id != held || held_since.is_none() {
+                            info!(
+                                group_id,
+                                member_id = held,
+                                waiting_for = ?updated.waiting_for(),
+                                deadline = ?updated.join_phase().map(|join_phase| join_phase.deadline),
+                                "holding the join until the join phase ends"
+                            );
+                        }
+
+                        let held_since = *held_since.get_or_insert_with(Instant::now);
+
+                        if held_since.elapsed() > updated.hold_limit(rebalance_timeout_ms) {
+                            warn!(
+                                group_id,
+                                member_id = held,
+                                "the join phase didn't end in time"
+                            );
+                            return Ok(join_error_response(&held, ErrorCode::RebalanceInProgress));
+                        }
+
+                        member_id = held;
+                        self.wait_for_change(changed, &updated).await;
+                        max_age = self.config.poll_interval;
+                    }
                 }
             }
         }
+        .await;
+
+        answered.or_else(|error| {
+            Ok(join_error_response(
+                member_id,
+                failed_request_error_code("join", group_id, Some(member_id), &error),
+            ))
+        })
     }
 
     #[instrument(skip(self, group_instance_id, protocol_type, protocol_name, assignments))]
@@ -1204,56 +1215,68 @@ where
             assignments,
         };
 
-        let subscription = self.subscribe(group_id)?;
-        let mut max_age = Duration::ZERO;
-        let held_since = Instant::now();
+        let answered: Result<Body> = async {
+            let subscription = self.subscribe(group_id)?;
+            let mut max_age = Duration::ZERO;
+            let held_since = Instant::now();
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
+            loop {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
 
-            let changed = subscription.notified();
-            tokio::pin!(changed);
-            _ = changed.as_mut().enable();
+                let changed = subscription.notified();
+                tokio::pin!(changed);
+                _ = changed.as_mut().enable();
 
-            let (stored, version, _) = self.recent_group(group_id, max_age).await?;
-            let now = SystemTime::now();
+                let (stored, version, _) = self.recent_group(group_id, max_age).await?;
+                let now = SystemTime::now();
 
-            let (updated, reply) = stored
-                .clone()
-                .settle(group_id, now)
-                .sync(now, &request)
-                .await;
+                let (updated, reply) = stored
+                    .clone()
+                    .settle(group_id, now)
+                    .sync(now, &request)
+                    .await;
 
-            debug!(group_id, %updated, ?version, ?reply);
+                debug!(group_id, %updated, ?version, ?reply);
 
-            if updated != stored
-                && !self
-                    .store_group(group_id, &updated, version, "sync")
-                    .await?
-            {
-                max_age = self.config.poll_interval;
-                continue;
-            }
-
-            match reply {
-                Reply::Ready(body) => return Ok(body),
-
-                Reply::Held { .. } => {
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_held")]);
-
-                    if held_since.elapsed() > updated.hold_limit(None) {
-                        warn!(
-                            group_id,
-                            member_id, "the leader's assignment didn't arrive in time"
-                        );
-                        return Ok(rebalance_in_progress_sync());
-                    }
-
-                    self.wait_for_change(changed, &updated).await;
+                if updated != stored
+                    && !self
+                        .store_group(group_id, &updated, version, "sync")
+                        .await?
+                {
                     max_age = self.config.poll_interval;
+                    continue;
+                }
+
+                match reply {
+                    Reply::Ready(body) => return Ok(body),
+
+                    Reply::Held { .. } => {
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_held")]);
+
+                        if held_since.elapsed() > updated.hold_limit(None) {
+                            warn!(
+                                group_id,
+                                member_id, "the leader's assignment didn't arrive in time"
+                            );
+                            return Ok(sync_error_response(ErrorCode::RebalanceInProgress));
+                        }
+
+                        self.wait_for_change(changed, &updated).await;
+                        max_age = self.config.poll_interval;
+                    }
                 }
             }
         }
+        .await;
+
+        answered.or_else(|error| {
+            Ok(sync_error_response(failed_request_error_code(
+                "sync",
+                group_id,
+                Some(member_id),
+                &error,
+            )))
+        })
     }
 
     #[instrument(skip(self, members))]
@@ -1267,40 +1290,51 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave")]);
 
-        let mut max_age = Duration::MAX;
+        let answered: Result<Body> = async {
+            let mut max_age = Duration::MAX;
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
+            loop {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
 
-            let (original, version, source) = self.recent_group(group_id, max_age).await?;
-            let now = SystemTime::now();
+                let (original, version, source) = self.recent_group(group_id, max_age).await?;
+                let now = SystemTime::now();
 
-            let (wrapper, body) = original
-                .clone()
-                .settle(group_id, now)
-                .leave(now, group_id, member_id, members)
-                .await;
+                let (wrapper, body) = original
+                    .clone()
+                    .settle(group_id, now)
+                    .leave(now, group_id, member_id, members)
+                    .await;
 
-            if wrapper == original {
-                // An answer that changes nothing needs no write. The cache can be older than
-                // another broker's change, so an answer from the cache is checked on storage.
-                match source {
-                    Source::Cache => {
-                        max_age = Duration::ZERO;
-                        continue;
+                if wrapper == original {
+                    // An answer that changes nothing needs no write. The cache can be older than
+                    // another broker's change, so an answer from the cache is checked on storage.
+                    match source {
+                        Source::Cache => {
+                            max_age = Duration::ZERO;
+                            continue;
+                        }
+
+                        Source::Storage => return Ok(body),
                     }
+                }
 
-                    Source::Storage => return Ok(body),
+                if self
+                    .store_group(group_id, &wrapper, version, "leave")
+                    .await?
+                {
+                    return Ok(body);
                 }
             }
-
-            if self
-                .store_group(group_id, &wrapper, version, "leave")
-                .await?
-            {
-                return Ok(body);
-            }
         }
+        .await;
+
+        answered.or_else(|error| {
+            Ok(LeaveGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(failed_request_error_code("leave", group_id, member_id, &error).into())
+                .members(Some([].into()))
+                .into())
+        })
     }
 
     #[instrument(skip(self, offset_commit), fields(group_id = offset_commit.group_id, generation_id = offset_commit.generation_id_or_member_epoch))]
@@ -1309,47 +1343,56 @@ where
 
         let group_id = offset_commit.group_id;
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
+        let answered: Result<Body> = async {
+            loop {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
 
-            // The commit is checked against the group in storage, not the cache: a cached group
-            // can be older than another broker's rebalance that removed this member.
-            let (original, version) = self.stored_group(group_id).await?;
-            let now = SystemTime::now();
+                // The commit is checked against the group in storage, not the cache: a cached group
+                // can be older than another broker's rebalance that removed this member.
+                let (original, version) = self.stored_group(group_id).await?;
+                let now = SystemTime::now();
 
-            let (mut wrapper, error_code) = original
-                .clone()
-                .settle(group_id, now)
-                .check_offset_commit(now, &offset_commit);
+                let (mut wrapper, error_code) = original
+                    .clone()
+                    .settle(group_id, now)
+                    .check_offset_commit(now, &offset_commit);
 
-            // The coordinator stores the group before the offsets, and stores the offsets only
-            // if the group's conditional write lands. A lost write means that another broker
-            // changed the group after this read, and may have removed the member, so the commit
-            // is checked again. A member's accepted commit refreshes its contact, so it always
-            // writes the group. A check that changes nothing needs no write, unless storage
-            // holds no group yet.
-            let is_unchanged = wrapper == original && version.is_some();
+                // The coordinator stores the group before the offsets, and stores the offsets only
+                // if the group's conditional write lands. A lost write means that another broker
+                // changed the group after this read, and may have removed the member, so the commit
+                // is checked again. A member's accepted commit refreshes its contact, so it always
+                // writes the group. A check that changes nothing needs no write, unless storage
+                // holds no group yet.
+                let is_unchanged = wrapper == original && version.is_some();
 
-            if !is_unchanged
-                && !self
-                    .store_group(group_id, &wrapper, version, "offset_commit")
-                    .await?
-            {
-                continue;
+                if !is_unchanged
+                    && !self
+                        .store_group(group_id, &wrapper, version, "offset_commit")
+                        .await?
+                {
+                    continue;
+                }
+
+                return Ok(match error_code {
+                    Some(error_code) => offset_commit_response(&offset_commit, error_code),
+
+                    None => wrapper.commit_offset(&offset_commit).await?,
+                });
             }
-
-            return Ok(match error_code {
-                Some(error_code) => offset_commit_response(&offset_commit, error_code),
-
-                None => wrapper
-                    .commit_offset(&offset_commit)
-                    .await
-                    .unwrap_or_else(|reason| {
-                        debug!(?reason);
-                        offset_commit_response(&offset_commit, ErrorCode::UnknownMemberId)
-                    }),
-            });
         }
+        .await;
+
+        answered.or_else(|error| {
+            Ok(offset_commit_response(
+                &offset_commit,
+                failed_request_error_code(
+                    "offset_commit",
+                    group_id,
+                    offset_commit.member_id,
+                    &error,
+                ),
+            ))
+        })
     }
 
     #[instrument(skip(self))]
@@ -1427,40 +1470,52 @@ where
         debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat")]);
 
-        let mut max_age = Duration::MAX;
+        let answered: Result<Body> = async {
+            let mut max_age = Duration::MAX;
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_loop")]);
+            loop {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_loop")]);
 
-            let (original, version, source) = self.recent_group(group_id, max_age).await?;
-            let now = SystemTime::now();
+                let (original, version, source) = self.recent_group(group_id, max_age).await?;
+                let now = SystemTime::now();
 
-            let (wrapper, body) = original
-                .clone()
-                .settle(group_id, now)
-                .heartbeat(now, group_id, generation_id, member_id, group_instance_id)
-                .await;
+                let (wrapper, body) = original
+                    .clone()
+                    .settle(group_id, now)
+                    .heartbeat(now, group_id, generation_id, member_id, group_instance_id)
+                    .await;
 
-            if wrapper == original {
-                // An answer that changes nothing needs no write. The cache can be older than
-                // another broker's change, so an answer from the cache is checked on storage.
-                match source {
-                    Source::Cache => {
-                        max_age = Duration::ZERO;
-                        continue;
+                if wrapper == original {
+                    // An answer that changes nothing needs no write. The cache can be older than
+                    // another broker's change, so an answer from the cache is checked on storage.
+                    match source {
+                        Source::Cache => {
+                            max_age = Duration::ZERO;
+                            continue;
+                        }
+
+                        Source::Storage => return Ok(body),
                     }
+                }
 
-                    Source::Storage => return Ok(body),
+                if self
+                    .store_group(group_id, &wrapper, version, "heartbeat")
+                    .await?
+                {
+                    return Ok(body);
                 }
             }
-
-            if self
-                .store_group(group_id, &wrapper, version, "heartbeat")
-                .await?
-            {
-                return Ok(body);
-            }
         }
+        .await;
+
+        answered.or_else(|error| {
+            Ok(heartbeat_response(failed_request_error_code(
+                "heartbeat",
+                group_id,
+                Some(member_id),
+                &error,
+            )))
+        })
     }
 
     /// Deletes every named group that has no members, and refuses each other
@@ -1488,75 +1543,103 @@ where
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut described = self
-            .storage
-            .describe_groups(Some(&group_ids), false)
-            .await?
-            .into_iter()
-            .map(|named| (named.name, named.response))
-            .collect::<BTreeMap<_, _>>();
-
-        let now = SystemTime::now();
         let mut results = Vec::with_capacity(group_ids.len());
-        let mut deletable = Vec::with_capacity(group_ids.len());
 
-        for group_id in group_ids {
-            let refusal = match described.remove(&group_id) {
-                Some(GroupDetailResponse::Found(detail)) => {
-                    // The coordinator removes each member whose session
-                    // timeout has expired, so that a member that never sent
-                    // `LeaveGroup` does not keep the group alive.
-                    let wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), detail)
-                        .settle(&group_id, now);
+        let decided: Result<()> = async {
+            let mut described = self
+                .storage
+                .describe_groups(Some(&group_ids), false)
+                .await?
+                .into_iter()
+                .map(|named| (named.name, named.response))
+                .collect::<BTreeMap<_, _>>();
 
-                    (!wrapper.members().is_empty()).then_some(ErrorCode::NonEmptyGroup)
-                }
+            let now = SystemTime::now();
+            let mut deletable = Vec::with_capacity(group_ids.len());
 
-                // `Storage::delete_groups` answers for a group that does not
-                // exist and for an invalid group id.
-                Some(GroupDetailResponse::ErrorCode(
-                    ErrorCode::GroupIdNotFound | ErrorCode::InvalidGroupId,
-                )) => None,
+            for group_id in group_ids.iter().cloned() {
+                let refusal = match described.remove(&group_id) {
+                    Some(GroupDetailResponse::Found(detail)) => {
+                        // The coordinator removes each member whose session
+                        // timeout has expired, so that a member that never sent
+                        // `LeaveGroup` does not keep the group alive.
+                        let wrapper =
+                            Wrapper::with_storage_group_detail(self.storage.clone(), detail)
+                                .settle(&group_id, now);
 
-                // The coordinator keeps a group whose state it cannot read,
-                // because an unread group can still have members.
-                Some(GroupDetailResponse::ErrorCode(error_code)) => {
-                    warn!(
-                        group_id,
-                        ?error_code,
-                        "describe groups failed, not deleting"
-                    );
-                    Some(error_code)
-                }
-
-                None => {
-                    warn!(group_id, "describe groups omitted group, not deleting");
-                    Some(ErrorCode::UnknownServerError)
-                }
-            };
-
-            match refusal {
-                None => deletable.push(group_id),
-                Some(error_code) => results.push(
-                    DeletableGroupResult::default()
-                        .group_id(group_id)
-                        .error_code(error_code.into()),
-                ),
-            }
-        }
-
-        if !deletable.is_empty() {
-            let deleted = self.storage.delete_groups(Some(&deletable)).await?;
-
-            _ = self.wrappers.lock().map(|mut wrappers| {
-                for result in &deleted {
-                    if result.error_code == i16::from(ErrorCode::None) {
-                        _ = wrappers.remove(&result.group_id);
+                        (!wrapper.members().is_empty()).then_some(ErrorCode::NonEmptyGroup)
                     }
-                }
-            })?;
 
-            results.extend(deleted);
+                    // `Storage::delete_groups` answers for a group that does not
+                    // exist and for an invalid group id.
+                    Some(GroupDetailResponse::ErrorCode(
+                        ErrorCode::GroupIdNotFound | ErrorCode::InvalidGroupId,
+                    )) => None,
+
+                    // The coordinator keeps a group whose state it cannot read,
+                    // because an unread group can still have members.
+                    Some(GroupDetailResponse::ErrorCode(error_code)) => {
+                        warn!(
+                            group_id,
+                            ?error_code,
+                            "describe groups failed, not deleting"
+                        );
+                        Some(error_code)
+                    }
+
+                    None => {
+                        warn!(group_id, "describe groups omitted group, not deleting");
+                        Some(ErrorCode::UnknownServerError)
+                    }
+                };
+
+                match refusal {
+                    None => deletable.push(group_id),
+                    Some(error_code) => results.push(
+                        DeletableGroupResult::default()
+                            .group_id(group_id)
+                            .error_code(error_code.into()),
+                    ),
+                }
+            }
+
+            if !deletable.is_empty() {
+                let deleted = self.storage.delete_groups(Some(&deletable)).await?;
+
+                let forgotten = self.wrappers.lock().map(|mut wrappers| {
+                    for result in &deleted {
+                        if result.error_code == i16::from(ErrorCode::None) {
+                            _ = wrappers.remove(&result.group_id);
+                        }
+                    }
+                });
+
+                // The response reports each deleted group as deleted, also when this broker
+                // fails to forget its cached state of the group.
+                results.extend(deleted);
+                forgotten?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        // A failure answers each group that the request had not decided with the failure's
+        // code, and keeps the answer of each group that it had decided.
+        if let Err(error) = decided {
+            let undecided = group_ids
+                .into_iter()
+                .filter(|group_id| !results.iter().any(|result| result.group_id == *group_id))
+                .collect::<Vec<_>>();
+
+            let error_code =
+                failed_request_error_code("delete_groups", &undecided.join(","), None, &error);
+
+            results.extend(undecided.into_iter().map(|group_id| {
+                DeletableGroupResult::default()
+                    .group_id(group_id)
+                    .error_code(error_code.into())
+            }));
         }
 
         Ok(Body::DeleteGroupsResponse(
@@ -1852,53 +1935,46 @@ fn new_member_id(prefix: Option<&str>) -> String {
     }
 }
 
-/// Returns a `JoinGroup` response that reports `error_code` to `member_id`.
+/// Returns a `JoinGroup` reply that reports `error_code` to `member_id`.
 fn join_error(member_id: &str, error_code: ErrorCode) -> Reply {
+    Reply::Ready(join_error_response(member_id, error_code))
+}
+
+/// Returns a `JoinGroup` response that reports `error_code` to `member_id`.
+fn join_error_response(member_id: &str, error_code: ErrorCode) -> Body {
     debug!(join_outcome = ?error_code);
 
-    Reply::Ready(
-        JoinGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(error_code.into())
-            .generation_id(-1)
-            .protocol_type(None)
-            // ProtocolName is non-nullable before version 7, so encoding None
-            // fails with `MandatoryFieldUnset`.
-            .protocol_name(Some("".into()))
-            .leader("".into())
-            .skip_assignment(Some(false))
-            .member_id(member_id.to_owned())
-            .members(Some([].into()))
-            .into(),
-    )
+    JoinGroupResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(error_code.into())
+        .generation_id(-1)
+        .protocol_type(None)
+        // ProtocolName is non-nullable before version 7, so encoding None
+        // fails with `MandatoryFieldUnset`.
+        .protocol_name(Some("".into()))
+        .leader("".into())
+        .skip_assignment(Some(false))
+        .member_id(member_id.to_owned())
+        .members(Some([].into()))
+        .into()
 }
 
+/// Returns a `SyncGroup` reply that reports `error_code`.
 fn sync_error(error_code: ErrorCode) -> Reply {
+    Reply::Ready(sync_error_response(error_code))
+}
+
+/// Returns a `SyncGroup` response that reports `error_code`.
+fn sync_error_response(error_code: ErrorCode) -> Body {
     debug!(sync_outcome = ?error_code);
 
-    Reply::Ready(
-        SyncGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(error_code.into())
-            .protocol_type(None)
-            .protocol_name(None)
-            .assignment(Bytes::from_static(b""))
-            .into(),
-    )
-}
-
-fn rebalance_in_progress_join(member_id: &str) -> Body {
-    match join_error(member_id, ErrorCode::RebalanceInProgress) {
-        Reply::Ready(body) => body,
-        Reply::Held { .. } => unreachable!("join_error answers at once"),
-    }
-}
-
-fn rebalance_in_progress_sync() -> Body {
-    match sync_error(ErrorCode::RebalanceInProgress) {
-        Reply::Ready(body) => body,
-        Reply::Held { .. } => unreachable!("sync_error answers at once"),
-    }
+    SyncGroupResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(error_code.into())
+        .protocol_type(None)
+        .protocol_name(None)
+        .assignment(Bytes::from_static(b""))
+        .into()
 }
 
 fn heartbeat_response(error_code: ErrorCode) -> Body {
@@ -2111,7 +2187,7 @@ where
                     OffsetFetchResponseGroup::default()
                         .group_id(group.group_id.clone())
                         .topics(Some([].into()))
-                        .error_code(offset_fetch_error_code(&error.into()).into())
+                        .error_code(group_error_code(&error.into()).into())
                 });
 
                 responses.push(response);
@@ -2199,7 +2275,6 @@ where
                         .topics(Some(topics))
                         .into()
                 })
-                .inspect_err(|err| error!(?err))
                 .map_err(Into::into)
         } else {
             Ok(OffsetCommitResponse::default()
@@ -3542,7 +3617,7 @@ where
                 warn!(group_id, ?topics, ?error);
                 (
                     self,
-                    offset_fetch_error_response(topics, groups, offset_fetch_error_code(&error)),
+                    offset_fetch_error_response(topics, groups, group_error_code(&error)),
                 )
             }
         }
@@ -3812,7 +3887,7 @@ where
                 warn!(group_id, ?topics, ?error);
                 (
                     self,
-                    offset_fetch_error_response(topics, groups, offset_fetch_error_code(&error)),
+                    offset_fetch_error_response(topics, groups, group_error_code(&error)),
                 )
             }
         }
@@ -3908,7 +3983,7 @@ fn fetched_offsets(
         .collect()
 }
 
-/// Returns the error code that an `OffsetFetch` reports when it fails with
+/// Returns the error code that a group request answers when it fails with
 /// `error`.
 ///
 /// A storage error answers [`nisshi_storage::Error::error_code`]: the code it
@@ -3919,13 +3994,90 @@ fn fetched_offsets(
 /// API timeout, and then reports a `TimeoutException` instead of the error.
 /// Any other broker error carries a code or is not one that a retry fixes.
 ///
+/// Kafka's group coordinator answers `NOT_COORDINATOR` when the log that holds
+/// the group fails with `KAFKA_STORAGE_ERROR`, and `COORDINATOR_NOT_AVAILABLE`
+/// when a write to it times out ([`handleOperationException`]). Nisshi answers
+/// `COORDINATOR_NOT_AVAILABLE` for both. `NOT_COORDINATOR` tells a client that
+/// another broker coordinates the group, and Nisshi's `FindCoordinator` answers
+/// this broker for every group. The Java consumer handles the two codes alike:
+/// it looks up the coordinator again and retries the `JoinGroup` ([join]),
+/// `SyncGroup` ([sync]), `Heartbeat` ([heartbeat]) or `OffsetCommit`
+/// ([commit]).
+///
 /// [retry]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1460-L1464
-fn offset_fetch_error_code(error: &Error) -> ErrorCode {
+/// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1178
+/// [join]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L690-L696
+/// [sync]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L886-L891
+/// [heartbeat]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/AbstractCoordinator.java#L1245-L1250
+/// [commit]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/clients/consumer/internals/ConsumerCoordinator.java#L1350-L1355
+fn group_error_code(error: &Error) -> ErrorCode {
     match error {
         Error::Storage(error) => error.error_code(ErrorCode::CoordinatorNotAvailable),
         Error::Api(error_code) => *error_code,
         _ => ErrorCode::UnknownServerError,
     }
+}
+
+/// When each group request last logged a `warn` line for a failure that a retry
+/// may clear.
+static GROUP_REQUEST_FAILURE_WARNS: WarnLimit<&str> = WarnLimit::new(STORAGE_FAILURE_WARN_INTERVAL);
+
+/// Returns the error code that the group request `method` for `group_id` answers
+/// when it fails with `error`, counts the failure as `<method>_failed` in
+/// `nisshi_group_coordinator_requests`, and logs it with the group id and the
+/// member id.
+///
+/// The coordinator answers the code in the request's response instead of
+/// returning `error`, because the broker closes the connection of a request
+/// that returns an error. Kafka's group coordinator answers every failure with
+/// a code and keeps the connection open ([`handleOperationException`]).
+///
+/// A failure that a retry may clear logs at `warn` at most once in each
+/// [`STORAGE_FAILURE_WARN_INTERVAL`] for each request, and at debug after that,
+/// because a client retries the request as often as it likes. Any other failure
+/// answers `UNKNOWN_SERVER_ERROR`, which a client reports at once, so it logs
+/// at `error` each time, as Kafka does.
+///
+/// [`handleOperationException`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java#L1139-L1178
+fn failed_request_error_code(
+    method: &'static str,
+    group_id: &str,
+    member_id: Option<&str>,
+    error: &Error,
+) -> ErrorCode {
+    let error_code = group_error_code(error);
+
+    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", format!("{method}_failed"))]);
+
+    if error_code == ErrorCode::UnknownServerError {
+        error!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            "the group request failed"
+        );
+    } else if GROUP_REQUEST_FAILURE_WARNS.warns_now(method) {
+        warn!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            ?error_code,
+            "the group request failed"
+        );
+    } else {
+        debug!(
+            method,
+            group_id,
+            member_id,
+            ?error,
+            ?error_code,
+            "the group request failed"
+        );
+    }
+
+    error_code
 }
 
 /// Returns an `OffsetFetch` response that reports `error_code` for every
