@@ -49,7 +49,7 @@ sql_row! {
         /// The epoch of the producer that wrote the record.
         producer_epoch: Option<i16>,
         /// Whether the row only marks that the fetch stopped at its hard limit before this record.
-        /// Only the keyed version returns such a row, and the row holds no key or value.
+        /// The key and value of a marker row are null.
         limit_reached: bool,
     }
 }

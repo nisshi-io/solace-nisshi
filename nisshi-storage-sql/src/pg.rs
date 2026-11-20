@@ -118,15 +118,15 @@ use crate::{
         idempotent_sequence_check, list_offset, pg_record_fetch,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update,
-        record_sender::RecordSender, result_columns::ResultColumns, topic_by_cluster,
-        topic_configuration_select, topic_configuration_select_keys,
-        topic_configuration_select_name, topic_configuration_upsert, topic_insert,
-        topic_select_name, topic_select_uuid, topition_insert, topition_select_id,
-        txn_detail_select_status_for_update, txn_detail_select_timed_out,
-        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
-        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
-        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
-        virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
+        result_columns::ResultColumns, topic_by_cluster, topic_configuration_select,
+        topic_configuration_select_keys, topic_configuration_select_name,
+        topic_configuration_upsert, topic_insert, topic_select_name, topic_select_uuid,
+        topition_insert, topition_select_id, txn_detail_select_status_for_update,
+        txn_detail_select_timed_out, txn_offset_commit_tp_select_pending,
+        txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
+        txn_produce_partition_check, txn_produce_partition_select, txn_select_name,
+        txn_select_produced_topitions, virtual_topic_upsert, watermark_insert, watermark_select,
+        watermark_select_for_write,
     },
 };
 
@@ -2036,13 +2036,8 @@ impl Postgres {
             ?limit
         );
 
-        let mut fetched_data = RecordSender::new(
-            fetched_sender.send_offsets(offset_stage).await?,
-            limit,
-            key_filter,
-            offset,
-            high_watermark,
-        );
+        let mut fetched_data = fetched_sender.send_offsets(offset_stage).await?;
+        let mut read_end = ReadEnd::Finished;
 
         let tx = c.transaction().await?;
 
@@ -2057,7 +2052,7 @@ impl Postgres {
         };
         let partition = topition.partition();
         let max_bytes = i64::from(limit.bytes());
-        let first_may_exceed = fetched_data.first_may_exceed();
+        let first_may_exceed = limit.is_soft();
         let mut params: Vec<&(dyn ToSql + Sync)> = vec![
             &self.cluster,
             &base_topic,
@@ -2128,7 +2123,7 @@ impl Postgres {
                 }) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    fetched_data.stop_at_limit();
+                    read_end = ReadEnd::ReachedLimit;
                     continue;
                 }
                 Err(error) => {
@@ -2151,7 +2146,7 @@ impl Postgres {
         // The transaction only reads, so a rollback has the same effect as a commit.
         tx.commit().await?;
 
-        Ok(RecordsStatement::Ended(fetched_data.end()))
+        Ok(RecordsStatement::Ended(read_end))
     }
 
     /// Reads the log start, high watermark and last stable offset of

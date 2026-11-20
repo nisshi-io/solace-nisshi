@@ -92,6 +92,11 @@ limit $7) sized_rows)
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size.
 --
+-- If $8 is false and the first row does not fit $5, the query returns that row as a marker:
+-- `limit_reached` is true, and the key and value are null, so the query does not send their
+-- bytes. The caller needs the marker, because the query also returns no rows when no record lies
+-- between $4 and $6.
+--
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
 select
@@ -99,15 +104,12 @@ select
 r.offset_id,
 r.attributes,
 r.timestamp,
-r.k as key,
-r.v as value,
+case when s.bytes < $5 or $8 then r.k end as key,
+case when s.bytes < $5 or $8 then r.v end as value,
 s.bytes,
 r.producer_id,
 r.producer_epoch,
-
--- Every row holds a record. Only the keyed query returns a marker row (see
--- record_fetch_keyed.sql).
-0 as limit_reached
+not (s.bytes < $5 or $8) as limit_reached
 
 from
 
@@ -117,7 +119,7 @@ join record r on r.topition = s.topition and r.offset_id = s.offset_id
 where
 
 s.bytes < $5
-or (s.ordinal = 1 and $8)
+or s.ordinal = 1
 
 -- The rows must come out in offset order, because the engine builds record batches from them
 -- in the order that it reads them, and each record's offset delta counts from the first record

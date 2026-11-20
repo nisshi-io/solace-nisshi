@@ -209,6 +209,11 @@ impl ByteLimit {
             Self::Soft(bytes) | Self::Hard(bytes) => bytes,
         }
     }
+
+    /// Returns whether the limit is soft: the first record or batch of a fetch may exceed it.
+    pub fn is_soft(self) -> bool {
+        matches!(self, Self::Soft(_))
+    }
 }
 
 /// What [`Storage::fetch`] reads handed to their caller.
