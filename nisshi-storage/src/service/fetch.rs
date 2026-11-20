@@ -1064,11 +1064,11 @@ where
                     responses.push(fetch_response);
                 }
 
-                let bytes = u32::try_from(round.available_bytes()).unwrap_or(u32::MAX);
+                let round_end = round.end();
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
-                debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
+                debug!(?iteration, ?max_wait, ?remaining, ?round_end, ?min_bytes);
 
                 if remaining.is_zero() {
                     break;
@@ -1078,7 +1078,7 @@ where
                 // ([DelayedFetch.scala#L147]).
                 //
                 // [DelayedFetch.scala#L147]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L147
-                if bytes >= min_bytes {
+                if round_end.reached_min_bytes {
                     break;
                 }
 
@@ -1097,7 +1097,7 @@ where
                 //
                 // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
                 // [`ReplicaManager.fetchMessages`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
-                if round.read_failed() {
+                if round_end.read_failed {
                     debug!(
                         ?iteration,
                         "partition read failed, not waiting for min_bytes"

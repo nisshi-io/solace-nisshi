@@ -19,6 +19,7 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
 };
 use tokio::time::Instant;
+use tracing::debug;
 
 use super::{ByteSize as _, PartitionFetch, PartitionRead, next_partition_deadline};
 use crate::{Result, fetched::ByteLimit};
@@ -50,6 +51,16 @@ pub(super) struct FetchRound {
     available_bytes: u64,
     /// Whether a partition's read failed after the partition had records.
     read_failed: bool,
+}
+
+/// The result of a finished [`FetchRound`], from which the Fetch decides whether to answer now or
+/// to read another round.
+#[derive(Debug)]
+pub(super) struct RoundEnd {
+    /// Whether the bytes of the round's partitions reached the Fetch's `min_bytes`.
+    pub(super) reached_min_bytes: bool,
+    /// Whether a partition's read failed after the partition had records.
+    pub(super) read_failed: bool,
 }
 
 impl FetchRound {
@@ -117,15 +128,16 @@ impl FetchRound {
         Ok(partition_read)
     }
 
-    /// Returns the bytes that count toward `min_bytes`: what the round's partitions returned, or
-    /// their whole limit for a partition whose read stopped at it.
-    pub(super) fn available_bytes(&self) -> u64 {
-        self.available_bytes
-    }
+    /// Ends the round, after every partition of the request has been read or skipped, and returns
+    /// whether its partitions reached `min_bytes` and whether a read failed.
+    pub(super) fn end(self) -> RoundEnd {
+        debug_assert_eq!(0, self.partitions_left, "{self:?}");
+        debug!(self.available_bytes, self.min_bytes);
 
-    /// Returns whether a partition's read failed after the partition had records.
-    pub(super) fn read_failed(&self) -> bool {
-        self.read_failed
+        RoundEnd {
+            reached_min_bytes: self.available_bytes >= u64::from(self.min_bytes),
+            read_failed: self.read_failed,
+        }
     }
 
     /// Returns the limit of the next partition's read.
