@@ -1106,7 +1106,7 @@ impl Storage for OutageStorage {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<nisshi_storage::ReadEnd> {
         self.inner
             .fetch(
                 topition,

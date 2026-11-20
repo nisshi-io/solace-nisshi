@@ -916,7 +916,7 @@ impl Storage for Engine {
         _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched: nisshi_storage::FetchedSender,
-    ) -> nisshi_storage::Result<()> {
+    ) -> nisshi_storage::Result<nisshi_storage::ReadEnd> {
         unimplemented!()
     }
 

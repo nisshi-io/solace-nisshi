@@ -250,7 +250,7 @@ pub use batch::ProduceRequestBatcher;
 pub use decoded_budget::{
     configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
 };
-pub use fetched::{ByteLimit, FetchedDataSender, FetchedRecord, FetchedSender};
+pub use fetched::{ByteLimit, FetchedDataSender, FetchedRecord, FetchedSender, ReadEnd};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
@@ -2319,9 +2319,12 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// holds also for a limit of 0.
     ///
     /// Under a [`ByteLimit::Hard`] limit, the read stops before a first record or batch that does
-    /// not fit, if it can without reading that data. It must then call
-    /// [`FetchedDataSender::send_limit_reached`]. Without that call, the caller can't tell the
-    /// stop from a partition that has no records.
+    /// not fit, if it can without reading that data.
+    ///
+    /// The read must return [`ReadEnd::ReachedLimit`] if a hard limit stopped it before its first
+    /// record or batch, because the caller can't tell that read from a partition that has no
+    /// records. It may also return [`ReadEnd::ReachedLimit`] if it stopped before a later record
+    /// or batch that does not fit its limit. Otherwise it returns [`ReadEnd::Finished`].
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
@@ -2335,7 +2338,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()>;
+    ) -> Result<ReadEnd>;
 
     /// Query the offset stage for a topic partition.
     ///
@@ -2677,7 +2680,7 @@ where
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.as_ref()
             .fetch(
                 topition,
@@ -3001,7 +3004,7 @@ where
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.as_ref()
             .fetch(
                 topition,

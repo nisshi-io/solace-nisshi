@@ -497,8 +497,8 @@ mod tests {
     use crate::{
         BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail,
         ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProducerIdResponse, Result, ScramCredential, SemaphoreProxy, Storage, StorageOperation,
-        TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+        ProducerIdResponse, ReadEnd, Result, ScramCredential, SemaphoreProxy, Storage,
+        StorageOperation, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
         TxnOffsetCommitRequest, UpdateError, Version,
         service::{
             RequestChannelService, bounded_channel,
@@ -586,7 +586,7 @@ mod tests {
             _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: crate::FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             unimplemented!()
         }
 

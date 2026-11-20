@@ -1426,7 +1426,7 @@ mod tests {
             _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             fetched_sender: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             let calls = {
                 let mut call_offsets = self.call_offsets.lock()?;
                 call_offsets.push(offset);
@@ -1467,7 +1467,7 @@ mod tests {
                 reader_stopped.await;
             }
 
-            Ok(())
+            Ok(ReadEnd::Finished)
         }
 
         async fn current_offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
@@ -2427,7 +2427,7 @@ mod tests {
             limit: ByteLimit,
             _isolation_level: IsolationLevel,
             fetched_sender: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             self.calls.lock()?.push(Call {
                 topic: topition.topic().into(),
                 partition: topition.partition(),
@@ -2457,9 +2457,11 @@ mod tests {
                 Read::Batch(batch) => {
                     let batches = vec![batch];
                     let offset_stage = covering_stage(PARTITION_STAGE, &batches);
-                    send_batches(fetched_sender, offset_stage, batches).await
+                    send_batches(fetched_sender, offset_stage, batches)
+                        .await
+                        .map(|()| ReadEnd::Finished)
                 }
-                Read::Empty => Ok(()),
+                Read::Empty => Ok(ReadEnd::Finished),
                 Read::Stall => pending().await,
                 Read::SendThenStall(batch) => {
                     let mut data = fetched_sender
@@ -2471,7 +2473,7 @@ mod tests {
                     // would send nothing more, so its caller would stop waiting at once.
                     pending::<()>().await;
                     drop(data);
-                    Ok(())
+                    Ok(ReadEnd::Finished)
                 }
                 Read::SendThenFail(batch) => {
                     let mut data = fetched_sender

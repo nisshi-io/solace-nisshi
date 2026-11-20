@@ -1098,7 +1098,7 @@ mod unreadable_groups {
             limit: ByteLimit,
             isolation: IsolationLevel,
             fetched_sender: nisshi_storage::FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<nisshi_storage::ReadEnd> {
             self.storage
                 .fetch(
                     topition,

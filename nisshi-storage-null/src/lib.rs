@@ -221,8 +221,8 @@ impl Storage for Engine {
         _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched_sender: nisshi_storage::FetchedSender,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<nisshi_storage::ReadEnd> {
+        Ok(nisshi_storage::ReadEnd::Finished)
     }
 
     #[instrument(skip_all)]

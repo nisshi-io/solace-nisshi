@@ -302,7 +302,7 @@ impl Storage for FaultInjectingStorage {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<nisshi_storage::ReadEnd> {
         self.inner
             .fetch(
                 topition,

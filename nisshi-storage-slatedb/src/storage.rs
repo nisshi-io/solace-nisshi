@@ -1076,7 +1076,7 @@ impl Storage for Engine {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<nisshi_storage::ReadEnd> {
         let max_bytes = limit.bytes();
         // Get the high watermark based on isolation level
         let offset_stage = self.offset_stage(topition).await?;
@@ -1113,7 +1113,7 @@ impl Storage for Engine {
         let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
         if offset >= high_watermark {
-            return Ok(());
+            return Ok(nisshi_storage::ReadEnd::Finished);
         }
 
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, topition.partition))?;
@@ -1183,7 +1183,7 @@ impl Storage for Engine {
             }
         }
 
-        Ok(())
+        Ok(nisshi_storage::ReadEnd::Finished)
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

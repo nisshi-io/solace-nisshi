@@ -56,9 +56,10 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, DeleteRecordsConcurrency, Error,
     GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version, fetched::FetchedSender, inflate_produced, offload, produce_path,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ReadEnd, Result, ScramCredential,
+    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version, fetched::FetchedSender, inflate_produced,
+    offload, produce_path,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -942,7 +943,7 @@ where
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.storage
             .fetch(
                 topition,
@@ -1562,7 +1563,7 @@ mod tests {
             _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             unimplemented!()
         }
 

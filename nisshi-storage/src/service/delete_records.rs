@@ -371,9 +371,9 @@ mod tests {
         BrokerRegistrationRequest, ByteLimit, CommittedOffset,
         DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, LatencyIntroducingStorage,
         ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-        ProduceRequestBatcher, ProducerIdResponse, Result, ScramCredential, SemaphoreProxy,
-        Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-        TxnOffsetCommitRequest, UpdateError, Version,
+        ProduceRequestBatcher, ProducerIdResponse, ReadEnd, Result, ScramCredential,
+        SemaphoreProxy, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
         service::read_deadline::DELETE_RECORDS_DEADLINE,
     };
 
@@ -547,7 +547,7 @@ mod tests {
             _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: crate::FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             unimplemented!()
         }
 
