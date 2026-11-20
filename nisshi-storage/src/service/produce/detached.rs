@@ -20,8 +20,12 @@ use std::{
 };
 
 use opentelemetry::metrics::UpDownCounter;
-use tokio::time::timeout;
+use tokio::{
+    sync::oneshot,
+    time::{Instant, timeout, timeout_at},
+};
 use tokio_util::task::TaskTracker;
+use tracing::{Instrument as _, Span};
 
 use crate::{METER, Topition};
 
@@ -53,7 +57,7 @@ type Key = (Topition, i64);
 /// partition for the others with it. The set is the process's, so it covers the requests that
 /// this process serves, on any connection, and not a retry that reaches another node.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Detached {
+pub struct Detached {
     writes: Arc<Mutex<HashMap<Key, usize>>>,
     /// The task of each write that has started and not ended, whether or not its request still
     /// waits for it.
@@ -102,7 +106,7 @@ impl Detached {
     }
 
     /// Returns the set that all services of this process share.
-    pub(super) fn process() -> Self {
+    pub fn process() -> Self {
         PROCESS.clone()
     }
 
@@ -116,7 +120,7 @@ impl Detached {
 
     /// Returns whether a write that the deadline left running is still in flight for `topition`
     /// from `producer_id`. A non-idempotent batch (`producer_id` below 0) is never held.
-    pub(super) fn contains(&self, topition: &Topition, producer_id: i64) -> bool {
+    pub fn contains(&self, topition: &Topition, producer_id: i64) -> bool {
         producer_id >= 0
             && self
                 .writes
@@ -170,6 +174,96 @@ impl Detached {
         }
 
         DETACHED_WRITES.add(-1, &[]);
+    }
+}
+
+/// What a caller of [`Detached::write_until`] learns of its write.
+#[derive(Debug)]
+pub enum WriteOutcome<T> {
+    /// The write ended before the deadline, with its output.
+    Ended(T),
+    /// The deadline passed first, and the write runs on in its own task.
+    Detached,
+    /// The write panicked before the deadline.
+    Panicked,
+}
+
+/// Tells a write that [`Detached::write_until`] runs whether its request still waits for it, so
+/// that the write can log its own outcome once nobody else will.
+#[derive(Clone, Debug)]
+pub struct Detachment(Arc<Vec<Write>>);
+
+impl Detachment {
+    /// Returns whether the request no longer waits for the write.
+    pub fn is_detached(&self) -> bool {
+        self.0.iter().any(Write::is_detached)
+    }
+}
+
+/// Marks each write of a task as ended when the task ends, whether it returned or panicked.
+struct End(Arc<Vec<Write>>);
+
+impl Drop for End {
+    fn drop(&mut self) {
+        for write in self.0.iter() {
+            write.finish();
+        }
+    }
+}
+
+impl Detached {
+    /// Runs the future that `write` returns in a task of its own, which the broker's shutdown
+    /// waits for, and waits for its output until `at`.
+    ///
+    /// The write covers `partitions`, each with the producer of its batch. If `at` passes first,
+    /// the write runs on, and [`Self::contains`] reports each of those partitions until it
+    /// ends, so that a producer's next write to one of them can wait for it. A write that ends
+    /// in the same instant as `at` returns its output.
+    pub async fn write_until<W, F, T>(
+        &self,
+        at: Instant,
+        partitions: impl IntoIterator<Item = (Topition, i64)>,
+        write: W,
+    ) -> WriteOutcome<T>
+    where
+        W: FnOnce(Detachment) -> F,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let writes = Arc::new(
+            partitions
+                .into_iter()
+                .map(|(topition, producer_id)| self.track(topition, producer_id))
+                .collect::<Vec<_>>(),
+        );
+        let (sender, mut receiver) = oneshot::channel();
+        let future = write(Detachment(Arc::clone(&writes)));
+        let end = End(Arc::clone(&writes));
+
+        self.spawn(
+            async move {
+                let _end = end;
+
+                // The caller has stopped waiting when this fails, and the write logs its own
+                // outcome through its `Detachment`.
+                _ = sender.send(future.await);
+            }
+            .instrument(Span::current()),
+        );
+
+        match timeout_at(at, &mut receiver).await {
+            Ok(output) => output.map_or(WriteOutcome::Panicked, WriteOutcome::Ended),
+
+            // Every write of the task ends together, so a task that ended in the same instant
+            // detaches none of them, and its output is waiting. Each write is detached, so the
+            // count visits every one rather than stopping at the first.
+            Err(_) if writes.iter().filter(|write| write.detach()).count() > 0 => {
+                WriteOutcome::Detached
+            }
+            Err(_) => receiver
+                .try_recv()
+                .map_or(WriteOutcome::Panicked, WriteOutcome::Ended),
+        }
     }
 }
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{convert::Infallible, pin::pin, sync::Arc, time::Duration};
+use std::{convert::Infallible, pin::pin, time::Duration};
 
 use nisshi_sans_io::{
     ErrorCode, TimestampType,
@@ -20,15 +20,12 @@ use nisshi_sans_io::{
     record::{deflated, inflated},
 };
 use rama::Service;
-use tokio::{
-    sync::oneshot,
-    time::{Instant, sleep_until, timeout_at},
-};
-use tracing::{Instrument as _, Span, info, instrument, warn};
+use tokio::time::{Instant, sleep_until};
+use tracing::{info, instrument, warn};
 
 use super::{
     deadline::{Deadline, Stage},
-    detached::{Detached, Write},
+    detached::{self, Detached},
     partition::PartitionProduce,
     response,
     slots::{WritePermit, take_write},
@@ -108,21 +105,18 @@ where
         batch: deflated::Batch,
         inflated: inflated::Batch,
     ) -> Waited {
-        let write = Arc::new(self.detached.track(topition.clone(), batch.producer_id));
-        let (sender, receiver) = oneshot::channel();
+        let storage = self.storage.clone();
+        let transaction_id = request.transaction_id.clone();
+        let reservation = request.reservation.clone();
+        let partitions = [(topition.clone(), batch.producer_id)];
 
-        let task = {
-            let storage = self.storage.clone();
-            let transaction_id = request.transaction_id.clone();
-            let reservation = request.reservation.clone();
-            let write = Arc::clone(&write);
-
-            async move {
+        let waited = self
+            .detached
+            .write_until(at, partitions, |detachment| async move {
                 // Both live as long as the write holds the engine's connection, not as long as
                 // its request. Dropping the task drops them, on a panic and on an abort too.
                 let _reservation = reservation;
                 let _permit = permit;
-                let _end = End(Arc::clone(&write));
 
                 let result = run(
                     &storage,
@@ -134,7 +128,7 @@ where
                 )
                 .await;
 
-                if write.is_detached() {
+                if detachment.is_detached() {
                     match &result {
                         Ok(base_offset) => {
                             info!(base_offset, "a write that outlived its request ended");
@@ -145,41 +139,17 @@ where
                     }
                 }
 
-                // The request has stopped waiting when this fails, and the result is logged.
-                _ = sender.send(result);
-            }
-            .instrument(Span::current())
-        };
+                result
+            })
+            .await;
 
-        self.detached.spawn(task);
-
-        let mut receiver = receiver;
-
-        // The task drops its sender without a result only when the write panicked.
-        let panicked = || Error::Message("the produce task ended without a result".into());
-
-        match timeout_at(at, &mut receiver).await {
-            Ok(result) => Waited::Ended(result.unwrap_or_else(|_| Err(panicked()))),
-
-            Err(_) => {
-                // A write that ended in the same instant has nothing to detach from, and its
-                // result is waiting.
-                if write.detach() {
-                    Waited::Detached
-                } else {
-                    Waited::Ended(receiver.try_recv().unwrap_or_else(|_| Err(panicked())))
-                }
-            }
+        match waited {
+            detached::WriteOutcome::Ended(result) => Waited::Ended(result),
+            detached::WriteOutcome::Detached => Waited::Detached,
+            detached::WriteOutcome::Panicked => Waited::Ended(Err(Error::Message(
+                "the produce task ended without a result".into(),
+            ))),
         }
-    }
-}
-
-/// Marks a write as ended when its task ends, whether it returned or panicked.
-struct End(Arc<Write>);
-
-impl Drop for End {
-    fn drop(&mut self) {
-        self.0.finish();
     }
 }
 

@@ -115,12 +115,12 @@ use opentelemetry::{
 };
 pub use produce::{
     AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
-    PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
+    Detached, Detachment, PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
     ProduceRequestValidationService, ProduceService, ProduceTopic, ProduceTopicService,
     SchemaValidationLayer, SchemaValidationService, StillRunning, StorePartitionService,
     StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,
-    UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic, inflate_produced,
-    wait_for_detached_writes,
+    UnknownPartitionService, ValidatedProduceRequest, ValidatedTopic, WriteOutcome,
+    inflate_produced, wait_for_detached_writes,
 };
 use rama::{Layer, Service};
 use tokio::{

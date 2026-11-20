@@ -274,7 +274,7 @@ pub use service::{
     DELETE_RECORDS_CONCURRENCY, DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency,
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
+    DescribeUserScramCredentialsService, Detached, Detachment, FetchService, FetchValidationLayer,
     FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, KnownTopics, LIST_OFFSETS_CONCURRENCY, ListGroupsService,
     ListOffsetsService, ListPartitionReassignmentsService, MalformedCreateTopicsRequest,
@@ -286,8 +286,8 @@ pub use service::{
     TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
     TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer, UnknownPartitionService,
     ValidatedCreateTopicsRequest, ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic,
-    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
-    wait_for_detached_writes,
+    WriteOutcome, bounded_channel, describe_groups_response, inflate_produced,
+    list_groups_response, wait_for_detached_writes,
 };
 
 #[cfg(feature = "dynostore")]
