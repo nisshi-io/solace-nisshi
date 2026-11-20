@@ -97,9 +97,9 @@ use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, CreateTopicsService,
     CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService,
-    ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    ProducerIdResponse, ReadEnd, Result as StorageResult, ScramCredential, Storage, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use std::{
@@ -454,7 +454,7 @@ impl Storage for FaultInjectingProduceStorage {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
-    ) -> StorageResult<nisshi_storage::ReadEnd> {
+    ) -> StorageResult<ReadEnd> {
         self.inner
             .fetch(
                 topition,

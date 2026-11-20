@@ -59,8 +59,8 @@ use nisshi_service::routable_range;
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, FetchedSender,
     GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, ReadEnd, Result as StorageResult, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     UpdateError, Version,
 };
 use tokio::time::{sleep, timeout};
@@ -1106,7 +1106,7 @@ impl Storage for OutageStorage {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> StorageResult<nisshi_storage::ReadEnd> {
+    ) -> StorageResult<ReadEnd> {
         self.inner
             .fetch(
                 topition,
