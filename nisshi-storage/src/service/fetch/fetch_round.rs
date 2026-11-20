@@ -149,31 +149,8 @@ impl FetchRound {
         }
     }
 
-    /// Updates the round after a partition's read has finished with `partition_read`.
-    ///
-    /// This subtracts the bytes that the partition returned, not its limit, from what the response
-    /// can still return, because the first partition with records can return a batch larger than
-    /// its limit. The response then stays within `max_bytes`, unless that batch alone exceeds it,
-    /// and then the response holds only that batch, as in Kafka.
-    ///
-    /// A partition whose read stopped at its limit returns nothing for the batch that did not fit,
-    /// so it takes nothing from what the response can still return. Kafka instead sends the start
-    /// of that batch and subtracts its bytes ([ReplicaManager.scala#L1736-L1740]), but the client
-    /// drops a partial batch, so this leaves those bytes to the partitions after it.
-    ///
-    /// The round answers once the bytes of its partitions reach `min_bytes`. A partition counts
-    /// the bytes that it returned. A partition whose read stopped at its limit counts its whole
-    /// limit instead, because at least that many bytes wait in it. Kafka counts each partition
-    /// the same way: the bytes available after the fetch offset, up to the partition's limit
-    /// ([DelayedFetch.scala#L108-L110]).
-    ///
-    /// Without this, a Fetch whose later partition holds a batch larger than its limit would wait
-    /// the whole `max_wait`, and then return the same records, because that batch is returned
-    /// only under a soft limit. The partition returns the batch in a later Fetch, when no
-    /// partition before it returns records.
-    ///
-    /// [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
-    /// [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
+    /// Adds `partition_read` to the round, so that the limit and deadline of the next partition's
+    /// read, and the check of `min_bytes`, take it into account.
     fn finish_partition(&mut self, partition_read: &PartitionRead) {
         let returned = partition_read.data.byte_size();
 
@@ -181,6 +158,12 @@ impl FetchRound {
         self.partitions_left = self.partitions_left.saturating_sub(1);
         self.read_failed |= partition_read.read_failed;
 
+        // The first partition with records can return a batch larger than `bytes_left`, so
+        // `bytes_left` stops at 0. A batch that did not fit a partition's limit is not subtracted,
+        // because the partition does not return it. Kafka returns the start of that batch, which
+        // the client drops, and subtracts it ([ReplicaManager.scala#L1736-L1740]).
+        //
+        // [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
         self.bytes_left = self
             .bytes_left
             .saturating_sub(u32::try_from(returned).unwrap_or(u32::MAX));
@@ -192,6 +175,13 @@ impl FetchRound {
             .as_ref()
             .is_some_and(|records| !records.batches.is_empty());
 
+        // A partition that stopped at its limit adds at least its whole limit to `available_bytes`,
+        // because at least that many bytes wait in it. Kafka counts each partition the same way
+        // ([DelayedFetch.scala#L108-L110]). If the partition added only the bytes that it
+        // returned, a Fetch would wait the whole `max_wait` when a partition holds a batch larger
+        // than the partition's limit.
+        //
+        // [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
         self.available_bytes += match partition_read.reached_limit {
             Some(limit) => returned.max(u64::from(limit.bytes())),
             None => returned,
