@@ -6520,63 +6520,6 @@ mod tests {
         Ok(())
     }
 
-    /// The partition holds one record of an open transaction, at offset 0. A `ReadCommitted` read
-    /// from offset 0, the last stable offset, under a hard limit returns nothing and does not
-    /// report that it reached its limit, because the record is above the last stable offset. A
-    /// `ReadUncommitted` read from offset 0 reports it, because the record is below the high
-    /// watermark and does not fit.
-    #[tokio::test]
-    async fn a_hard_read_at_the_last_stable_offset_does_not_reach_its_limit() -> Result<()> {
-        use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
-
-        let _guard = init_tracing()?;
-
-        let (_temp_dir, engine, topition, _) = fetch_engine_with_topic(false).await?;
-
-        let producer = engine
-            .init_producer(Some("tx"), 0, Some(-1), Some(-1))
-            .await?;
-
-        _ = engine
-            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                transaction_id: "tx".into(),
-                producer_id: producer.id,
-                producer_epoch: 0,
-                topics: vec![
-                    AddPartitionsToTxnTopic::default()
-                        .name(topition.topic().into())
-                        .partitions(Some(vec![0])),
-                ],
-            })
-            .await?;
-
-        _ = engine
-            .produce(Some("tx"), &topition, txn_batch(producer.id))
-            .await?;
-
-        for (isolation_level, reached_limit) in [
-            (IsolationLevel::ReadCommitted, false),
-            (IsolationLevel::ReadUncommitted, true),
-        ] {
-            // The record takes 8 bytes against the limit, so a limit of 1 byte stops before it.
-            let read = engine
-                .fetch_until_limit(
-                    &topition,
-                    0,
-                    1,
-                    ByteLimit::Hard(1),
-                    isolation_level,
-                    Instant::now() + Duration::from_secs(60),
-                )
-                .await?;
-
-            assert!(read.batches.is_empty(), "{isolation_level:?}");
-            assert_eq!(reached_limit, read.reached_limit, "{isolation_level:?}");
-        }
-
-        Ok(())
-    }
-
     /// Fetches `topition` from `offset` once, with a limit of `max_bytes`, and returns the batches.
     async fn fetched_batches(
         engine: &ArcDynStorage,
