@@ -33,6 +33,7 @@ use nisshi_service::{BytesFrameLayer, ConsumerGroupLayer, FrameBytesLayer, Frame
 use nisshi_storage::Storage;
 use rama::{Layer as _, Service};
 
+/// Sends a `JoinGroup` request to the coordinator and returns its response.
 #[allow(clippy::too_many_arguments)]
 pub async fn join_group<G>(
     controller: &mut Controller<G>,
@@ -67,6 +68,8 @@ where
         .and_then(|body| TryInto::try_into(body).map_err(Into::into))
 }
 
+/// Sends a `SyncGroup` request with the leader's assignments to the coordinator and returns its
+/// response.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_group<G>(
     controller: &mut Controller<G>,
@@ -95,6 +98,7 @@ where
         .and_then(|body| TryInto::try_into(body).map_err(Into::into))
 }
 
+/// Sends a `Heartbeat` request to the coordinator and returns its response.
 pub async fn heartbeat<G>(
     controller: &mut Controller<G>,
     group_id: &str,
@@ -111,6 +115,7 @@ where
         .and_then(|body| TryInto::try_into(body).map_err(Into::into))
 }
 
+/// Sends a `LeaveGroup` request for one member to the coordinator and returns its response.
 pub async fn leave<G>(
     controller: &mut Controller<G>,
     group_id: &str,
@@ -133,6 +138,8 @@ where
         .and_then(|body| TryInto::try_into(body).map_err(Into::into))
 }
 
+/// A member's role in its group after a join: the leader, which gets every member's metadata and
+/// assigns the partitions, or a follower.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JoinResponse {
     Leader {
@@ -150,19 +157,21 @@ pub enum JoinResponse {
 }
 
 impl JoinResponse {
-    #[allow(dead_code)]
+    /// Returns the member ID of the group's leader.
     pub fn leader(&self) -> &str {
         match self {
             Self::Leader { id: leader, .. } | Self::Follower { leader, .. } => leader.as_str(),
         }
     }
 
+    /// Returns the member's own ID.
     pub fn id(&self) -> &str {
         match self {
             Self::Leader { id, .. } | Self::Follower { id, .. } => id.as_str(),
         }
     }
 
+    /// Returns the generation that the member joined.
     pub fn generation(&self) -> i32 {
         match self {
             Self::Leader { generation, .. } | Self::Follower { generation, .. } => *generation,
@@ -173,6 +182,7 @@ impl JoinResponse {
         matches!(self, Self::Leader { .. })
     }
 
+    /// Returns the protocols that the member offered when it joined.
     pub fn protocols(&self) -> &[JoinGroupRequestProtocol] {
         match self {
             Self::Leader { protocols, .. } | Self::Follower { protocols, .. } => &protocols[..],
@@ -183,11 +193,26 @@ impl JoinResponse {
 /// The newest `JoinGroup` version, which the test helpers send.
 pub const JOIN_GROUP_VERSION: i16 = 9;
 
+/// The client ID that [`join`] sends.
 pub const CLIENT_ID: &str = "console-consumer";
+
+/// The name of the range assignor: the first protocol that [`join`] offers, and the one that it
+/// expects the coordinator to choose.
 pub const RANGE: &str = "range";
+
+/// The name of the cooperative sticky assignor: the second protocol that [`join`] offers.
 pub const COOPERATIVE_STICKY: &str = "cooperative-sticky";
+
+/// The protocol type of a consumer group.
 pub const PROTOCOL_TYPE: &str = "consumer";
 
+/// Joins a group as a consumer does, and returns the member's role in the group.
+///
+/// When the caller gives neither a member ID nor a group instance ID, the coordinator answers
+/// `MEMBER_ID_REQUIRED` with a new member ID, and `join` joins again with that ID. Without
+/// `protocols`, the member offers [`RANGE`] and [`COOPERATIVE_STICKY`]. Panics when the
+/// coordinator's answer differs from what a consumer expects, such as a protocol other than
+/// [`RANGE`].
 #[allow(clippy::too_many_arguments)]
 pub async fn join<G>(
     controller: &mut Controller<G>,
@@ -309,6 +334,8 @@ pub struct Formed {
     pub member_id: String,
 }
 
+/// Forms a group with a random ID and one member, through the coordinator's request routes, as a
+/// consumer client does.
 pub async fn form_group<S>(coordinator: &Controller<S>) -> anyhow::Result<Formed>
 where
     S: Storage + Clone,

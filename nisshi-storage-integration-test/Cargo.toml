@@ -30,5 +30,10 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+# Only `tests/it/outside_caller.rs` uses an engine crate, to build its own engine as a caller
+# does. A dev-dependency is not passed on to the crate's callers.
+[dev-dependencies]
+nisshi-storage-dynostore.workspace = true
+
 [lints]
 workspace = true

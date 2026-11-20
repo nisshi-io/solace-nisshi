@@ -87,6 +87,13 @@ project's services from a worktree instead.
    [comment rules](.claude/rules/comments.md), and choose names by the
    [naming rules](.claude/rules/naming.md).
 3. Add or update tests. `just test` runs the full suite.
+   A test of broker code that runs on top of any storage engine, such as
+   the group coordinator, goes in
+   [`nisshi-storage-integration-test`](nisshi-storage-integration-test/README.md),
+   so that every engine can run it. A test of the engine itself, and a
+   wire, authentication or startup test, goes in `nisshi-broker/tests/it`.
+   The [rule](.claude/rules/storage-integration-tests.md) says how to
+   decide.
 4. Open a pull request against `main`. Fill in the PR template — it's short
    on purpose. Merging requires an approval from a code owner and all
    required checks passing; see `.github/CODEOWNERS` for who that is.

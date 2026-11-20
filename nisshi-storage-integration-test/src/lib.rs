@@ -15,9 +15,9 @@
 //! Tests of Nisshi's broker running on top of a storage engine that the caller supplies.
 //!
 //! A case checks Nisshi code above the [`Storage`](nisshi_storage::Storage) trait, such as the
-//! group coordinator or a request handler, so any engine can run it: if an engine passes these
-//! cases, Nisshi's broker works on it. The crate never builds an engine; each caller passes in
-//! the engine that it tests.
+//! group coordinator or a request handler, so any engine can run it. If an engine passes these
+//! cases, the parts of Nisshi's broker that the suite's areas cover work on it. The crate never
+//! builds an engine; each caller passes in the engine that it tests.
 //!
 //! A caller invokes [`storage_integration_tests!`] once for each engine that it tests, and gets
 //! one test for each case:
@@ -39,7 +39,8 @@
 //! # fn main() {}
 //! ```
 //!
-//! The crate's API and its test names may change in any commit. A caller updates its call and
+//! The crate's API and its test names may change in any commit. A file that moves, splits or is
+//! renamed also changes which cases a `without` name leaves out. A caller updates its call and
 //! its skip list when it moves to a newer Nisshi.
 
 // The cases are tests, and a test fails on an unexpected value, as nisshi-broker's tests do.
@@ -143,14 +144,12 @@ macro_rules! __area_consumer_group {
 
                 $crate::__file!(consumer_group, cg_dynamic, [
                     reject_empty_member_id_on_join(cluster_id, broker_id, storage),
-                    #[ignore]
+                    #[ignore = "the second member's SyncGroup answers NONE, not the REBALANCE_IN_PROGRESS that the case expects"]
                     lifecycle(cluster_id, broker_id, storage),
                 ], $config);
 
                 $crate::__file!(consumer_group, cg_static, [
-                    #[ignore]
                     join_with_empty_member_id(cluster_id, broker_id, storage),
-                    #[ignore]
                     rejoin_with_empty_member_id(cluster_id, broker_id, storage),
                 ], $config);
 

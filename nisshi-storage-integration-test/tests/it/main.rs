@@ -15,6 +15,10 @@
 //! Tests of `nisshi-storage-integration-test` itself.
 
 #![allow(clippy::expect_used)]
+// `outside_caller` gives the suite's macro a long `without` list, which needs a higher limit
+// than the compiler's default, as the macro's doc tells a caller.
+#![recursion_limit = "256"]
 
 pub mod cases;
 pub mod dependencies;
+pub mod outside_caller;

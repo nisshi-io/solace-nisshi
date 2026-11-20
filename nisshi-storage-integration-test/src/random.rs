@@ -21,6 +21,7 @@ use rand::{
     rng,
 };
 
+/// Returns a random string of `length` ASCII letters and digits.
 pub fn alphanumeric_string(length: usize) -> String {
     rng()
         .sample_iter(&Alphanumeric)
@@ -29,6 +30,7 @@ pub fn alphanumeric_string(length: usize) -> String {
         .collect()
 }
 
+/// Returns `length` random bytes.
 pub fn random_bytes(length: usize) -> Bytes {
     rng()
         .sample_iter(StandardUniform)

@@ -115,12 +115,12 @@ where
 
     let service = ConsumerGroupDescribeService { storage };
 
-    let group_id = "abc";
+    let group_id = random::alphanumeric_string(15);
 
     let response = service
         .serve(RequestInput {
             request: ConsumerGroupDescribeRequest::default()
-                .group_ids(Some([group_id.into()].into()))
+                .group_ids(Some([group_id.clone()].into()))
                 .include_authorized_operations(false),
             extensions: Extensions::default(),
         })

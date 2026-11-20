@@ -6486,6 +6486,7 @@ dependencies = [
  "nisshi-sans-io",
  "nisshi-service",
  "nisshi-storage",
+ "nisshi-storage-dynostore",
  "rama",
  "rand 0.10.3",
  "tokio",

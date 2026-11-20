@@ -18,6 +18,8 @@ use nisshi_broker::Result;
 use nisshi_storage::{BrokerRegistrationRequest, Storage};
 use uuid::Uuid;
 
+/// Registers the broker `broker_id` of the cluster `cluster_id` with the engine, under a new
+/// incarnation ID, as a broker does when it starts.
 pub async fn register_broker(
     cluster_id: impl Into<String>,
     broker_id: i32,
