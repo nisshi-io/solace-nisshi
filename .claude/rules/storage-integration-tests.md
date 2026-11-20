@@ -48,7 +48,10 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   the Kafka assertion and tag the case `not_on_<engine>` for that engine. Write the reason at the
   engine's call in `storage_integration.rs`. Don't loosen the assertion to accept every engine's
   answer: the other engines would no longer pin the right one. `unknown_group_is_not_found` and
-  `empty_group_id_is_not_found` in `delete_groups` show the form.
+  `empty_group_id_is_not_found` in `delete_groups` show the form. When a case also checks
+  something that every engine must pass, so that no engine can leave it out, it may accept more
+  than one answer. Then add a strict case beside it that sends the same request, as
+  `unknown_group_in_mixed_request_is_not_found` does for `mixed_request`.
 - **Decide each new case's engines.** A new case runs on every engine that runs its file. SlateDB
   is deprecated and its coverage is frozen (`AGENTS.md`), so tag a new case `not_on_slatedb` when
   it lands in a file that SlateDB runs. Turso leaves out most files until #866 is done; check its
@@ -73,6 +76,8 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   comment gives its reason. The check also fails for a listed file that no longer builds an
   engine, or that is on two lists.
 - **`every_case_is_registered`** (`tests/it/cases.rs`): add the case to its file's `__file!` list.
+  If the message names a missing `@search` rule, add the area's or file's rule to
+  `__unless_listed!`, before the rule that steps over a name.
 - **`dependencies_include_no_engine`** (`tests/it/dependencies.rs`): remove the engine crate, or
   the engine feature of `nisshi-broker`, from the crate's `[dependencies]`.
 - **"recursion limit reached while expanding `__in_group!`"**: a long `without` list needs

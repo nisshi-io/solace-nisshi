@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! A case runs only if the macro lists it, so each `pub async fn` in a file of an area must be in
-//! that file's case list.
+//! that file's case list. A caller leaves out an area or a file only if the macro can find its
+//! name in a `without` list, so each area and file must have a rule that finds it.
 
 use std::{
     fs, io,
@@ -30,6 +31,25 @@ fn case_list(area: &str, file: &str) -> Option<&'static str> {
     let list = &MACRO[start..];
     let end = list.find("], $config);")?;
     Some(&list[..end])
+}
+
+/// The start of the rule in `__unless_listed!` that steps over a name of the `without` list that
+/// no rule before it matched. A rule after it never applies.
+const NEXT_NAME_RULE: &str = "@search $name:ident; [$other:ident";
+
+/// Returns whether `__unless_listed!` has the rule that finds `name` in a `without` list: the
+/// rule searches for `name`, matches a list that starts with `name`, and stands before
+/// [`NEXT_NAME_RULE`]. Without the rule, a caller that names the area or file gets "is not an
+/// area, file or group".
+fn can_be_left_out(name: &str) -> bool {
+    // rustfmt wraps a long rule, so the search ignores how the macro's source is spaced.
+    let source = MACRO.split_whitespace().collect::<Vec<_>>().join(" ");
+    let rule = format!("@search {name}; [{name} $(");
+
+    match (source.find(&rule), source.find(NEXT_NAME_RULE)) {
+        (Some(rule_at), Some(next_name_at)) => rule_at < next_name_at,
+        _ => false,
+    }
 }
 
 /// Returns whether `list` names `case`, written as the case's name and its arguments.
@@ -68,6 +88,8 @@ fn stems(directory: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 /// A case that the macro doesn't list in its own file's list runs on no engine, and nothing else
 /// warns about it, because an unused public function is not a warning. Each area is a directory
 /// in `src`, and each file in it holds cases.
+///
+/// An area or a file also needs its rule in `__unless_listed!`, or no caller can leave it out.
 #[test]
 fn every_case_is_registered() -> io::Result<()> {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -85,7 +107,19 @@ fn every_case_is_registered() -> io::Result<()> {
             ));
         }
 
+        if !can_be_left_out(&area) {
+            unregistered.push(format!(
+                "src/{area}: no `@search {area};` rule in `__unless_listed!`"
+            ));
+        }
+
         for (file, path) in stems(&area_dir)? {
+            if !can_be_left_out(&file) {
+                unregistered.push(format!(
+                    "src/{area}/{file}.rs: no `@search {file};` rule in `__unless_listed!`"
+                ));
+            }
+
             let list = case_list(&area, &file).unwrap_or_default();
             for case in cases(&fs::read_to_string(&path)?) {
                 if !lists(list, &case) {
@@ -97,7 +131,8 @@ fn every_case_is_registered() -> io::Result<()> {
 
     assert!(
         unregistered.is_empty(),
-        "list each case in its file's `__file!` list in the macro in src/lib.rs: {unregistered:?}"
+        "list each case in its file's `__file!` list in the macro in src/lib.rs, and give each \
+         area and file a rule in `__unless_listed!`: {unregistered:?}"
     );
     Ok(())
 }

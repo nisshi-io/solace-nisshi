@@ -170,10 +170,14 @@ macro_rules! __area_consumer_group {
                     stale_cache_on_another_broker(storage),
                     storage_read_error(storage),
                     mixed_request(storage),
+                    [not_on_in_memory, not_on_slatedb]
+                    unknown_group_in_mixed_request_is_not_found(storage),
+                    [not_on_in_memory] empty_group_id_in_mixed_request_is_not_found(storage),
                     delete_non_existent(storage),
                     [not_on_in_memory, not_on_slatedb] unknown_group_is_not_found(storage),
                     [not_on_in_memory] empty_group_id_is_not_found(storage),
                     empty_group_id_mixed_list(storage),
+                    [not_on_in_memory] empty_group_id_in_mixed_list_is_not_found(storage),
                     [not_on_turso] slash_and_empty_group_ids_are_distinct_groups(storage),
                     [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
                     slash_in_group_id_does_not_break_committed_offset_topitions(storage),

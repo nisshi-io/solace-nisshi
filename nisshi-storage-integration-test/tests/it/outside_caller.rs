@@ -47,10 +47,12 @@ async fn caller_built_engine(
 }
 
 // The files that the call runs take each of the macro's argument lists. `list_groups` has the
-// cases with the most groups, which nest the deepest search of the `without` list.
+// cases with the most groups, which nest the deepest search of the `without` list. The attribute
+// changes nothing: it is here so that a real test build compiles the `attributes` option.
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: caller_engine,
     storage: caller_built_engine,
+    attributes: [cfg(test)],
     without: [
         cg_dynamic,
         cg_static,

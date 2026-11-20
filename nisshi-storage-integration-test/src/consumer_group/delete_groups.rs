@@ -34,6 +34,13 @@ use rand::{RngExt as _, rng};
 use tokio::time::sleep;
 use unreadable_groups::UnreadableGroups;
 
+/// Kafka's answer to a delete of a group that was never stored.
+const NOT_FOUND: &[ErrorCode] = &[ErrorCode::GroupIdNotFound];
+
+/// Kafka's answer to a delete of a group that was never stored, and the `NONE` that the
+/// in-memory engine answers instead.
+const NONE_OR_NOT_FOUND: &[ErrorCode] = &[ErrorCode::None, ErrorCode::GroupIdNotFound];
+
 /// A consumer joined to a group blocks its deletion (`NON_EMPTY_GROUP`), and
 /// the group's committed offsets survive the refused attempt; once the
 /// consumer leaves, the now-empty group deletes cleanly and its offsets are
@@ -494,10 +501,40 @@ pub async fn storage_read_error(storage: impl Storage + Clone) -> Result<(), Err
 /// empty group (twice), a group that does not exist, and the empty group
 /// id. Each distinct id gets one result, and only the empty group loses its
 /// committed offset. Kafka answers the group that does not exist and the empty
-/// group id with `GROUP_ID_NOT_FOUND`, which `unknown_group_is_not_found` and
-/// `empty_group_id_is_not_found` check. This case also accepts `NONE`, which
-/// the in-memory engine answers for a group that it never stored.
+/// group id with `GROUP_ID_NOT_FOUND`, which
+/// `unknown_group_in_mixed_request_is_not_found` and
+/// `empty_group_id_in_mixed_request_is_not_found` check. This case also accepts
+/// `NONE`, which the in-memory engine answers for a group that it never stored.
 pub async fn mixed_request(storage: impl Storage + Clone) -> Result<(), Error> {
+    mixed_request_answering(storage, NONE_OR_NOT_FOUND, NONE_OR_NOT_FOUND).await
+}
+
+/// The request of `mixed_request` answers the group that does not exist with
+/// `GROUP_ID_NOT_FOUND`, as Kafka does, also when the same request deletes
+/// another group.
+pub async fn unknown_group_in_mixed_request_is_not_found(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    mixed_request_answering(storage, NOT_FOUND, NONE_OR_NOT_FOUND).await
+}
+
+/// The request of `mixed_request` answers the empty group id with
+/// `GROUP_ID_NOT_FOUND`, as Kafka does, also when the same request deletes
+/// another group.
+pub async fn empty_group_id_in_mixed_request_is_not_found(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    mixed_request_answering(storage, NONE_OR_NOT_FOUND, NOT_FOUND).await
+}
+
+/// Sends the request of `mixed_request`, and checks that the group that does not
+/// exist answers one of `for_unknown` and the empty group id one of
+/// `for_empty_id`.
+async fn mixed_request_answering(
+    storage: impl Storage + Clone,
+    for_unknown: &[ErrorCode],
+    for_empty_id: &[ErrorCode],
+) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
     let non_empty = group::form_group(&coordinator)
@@ -540,15 +577,13 @@ pub async fn mixed_request(storage: impl Storage + Clone) -> Result<(), Error> {
 
     assert_eq!(Some(ErrorCode::NonEmptyGroup), result_for(&non_empty));
     assert_eq!(Some(ErrorCode::None), result_for(&empty));
-    assert_matches!(
-        result_for(&unknown),
-        Some(ErrorCode::None | ErrorCode::GroupIdNotFound),
-        "{results:?}"
+    assert!(
+        result_for(&unknown).is_some_and(|error_code| for_unknown.contains(&error_code)),
+        "expected one of {for_unknown:?} for the unknown group in {results:?}"
     );
-    assert_matches!(
-        result_for(""),
-        Some(ErrorCode::None | ErrorCode::GroupIdNotFound),
-        "{results:?}"
+    assert!(
+        result_for("").is_some_and(|error_code| for_empty_id.contains(&error_code)),
+        "expected one of {for_empty_id:?} for the empty group id in {results:?}"
     );
 
     assert_eq!(
@@ -639,11 +674,29 @@ pub async fn empty_group_id_is_not_found(storage: impl Storage + Clone) -> Resul
 /// committed offsets.
 ///
 /// Kafka still accepts `""` in DeleteGroups for backwards compatibility, and
-/// answers it with `GROUP_ID_NOT_FOUND`, which `empty_group_id_is_not_found`
-/// checks. This case also accepts `NONE`: the in-memory engine answers `NONE`,
-/// because deleting an absent object store key succeeds, as an S3
-/// `DeleteObject` does.
+/// answers it with `GROUP_ID_NOT_FOUND`, which
+/// `empty_group_id_in_mixed_list_is_not_found` checks. This case also accepts
+/// `NONE`: the in-memory engine answers `NONE`, because deleting an absent
+/// object store key succeeds, as an S3 `DeleteObject` does.
 pub async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
+    empty_group_id_mixed_list_answering(storage, NONE_OR_NOT_FOUND).await
+}
+
+/// The request of `empty_group_id_mixed_list` answers the empty group id with
+/// `GROUP_ID_NOT_FOUND`, as Kafka does, also when the same request deletes
+/// another group.
+pub async fn empty_group_id_in_mixed_list_is_not_found(
+    storage: impl Storage + Clone,
+) -> Result<(), Error> {
+    empty_group_id_mixed_list_answering(storage, NOT_FOUND).await
+}
+
+/// Sends the request of `empty_group_id_mixed_list`, and checks that the empty
+/// group id answers one of `for_empty_id`.
+async fn empty_group_id_mixed_list_answering(
+    storage: impl Storage + Clone,
+    for_empty_id: &[ErrorCode],
+) -> Result<(), Error> {
     let topic_name = random::alphanumeric_string(15);
     let num_partitions = 6;
 
@@ -711,9 +764,10 @@ pub async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<
         .iter()
         .find(|result| result.group_id.is_empty())
         .expect("missing result for the empty group id");
-    assert_matches!(
-        ErrorCode::try_from(empty_result.error_code)?,
-        ErrorCode::None | ErrorCode::GroupIdNotFound
+    let empty_error_code = ErrorCode::try_from(empty_result.error_code)?;
+    assert!(
+        for_empty_id.contains(&empty_error_code),
+        "expected one of {for_empty_id:?} for the empty group id, got {empty_error_code:?}"
     );
 
     let group_b_result = results
