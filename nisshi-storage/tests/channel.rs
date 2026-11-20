@@ -28,8 +28,8 @@ use std::{
 
 use nisshi_sans_io::{ErrorCode, IsolationLevel};
 use nisshi_storage::{
-    ChannelRequest, ChannelRequestLayer, Error, Request, RequestChannelService, Response, Storage,
-    Topition, bounded_channel, fetched,
+    ByteLimit, ChannelRequest, ChannelRequestLayer, Error, Request, RequestChannelService,
+    Response, Storage, Topition, bounded_channel, fetched,
 };
 use rama::{Layer, Service};
 use tokio::{sync::oneshot, task::JoinSet};
@@ -388,7 +388,7 @@ async fn fetch_whose_reader_stopped_is_answered_without_being_served() -> Result
                 topition: Topition::new("abc", 0),
                 offset: 0,
                 min_bytes: 1,
-                max_bytes: 1024,
+                limit: ByteLimit::Soft(1024),
                 isolation: IsolationLevel::ReadUncommitted,
                 fetched_sender,
             },

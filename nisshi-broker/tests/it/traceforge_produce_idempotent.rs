@@ -94,7 +94,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::fetched::FetchUntilDeadline as _;
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, CreateTopicsService,
+    ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, CreateTopicsService,
     CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService,
     ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
@@ -451,7 +451,7 @@ impl Storage for FaultInjectingProduceStorage {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
     ) -> StorageResult<()> {
@@ -460,7 +460,7 @@ impl Storage for FaultInjectingProduceStorage {
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )

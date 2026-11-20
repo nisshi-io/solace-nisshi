@@ -75,7 +75,7 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail,
+    ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
     ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
@@ -299,7 +299,7 @@ impl Storage for FaultInjectingStorage {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
     ) -> StorageResult<()> {
@@ -308,7 +308,7 @@ impl Storage for FaultInjectingStorage {
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )

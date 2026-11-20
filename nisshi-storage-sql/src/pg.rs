@@ -70,7 +70,7 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, PRODUCE_CONCURRENCY, ProduceEpoch,
@@ -4470,10 +4470,14 @@ impl Storage for Postgres {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
+        // The read returns a first record whatever the limit's kind, and the caller discards one
+        // that does not fit a hard limit.
+        let max_bytes = limit.bytes();
+
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
         let (base_topic, key_filter): (&str, Option<&str>) =
@@ -7713,7 +7717,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            1024 * 1024,
+            ByteLimit::Soft(1024 * 1024),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14487,7 +14491,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            u32::MAX,
+            ByteLimit::Soft(u32::MAX),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14534,7 +14538,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            u32::MAX,
+            ByteLimit::Soft(u32::MAX),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14631,11 +14635,11 @@ pub(crate) mod tests {
         cut.store(true, atomic::Ordering::Relaxed);
 
         let fetched = storage
-            .fetch_until_deadline_or_failure(
+            .fetch_until_limit(
                 &topition,
                 0,
                 1,
-                u32::MAX,
+                ByteLimit::Soft(u32::MAX),
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(30),
             )

@@ -75,7 +75,7 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
     DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
@@ -1760,10 +1760,14 @@ impl Storage for Engine {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
+        // The read returns a first record whatever the limit's kind, and the caller discards one
+        // that does not fit a hard limit.
+        let max_bytes = limit.bytes();
+
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
         let offset_stage = self.offset_stage(topition).await?;

@@ -71,8 +71,8 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    FetchedDataSender, FetchedSender, FirstSequence, GroupDetail, ListOffsetResponse, METER,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    Error, FetchedDataSender, FetchedSender, FirstSequence, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage,
     ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
@@ -4330,7 +4330,7 @@ impl Storage for DynoStore {
         topition: &'_ Topition,
         offset: i64,
         _min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
@@ -4350,9 +4350,11 @@ impl Storage for DynoStore {
 
         let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
+        // The read sends a first batch whatever the limit's kind, and the caller discards one
+        // that does not fit a hard limit.
         let bounds = FetchBounds {
             offset,
-            max_bytes,
+            max_bytes: limit.bytes(),
             high_watermark,
         };
 

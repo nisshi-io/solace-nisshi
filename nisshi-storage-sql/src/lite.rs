@@ -72,7 +72,7 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, ChannelRequestLayer, CommittedOffset,
+    ArcDynStorage, BrokerRegistrationRequest, ByteLimit, ChannelRequestLayer, CommittedOffset,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
@@ -2170,7 +2170,7 @@ impl Storage for Engine {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
@@ -2186,7 +2186,7 @@ impl Storage for Engine {
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation_level,
                 fetched_sender,
             )
@@ -3357,10 +3357,14 @@ impl Storage for Delegate {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
+        // The read returns a first record whatever the limit's kind, and the caller discards one
+        // that does not fit a hard limit.
+        let max_bytes = limit.bytes();
+
         let timer = RequestTimer::new(
             &DELEGATE_REQUEST_DURATION,
             StorageOperation::Fetch,
@@ -6560,8 +6564,9 @@ mod tests {
     }
 
     /// The row limit applies to records that have headers, and a record's headers still count
-    /// toward `max_bytes` when the limit ends the read. A record costs 111 bytes with the 7 of
-    /// every record, so a budget of 1111 bytes returns 10 of them.
+    /// toward `max_bytes` when the limit ends the read. The query counts each record as 111 bytes,
+    /// so it returns at most 10 records within a budget of 1,111 bytes. The read measures each
+    /// record by its encoded size, and keeps the contiguous records from the fetch offset that fit.
     #[tokio::test]
     async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
     {
@@ -6580,10 +6585,16 @@ mod tests {
                 "the row limit counts from the fetch offset, keyed: {keyed}",
             );
 
+            let offsets = fetched_offsets(&engine, &fetched, 40, 1111).await?;
+
+            assert!(
+                (1..=10).contains(&offsets.len()),
+                "the byte budget must count the headers, keyed: {keyed}: {offsets:?}",
+            );
             assert_eq!(
-                (40..50).collect::<Vec<_>>(),
-                fetched_offsets(&engine, &fetched, 40, 1111).await?,
-                "the byte budget must count the headers, keyed: {keyed}",
+                (40..40 + i64::try_from(offsets.len())?).collect::<Vec<_>>(),
+                offsets,
+                "keyed: {keyed}",
             );
         }
 

@@ -250,7 +250,7 @@ pub use batch::ProduceRequestBatcher;
 pub use decoded_budget::{
     configure_produce_decoded_bytes, default_bytes as default_produce_decoded_bytes,
 };
-pub use fetched::{FetchedDataSender, FetchedRecord, FetchedSender};
+pub use fetched::{ByteLimit, FetchedDataSender, FetchedRecord, FetchedSender};
 pub use inflate::{inflate, offload};
 pub use latency::LatencyIntroducingStorage;
 pub use operation::StorageOperation;
@@ -1356,6 +1356,15 @@ impl OffsetStage {
             && (isolation == IsolationLevel::ReadUncommitted || self.last_stable >= next)
     }
 
+    /// Returns the stage that has, for each offset, the larger of this stage's and `other`'s.
+    pub(crate) fn latest(self, other: Self) -> Self {
+        Self {
+            last_stable: self.last_stable.max(other.last_stable),
+            high_watermark: self.high_watermark.max(other.high_watermark),
+            log_start: self.log_start.max(other.log_start),
+        }
+    }
+
     /// Returns this stage with its high watermark raised to at least `next`.
     pub(crate) fn with_high_watermark_at_least(self, next: i64) -> Self {
         Self {
@@ -2301,14 +2310,18 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// stored batches, in offset order from the batch that holds `offset`, with no gap. A read
     /// that finds nothing to read may send nothing at all.
     ///
-    /// The records hold at most `max_bytes`, except that a read can exceed it by one batch. A read
-    /// returns the first batch at or after `offset` even when that batch alone is larger than
-    /// `max_bytes`, so that a consumer gets past it (KIP-74). The fetch service relies on this
-    /// so that a consumer whose fetch limit is smaller than a record can read past that record.
+    /// The read stops once its records reach `limit`, by their encoded size. It may send a record
+    /// or batch past the limit, because an engine can count a record as fewer bytes than its
+    /// encoding. The caller discards what does not fit.
     ///
-    /// `max_bytes` can be 0, and the read still returns that first batch. The fetch service
-    /// passes 0 for the first partition that has records when the request's limit is 0, as Kafka
-    /// does.
+    /// Under a [`ByteLimit::Soft`] limit, the read returns the first record or batch at or after
+    /// `offset` even if it alone exceeds the limit, so that a consumer gets past it (KIP-74). This
+    /// holds also for a limit of 0.
+    ///
+    /// Under a [`ByteLimit::Hard`] limit, the read stops before a first record or batch that does
+    /// not fit, if it can without reading that data. It must then call
+    /// [`FetchedDataSender::send_limit_reached`]. Without that call, the caller can't tell the
+    /// stop from a partition that has no records.
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///
@@ -2319,7 +2332,7 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()>;
@@ -2661,7 +2674,7 @@ where
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
@@ -2670,7 +2683,7 @@ where
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )
@@ -2985,7 +2998,7 @@ where
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
@@ -2994,7 +3007,7 @@ where
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )

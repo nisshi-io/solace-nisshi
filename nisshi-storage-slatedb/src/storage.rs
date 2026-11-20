@@ -52,8 +52,8 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    FetchedSender, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    Error, FetchedSender, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
     TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
@@ -1073,10 +1073,11 @@ impl Storage for Engine {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
+        let max_bytes = limit.bytes();
         // Get the high watermark based on isolation level
         let offset_stage = self.offset_stage(topition).await?;
         let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
