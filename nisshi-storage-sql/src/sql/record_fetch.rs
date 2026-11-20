@@ -48,5 +48,17 @@ sql_row! {
         producer_id: Option<i64>,
         /// The epoch of the producer that wrote the record.
         producer_epoch: Option<i16>,
+        /// Whether the row only marks that the fetch stopped at its hard limit before this record.
+        /// Only the keyed version returns such a row, and the row holds no key or value.
+        limit_reached: bool,
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "turso"))]
+impl Row {
+    /// Returns the row, or `None` if the row only marks that the fetch stopped at its hard limit
+    /// before this record.
+    pub(crate) fn within_limit(self) -> Option<Self> {
+        (!self.limit_reached).then_some(self)
     }
 }

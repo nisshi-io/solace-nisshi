@@ -16,7 +16,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch (text, text, integer, integer, integer, integer, bigint) as
+-- prepare record_fetch (text, text, integer, integer, integer, integer, bigint, boolean) as
 -- Each row holds one record with all of its headers, so that a read stopped after any row keeps
 -- only complete records.
 --
@@ -134,11 +134,11 @@ and h.offset_id < $6
 
 group by h.offset_id)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch.
+-- If $8 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $8 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
 --
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size. It does not compare offset_id
@@ -157,7 +157,11 @@ s.v as value,
 s.producer_id,
 s.producer_epoch,
 h.header_keys,
-h.header_values
+h.header_values,
+
+-- Every row holds a record. Only the keyed query returns a marker row (see
+-- record_fetch_keyed.sql).
+false as limit_reached
 
 from
 
@@ -167,6 +171,6 @@ left join headers h on h.offset_id = s.offset_id
 where
 
 s.bytes < $5
-or s.ordinal = 1
+or (s.ordinal = 1 and $8)
 
 order by s.offset_id;

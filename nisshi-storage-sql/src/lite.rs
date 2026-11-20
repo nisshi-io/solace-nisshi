@@ -25,13 +25,14 @@ use crate::{
         header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
-        remove_comments, result_columns::ResultColumns, topic_by_cluster,
-        topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
-        topic_insert, topic_select_name, topic_select_uuid, topition_insert,
-        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
-        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
-        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
-        virtual_topic_upsert, watermark_insert, watermark_select, watermark_select_for_write,
+        record_sender::RecordSender, remove_comments, result_columns::ResultColumns,
+        topic_by_cluster, topic_configuration_select, topic_configuration_select_name,
+        topic_configuration_upsert, topic_insert, topic_select_name, topic_select_uuid,
+        topition_insert, txn_offset_commit_tp_select_pending,
+        txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
+        txn_produce_partition_check, txn_produce_partition_select, txn_select_name,
+        txn_select_produced_topitions, virtual_topic_upsert, watermark_insert, watermark_select,
+        watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -3361,10 +3362,7 @@ impl Storage for Delegate {
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<()> {
-        // The read returns a first record whatever the limit's kind, and the caller discards one
-        // that does not fit a hard limit.
         let max_bytes = limit.bytes();
-
         let timer = RequestTimer::new(
             &DELEGATE_REQUEST_DURATION,
             StorageOperation::Fetch,
@@ -3395,6 +3393,15 @@ impl Storage for Delegate {
                 max_bytes
             );
 
+            let mut data = RecordSender::new(
+                fetched_sender.send_offsets(offset_stage).await?,
+                limit,
+                key_filter,
+                offset,
+                high_watermark,
+            );
+            let first_may_exceed = data.first_may_exceed();
+
             let c = self.connection().await?;
 
             let mut records = if let Some(key) = key_filter {
@@ -3410,6 +3417,7 @@ impl Storage for Delegate {
                         high_watermark,
                         key_bytes,
                         ROWS_PER_FETCH,
+                        first_may_exceed,
                     ),
                 )
                 .await
@@ -3424,13 +3432,12 @@ impl Storage for Delegate {
                         (max_bytes as i64),
                         high_watermark,
                         ROWS_PER_FETCH,
+                        first_may_exceed,
                     ),
                 )
                 .await
             }
             .inspect_err(|err| error!(?err))?;
-
-            let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
             // This loop can run past the read's deadline by the time that it takes to read one full
             // channel of records, with the header query of each. The caller stops the read at its
@@ -3442,16 +3449,22 @@ impl Storage for Delegate {
             // rarely, such as while a checkpoint restarts the log. The busy timeout stays as
             // configured instead of shrinking to the time left, because it applies to each wait and
             // is shared with every later user of the pooled connection.
-            while let Some(record_fetch::Row {
-                offset_id: offset,
-                attributes,
-                timestamp,
-                key,
-                value,
-                producer_id,
-                producer_epoch,
-            }) = records.next().await?
-            {
+            while let Some(row) = records.next().await? {
+                let Some(record_fetch::Row {
+                    offset_id: offset,
+                    attributes,
+                    timestamp,
+                    key,
+                    value,
+                    producer_id,
+                    producer_epoch,
+                    ..
+                }) = row.within_limit()
+                else {
+                    data.stop_at_limit();
+                    continue;
+                };
+
                 debug!(offset, ?timestamp);
                 debug!(key_len = ?key.as_ref().map(Bytes::len));
                 debug!(value_len = ?value.as_ref().map(Bytes::len));
@@ -3487,7 +3500,7 @@ impl Storage for Delegate {
                 .await?;
             }
 
-            Ok::<_, Error>(())
+            data.end().await
         }
         .await;
 
@@ -5567,7 +5580,7 @@ mod tests {
     use std::thread;
 
     use nisshi_sans_io::{
-        Compression,
+        ByteSize as _, Compression,
         create_topics_request::{CreatableTopic, CreatableTopicConfig},
     };
     use nisshi_schema::{Registry, lake::House};
@@ -6477,15 +6490,107 @@ mod tests {
         Ok(())
     }
 
-    /// Returns the offsets of the records that one engine read of `topition` from `offset`
-    /// returns within `max_bytes`.
-    async fn fetched_offsets(
+    /// A plain topic and a keyed topic each hold 3 records of more than 50 bytes. Under a hard
+    /// limit of 50 bytes, a read from offset 0 returns nothing and reports that it reached its
+    /// limit. A read from offset 3, the high watermark, returns nothing and does not report it.
+    #[tokio::test]
+    async fn a_hard_read_before_a_record_that_does_not_fit_reaches_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            // Each record, with its header, takes more than 50 bytes.
+            produce_keyed_records(&engine, &produced, 3, true, false).await?;
+
+            for (offset, reached_limit) in [(0, true), (3, false)] {
+                let read = engine
+                    .fetch_until_limit(
+                        &fetched,
+                        offset,
+                        1,
+                        ByteLimit::Hard(50),
+                        IsolationLevel::ReadUncommitted,
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .await?;
+
+                assert!(read.batches.is_empty(), "keyed: {keyed}, offset: {offset}");
+                assert_eq!(
+                    reached_limit, read.reached_limit,
+                    "keyed: {keyed}, offset: {offset}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The partition holds one record of an open transaction, at offset 0. A `ReadCommitted` read
+    /// from offset 0, the last stable offset, under a hard limit returns nothing and does not
+    /// report that it reached its limit, because the record is above the last stable offset. A
+    /// `ReadUncommitted` read from offset 0 reports it, because the record is below the high
+    /// watermark and does not fit.
+    #[tokio::test]
+    async fn a_hard_read_at_the_last_stable_offset_does_not_reach_its_limit() -> Result<()> {
+        use nisshi_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+        let _guard = init_tracing()?;
+
+        let (_temp_dir, engine, topition, _) = fetch_engine_with_topic(false).await?;
+
+        let producer = engine
+            .init_producer(Some("tx"), 0, Some(-1), Some(-1))
+            .await?;
+
+        _ = engine
+            .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+                transaction_id: "tx".into(),
+                producer_id: producer.id,
+                producer_epoch: 0,
+                topics: vec![
+                    AddPartitionsToTxnTopic::default()
+                        .name(topition.topic().into())
+                        .partitions(Some(vec![0])),
+                ],
+            })
+            .await?;
+
+        _ = engine
+            .produce(Some("tx"), &topition, txn_batch(producer.id))
+            .await?;
+
+        for (isolation_level, reached_limit) in [
+            (IsolationLevel::ReadCommitted, false),
+            (IsolationLevel::ReadUncommitted, true),
+        ] {
+            // The record takes 8 bytes against the limit, so a limit of 1 byte stops before it.
+            let read = engine
+                .fetch_until_limit(
+                    &topition,
+                    0,
+                    1,
+                    ByteLimit::Hard(1),
+                    isolation_level,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .await?;
+
+            assert!(read.batches.is_empty(), "{isolation_level:?}");
+            assert_eq!(reached_limit, read.reached_limit, "{isolation_level:?}");
+        }
+
+        Ok(())
+    }
+
+    /// Fetches `topition` from `offset` once, with a limit of `max_bytes`, and returns the batches.
+    async fn fetched_batches(
         engine: &ArcDynStorage,
         topition: &Topition,
         offset: i64,
         max_bytes: u32,
-    ) -> Result<Vec<i64>> {
-        engine
+    ) -> Result<Vec<deflated::Batch>> {
+        Ok(engine
             .fetch_until_deadline(
                 topition,
                 offset,
@@ -6495,7 +6600,11 @@ mod tests {
                 Instant::now() + Duration::from_secs(60),
             )
             .await?
-            .batches
+            .batches)
+    }
+
+    fn offsets_in_batches(batches: Vec<deflated::Batch>) -> Result<Vec<i64>> {
+        batches
             .into_iter()
             .try_fold(Vec::new(), |mut offsets, batch| {
                 let batch = inflated::Batch::try_from(batch)?;
@@ -6509,6 +6618,17 @@ mod tests {
 
                 Ok(offsets)
             })
+    }
+
+    /// Fetches `topition` from `offset` once, with a limit of `max_bytes`, and returns the offsets
+    /// of the records.
+    async fn fetched_offsets(
+        engine: &ArcDynStorage,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+    ) -> Result<Vec<i64>> {
+        offsets_in_batches(fetched_batches(engine, topition, offset, max_bytes).await?)
     }
 
     /// One engine read returns at most `ROWS_PER_FETCH` rows, and a read from the last offset that
@@ -6567,10 +6687,11 @@ mod tests {
         Ok(())
     }
 
-    /// The row limit applies to records that have headers, and a record's headers still count
-    /// toward `max_bytes` when the limit ends the read. The query counts each record as 111 bytes,
-    /// so it returns at most 10 records within a budget of 1,111 bytes. The read measures each
-    /// record by its encoded size, and keeps the contiguous records from the fetch offset that fit.
+    /// The row limit applies to records that have headers, and a record's headers count toward the
+    /// byte budget when the byte budget ends the read. A read with a byte budget of 1,111 bytes
+    /// returns batches whose encoded size, record headers included, fits the byte budget. The
+    /// libSQL fetch query counts the headers too: it counts each record as 111 bytes, the 7 bytes
+    /// of every record included, so it returns 10 records within 1,111 bytes.
     #[tokio::test]
     async fn fetch_of_records_with_headers_stops_at_the_row_limit_or_the_byte_budget() -> Result<()>
     {
@@ -6579,7 +6700,7 @@ mod tests {
         let _guard = init_tracing()?;
 
         for keyed in [false, true] {
-            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+            let (temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
 
             produce_keyed_records(&engine, &produced, RECORDS, true, false).await?;
 
@@ -6589,16 +6710,73 @@ mod tests {
                 "the row limit counts from the fetch offset, keyed: {keyed}",
             );
 
-            let offsets = fetched_offsets(&engine, &fetched, 40, 1111).await?;
+            let batches = fetched_batches(&engine, &fetched, 40, 1111).await?;
+            let size = batches
+                .iter()
+                .map(|batch| batch.size_in_bytes())
+                .sum::<nisshi_sans_io::Result<usize>>()?;
+            let offsets = offsets_in_batches(batches)?;
 
             assert!(
-                (1..=10).contains(&offsets.len()),
-                "the byte budget must count the headers, keyed: {keyed}: {offsets:?}",
+                size <= 1111,
+                "the byte budget must count the headers, keyed: {keyed}: {size} bytes",
             );
+            // The records are contiguous from the fetch offset, however many fit the byte budget.
             assert_eq!(
                 (40..40 + i64::try_from(offsets.len())?).collect::<Vec<_>>(),
                 offsets,
                 "keyed: {keyed}",
+            );
+            assert!(!offsets.is_empty(), "keyed: {keyed}");
+
+            // The read above discards records by their encoded size, so only the query's own
+            // result shows how the query counts headers.
+            let connection = pooled_connection(
+                libsql::Builder::new_local(temp_dir.path().join("nisshi.db"))
+                    .build()
+                    .await?,
+            )
+            .await?;
+
+            let rows = if keyed {
+                connection
+                    .query(
+                        "record_fetch_keyed.sql",
+                        (
+                            "nisshi",
+                            "test",
+                            0,
+                            40,
+                            1111_i64,
+                            RECORDS,
+                            b"k".to_vec(),
+                            ROWS_PER_FETCH,
+                            true,
+                        ),
+                    )
+                    .await?
+            } else {
+                connection
+                    .query(
+                        "record_fetch.sql",
+                        (
+                            "nisshi",
+                            "test",
+                            0,
+                            40,
+                            1111_i64,
+                            RECORDS,
+                            ROWS_PER_FETCH,
+                            true,
+                        ),
+                    )
+                    .await?
+            };
+
+            assert_eq!(
+                (40..50).collect::<Vec<_>>(),
+                offsets_of(rows).await?,
+                "the fetch query must count the headers, keyed: {keyed}",
             );
         }
 
@@ -6712,8 +6890,8 @@ mod tests {
             .next()
             .await?;
 
-        // Each record is 500,001 bytes, more than the budget, so each fetch returns only its
-        // first record (KIP-74).
+        // Each record is 500,001 bytes, more than the budget, so each fetch, under a soft limit,
+        // returns only its first record (KIP-74).
         let max_bytes = 100_000_i64;
         let high_watermark = RECORDS;
 
@@ -6743,6 +6921,7 @@ mod tests {
                     max_bytes,
                     high_watermark,
                     ROWS_PER_FETCH,
+                    true,
                 ),
             )
             .await?;
@@ -6761,6 +6940,7 @@ mod tests {
                     high_watermark,
                     KEY.to_vec(),
                     ROWS_PER_FETCH,
+                    true,
                 ),
             )
             .await?;
@@ -7444,13 +7624,18 @@ mod tests {
 
         ensure_schema(&db, Duration::from_secs(5)).await?;
 
+        Ok((temp_dir, pooled_connection(db).await?))
+    }
+
+    /// Returns a connection to `db` from a pool of its own.
+    async fn pooled_connection(db: Database) -> Result<managed::Object<ConnectionManager>> {
         let pool = Pool::builder(ConnectionManager {
             db: Arc::new(Mutex::new(db)),
             busy_timeout: Duration::from_millis(100),
         })
         .build()?;
 
-        Ok((temp_dir, pool.get().await?))
+        Ok(pool.get().await?)
     }
 
     async fn cluster_names(connection: &PoolConnection) -> Result<Vec<String>> {

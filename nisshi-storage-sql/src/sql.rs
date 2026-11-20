@@ -293,6 +293,7 @@ pub(crate) mod producer_epochs_select;
 pub(crate) mod producer_insert;
 pub(crate) mod producer_select_for_update;
 pub(crate) mod record_fetch;
+pub(crate) mod record_sender;
 pub(crate) mod result_columns;
 pub(crate) mod row;
 #[cfg(test)]

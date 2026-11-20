@@ -13,7 +13,8 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, blob, integer) as
+-- prepare record_fetch_keyed
+--   (text, text, integer, integer, integer, integer, blob, integer, integer) as
 -- A fetch reads at most $8 rows past the fetch offset (ROWS_PER_FETCH). The running byte total
 -- below covers every row that this query reads, so without the limit, one fetch costs as much as
 -- the whole backlog between the fetch offset and the high watermark, however few rows the client
@@ -92,13 +93,18 @@ and r.k = $7
 order by r.offset_id
 limit $8) sized_rows)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch. The query finds the
--- first row by its ordinal, so that finding it does not depend on every record having a
--- non-zero size.
+-- If $9 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $9 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
+-- The query finds the first row by its ordinal, so that finding it does not depend on every
+-- record having a non-zero size.
+--
+-- If $9 is false, a first row that does not fit $5 comes back as a marker: `limit_reached` is
+-- true, and the key and value are null, so the query does not send their bytes. The caller needs
+-- the marker, because the key filter can match no row, and an empty result would not show that the
+-- first match did not fit.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -107,11 +113,12 @@ select
 r.offset_id,
 r.attributes,
 r.timestamp,
-r.k as key,
-r.v as value,
+case when s.bytes < $5 or $9 then r.k end as key,
+case when s.bytes < $5 or $9 then r.v end as value,
 s.bytes,
 r.producer_id,
-r.producer_epoch
+r.producer_epoch,
+not (s.bytes < $5 or $9) as limit_reached
 
 from
 
