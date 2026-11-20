@@ -32,6 +32,7 @@ mod delete_records;
 mod describe_groups;
 mod epoch_fence;
 mod failing_object_store;
+mod fetch_limit;
 mod fetch_listing;
 mod held_put_store;
 mod init_producer;

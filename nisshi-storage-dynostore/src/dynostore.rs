@@ -81,8 +81,8 @@ use nisshi_storage::{
     offload, producer_claim,
 };
 use object_store::{
-    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetRange,
+    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion,
     path::{Path, PathPart},
 };
@@ -215,11 +215,11 @@ const FETCH_LISTING_FIRST_WINDOW: i64 = 512;
 const FETCH_LISTING_GROWTH: i64 = 8;
 
 /// The batches that a fetch reads from a partition: each batch below
-/// `high_watermark` that ends at or after `offset`, until the batches fill `max_bytes`.
+/// `high_watermark` that ends at or after `offset`, within `limit`.
 #[derive(Clone, Copy, Debug)]
 struct FetchBounds {
     offset: i64,
-    max_bytes: u32,
+    limit: ByteLimit,
     high_watermark: i64,
 }
 
@@ -2205,18 +2205,74 @@ impl DynoStore {
         topition: &Topition,
         base_offset: i64,
     ) -> Result<Option<deflated::Batch>> {
+        match self.batch_object(topition, base_offset, None).await? {
+            Some(object) => self
+                .read_batch_object(topition, base_offset, object)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Starts the GET of the batch object at `base_offset`, and returns it before its body is read.
+    /// When `max_size` is set, the GET asks for only the object's first `max_size` bytes. Returns
+    /// `Ok(None)` when the object does not exist.
+    ///
+    /// The returned [`GetResult`] holds the object's size, which is the batch's encoded size, and
+    /// the range of bytes in its body. The errors are those of
+    /// [`DynoStore::batch_with_base_offset`].
+    async fn batch_object(
+        &self,
+        topition: &Topition,
+        base_offset: i64,
+        max_size: Option<u64>,
+    ) -> Result<Option<GetResult>> {
         let path = batch_path(&self.cluster, topition, base_offset);
 
-        let encoded = match self.object_store.get(&path).await {
-            Ok(get_result) => get_result.bytes().await,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => Err(error),
+        // The object store rejects a range of zero bytes.
+        let options = GetOptions {
+            range: max_size.map(|max_size| GetRange::Bounded(0..max_size.max(1))),
+            ..GetOptions::default()
         };
 
-        encoded
+        match self.object_store.get_opts(&path, options).await {
+            Ok(object) => Ok(Some(object)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => {
+                error!(?error, ?topition, base_offset, "reading batch");
+                Err(Error::Api(ErrorCode::KafkaStorageError))
+            }
+        }
+    }
+
+    /// Downloads the body of `object`, the batch object at `base_offset`, without decoding it. The
+    /// errors are those of [`DynoStore::batch_with_base_offset`].
+    async fn download_batch_object(
+        &self,
+        topition: &Topition,
+        base_offset: i64,
+        object: GetResult,
+    ) -> Result<Bytes> {
+        object
+            .bytes()
+            .await
+            .inspect_err(|error| error!(?error, ?topition, base_offset, "reading batch"))
+            .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))
+    }
+
+    /// Downloads and decodes the body of `object`, the batch object at `base_offset`. The errors
+    /// are those of [`DynoStore::batch_with_base_offset`].
+    async fn read_batch_object(
+        &self,
+        topition: &Topition,
+        base_offset: i64,
+        object: GetResult,
+    ) -> Result<deflated::Batch> {
+        object
+            .bytes()
+            .await
             .map_err(Error::from)
             .and_then(|encoded| self.decode(encoded))
-            .map(Some)
             .inspect_err(|error| error!(?error, ?topition, base_offset, "reading batch"))
             .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))
     }
@@ -2279,15 +2335,17 @@ impl DynoStore {
     }
 
     /// Sends the batches of `topition` within `bounds` through `data`, in offset order, starting
-    /// with the batch at `base_offset`. `first_batch` is that batch, if the caller has read it.
+    /// with the batch at `base_offset`. `first_object` is the object of that batch, if the caller
+    /// has started its GET.
     ///
     /// Each batch starts right after the previous batch's last offset, so the read gets the next
     /// batch by that base offset, without a listing. If no batch has that base offset,
     /// [`Self::offset_past_gap`] decides whether the read skips the gap or stops.
     ///
-    /// The batch that reaches `max_bytes` is sent whole. Kafka also sends a first batch whole, so
-    /// that a consumer always gets a record ([`ReplicaManager.readFromLog`]), but it cuts a later
-    /// batch at `max_bytes`, and the client drops the partial batch.
+    /// The read sends only the batches that fit the limit. Under a soft limit, it also sends the
+    /// first batch whatever its size, as Kafka does, so that a consumer always gets a record
+    /// ([`ReplicaManager.readFromLog`]). Kafka also sends the start of a later batch that does not
+    /// fit, but the client drops that partial batch, so the client receives the same records.
     ///
     /// [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733
     async fn send_batches_from(
@@ -2295,15 +2353,70 @@ impl DynoStore {
         topition: &Topition,
         bounds: FetchBounds,
         mut base_offset: i64,
-        mut first_batch: Option<deflated::Batch>,
+        mut first_object: Option<GetResult>,
         data: &mut FetchedDataSender,
     ) -> Result<()> {
-        let mut bytes_left = u64::from(bounds.max_bytes);
+        let mut bytes_left = u64::from(bounds.limit.bytes());
+        let mut first_may_exceed = matches!(bounds.limit, ByteLimit::Soft(_));
+        let batch_header_size = u64::try_from(deflated::BATCH_OVERHEAD)?;
 
         while base_offset < bounds.high_watermark {
-            let batch = match first_batch.take() {
-                Some(batch) => Some(batch),
-                None => self.batch_with_base_offset(topition, base_offset).await?,
+            // Under a hard limit, the GET asks for only the bytes left, as Kafka reads its log only
+            // up to the limit. For a batch below the fetch offset, it asks for at least the batch's
+            // header, which shows whether the batch ends before the fetch offset.
+            let max_size = (!first_may_exceed).then(|| {
+                if base_offset < bounds.offset {
+                    bytes_left.max(batch_header_size)
+                } else {
+                    bytes_left
+                }
+            });
+
+            let object = match first_object.take() {
+                Some(object) => Some(object),
+                None => self.batch_object(topition, base_offset, max_size).await?,
+            };
+
+            // If the object is larger than the range asked for, the batch does not fit. The read
+            // still downloads that range instead of dropping the response. The store sends the
+            // range either way, so a drop saves at most the bytes not yet received, and it costs a
+            // new connection, because the object store's HTTP client reuses a connection only
+            // after it reads the body to its end.
+            let object = match object {
+                Some(object) if object.range.end < object.meta.size => {
+                    let batch_start = self
+                        .download_batch_object(topition, base_offset, object)
+                        .await?;
+
+                    // A batch that ends before the fetch offset is skipped, whatever its size.
+                    // The batch's offset comes from its object's name, as for a whole batch,
+                    // because the stored batch keeps the base offset that its producer sent.
+                    if base_offset < bounds.offset {
+                        let last_offset = deflated::Batch::try_from_header(&batch_start)
+                            .map(|header| base_offset + i64::from(header.last_offset_delta))
+                            .inspect_err(|error| {
+                                error!(?error, ?topition, base_offset, "reading batch header")
+                            })
+                            .map_err(|_| Error::Api(ErrorCode::KafkaStorageError))?;
+
+                        if last_offset < bounds.offset {
+                            base_offset = last_offset + 1;
+                            continue;
+                        }
+                    }
+
+                    data.send_limit_reached().await?;
+                    break;
+                }
+                object => object,
+            };
+
+            let batch = match object {
+                Some(object) => Some(
+                    self.read_batch_object(topition, base_offset, object)
+                        .await?,
+                ),
+                None => None,
             };
 
             let Some(mut batch) = batch else {
@@ -2329,9 +2442,16 @@ impl DynoStore {
             }
 
             let size = u64::try_from(batch.size_in_bytes()?)?;
-            data.send_batch(batch).await?;
 
-            if size > bytes_left {
+            if size > bytes_left && !first_may_exceed {
+                data.send_limit_reached().await?;
+                break;
+            }
+
+            data.send_batch(batch).await?;
+            first_may_exceed = false;
+
+            if size >= bytes_left {
                 break;
             }
 
@@ -4360,28 +4480,33 @@ impl Storage for DynoStore {
 
         let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
-        // The read sends a first batch whatever the limit's kind, and the caller discards one
-        // that does not fit a hard limit.
         let bounds = FetchBounds {
             offset,
-            max_bytes: limit.bytes(),
+            limit,
             high_watermark,
         };
 
         // A consumer that reads in order fetches the base offset of the next batch, so try that
         // batch first. Only a fetch offset that is not a base offset needs a listing.
-        let (base_offset, first_batch) = match self.batch_with_base_offset(topition, offset).await?
-        {
-            Some(batch) => (offset, Some(batch)),
-            None => (
-                self.find_base_offset_for_batch_containing(topition, offset)
-                    .await?
-                    .unwrap_or(offset),
-                None,
-            ),
+        // Under a hard limit, the batch at the fetch offset must fit, so the GET asks for at most
+        // the limit's bytes.
+        let max_size = match limit {
+            ByteLimit::Hard(bytes) => Some(u64::from(bytes)),
+            ByteLimit::Soft(_) => None,
         };
 
-        self.send_batches_from(topition, bounds, base_offset, first_batch, &mut data)
+        let (base_offset, first_object) =
+            match self.batch_object(topition, offset, max_size).await? {
+                Some(object) => (offset, Some(object)),
+                None => (
+                    self.find_base_offset_for_batch_containing(topition, offset)
+                        .await?
+                        .unwrap_or(offset),
+                    None,
+                ),
+            };
+
+        self.send_batches_from(topition, bounds, base_offset, first_object, &mut data)
             .await
     }
 
