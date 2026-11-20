@@ -2321,10 +2321,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Under a [`ByteLimit::Hard`] limit, the read stops before a first record or batch that does
     /// not fit, if it can without reading that data.
     ///
-    /// The read must return [`ReadEnd::ReachedLimit`] if a hard limit stopped it before its first
-    /// record or batch, because the caller can't tell that read from a partition that has no
-    /// records. It may also return [`ReadEnd::ReachedLimit`] if it stopped before a later record
-    /// or batch that does not fit its limit. Otherwise it returns [`ReadEnd::Finished`].
+    /// The read returns [`ReadEnd::ReachedLimit`] if its limit stopped it before a record or
+    /// batch, and [`ReadEnd::Finished`] otherwise.
     ///
     /// For a topic or partition that does not exist, see [`Storage::offset_stage`].
     ///

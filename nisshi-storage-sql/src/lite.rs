@@ -6516,6 +6516,48 @@ mod tests {
         Ok(())
     }
 
+    /// A plain topic and a virtual topic, read through the key `k`, each hold 3 records. Under a
+    /// soft limit of 1 byte, a read from offset 0 sends the first record and then stops at its
+    /// limit before the second. A read under a hard limit of 1 MiB sends every record, and a read
+    /// from offset 3, the high watermark, sends nothing: neither stops at its limit.
+    #[tokio::test]
+    async fn a_read_reports_a_stop_at_its_limit_after_records() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        for keyed in [false, true] {
+            let (_temp_dir, engine, produced, fetched) = fetch_engine_with_topic(keyed).await?;
+
+            produce_keyed_records(&engine, &produced, 3, true, false).await?;
+
+            for (offset, limit, read_end) in [
+                (0, ByteLimit::Soft(1), ReadEnd::ReachedLimit),
+                (0, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+                (3, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+            ] {
+                // The test keeps the receiver, because a read fails with `UnableToSend` once its
+                // receiver is dropped.
+                let (sender, _receiver) = nisshi_storage::fetched::channel();
+
+                assert_eq!(
+                    read_end,
+                    engine
+                        .fetch(
+                            &fetched,
+                            offset,
+                            1,
+                            limit,
+                            IsolationLevel::ReadUncommitted,
+                            sender
+                        )
+                        .await?,
+                    "keyed: {keyed}, offset: {offset}, limit: {limit:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Fetches `topition` from `offset` once, with a limit of `max_bytes`, and returns the batches.
     async fn fetched_batches(
         engine: &ArcDynStorage,
@@ -6708,7 +6750,15 @@ mod tests {
 
             assert_eq!(
                 (40..50).collect::<Vec<_>>(),
-                offsets_of(rows).await?,
+                offsets_of(
+                    if keyed {
+                        "record_fetch_keyed.sql"
+                    } else {
+                        "record_fetch.sql"
+                    },
+                    rows
+                )
+                .await?,
                 "the fetch query must count the headers, keyed: {keyed}",
             );
         }
@@ -6742,12 +6792,19 @@ mod tests {
         Ok(())
     }
 
-    /// Returns the offset of each row of a fetch query's result.
-    async fn offsets_of(mut rows: Rows) -> Result<Vec<i64>> {
+    /// Returns the offset of each record in the result of the fetch query `query`, leaving out the
+    /// marker row of the first record that the query does not send.
+    async fn offsets_of(query: &'static str, mut rows: Rows) -> Result<Vec<i64>> {
+        let columns = ResultColumns::new(query, &rows);
+        let offset_index = i32::try_from(columns.index("offset_id")?)?;
+        let limit_reached_index = i32::try_from(columns.index("limit_reached")?)?;
+
         let mut offsets = vec![];
 
         while let Some(row) = rows.next().await? {
-            offsets.push(row.get::<i64>(0)?);
+            if row.get::<i64>(limit_reached_index)? == 0 {
+                offsets.push(row.get::<i64>(offset_index)?);
+            }
         }
 
         Ok(offsets)
@@ -6859,7 +6916,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(vec![0], offsets_of(plain).await?);
+        assert_eq!(vec![0], offsets_of("record_fetch.sql", plain).await?);
 
         let keyed = connection
             .query(
@@ -6878,7 +6935,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(vec![0], offsets_of(keyed).await?);
+        assert_eq!(vec![0], offsets_of("record_fetch_keyed.sql", keyed).await?);
 
         Ok(())
     }

@@ -14192,8 +14192,8 @@ pub(crate) mod tests {
             return Ok(());
         };
 
-        // The setting makes the topic answer a fetch of `<topic>/key-a` with its records whose
-        // key is `key-a`.
+        // `tansu.virtual` makes the topic virtual: a fetch of `<topic>/key-a` reads the topic's
+        // records whose key is `key-a`.
         let c = storage.connection().await?;
         _ = c
             .execute(
@@ -14281,6 +14281,77 @@ pub(crate) mod tests {
                 ..
             }]
         );
+
+        Ok(())
+    }
+
+    /// A topic and its keyed view each hold 3 records with a 200-byte value. Under a soft limit of
+    /// 1 byte, a read from offset 0 sends the first record and then stops at its limit before the
+    /// second. A read under a hard limit of 1 MiB sends every record, and a read from offset 3, the
+    /// high watermark, sends nothing: neither stops at its limit.
+    #[tokio::test]
+    async fn a_read_reports_a_stop_at_its_limit_after_records() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        // `tansu.virtual` makes the topic virtual: a fetch of `<topic>/key-a` reads the topic's
+        // records whose key is `key-a`.
+        let c = storage.connection().await?;
+        _ = c
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, 'tansu.virtual', 'true' \
+                 from topic t join cluster c on c.id = t.cluster \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        let batch = (0..3)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::from_static(b"key-a").into())
+                        .value(Bytes::from(vec![b'v'; 200]).into())
+                        .offset_delta(delta),
+                )
+            })
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        let keyed = Topition::new(format!("{}/key-a", topition.topic()), 0);
+
+        for fetched in [&topition, &keyed] {
+            for (offset, limit, read_end) in [
+                (0, ByteLimit::Soft(1), ReadEnd::ReachedLimit),
+                (0, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+                (3, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+            ] {
+                // The test keeps the receiver, because a read fails with `UnableToSend` once its
+                // receiver is dropped.
+                let (sender, _receiver) = fetched::channel();
+
+                assert_eq!(
+                    read_end,
+                    storage
+                        .fetch(
+                            fetched,
+                            offset,
+                            1,
+                            limit,
+                            IsolationLevel::ReadUncommitted,
+                            sender
+                        )
+                        .await?,
+                    "{fetched:?} from {offset} within {limit:?}"
+                );
+            }
+        }
 
         Ok(())
     }

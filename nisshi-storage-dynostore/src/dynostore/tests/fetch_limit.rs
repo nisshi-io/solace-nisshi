@@ -394,3 +394,21 @@ async fn a_mid_batch_fetch_below_the_header_size_downloads_the_header() -> Resul
 
     Ok(())
 }
+
+/// The partition holds two batches, each with a 1,000-byte record. A fetch under a hard limit of
+/// exactly the first batch's size returns the first batch, and reports that it reached its limit,
+/// because the first batch leaves no bytes of the limit for the second.
+#[tokio::test]
+async fn a_batch_that_fills_a_hard_limit_reaches_the_limit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let (storage, _store, topition, batches) = partition_with_batches(&[1_000, 1_000]).await?;
+    let limit = size(&batches[0])?;
+
+    let read = fetch_within(&storage, &topition, ByteLimit::Hard(limit)).await?;
+
+    assert_eq!(vec![0], base_offsets(&read));
+    assert!(read.reached_limit);
+
+    Ok(())
+}

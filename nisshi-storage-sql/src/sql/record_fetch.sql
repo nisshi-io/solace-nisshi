@@ -49,6 +49,7 @@ select
 
 topition,
 offset_id,
+row_bytes,
 sum(row_bytes) over (order by offset_id) as bytes,
 row_number() over (order by offset_id) as ordinal
 
@@ -92,10 +93,11 @@ limit $7) sized_rows)
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size.
 --
--- If $8 is false and the first row does not fit $5, the query returns that row as a marker:
--- `limit_reached` is true, and the key and value are null, so the query does not send their
--- bytes. The caller needs the marker, because the query also returns no rows when no record lies
--- between $4 and $6.
+-- The query sends a row, with its key and value, if the row's `bytes`, the size of the rows
+-- up to and including it, is less than $5, or if it is the first row and $8 is true. It also
+-- returns the first row that it does not send, as a marker: `limit_reached` is true, and the
+-- key and value are null, so the query does not send their bytes. Without the marker, a result
+-- that stopped at $5 looks the same as one that ended at $6 or at the row limit $7.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -104,12 +106,12 @@ select
 r.offset_id,
 r.attributes,
 r.timestamp,
-case when s.bytes < $5 or $8 then r.k end as key,
-case when s.bytes < $5 or $8 then r.v end as value,
+case when s.bytes < $5 or (s.ordinal = 1 and $8) then r.k end as key,
+case when s.bytes < $5 or (s.ordinal = 1 and $8) then r.v end as value,
 s.bytes,
 r.producer_id,
 r.producer_epoch,
-not (s.bytes < $5 or $8) as limit_reached
+not (s.bytes < $5 or (s.ordinal = 1 and $8)) as limit_reached
 
 from
 
@@ -118,8 +120,12 @@ join record r on r.topition = s.topition and r.offset_id = s.offset_id
 
 where
 
-s.bytes < $5
-or s.ordinal = 1
+-- The query returns the first row, and each row after a row that it sends: `s.bytes - s.row_bytes`
+-- is the `bytes` of the row before. `bytes` grows with every row, so the last row returned is the
+-- first row that the query does not send: the marker.
+s.ordinal = 1
+or s.bytes - s.row_bytes < $5
+or (s.ordinal = 2 and $8)
 
 -- The rows must come out in offset order, because the engine builds record batches from them
 -- in the order that it reads them, and each record's offset delta counts from the first record
