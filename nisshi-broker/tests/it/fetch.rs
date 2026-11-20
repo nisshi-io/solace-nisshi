@@ -1987,12 +1987,15 @@ where
         }
     }
 
+    // The Fetch answers after its first round, because `min_bytes` is 1, so a long `max_wait`
+    // does not slow the test. It gives each read time to fill its limit on a slow machine,
+    // where a read cut short by its deadline would return fewer records than fit.
     let partitions = partition_data(
         fetch_offsets_within(
             &sc,
             &topic_name,
             &[(0, 0), (1, 0)],
-            500,
+            30_000,
             1,
             50 * 1024 * 1024,
             PARTITION_MAX_BYTES,
