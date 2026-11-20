@@ -45,7 +45,7 @@ macro_rules! storage_double {
                 _limit: ByteLimit,
                 _isolation_level: IsolationLevel,
                 $fetched_sender: FetchedSender,
-            ) -> Result<()> $body
+            ) -> Result<ReadEnd> $body
 
             async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
                 unimplemented!()
@@ -95,7 +95,7 @@ macro_rules! storage_double {
             use $crate::{
                 BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse,
                 MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-                ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+                ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
                 TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
                 UpdateError, Version, fetched::FetchedSender,
             };

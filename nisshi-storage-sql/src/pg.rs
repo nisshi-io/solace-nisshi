@@ -74,7 +74,7 @@ use nisshi_storage::{
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, PRODUCE_CONCURRENCY, ProduceEpoch,
-    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, StorageOperation, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
@@ -637,9 +637,9 @@ const FETCH_PLAN_SETTINGS: &str = "SET LOCAL enable_bitmapscan = off; \
 /// records statement started, or the server ended the statement with an error.
 #[derive(Debug)]
 enum RecordsStatement {
-    /// The statement sent all of its rows, and its transaction committed, so no statement runs on
-    /// the connection.
-    Ended,
+    /// The statement sent all of its rows, and its transaction committed, so the connection does
+    /// not run a statement. The [`ReadEnd`] holds how the read ended.
+    Ended(ReadEnd),
     /// The read stopped before its statement ended, because a row failed to decode or the caller
     /// stopped taking records. The statement can still be running on the connection.
     Abandoned(Error),
@@ -2151,13 +2151,7 @@ impl Postgres {
         // The transaction only reads, so a rollback has the same effect as a commit.
         tx.commit().await?;
 
-        // If the send fails, the caller has stopped reading, and the fetch has nothing more to
-        // send.
-        if let Err(error) = fetched_data.end().await {
-            debug!(?error);
-        }
-
-        Ok(RecordsStatement::Ended)
+        Ok(RecordsStatement::Ended(fetched_data.end()))
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -4496,7 +4490,7 @@ impl Storage for Postgres {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
         let (base_topic, key_filter): (&str, Option<&str>) =
@@ -4528,9 +4522,9 @@ impl Storage for Postgres {
             .await;
 
         match read {
-            Ok(RecordsStatement::Ended) => {
+            Ok(RecordsStatement::Ended(end)) => {
                 connection.release();
-                Ok(())
+                Ok(end)
             }
             // The statement may still be running on the connection. Dropping the connection
             // cancels it.

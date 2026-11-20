@@ -79,11 +79,11 @@ use nisshi_storage::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
     DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
-    producer_claim,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage,
+    StoredEpochs, TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip,
+    max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1764,7 +1764,7 @@ impl Storage for Engine {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let max_bytes = limit.bytes();
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
@@ -1855,7 +1855,7 @@ impl Storage for Engine {
             .await?;
         }
 
-        data.end().await
+        Ok(data.end())
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

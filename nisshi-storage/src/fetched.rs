@@ -91,14 +91,20 @@ impl FetchedDataSender {
     pub async fn send_batch(&mut self, batch: deflated::Batch) -> Result<()> {
         send(&self.0, Fetched::Batch(batch)).await
     }
+}
 
-    /// Reports that the read stopped at its limit, before a record or batch that does not fit.
-    ///
-    /// An engine must call this when a hard limit stops it before its first record or batch.
-    /// Without the report, the caller can't tell that stop from a partition that has no records.
-    pub async fn send_limit_reached(&mut self) -> Result<()> {
-        send(&self.0, Fetched::LimitReached).await
-    }
+/// How a [`Storage::fetch`] read ended.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReadEnd {
+    /// The read sent every record up to the high watermark, or the last stable offset for
+    /// `ReadCommitted`, or it stopped for a reason other than its [`ByteLimit`]. A read that sent
+    /// records and then stopped before one that does not fit may also return this, because the
+    /// caller starts another read after those records.
+    #[default]
+    Finished,
+    /// The read stopped before a record or batch that does not fit its [`ByteLimit`], so the
+    /// partition holds more records after what the read sent.
+    ReachedLimit,
 }
 
 /// One record that a row-based storage engine read, with the attributes of its batch.
@@ -126,7 +132,6 @@ pub(crate) enum Fetched {
     Offsets(OffsetStage),
     Record(FetchedRecord),
     Batch(deflated::Batch),
-    LimitReached,
 }
 
 /// Sends `fetched` through `sender`, waiting only when the channel is full.
@@ -346,7 +351,8 @@ impl ReadProgress {
             isolation,
             sender,
         );
-        let mut engine_finished = false;
+        // The `ReadEnd` that `engine` returned, or `None` while `engine` still runs.
+        let mut engine_end = None;
 
         let mut items = Vec::with_capacity(CHANNEL_CAPACITY);
 
@@ -354,14 +360,17 @@ impl ReadProgress {
             let next = read_deadline
                 .run_until_deadline(next_items(
                     &mut engine,
-                    &mut engine_finished,
+                    &mut engine_end,
                     &mut receiver.0,
                     &mut items,
                 ))
                 .await;
 
             match next {
-                Ok(Ok(0)) => break,
+                Ok(Ok(0)) => {
+                    self.fetched.reached_limit |= engine_end == Some(ReadEnd::ReachedLimit);
+                    break;
+                }
                 Ok(Ok(_)) => {
                     for item in items.drain(..) {
                         self.add(item)?;
@@ -403,9 +412,8 @@ impl ReadProgress {
     /// Adds `item` to the progress: an offset stage updates the latest stage, and a record or batch
     /// joins the batches if it fits their limit.
     ///
-    /// The first record or batch that does not fit, or a [`Fetched::LimitReached`] report, sets
-    /// `reached_limit`. After that, this rejects every record or batch, smaller ones too, because
-    /// the batches must hold contiguous offsets.
+    /// The first record or batch that does not fit sets `reached_limit`. After that, this rejects
+    /// every record or batch, smaller ones too, because the batches must hold contiguous offsets.
     fn add(&mut self, item: Fetched) -> Result<()> {
         let added = match item {
             Fetched::Offsets(offsets) => {
@@ -414,10 +422,6 @@ impl ReadProgress {
                         .offsets
                         .map_or(offsets, |latest| latest.latest(offsets)),
                 );
-                true
-            }
-            Fetched::LimitReached => {
-                self.fetched.reached_limit = true;
                 true
             }
             Fetched::Record(_) | Fetched::Batch(_) if self.fetched.reached_limit => false,
@@ -440,7 +444,8 @@ impl ReadProgress {
 }
 
 /// Receives into `items` every item that `engine` has sent, waiting for at least one, and
-/// returns how many it received, or 0 once `engine` has finished and sent everything.
+/// returns how many it received, or 0 once `engine` has finished and sent everything. When `engine`
+/// finishes, this stores its [`ReadEnd`] in `engine_end`.
 ///
 /// It polls `engine` while it waits, because the engine runs only while it is polled. It polls
 /// `engine` before `receiver`, so that the items that `engine` sends in a poll are received in the
@@ -449,28 +454,26 @@ impl ReadProgress {
 /// Returns the error of `engine` if it fails, also when it fails after it closed the channel.
 async fn next_items<F>(
     engine: &mut F,
-    engine_finished: &mut bool,
+    engine_end: &mut Option<ReadEnd>,
     receiver: &mut mpsc::Receiver<Fetched>,
     items: &mut Vec<Fetched>,
 ) -> Result<usize>
 where
-    F: Future<Output = Result<()>> + Unpin,
+    F: Future<Output = Result<ReadEnd>> + Unpin,
 {
     loop {
         tokio::select! {
             biased;
-            finished = &mut *engine, if !*engine_finished => {
-                *engine_finished = true;
-                finished?;
+            end = &mut *engine, if engine_end.is_none() => {
+                *engine_end = Some(end?);
             }
             received = receiver.recv_many(items, CHANNEL_CAPACITY) => {
                 // The channel can close before `engine` finishes: a read behind
                 // `RequestChannelService` drops its sender on another task, and the error of that
                 // read reaches `engine` only after the drop. The read waits for `engine` here
                 // instead of ending, so that a failed read returns its error, not an empty answer.
-                if received == 0 && !*engine_finished {
-                    *engine_finished = true;
-                    (&mut *engine).await?;
+                if received == 0 && engine_end.is_none() {
+                    *engine_end = Some((&mut *engine).await?);
                 }
 
                 return Ok(received);
@@ -1034,7 +1037,7 @@ mod tests {
             data.send_batch(batch.clone()).await?;
         }
 
-        Ok(())
+        Ok(ReadEnd::Finished)
     });
 
     /// The engine sends a small batch, a large batch, and another small batch. The limit holds two
@@ -1067,15 +1070,15 @@ mod tests {
         Ok(())
     }
 
-    /// A storage double whose read sends the offsets of a 3-record partition but no records. If
-    /// `limit_reached` is set, the read then reports that it stopped at its limit.
+    /// A storage double whose read sends the offsets of a 3-record partition and does not send its
+    /// records. If `limit_reached` is set, the read returns [`ReadEnd::ReachedLimit`].
     #[derive(Debug)]
     struct SendsOnlyOffsets {
         limit_reached: bool,
     }
 
     storage_double!(SendsOnlyOffsets, async fn fetch(&self, fetched_sender) {
-        let mut data = fetched_sender
+        let _data = fetched_sender
             .send_offsets(OffsetStage {
                 last_stable: 3,
                 high_watermark: 3,
@@ -1083,18 +1086,18 @@ mod tests {
             })
             .await?;
 
-        if self.limit_reached {
-            data.send_limit_reached().await?;
-        }
-
-        Ok(())
+        Ok(if self.limit_reached {
+            ReadEnd::ReachedLimit
+        } else {
+            ReadEnd::Finished
+        })
     });
 
-    /// The engine sends offsets for 3 records but no records. The read reports that it reached its
-    /// limit only if the engine reported that, because offsets can exist before their records are
-    /// readable.
+    /// The engine sends the offsets of 3 records and does not send the records. The read reports
+    /// that it reached its limit only if the engine returned [`ReadEnd::ReachedLimit`], because
+    /// offsets can exist before their records are readable.
     #[tokio::test]
-    async fn a_read_without_records_reaches_its_limit_only_when_reported() -> Result<()> {
+    async fn an_empty_read_reaches_its_limit_only_when_its_engine_says_so() -> Result<()> {
         for limit_reached in [true, false] {
             let read = SendsOnlyOffsets { limit_reached }
                 .fetch_until_limit(
@@ -1128,7 +1131,7 @@ mod tests {
         // polls the double again after the records reach the limit.
         tokio::task::yield_now().await;
         self.ended.store(true, Ordering::Relaxed);
-        Ok(())
+        Ok(ReadEnd::Finished)
     });
 
     /// The engine sends 3 records, then ends after one more poll. Under a soft limit of 1 byte,
@@ -1197,7 +1200,7 @@ mod tests {
     storage_double!(SendsWithoutWaiting, async fn fetch(&self, fetched_sender) {
         send_records(fetched_sender, self.records, self.record_time)
             .await
-            .map(drop)
+            .map(|_data| ReadEnd::Finished)
     });
 
     /// A read that never waits for I/O still stops at its deadline, because it waits for room once

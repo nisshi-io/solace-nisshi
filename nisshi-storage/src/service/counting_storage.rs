@@ -53,7 +53,7 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEntry,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version,
 };
@@ -569,7 +569,7 @@ impl Storage for CountingStorage {
         _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched: crate::FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         unimplemented!()
     }
 

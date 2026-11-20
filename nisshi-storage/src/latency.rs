@@ -47,7 +47,7 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version, fetched::FetchedSender,
 };
@@ -212,7 +212,7 @@ where
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.introduce_latency().await?;
 
         self.storage

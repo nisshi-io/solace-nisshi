@@ -142,8 +142,8 @@ use uuid::Uuid;
 use crate::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
     METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, RequestTimer, Result, ScramCredential, Storage, StorageOperation, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    ProducerIdResponse, ReadEnd, RequestTimer, Result, ScramCredential, Storage, StorageOperation,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     UpdateError, Version,
     fetched::FetchedSender,
     produce_path,
@@ -323,7 +323,7 @@ pub enum Response {
     DescribeConfig(Result<DescribeConfigsResult>),
     DescribeGroups(Result<Vec<NamedGroupDetail>>),
     DescribeTopicPartitions(Result<Vec<DescribeTopicPartitionsResponseTopic>>),
-    Fetch(Result<()>),
+    Fetch(Result<ReadEnd>),
     GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
     IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
     InitProducer(Result<ProducerIdResponse>),
@@ -800,7 +800,7 @@ impl Storage for RequestChannelService {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let request = Request::Fetch {
             topition: topition.to_owned(),
             offset,
@@ -1312,7 +1312,7 @@ where
                     if let Request::Fetch { fetched_sender, .. } = &request
                         && fetched_sender.reader_has_stopped()
                     {
-                        _ = tx.send(Ok(Response::Fetch(Ok(()))));
+                        _ = tx.send(Ok(Response::Fetch(Ok(ReadEnd::Finished))));
                         continue;
                     }
 
@@ -1475,7 +1475,7 @@ where
                     fetched = self.storage.fetch(
                         &topition, offset, min_bytes, limit, isolation, fetched_sender,
                     ) => fetched,
-                    () = reader_stopped => Ok(()),
+                    () = reader_stopped => Ok(ReadEnd::Finished),
                 }))
             }
             Request::OffsetStage(topition) => Ok(Response::OffsetStage(
@@ -1956,7 +1956,9 @@ mod tests {
             data.send_batch(batch).await.expect("the reader");
             drop(data);
 
-            reply.send(Ok(Response::Fetch(Ok(())))).expect("the reader");
+            reply
+                .send(Ok(Response::Fetch(Ok(ReadEnd::Finished))))
+                .expect("the reader");
         };
 
         let (fetched, ()) = tokio::join!(fetch(&storage, deadline), answer);
@@ -2028,7 +2030,7 @@ mod tests {
 
         let served = tokio::time::timeout(Duration::from_secs(1), serving).await;
 
-        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(())))));
+        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(ReadEnd::Finished)))));
         assert_matches!(
             read_ended.try_recv(),
             Err(TryRecvError::Closed),
@@ -2059,7 +2061,7 @@ mod tests {
         data.send_batch(batch).await?;
         drop(data);
 
-        self.outcome.clone()
+        self.outcome.clone().map(|()| ReadEnd::Finished)
     });
 
     /// Returns a client of a storage channel whose service loop serves `storage`, as mpsc mode

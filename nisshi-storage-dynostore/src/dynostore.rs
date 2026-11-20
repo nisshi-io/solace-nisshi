@@ -74,7 +74,7 @@ use nisshi_storage::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
     Error, FetchedDataSender, FetchedSender, FirstSequence, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OLDER_EPOCH_ERROR, OffsetCommitRequest, OffsetStage,
-    ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
+    ProduceEpoch, ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
     delete_records_cutoff, epoch_is_exhausted, inflate_produced, lake_skip, max_message_bytes,
@@ -2355,7 +2355,7 @@ impl DynoStore {
         mut base_offset: i64,
         mut first_object: Option<GetResult>,
         data: &mut FetchedDataSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let mut bytes_left = u64::from(bounds.limit.bytes());
         let mut first_may_exceed = matches!(bounds.limit, ByteLimit::Soft(_));
         let batch_header_size = u64::try_from(deflated::BATCH_OVERHEAD)?;
@@ -2405,8 +2405,7 @@ impl DynoStore {
                         }
                     }
 
-                    data.send_limit_reached().await?;
-                    break;
+                    return Ok(ReadEnd::ReachedLimit);
                 }
                 object => object,
             };
@@ -2444,8 +2443,7 @@ impl DynoStore {
             let size = u64::try_from(batch.size_in_bytes()?)?;
 
             if size > bytes_left && !first_may_exceed {
-                data.send_limit_reached().await?;
-                break;
+                return Ok(ReadEnd::ReachedLimit);
             }
 
             data.send_batch(batch).await?;
@@ -2458,7 +2456,7 @@ impl DynoStore {
             bytes_left -= size;
         }
 
-        Ok(())
+        Ok(ReadEnd::Finished)
     }
 
     /// Returns the offset that the fetch reads next if it skips the gap at `gap_start`, or
@@ -4463,7 +4461,7 @@ impl Storage for DynoStore {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let offset_stage = self.offset_stage(topition).await?;
 
         let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
@@ -4475,7 +4473,7 @@ impl Storage for DynoStore {
         debug!(high_watermark);
 
         if offset >= high_watermark {
-            return Ok(());
+            return Ok(ReadEnd::Finished);
         }
 
         let mut data = fetched_sender.send_offsets(offset_stage).await?;

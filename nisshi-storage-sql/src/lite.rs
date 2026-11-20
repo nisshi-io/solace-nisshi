@@ -76,11 +76,11 @@ use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ByteLimit, ChannelRequestLayer, CommittedOffset,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, RequestChannelService,
-    RequestStorageService, RequestTimer, Result, ScramCredential, SemaphoreProxy, StartupFailure,
-    Storage, StorageOperation, StoredEpochs, TopicConfiguration, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, bounded_channel, check_claim,
+    OffsetCommitRequest, OffsetStage, ProduceEpoch, ProducerIdResponse, ReadEnd,
+    RequestChannelService, RequestStorageService, RequestTimer, Result, ScramCredential,
+    SemaphoreProxy, StartupFailure, Storage, StorageOperation, StoredEpochs, TopicConfiguration,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    TxnState, UpdateError, Version, bounded_channel, check_claim,
     config::{self, apply_op},
     delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
     parse_storage_option, producer_claim,
@@ -2174,7 +2174,7 @@ impl Storage for Engine {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let timer = RequestTimer::new(
             &ENGINE_REQUEST_DURATION,
             StorageOperation::Fetch,
@@ -3361,7 +3361,7 @@ impl Storage for Delegate {
         limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let max_bytes = limit.bytes();
         let timer = RequestTimer::new(
             &DELEGATE_REQUEST_DURATION,
@@ -3500,7 +3500,7 @@ impl Storage for Delegate {
                 .await?;
             }
 
-            data.end().await
+            Ok(data.end())
         }
         .await;
 
