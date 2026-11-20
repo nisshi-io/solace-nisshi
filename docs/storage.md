@@ -19,6 +19,10 @@ The engines differ in what they support. For example, only PostgreSQL and SQLite
 retention and compaction. [Compatibility and feature status](compatibility.md) lists what
 each engine supports.
 
+With `s3://` and `gs://`, a fetch reads part of a batch with a range request, so the object
+store must answer a range request with 206 Partial Content, as S3, Google Cloud Storage and
+MinIO do.
+
 Switching storage engines does not move data: topics, messages, and consumer group offsets stay in the old engine, and the new one starts empty. The release binary starts on `memory://`, and Docker Compose runs on PostgreSQL unless you set `STORAGE_ENGINE`.
 
 PostgreSQL can stream transaction logs to an archive with
