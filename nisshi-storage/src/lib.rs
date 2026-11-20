@@ -2446,7 +2446,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// only the other resource types.
     ///
     /// For a topic, an implementation returns only the configs that the topic sets, and answers
-    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store.
+    /// [`ErrorCode::UnknownTopicOrPartition`] for a topic that it doesn't store. When `keys` is not
+    /// empty, it returns only the configs whose name is in `keys`.
     /// [`DescribeConfigsService`] adds Kafka's default for each other topic config when the error
     /// code is [`ErrorCode::None`]. The broker also calls this method, and reads a config that the
     /// topic doesn't set as Nisshi's own default.

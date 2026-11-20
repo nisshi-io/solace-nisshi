@@ -1052,8 +1052,13 @@ struct TopicMetadata {
 
 impl TopicMetadata {
     /// Returns the `DescribeConfigs` result for this topic. The result holds each config that the
-    /// topic sets, and gives `name` as the resource name.
-    fn describe_configs_result(&self, name: &str) -> DescribeConfigsResult {
+    /// topic sets and that `keys` names, and gives `name` as the resource name. An absent or empty
+    /// `keys` names every config.
+    fn describe_configs_result(
+        &self,
+        name: &str,
+        keys: Option<&[String]>,
+    ) -> DescribeConfigsResult {
         let error_code = ErrorCode::None;
 
         DescribeConfigsResult::default()
@@ -1064,6 +1069,9 @@ impl TopicMetadata {
             .configs(self.topic.configs.as_ref().map(|configs| {
                 configs
                     .iter()
+                    .filter(|config| {
+                        keys.is_none_or(|keys| keys.is_empty() || keys.contains(&config.name))
+                    })
                     .map(|config| {
                         DescribeConfigsResourceResult::default()
                             .name(config.name.clone())
@@ -3485,7 +3493,9 @@ impl DynoStore {
         );
         max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
-        let config = metadata.describe_configs_result(topition.topic());
+        // The lake reads configs by name prefix as well as by name, so this call asks for every
+        // config and not for a list of names.
+        let config = metadata.describe_configs_result(topition.topic(), None);
 
         if self.lake.is_some()
             && config
@@ -4911,11 +4921,11 @@ impl Storage for DynoStore {
         &self,
         name: &str,
         resource: ConfigResource,
-        _keys: Option<&[String]>,
+        keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
         match resource {
             ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
-                Ok(Some(topic_metadata)) => Ok(topic_metadata.describe_configs_result(name)),
+                Ok(Some(topic_metadata)) => Ok(topic_metadata.describe_configs_result(name, keys)),
 
                 Ok(None) => Ok(DescribeConfigsResult::default()
                     .error_code(ErrorCode::UnknownTopicOrPartition.into())
