@@ -37,14 +37,13 @@ use crate::{
         header_fetch, idempotent_epoch_check, idempotent_sequence_check, list_offset,
         producer_epoch_current_for_producer, producer_epoch_for_current_txn, producer_epoch_insert,
         producer_epochs_select, producer_insert, producer_select_for_update, record_fetch,
-        record_sender::RecordSender, remove_comments, result_columns::ResultColumns,
-        topic_by_cluster, topic_configuration_select, topic_configuration_select_name,
-        topic_configuration_upsert, topic_insert, topic_select_name, topic_select_uuid,
-        topition_insert, txn_offset_commit_tp_select_pending,
-        txn_produce_offset_select_offset_range, txn_produce_offset_select_overlapping_txn,
-        txn_produce_partition_check, txn_produce_partition_select, txn_select_name,
-        txn_select_produced_topitions, watermark_insert, watermark_select,
-        watermark_select_for_write,
+        remove_comments, result_columns::ResultColumns, topic_by_cluster,
+        topic_configuration_select, topic_configuration_select_name, topic_configuration_upsert,
+        topic_insert, topic_select_name, topic_select_uuid, topition_insert,
+        txn_offset_commit_tp_select_pending, txn_produce_offset_select_offset_range,
+        txn_produce_offset_select_overlapping_txn, txn_produce_partition_check,
+        txn_produce_partition_select, txn_select_name, txn_select_produced_topitions,
+        watermark_insert, watermark_select, watermark_select_for_write,
     },
 };
 use async_trait::async_trait;
@@ -1786,14 +1785,9 @@ impl Storage for Engine {
             max_bytes
         );
 
-        let mut data = RecordSender::new(
-            fetched_sender.send_offsets(offset_stage).await?,
-            limit,
-            None,
-            offset,
-            high_watermark,
-        );
-        let first_may_exceed = data.first_may_exceed();
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+        let first_may_exceed = limit.is_soft();
+        let mut read_end = ReadEnd::Finished;
 
         let c = self.connection().await?;
 
@@ -1827,7 +1821,7 @@ impl Storage for Engine {
                 ..
             }) = row.within_limit()
             else {
-                data.stop_at_limit();
+                read_end = ReadEnd::ReachedLimit;
                 continue;
             };
 
@@ -1855,7 +1849,7 @@ impl Storage for Engine {
             .await?;
         }
 
-        Ok(data.end())
+        Ok(read_end)
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -3965,9 +3959,9 @@ mod tests {
 
     /// The statements count each record as 110 bytes: the 7 bytes of every record, a 1-byte key,
     /// and a 100-byte header with 2 bytes of framing. Under a soft limit of 50 bytes, the fetch
-    /// statements return the first record. Under a hard limit of 50 bytes they return no record,
-    /// and the keyed statement returns a marker row for the first record, without its key. Under a
-    /// hard limit of 250 bytes they return the first two records.
+    /// statements return the first record. Under a hard limit of 50 bytes they return only a
+    /// marker row for the first record, and its key is null. Under a hard limit of 250 bytes they
+    /// return the first two records.
     #[tokio::test]
     async fn fetch_returns_an_oversized_first_record_only_for_a_soft_limit() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3995,14 +3989,12 @@ mod tests {
                 );
             }
 
-            // The plain statement shows a first record that does not fit by returning no row.
-            let marker = key.map(|_| StatementRow {
-                offset: 0,
-                limit_reached: true,
-                has_key: false,
-            });
             assert_eq!(
-                Vec::from_iter(marker),
+                vec![StatementRow {
+                    offset: 0,
+                    limit_reached: true,
+                    has_key: false,
+                }],
                 fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(50), 3).await?,
                 "{statement} within Hard(50)"
             );

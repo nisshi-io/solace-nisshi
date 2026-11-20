@@ -58,7 +58,7 @@ sql_row! {
         /// record without headers.
         header_values: Option<Vec<Option<bytes::Bytes>>>,
         /// Whether the row only marks that the fetch stopped at its hard limit before this record.
-        /// Only the keyed version returns such a row, and the row holds no key, value or headers.
+        /// The key, value and headers of a marker row are null.
         limit_reached: bool,
     }
 }

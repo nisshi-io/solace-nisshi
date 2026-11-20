@@ -145,6 +145,11 @@ group by h.offset_id)
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
 --
+-- If $8 is false and the first row does not fit $5, the query returns that row as a marker:
+-- `limit_reached` is true, and the key, value and headers are null, so the query does not send
+-- their bytes. The caller needs the marker, because the query also returns no rows when no record
+-- lies between $4 and $6.
+--
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
 select
@@ -152,16 +157,13 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-s.k as key,
-s.v as value,
+case when s.bytes < $5 or $8 then s.k end as key,
+case when s.bytes < $5 or $8 then s.v end as value,
 s.producer_id,
 s.producer_epoch,
-h.header_keys,
-h.header_values,
-
--- Every row holds a record. Only the keyed query returns a marker row (see
--- record_fetch_keyed.sql).
-false as limit_reached
+case when s.bytes < $5 or $8 then h.header_keys end as header_keys,
+case when s.bytes < $5 or $8 then h.header_values end as header_values,
+not (s.bytes < $5 or $8) as limit_reached
 
 from
 
@@ -171,6 +173,6 @@ left join headers h on h.offset_id = s.offset_id
 where
 
 s.bytes < $5
-or (s.ordinal = 1 and $8)
+or s.ordinal = 1
 
 order by s.offset_id;
