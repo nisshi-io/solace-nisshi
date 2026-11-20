@@ -56,6 +56,8 @@ every pull request.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) explains how the crates fit together.
 See `AGENTS.md` at the repo root for the full command reference.
+Claude Code reads `AGENTS.md` with every model provider from v2.1.281, so
+use that version or later.
 
 In a linked git worktree, the tests start the worktree's own services
 (`etc/worktree-services.sh`) on ports that Docker picks, and write those ports
