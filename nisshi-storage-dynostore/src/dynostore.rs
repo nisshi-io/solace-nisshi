@@ -3493,6 +3493,8 @@ impl DynoStore {
         );
         max_message_bytes::ensure_batch_fits(&deflated, limit)?;
 
+        // The lake reads configs by name prefix as well as by name, so this call asks for every
+        // config and not for a list of names.
         let config = metadata.describe_configs_result(topition.topic(), None);
 
         if self.lake.is_some()
