@@ -269,10 +269,10 @@ Kafka broker that enables it, and only with TLS, because PLAIN sends the passwor
 The mechanism name is not case sensitive, so Kafka's `SCRAM-SHA-512` works too. A SCRAM login
 stops when the broker asks for fewer than 4096 iterations, which is the minimum that Kafka's
 client enforces, or for more than 65,536, which is four times the most that a Kafka broker
-asks for. A user that `nisshi user create --iterations` made with a count outside that range
-cannot log in with these commands. Each connection
-logs in once, as it opens, and a broker that limits the session lifetime has the command open a
-new connection, which logs in again, a little before the limit. `proxy` has none of these
+asks for. A user that an earlier version of `nisshi user create --iterations` stored with a
+count outside that range cannot log in with these commands. Each connection logs in once, as it
+opens, and a broker that limits the session lifetime has the command open a new connection,
+which logs in again, a little before the limit. `proxy` has none of these
 options.
 
 If the TLS handshake or the login fails, the command says so, and which option to check.
