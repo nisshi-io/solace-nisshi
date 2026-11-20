@@ -17,18 +17,27 @@
 //! An engine's `without` list names the suite's areas, files and groups of cases that the engine
 //! doesn't run.
 
+// The in-memory engine answers a DeleteGroups request for a group that it never stored with
+// `NONE`, because deleting an absent object store key succeeds, so it leaves out the cases that
+// check Kafka's `GROUP_ID_NOT_FOUND`.
 #[cfg(feature = "dynostore")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: in_memory,
     storage: crate::common::memory_storage,
     before_each: crate::common::init_tracing,
+    without: [not_on_in_memory],
 }
 
+// The `not_on_lite`, `not_on_pg` and `not_on_turso` groups hold cases that run only on the
+// in-memory engine. Most of them check group IDs that are hard to store as an object store key,
+// such as the empty ID and IDs with a `/`. Lite also leaves out `cg_static`, whose cases are
+// ignored on every engine.
 #[cfg(feature = "libsql")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: lite,
     storage: crate::common::lite_storage,
     before_each: crate::common::init_tracing,
+    without: [cg_static, not_on_lite],
 }
 
 #[cfg(feature = "postgres")]
@@ -36,22 +45,56 @@ nisshi_storage_integration_test::storage_integration_tests! {
     engine: pg,
     storage: crate::common::postgres_storage,
     before_each: crate::common::init_tracing,
+    without: [not_on_pg],
 }
 
-// SlateDB is deprecated, and `AGENTS.md` says to keep its test coverage as it is, so it leaves out
-// the `not_on_slatedb` group.
+// SlateDB is deprecated, and `AGENTS.md` says to keep its tests and coverage as they are. This list
+// keeps that coverage.
 #[cfg(feature = "slatedb")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: slatedb,
     storage: crate::common::slate_storage,
     before_each: crate::common::init_tracing,
-    without: [not_on_slatedb],
+    without: [
+        not_on_slatedb,
+        cg_static,
+        consumer_group_describe,
+        offset_commit_v1_timestamp,
+        offset_fetch_commit_metadata,
+        offset_fetch_require_stable,
+        offset_metadata_max_size,
+        txn_offset_commit_fence,
+        txn_offset_fetch_commit_metadata,
+        txn_offset_metadata_max_size,
+    ],
 }
 
+// Turso runs only some of the suite until #866 is done. The `offset` area, which holds
+// `offset_fetch_commit_metadata`, and the files `txn_offset_fetch_commit_metadata` and
+// `offset_fetch_require_stable` wait for #866. No reason is recorded for the other areas, files
+// and groups in this list.
 #[cfg(feature = "turso")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: turso,
     storage: crate::common::turso_storage,
     before_each: crate::common::init_tracing,
-    without: [consumer_group],
+    without: [
+        not_on_turso,
+        cg_dynamic,
+        cg_static,
+        consumer_group_describe,
+        describe_groups,
+        find_coordinator,
+        group_across_brokers,
+        group_cache_miss,
+        join_invalid_session_timeout,
+        list_groups,
+        new_cg,
+        rebalance_timing,
+        offset,
+        offset_fetch_require_stable,
+        txn_offset_commit_fence,
+        txn_offset_fetch_commit_metadata,
+        txn_offset_metadata_max_size,
+    ],
 }

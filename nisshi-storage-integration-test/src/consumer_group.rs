@@ -14,5 +14,15 @@
 
 //! Cases about consumer groups: joining, syncing, describing, listing and deleting them.
 
+pub mod cg_dynamic;
+pub mod cg_static;
+pub mod consumer_group_describe;
+pub mod delete_groups;
+pub mod describe_groups;
+pub mod find_coordinator;
+pub mod group_across_brokers;
+pub mod group_cache_miss;
 pub mod join_invalid_session_timeout;
+pub mod list_groups;
 pub mod new_cg;
+pub mod rebalance_timing;

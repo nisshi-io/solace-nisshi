@@ -36,14 +36,11 @@ use nisshi_sans_io::{
     sync_group_request::SyncGroupRequestAssignment,
 };
 use nisshi_storage::Storage;
-use rand::{prelude::*, rng};
 use tokio::{task::JoinHandle, time::sleep};
-use url::Url;
-use uuid::Uuid;
 
-use crate::common::{
-    self, CLIENT_ID, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string, heartbeat,
-    init_tracing, join_group, leave, random_bytes, sync_group,
+use crate::{
+    group::{self, CLIENT_ID, PROTOCOL_TYPE, RANGE},
+    random,
 };
 
 const SESSION_TIMEOUT_MS: i32 = 45_000;
@@ -129,7 +126,7 @@ async fn join_request<G>(
 where
     G: Storage + Clone,
 {
-    let response = join_group(
+    let response = group::join_group(
         &mut brokers.for_request(request),
         Some(CLIENT_ID),
         group,
@@ -170,7 +167,7 @@ where
     let protocols = vec![
         JoinGroupRequestProtocol::default()
             .name(RANGE.into())
-            .metadata(random_bytes(15)),
+            .metadata(random::random_bytes(15)),
     ];
 
     let (error_code, required) =
@@ -214,7 +211,7 @@ where
         })
         .collect::<Vec<_>>();
 
-    let response = sync_group(
+    let response = group::sync_group(
         &mut brokers.for_request(member.requests),
         &group,
         member.generation,
@@ -246,7 +243,7 @@ where
     let started = Instant::now();
 
     loop {
-        let response = heartbeat(
+        let response = group::heartbeat(
             &mut brokers.for_request(member.requests),
             group,
             member.generation,
@@ -338,7 +335,7 @@ where
 /// Four members form a group, one leaves, and a new one joins, with each request of each member
 /// sent to the other broker than its request before. Each rebalance ends in one generation that
 /// every member joined, with each member's assignment from that generation.
-async fn rebalances_end_in_one_generation_when_requests_alternate_brokers<G>(
+pub async fn rebalances_end_in_one_generation_when_requests_alternate_brokers<G>(
     storage: G,
 ) -> Result<()>
 where
@@ -347,7 +344,7 @@ where
     const MEMBERS: usize = 4;
 
     let brokers = Brokers::new(storage);
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let joins = (0..MEMBERS)
         .map(|first_request| tokio::spawn(join_new(brokers.clone(), group.clone(), first_request)))
@@ -355,7 +352,7 @@ where
     let mut members = complete_rebalance(&brokers, &group, joins, 0).await?;
 
     let leaving = members.pop().expect("a member");
-    let left = leave(
+    let left = group::leave(
         &mut brokers.for_request(leaving.requests),
         &group,
         &leaving.id,
@@ -383,35 +380,3 @@ where
 
     Ok(())
 }
-
-macro_rules! backend {
-    ($name:ident, $feature:literal, $storage_type:expr) => {
-        #[cfg(feature = $feature)]
-        mod $name {
-            use super::*;
-
-            #[tokio::test]
-            async fn rebalances_end_in_one_generation_when_requests_alternate_brokers()
-            -> Result<()> {
-                let _guard = init_tracing()?;
-
-                super::rebalances_end_in_one_generation_when_requests_alternate_brokers(
-                    common::storage_container(
-                        $storage_type,
-                        Uuid::now_v7(),
-                        rng().random_range(0..i32::MAX),
-                        Url::parse("tcp://127.0.0.1/")?,
-                        None,
-                    )
-                    .await?,
-                )
-                .await
-            }
-        }
-    };
-}
-
-backend!(in_memory, "dynostore", StorageType::InMemory);
-backend!(lite, "libsql", StorageType::Lite);
-backend!(pg, "postgres", StorageType::Postgres);
-backend!(slatedb, "slatedb", StorageType::SlateDb);

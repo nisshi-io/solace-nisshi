@@ -16,6 +16,7 @@ rust-version.workspace = true
 # crate or on an engine feature of `nisshi-broker`. `tests/it/dependencies.rs` checks it.
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
 nisshi-broker.workspace = true
 nisshi-sans-io.workspace = true
@@ -26,6 +27,7 @@ rand.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [lints]

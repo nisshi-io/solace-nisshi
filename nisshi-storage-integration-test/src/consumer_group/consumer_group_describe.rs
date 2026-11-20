@@ -22,9 +22,8 @@ use nisshi_sans_io::{
 use nisshi_storage::{ConsumerGroupDescribeService, GroupDetail, Storage};
 use rama::{Service as _, extensions::Extensions};
 use tracing::debug;
-use url::Url;
 
-use crate::common::{self, alphanumeric_string, register_broker};
+use crate::{broker, random};
 
 async fn create_group(storage: &impl Storage, group_id: &str) -> Result<()> {
     _ = storage
@@ -56,8 +55,8 @@ async fn describe(
 /// `kafka-consumer-groups --describe --members` show no members. The broker must answer
 /// `GROUP_ID_NOT_FOUND` for a stored group, as Kafka does for a classic group, and omit the
 /// group's authorized operations, as it does on every error row.
-async fn stored_group_answers_group_id_not_found(storage: impl Storage + Clone) -> Result<()> {
-    let group_id = alphanumeric_string(15);
+pub async fn stored_group_answers_group_id_not_found(storage: impl Storage + Clone) -> Result<()> {
+    let group_id = random::alphanumeric_string(15);
     create_group(&storage, &group_id).await?;
 
     for include_authorized_operations in [false, true] {
@@ -82,13 +81,12 @@ async fn stored_group_answers_group_id_not_found(storage: impl Storage + Clone) 
     Ok(())
 }
 
-/// Requires an engine that answers an unknown group with `GROUP_ID_NOT_FOUND`.
-#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
-async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) -> Result<()> {
+/// An unknown group answers `GROUP_ID_NOT_FOUND`, and its row omits the authorized operations.
+pub async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
             storage.clone(),
-            &[alphanumeric_string(15)],
+            &[random::alphanumeric_string(15)],
             include_authorized_operations,
         )
         .await?;
@@ -106,15 +104,14 @@ async fn error_row_omits_authorized_operations(storage: impl Storage + Clone) ->
 pub async fn describe_non_existent_group<C, G>(
     cluster_id: C,
     broker_id: i32,
-    advertised_listener: Url,
     storage: G,
 ) -> Result<()>
 where
     C: Into<String>,
     G: Storage + Clone,
 {
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, &storage).await?;
+    debug!(broker_id);
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let service = ConsumerGroupDescribeService { storage };
 
@@ -139,117 +136,4 @@ where
     assert_eq!(group_id, groups[0].group_id.as_str());
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use nisshi_storage::ArcDynStorage;
-
-    use crate::common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-    use uuid::Uuid;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            advertised_listener,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn describe_non_existent_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::describe_non_existent_group(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    async fn storage() -> Result<ArcDynStorage> {
-        common::memory_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn stored_group_answers_group_id_not_found() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stored_group_answers_group_id_not_found(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use nisshi_storage::ArcDynStorage;
-    use rand::{prelude::*, rng};
-    use uuid::Uuid;
-
-    use crate::common::init_tracing;
-
-    use super::*;
-
-    async fn storage() -> Result<ArcDynStorage> {
-        common::lite_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn stored_group_answers_group_id_not_found() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stored_group_answers_group_id_not_found(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
-    }
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use nisshi_storage::ArcDynStorage;
-    use rand::{prelude::*, rng};
-    use uuid::Uuid;
-
-    use crate::common::init_tracing;
-
-    use super::*;
-
-    async fn storage() -> Result<ArcDynStorage> {
-        common::postgres_storage(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn stored_group_answers_group_id_not_found() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stored_group_answers_group_id_not_found(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn error_row_omits_authorized_operations() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::error_row_omits_authorized_operations(storage().await?).await
-    }
 }

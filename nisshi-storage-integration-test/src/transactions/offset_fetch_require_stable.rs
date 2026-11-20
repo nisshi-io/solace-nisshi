@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
+use crate::{broker, random};
 use bytes::Bytes;
 use nisshi_broker::{
     Result,
@@ -46,9 +46,6 @@ use nisshi_storage::{
     OffsetCommitRequest, ProducerIdResponse, Storage, Topition, TxnAddPartitionsRequest,
     TxnOffsetCommitRequest,
 };
-use rand::{RngExt as _, rng};
-use url::Url;
-use uuid::Uuid;
 
 /// The partition that the open transaction commits an offset for.
 const PENDING: i32 = 0;
@@ -119,9 +116,9 @@ async fn create_topic<G>(
 where
     G: Storage,
 {
-    register_broker(cluster_id, broker_id, storage).await?;
+    broker::register_broker(cluster_id, broker_id, storage).await?;
 
-    let topic = alphanumeric_string(15);
+    let topic = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -299,7 +296,7 @@ impl OpenTransaction {
     where
         G: Storage,
     {
-        let transaction_id = alphanumeric_string(15);
+        let transaction_id = random::alphanumeric_string(15);
 
         let producer = storage
             .init_producer(Some(transaction_id.as_str()), 10_000, Some(-1), Some(-1))
@@ -394,7 +391,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let _transaction = commit_then_begin(&storage, &group_id, &topic).await?;
 
@@ -420,7 +417,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let _transaction = commit_then_begin(&storage, &group_id, &topic).await?;
 
@@ -442,7 +439,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     commit_then_begin(&storage, &group_id, &topic)
         .await?
@@ -471,7 +468,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     commit_then_begin(&storage, &group_id, &topic)
         .await?
@@ -502,8 +499,8 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
-    let other_group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
+    let other_group_id = random::alphanumeric_string(15);
 
     offset_commit(&storage, &other_group_id, &topic, PENDING, COMMITTED).await?;
     offset_commit(&storage, &other_group_id, &topic, OTHER, OTHER_COMMITTED).await?;
@@ -536,7 +533,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let _transaction = OpenTransaction::begin(&storage, &group_id, &topic).await?;
 
@@ -570,7 +567,7 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let transaction = commit_then_begin(&storage, &group_id, &topic).await?;
 
@@ -652,13 +649,13 @@ where
     G: Storage + Clone,
 {
     let topic = create_topic(cluster_id, broker_id, &storage).await?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     offset_commit(&storage, &group_id, &topic, PENDING, COMMITTED).await?;
     offset_commit(&storage, &group_id, &topic, OTHER, OTHER_COMMITTED).await?;
 
     // The older transaction produces to the partition, and stays open.
-    let older = alphanumeric_string(15);
+    let older = random::alphanumeric_string(15);
     let older_producer = storage
         .init_producer(Some(older.as_str()), 10_000, Some(-1), Some(-1))
         .await?;
@@ -723,62 +720,3 @@ where
     )
     .await
 }
-
-macro_rules! backend {
-    ($name:ident, $feature:literal, $storage_type:expr $(, #[$attribute:meta])*) => {
-        #[cfg(feature = $feature)]
-        mod $name {
-            use nisshi_storage::ArcDynStorage;
-
-            use super::*;
-
-            async fn storage_container(cluster_id: Uuid, broker_id: i32) -> Result<ArcDynStorage> {
-                common::storage_container(
-                    $storage_type,
-                    cluster_id,
-                    broker_id,
-                    Url::parse("tcp://127.0.0.1/")?,
-                    None,
-                )
-                .await
-            }
-
-            backend!(@test pending_offset_is_unstable_with_require_stable $(, #[$attribute])*);
-            backend!(@test pending_offset_is_ignored_without_require_stable $(, #[$attribute])*);
-            backend!(@test committed_transaction_offset_is_stable $(, #[$attribute])*);
-            backend!(@test aborted_transaction_offset_is_stable $(, #[$attribute])*);
-            backend!(@test pending_offset_of_another_group_is_stable $(, #[$attribute])*);
-            backend!(@test pending_offset_without_commit_is_unstable $(, #[$attribute])*);
-            backend!(@test reinitialized_producer_ends_pending_offset $(, #[$attribute])*);
-            backend!(@test deferred_commit_of_reinitialized_producer_keeps_offset_pending $(, #[$attribute])*);
-        }
-    };
-
-    (@test $test:ident $(, #[$attribute:meta])*) => {
-        $(#[$attribute])*
-        #[tokio::test]
-        async fn $test() -> Result<()> {
-            let _guard = init_tracing()?;
-
-            let cluster_id = Uuid::now_v7();
-            let broker_id = rng().random_range(0..i32::MAX);
-
-            super::$test(
-                cluster_id,
-                broker_id,
-                storage_container(cluster_id, broker_id).await?,
-            )
-            .await
-        }
-    };
-}
-
-backend!(in_memory, "dynostore", StorageType::InMemory);
-backend!(lite, "libsql", StorageType::Lite);
-backend!(pg, "postgres", StorageType::Postgres);
-backend!(
-    turso,
-    "turso",
-    StorageType::Turso,
-    #[ignore = "the Turso engine does not start in the broker tests yet, see #866"]
-);

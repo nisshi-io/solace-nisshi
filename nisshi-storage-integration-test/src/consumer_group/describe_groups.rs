@@ -19,10 +19,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::common::{
-    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
-    slate_storage,
-};
+use crate::random;
 use bytes::Bytes;
 use nisshi_broker::{
     Error, Result,
@@ -35,12 +32,11 @@ use nisshi_sans_io::{
     join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
-    ArcDynStorage, DescribeGroupsService, GroupDetail, GroupMember, GroupRebalance, GroupState,
+    DescribeGroupsService, GroupDetail, GroupMember, GroupRebalance, GroupState,
     OffsetCommitRequest, PendingSync, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{RngExt as _, rng};
-use uuid::Uuid;
 
 /// The authorized operations that Kafka 3.9.1 answers for a group when the broker has no
 /// authorizer: the group's supported operations READ (3), DELETE (6) and DESCRIBE (8), as the
@@ -73,8 +69,8 @@ async fn describe(
     Ok(response.groups.unwrap_or_default())
 }
 
-async fn operations_omitted_unless_requested(storage: impl Storage + Clone) -> Result<()> {
-    let group_id = alphanumeric_string(15);
+pub async fn operations_omitted_unless_requested(storage: impl Storage + Clone) -> Result<()> {
+    let group_id = random::alphanumeric_string(15);
     create_group(&storage, &group_id).await?;
 
     let groups = describe(storage, &[group_id], false).await?;
@@ -85,10 +81,10 @@ async fn operations_omitted_unless_requested(storage: impl Storage + Clone) -> R
     Ok(())
 }
 
-async fn found_group_answers_supported_operations_when_asked(
+pub async fn found_group_answers_supported_operations_when_asked(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
     create_group(&storage, &group_id).await?;
 
     let groups = describe(storage, &[group_id], true).await?;
@@ -104,13 +100,12 @@ async fn found_group_answers_supported_operations_when_asked(
 
 /// `DescribeGroups` v0 to v5 describes a group that does not exist with the error NONE and the
 /// state `Dead`, as Kafka does. A client reads the group as missing from that state, but fails on
-/// `GROUP_ID_NOT_FOUND`. Requires an engine that stores the groups that it describes.
-#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
-async fn unknown_group_answers_dead(storage: impl Storage + Clone) -> Result<()> {
+/// `GROUP_ID_NOT_FOUND`.
+pub async fn unknown_group_answers_dead(storage: impl Storage + Clone) -> Result<()> {
     for include_authorized_operations in [false, true] {
         let groups = describe(
             storage.clone(),
-            &[alphanumeric_string(15)],
+            &[random::alphanumeric_string(15)],
             include_authorized_operations,
         )
         .await?;
@@ -132,9 +127,10 @@ async fn unknown_group_answers_dead(storage: impl Storage + Clone) -> Result<()>
 
 /// A group that only committed offsets, and never joined, exists: the broker must answer it as
 /// an empty group, not with `GROUP_ID_NOT_FOUND`.
-#[cfg(any(feature = "dynostore", feature = "libsql", feature = "postgres"))]
-async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clone) -> Result<()> {
-    let topic_name = alphanumeric_string(15);
+pub async fn group_with_only_committed_offsets_is_empty(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let topic_name = random::alphanumeric_string(15);
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -147,7 +143,7 @@ async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clon
         )
         .await?;
 
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
     let topition = Topition::new(topic_name, 0);
     let committed = storage
         .offset_commit(
@@ -176,11 +172,11 @@ async fn group_with_only_committed_offsets_is_empty(storage: impl Storage + Clon
 /// it describes the group, also when no member has sent a request since. The broker answers no
 /// protocol for the group, as Kafka does: Kafka forgets the protocol when the group becomes
 /// `Empty`, and answers a protocol only for a `Stable` group.
-async fn group_whose_sessions_expired_is_described_as_empty(
+pub async fn group_whose_sessions_expired_is_described_as_empty(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let group_id = alphanumeric_string(15);
-    let member_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
+    let member_id = random::alphanumeric_string(15);
 
     let session_timeout =
         Duration::from_millis(u64::try_from(GroupDetail::default().session_timeout_ms)?);
@@ -232,7 +228,7 @@ struct TestMember {
 impl TestMember {
     fn new(client_id: &'static str, client_host: &'static str) -> Self {
         Self {
-            member_id: alphanumeric_string(15),
+            member_id: random::alphanumeric_string(15),
             group_instance_id: None,
             client_id,
             client_host,
@@ -325,7 +321,7 @@ async fn store_and_describe(
 /// Describing a running group must show who reads which partitions. The broker must answer
 /// `DescribeGroups` for a `Stable` group with each member's group instance id, client id, host,
 /// subscription and assignment, and the group's assignor.
-async fn stable_group_reports_each_member_and_the_protocol(
+pub async fn stable_group_reports_each_member_and_the_protocol(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let members = [
@@ -357,7 +353,7 @@ async fn stable_group_reports_each_member_and_the_protocol(
                 .map(|member| (member.member_id.clone(), member.described()))
                 .collect(),
         },
-        store_and_describe(storage, &alphanumeric_string(15), detail).await?
+        store_and_describe(storage, &random::alphanumeric_string(15), detail).await?
     );
 
     Ok(())
@@ -368,7 +364,7 @@ async fn stable_group_reports_each_member_and_the_protocol(
 /// subscription. The broker must answer `DescribeGroups` for a rebalancing group with each
 /// member's group instance id, client id and host, and with an empty subscription, assignment and
 /// protocol, as Kafka does.
-async fn rebalancing_group_reports_members_without_metadata(
+pub async fn rebalancing_group_reports_members_without_metadata(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let members = [
@@ -412,18 +408,18 @@ async fn rebalancing_group_reports_members_without_metadata(
                 })
                 .collect(),
         },
-        store_and_describe(storage, &alphanumeric_string(15), detail).await?
+        store_and_describe(storage, &random::alphanumeric_string(15), detail).await?
     );
 
     Ok(())
 }
 
-async fn simple(storage: impl Storage + Clone) -> Result<()> {
+pub async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let service = DescribeGroupsService {
         storage: storage.clone(),
     };
 
-    let group_id = &alphanumeric_string(15)[..];
+    let group_id = &random::alphanumeric_string(15)[..];
 
     let response = service
         .serve(RequestInput {
@@ -442,246 +438,4 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
     assert_matches!(groups[0].group_state.as_str(), "Empty" | "Dead");
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    async fn storage() -> Result<ArcDynStorage> {
-        storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn unknown_group_answers_dead() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_dead(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_with_only_committed_offsets_is_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    async fn storage() -> Result<ArcDynStorage> {
-        storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn unknown_group_answers_dead() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_dead(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_with_only_committed_offsets_is_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        postgres_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    async fn storage() -> Result<ArcDynStorage> {
-        storage_container(Uuid::now_v7(), rng().random_range(0..i32::MAX)).await
-    }
-
-    #[tokio::test]
-    async fn operations_omitted_unless_requested() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::operations_omitted_unless_requested(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn found_group_answers_supported_operations_when_asked() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::found_group_answers_supported_operations_when_asked(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn unknown_group_answers_dead() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::unknown_group_answers_dead(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_with_only_committed_offsets_is_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_with_only_committed_offsets_is_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_described_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::group_whose_sessions_expired_is_described_as_empty(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn stable_group_reports_each_member_and_the_protocol() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::stable_group_reports_each_member_and_the_protocol(storage().await?).await
-    }
-
-    #[tokio::test]
-    async fn rebalancing_group_reports_members_without_metadata() -> Result<()> {
-        let _guard = init_tracing()?;
-        super::rebalancing_group_reports_members_without_metadata(storage().await?).await
-    }
 }

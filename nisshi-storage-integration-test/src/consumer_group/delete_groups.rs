@@ -14,7 +14,10 @@
 
 use std::{assert_matches, collections::BTreeMap, slice, time::Duration};
 
-use crate::common::{self, Formed, alphanumeric_string, form_group};
+use crate::{
+    group::{self, Formed},
+    random,
+};
 use nisshi_broker::{
     Error,
     coordinator::group::{Coordinator, administrator::Controller},
@@ -37,16 +40,16 @@ use unreadable_groups::UnreadableGroups;
 /// gone. This exercises the coordinator-level route
 /// (`Coordinator::delete_groups`), not the raw storage primitive the other
 /// tests in this file use.
-async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
     let Formed {
         group, member_id, ..
-    } = form_group(&coordinator)
+    } = group::form_group(&coordinator)
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
 
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -101,7 +104,7 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
             .map(|committed| committed.offset)
     );
 
-    _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
+    _ = group::leave(&mut coordinator, &group, &member_id, None).await?;
 
     let response: DeleteGroupsResponse =
         coordinator
@@ -127,6 +130,51 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
     Ok(())
 }
 
+/// Forms a group through `coordinator`, has its only member leave, and
+/// deletes the group, which must succeed. Returns the group's id.
+async fn delete_empty_group<G>(coordinator: &mut Controller<G>) -> Result<String, Error>
+where
+    G: Storage + Clone,
+{
+    let Formed {
+        group, member_id, ..
+    } = group::form_group(coordinator)
+        .await
+        .map_err(|err| Error::Message(err.to_string()))?;
+
+    _ = group::leave(coordinator, &group, &member_id, None).await?;
+
+    let response: DeleteGroupsResponse =
+        coordinator
+            .delete_groups(slice::from_ref(&group))
+            .await
+            .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
+
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    Ok(group)
+}
+
+/// A group that the coordinator deletes is gone from storage: storage
+/// describes it with `GROUP_ID_NOT_FOUND`.
+pub async fn deleted_group_is_not_found(storage: impl Storage + Clone) -> Result<(), Error> {
+    let mut coordinator = Controller::with_storage(storage.clone())?;
+    let group = delete_empty_group(&mut coordinator).await?;
+
+    let described = storage
+        .describe_groups(Some(slice::from_ref(&group)), false)
+        .await?;
+    assert_eq!(1, described.len());
+    assert_matches!(
+        described[0].response,
+        GroupDetailResponse::ErrorCode(ErrorCode::GroupIdNotFound)
+    );
+
+    Ok(())
+}
+
 /// Deleting a group must forget whatever the coordinator cached for it, or
 /// a brand-new member joining under the same, just-deleted group name would
 /// silently reuse the deleted group's stale state instead of starting a
@@ -139,43 +187,9 @@ async fn non_empty_group_then_empty(storage: impl Storage + Clone) -> Result<(),
 /// reliable signal is whether the rejoin actually started a fresh
 /// generation or continued the deleted group's: compare it against a
 /// genuinely new control group joined the same way.
-async fn delete_evicts_coordinator_cache(
-    storage: impl Storage + Clone,
-    after_delete_not_found: Option<ErrorCode>,
-) -> Result<(), Error> {
-    let mut coordinator = Controller::with_storage(storage.clone())?;
-
-    let Formed {
-        group, member_id, ..
-    } = form_group(&coordinator)
-        .await
-        .map_err(|err| Error::Message(err.to_string()))?;
-
-    _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
-
-    let response: DeleteGroupsResponse =
-        coordinator
-            .delete_groups(slice::from_ref(&group))
-            .await
-            .and_then(|body| TryInto::try_into(body).map_err(Into::into))?;
-
-    let results = response.results.unwrap_or_default();
-    assert_eq!(1, results.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
-
-    // SlateDB answers a missing group as `Found(GroupDetail::default())`, so
-    // this check applies only to the engines that report `GroupIdNotFound`.
-    if let Some(expected) = after_delete_not_found {
-        let described = storage
-            .describe_groups(Some(slice::from_ref(&group)), false)
-            .await?;
-        assert_eq!(1, described.len());
-        assert!(
-            matches!(described[0].response, GroupDetailResponse::ErrorCode(code) if code == expected),
-            "expected {expected:?}, got {:?}",
-            described[0].response
-        );
-    }
+pub async fn delete_evicts_coordinator_cache(storage: impl Storage + Clone) -> Result<(), Error> {
+    let mut coordinator = Controller::with_storage(storage)?;
+    let group = delete_empty_group(&mut coordinator).await?;
 
     // A short timeout: the coordinator's own join-rebalance wait sleeps
     // until half the session timeout has elapsed before closing a solo
@@ -183,7 +197,7 @@ async fn delete_evicts_coordinator_cache(
     // doesn't need to exercise that wait.
     let session_timeout_ms = 1_000;
 
-    let rejoined = common::join(
+    let rejoined = group::join(
         &mut coordinator,
         &group,
         None,
@@ -194,8 +208,8 @@ async fn delete_evicts_coordinator_cache(
     )
     .await?;
 
-    let control_group = alphanumeric_string(15);
-    let control = common::join(
+    let control_group = random::alphanumeric_string(15);
+    let control = group::join(
         &mut coordinator,
         &control_group,
         None,
@@ -222,13 +236,13 @@ async fn delete_evicts_coordinator_cache(
 /// (via `missed_heartbeat`) before deciding a group is non-empty, or a
 /// consumer that died without `LeaveGroup` would make its group
 /// permanently undeletable.
-async fn delete_after_session_expiry(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn delete_after_session_expiry(storage: impl Storage + Clone) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
     let session_timeout_ms = 500;
 
-    let joined = common::join(
+    let joined = group::join(
         &mut coordinator,
         &group_id,
         None,
@@ -264,10 +278,10 @@ async fn delete_after_session_expiry(storage: impl Storage + Clone) -> Result<()
 /// `Storage::describe_groups`, which must treat this group's NULL `detail`
 /// column on the SQL backends (a group row with no detail row) as empty,
 /// not an error.
-async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), Error> {
     let coordinator = Controller::with_storage(storage.clone())?;
 
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -281,7 +295,7 @@ async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), 
         .await?;
 
     let topition = Topition::new(topic_name, 0);
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
     let offset = rng().random_range(0..i64::MAX);
 
     let commit = storage
@@ -313,7 +327,7 @@ async fn delete_offsets_only_group(storage: impl Storage + Clone) -> Result<(), 
 /// Commits one offset for `group_id` on a new single-partition topic, and
 /// returns the partition and the offset.
 async fn commit_offset(storage: &impl Storage, group_id: &str) -> Result<(Topition, i64), Error> {
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
     _ = storage
         .create_topic(
             CreatableTopic::default()
@@ -381,14 +395,14 @@ async fn delete(
 /// A broker that has not cached a group reads the group from storage, and
 /// refuses to delete it while a member that joined through another broker
 /// is live. The member's next heartbeat through that broker succeeds.
-async fn cache_miss_with_live_member(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn cache_miss_with_live_member(storage: impl Storage + Clone) -> Result<(), Error> {
     let a = Controller::with_storage(storage.clone())?;
 
     let Formed {
         group,
         generation_id,
         member_id,
-    } = form_group(&a)
+    } = group::form_group(&a)
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
 
@@ -406,7 +420,7 @@ async fn cache_miss_with_live_member(storage: impl Storage + Clone) -> Result<()
         committed_offset(&storage, &group, &topition).await?
     );
 
-    let heartbeat = common::heartbeat(&mut b, &group, generation_id, &member_id, None).await?;
+    let heartbeat = group::heartbeat(&mut b, &group, generation_id, &member_id, None).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(heartbeat.error_code)?);
 
     Ok(())
@@ -415,21 +429,21 @@ async fn cache_miss_with_live_member(storage: impl Storage + Clone) -> Result<()
 /// A broker whose cache holds a group as empty still refuses to delete the
 /// group after a member joins it through another broker, because the
 /// decision comes from storage.
-async fn stale_cache_on_another_broker(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn stale_cache_on_another_broker(storage: impl Storage + Clone) -> Result<(), Error> {
     let mut a = Controller::with_storage(storage.clone())?;
 
     let Formed {
         group, member_id, ..
-    } = form_group(&a)
+    } = group::form_group(&a)
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
 
-    _ = common::leave(&mut a, &group, &member_id, None).await?;
+    _ = group::leave(&mut a, &group, &member_id, None).await?;
 
     let (topition, offset) = commit_offset(&storage, &group).await?;
 
     let mut b = Controller::with_storage(storage.clone())?;
-    _ = common::join(&mut b, &group, None, None, None, 30_000, Some(300_000)).await?;
+    _ = group::join(&mut b, &group, None, None, None, 30_000, Some(300_000)).await?;
 
     assert_eq!(
         vec![(group.clone(), ErrorCode::NonEmptyGroup)],
@@ -446,16 +460,16 @@ async fn stale_cache_on_another_broker(storage: impl Storage + Clone) -> Result<
 
 /// A group whose state the coordinator cannot read is not deleted, and the
 /// response carries the storage error for that group.
-async fn storage_read_error(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn storage_read_error(storage: impl Storage + Clone) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
     let Formed {
         group, member_id, ..
-    } = form_group(&coordinator)
+    } = group::form_group(&coordinator)
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
 
-    _ = common::leave(&mut coordinator, &group, &member_id, None).await?;
+    _ = group::leave(&mut coordinator, &group, &member_id, None).await?;
 
     let (topition, offset) = commit_offset(&storage, &group).await?;
 
@@ -479,15 +493,14 @@ async fn storage_read_error(storage: impl Storage + Clone) -> Result<(), Error> 
 /// One request through the coordinator that names a non-empty group, an
 /// empty group (twice), a group that does not exist, and the empty group
 /// id. Each distinct id gets one result, and only the empty group loses its
-/// committed offset.
-async fn mixed_request(
-    storage: impl Storage + Clone,
-    expected_for_unknown: &[ErrorCode],
-    expected_for_empty_id: ErrorCode,
-) -> Result<(), Error> {
+/// committed offset. Kafka answers the group that does not exist and the empty
+/// group id with `GROUP_ID_NOT_FOUND`, which `unknown_group_is_not_found` and
+/// `empty_group_id_is_not_found` check. This case also accepts `NONE`, which
+/// the in-memory engine answers for a group that it never stored.
+pub async fn mixed_request(storage: impl Storage + Clone) -> Result<(), Error> {
     let mut coordinator = Controller::with_storage(storage.clone())?;
 
-    let non_empty = form_group(&coordinator)
+    let non_empty = group::form_group(&coordinator)
         .await
         .map_err(|err| Error::Message(err.to_string()))?
         .group;
@@ -497,13 +510,13 @@ async fn mixed_request(
         group: empty,
         member_id,
         ..
-    } = form_group(&coordinator)
+    } = group::form_group(&coordinator)
         .await
         .map_err(|err| Error::Message(err.to_string()))?;
-    _ = common::leave(&mut coordinator, &empty, &member_id, None).await?;
+    _ = group::leave(&mut coordinator, &empty, &member_id, None).await?;
     let (empty_topition, empty_offset) = commit_offset(&storage, &empty).await?;
 
-    let unknown = alphanumeric_string(15);
+    let unknown = random::alphanumeric_string(15);
 
     let results = delete(
         &coordinator,
@@ -527,11 +540,16 @@ async fn mixed_request(
 
     assert_eq!(Some(ErrorCode::NonEmptyGroup), result_for(&non_empty));
     assert_eq!(Some(ErrorCode::None), result_for(&empty));
-    assert!(
-        result_for(&unknown).is_some_and(|error_code| expected_for_unknown.contains(&error_code)),
+    assert_matches!(
+        result_for(&unknown),
+        Some(ErrorCode::None | ErrorCode::GroupIdNotFound),
         "{results:?}"
     );
-    assert_eq!(Some(expected_for_empty_id), result_for(""));
+    assert_matches!(
+        result_for(""),
+        Some(ErrorCode::None | ErrorCode::GroupIdNotFound),
+        "{results:?}"
+    );
 
     assert_eq!(
         Some(non_empty_offset),
@@ -545,12 +563,12 @@ async fn mixed_request(
     Ok(())
 }
 
-async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error> {
+pub async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error> {
     let service = DeleteGroupsService {
         storage: storage.clone(),
     };
 
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let response = service
         .serve(RequestInput {
@@ -571,21 +589,62 @@ async fn delete_non_existent(storage: impl Storage + Clone) -> Result<(), Error>
     Ok(())
 }
 
+/// A DeleteGroups request through the coordinator answers a group that was
+/// never stored with `GROUP_ID_NOT_FOUND`, as [Kafka's `handleDeleteGroups`]
+/// does.
+///
+/// [Kafka's `handleDeleteGroups`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/coordinator/group/GroupCoordinator.scala
+pub async fn unknown_group_is_not_found(storage: impl Storage + Clone) -> Result<(), Error> {
+    let coordinator = Controller::with_storage(storage)?;
+    let unknown = random::alphanumeric_string(15);
+
+    assert_eq!(
+        vec![(unknown.clone(), ErrorCode::GroupIdNotFound)],
+        delete(&coordinator, slice::from_ref(&unknown)).await?
+    );
+
+    Ok(())
+}
+
+/// A DeleteGroups request answers the empty group id with `GROUP_ID_NOT_FOUND`,
+/// through the coordinator and through the storage's `DeleteGroupsService`,
+/// as Kafka does for any group that was never stored.
+pub async fn empty_group_id_is_not_found(storage: impl Storage + Clone) -> Result<(), Error> {
+    let coordinator = Controller::with_storage(storage.clone())?;
+
+    assert_eq!(
+        vec![(String::new(), ErrorCode::GroupIdNotFound)],
+        delete(&coordinator, &[String::new()]).await?
+    );
+
+    let response = DeleteGroupsService { storage }
+        .serve(RequestInput {
+            request: DeleteGroupsRequest::default().groups_names(Some([String::new()].into())),
+            extensions: Extensions::default(),
+        })
+        .await?;
+    let results = response.results.unwrap_or_default();
+    assert_eq!(1, results.len());
+    assert_eq!(
+        ErrorCode::GroupIdNotFound,
+        ErrorCode::try_from(results[0].error_code)?
+    );
+
+    Ok(())
+}
+
 /// A DeleteGroups request naming an empty group id alongside a real one must
 /// never touch groups that were not named. On dynostore an empty id used to
 /// widen the delete's key prefix to every group, wiping all group state and
 /// committed offsets.
 ///
 /// Kafka still accepts `""` in DeleteGroups for backwards compatibility, and
-/// every backend treats it like any other id that nothing was stored under.
-/// SQL and SlateDB answer `GROUP_ID_NOT_FOUND`. Dynostore answers `NONE`,
+/// answers it with `GROUP_ID_NOT_FOUND`, which `empty_group_id_is_not_found`
+/// checks. This case also accepts `NONE`: the in-memory engine answers `NONE`,
 /// because deleting an absent object store key succeeds, as an S3
 /// `DeleteObject` does.
-async fn empty_group_id_mixed_list(
-    storage: impl Storage + Clone,
-    expected_for_empty: ErrorCode,
-) -> Result<(), Error> {
-    let topic_name = alphanumeric_string(15);
+pub async fn empty_group_id_mixed_list(storage: impl Storage + Clone) -> Result<(), Error> {
+    let topic_name = random::alphanumeric_string(15);
     let num_partitions = 6;
 
     _ = storage
@@ -602,8 +661,8 @@ async fn empty_group_id_mixed_list(
 
     let topition = Topition::new(topic_name, 0);
 
-    let group_a = alphanumeric_string(15);
-    let group_b = alphanumeric_string(15);
+    let group_a = random::alphanumeric_string(15);
+    let group_b = random::alphanumeric_string(15);
 
     let offset_a = rng().random_range(0..i64::MAX);
     let offset_b = rng().random_range(0..i64::MAX);
@@ -652,9 +711,9 @@ async fn empty_group_id_mixed_list(
         .iter()
         .find(|result| result.group_id.is_empty())
         .expect("missing result for the empty group id");
-    assert_eq!(
-        expected_for_empty,
-        ErrorCode::try_from(empty_result.error_code)?
+    assert_matches!(
+        ErrorCode::try_from(empty_result.error_code)?,
+        ErrorCode::None | ErrorCode::GroupIdNotFound
     );
 
     let group_b_result = results
@@ -734,10 +793,10 @@ async fn described_generation(
 /// its own, then deletes them one at a time, never as a batch, which could
 /// mask a collision. After each delete, only the deleted group's offset and
 /// state are gone, and every other group still reads back its own.
-async fn slash_and_empty_group_ids_are_distinct_groups(
+pub async fn slash_and_empty_group_ids_are_distinct_groups(
     storage: impl Storage + Clone,
 ) -> Result<(), Error> {
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -872,11 +931,10 @@ async fn slash_and_empty_group_ids_are_distinct_groups(
 /// below the group's offsets prefix. A group id containing `/` must not shift
 /// those segments, which would turn the partition parse into a
 /// `ParseIntError`.
-#[cfg(feature = "dynostore")]
-async fn slash_in_group_id_does_not_break_committed_offset_topitions(
+pub async fn slash_in_group_id_does_not_break_committed_offset_topitions(
     storage: impl Storage + Clone,
 ) -> Result<(), Error> {
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -921,12 +979,11 @@ async fn slash_in_group_id_does_not_break_committed_offset_topitions(
 /// rest against `offsets/{topic}/partitions/`. That holds only while a group
 /// id is one segment: interpolated raw, "a/b" took two segments and ""
 /// none, so those groups kept their offsets for a deleted topic.
-#[cfg(feature = "dynostore")]
-async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
+pub async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids(
     storage: impl Storage + Clone,
 ) -> Result<(), Error> {
-    let deleted_name = alphanumeric_string(15);
-    let kept_name = alphanumeric_string(15);
+    let deleted_name = random::alphanumeric_string(15);
+    let kept_name = random::alphanumeric_string(15);
 
     for name in [deleted_name.clone(), kept_name.clone()] {
         _ = storage
@@ -1339,903 +1396,5 @@ mod unreadable_groups {
         async fn ping(&self) -> Result<()> {
             self.storage.ping().await
         }
-    }
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use nisshi_broker::Result;
-    use nisshi_sans_io::ErrorCode;
-    use nisshi_storage::ArcDynStorage;
-    use rand::{RngExt as _, rng};
-    use uuid::Uuid;
-
-    use crate::common::{init_tracing, memory_storage};
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn non_empty_group_then_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::non_empty_group_then_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_evicts_coordinator_cache() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_after_session_expiry() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_after_session_expiry(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_offsets_only_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_offsets_only_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cache_miss_with_live_member() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::cache_miss_with_live_member(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_cache_on_another_broker() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::stale_cache_on_another_broker(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn storage_read_error() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::storage_read_error(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_request() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::mixed_request(
-            storage,
-            &[ErrorCode::None, ErrorCode::GroupIdNotFound],
-            ErrorCode::None,
-        )
-        .await?;
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn delete_non_existent() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_non_existent(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_mixed_list() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_mixed_list(storage, ErrorCode::None).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn slash_and_empty_group_ids_are_distinct_groups() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::slash_and_empty_group_ids_are_distinct_groups(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn slash_in_group_id_does_not_break_committed_offset_topitions() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::slash_in_group_id_does_not_break_committed_offset_topitions(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_topic_removes_offsets_of_slash_and_empty_group_ids() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use crate::common::{init_tracing, lite_storage};
-    use nisshi_broker::Result;
-    use nisshi_sans_io::ErrorCode;
-    use nisshi_storage::ArcDynStorage;
-    use rand::{RngExt as _, rng};
-    use uuid::Uuid;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn non_empty_group_then_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::non_empty_group_then_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_evicts_coordinator_cache() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_after_session_expiry() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_after_session_expiry(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_offsets_only_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_offsets_only_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cache_miss_with_live_member() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::cache_miss_with_live_member(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_cache_on_another_broker() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::stale_cache_on_another_broker(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn storage_read_error() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::storage_read_error(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_request() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::mixed_request(
-            storage,
-            &[ErrorCode::GroupIdNotFound],
-            ErrorCode::GroupIdNotFound,
-        )
-        .await?;
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn delete_non_existent() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_non_existent(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_mixed_list() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn slash_and_empty_group_ids_are_distinct_groups() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::slash_and_empty_group_ids_are_distinct_groups(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use crate::common::{init_tracing, slate_storage};
-    use nisshi_broker::Result;
-    use nisshi_sans_io::ErrorCode;
-    use nisshi_storage::ArcDynStorage;
-    use rand::{RngExt as _, rng};
-    use uuid::Uuid;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn non_empty_group_then_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::non_empty_group_then_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_evicts_coordinator_cache() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_evicts_coordinator_cache(storage, None).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_after_session_expiry() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_after_session_expiry(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_offsets_only_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_offsets_only_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cache_miss_with_live_member() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::cache_miss_with_live_member(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_cache_on_another_broker() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::stale_cache_on_another_broker(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn storage_read_error() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::storage_read_error(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_request() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::mixed_request(
-            storage,
-            &[ErrorCode::None, ErrorCode::GroupIdNotFound],
-            ErrorCode::GroupIdNotFound,
-        )
-        .await?;
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn delete_non_existent() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_non_existent(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_mixed_list() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn slash_and_empty_group_ids_are_distinct_groups() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::slash_and_empty_group_ids_are_distinct_groups(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use crate::common::{init_tracing, postgres_storage};
-    use nisshi_broker::Result;
-    use nisshi_sans_io::ErrorCode;
-    use nisshi_storage::ArcDynStorage;
-    use rand::{RngExt as _, rng};
-    use uuid::Uuid;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        postgres_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn non_empty_group_then_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::non_empty_group_then_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_evicts_coordinator_cache() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_after_session_expiry() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_after_session_expiry(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_offsets_only_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_offsets_only_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cache_miss_with_live_member() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::cache_miss_with_live_member(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_cache_on_another_broker() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::stale_cache_on_another_broker(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn storage_read_error() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::storage_read_error(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_request() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::mixed_request(
-            storage,
-            &[ErrorCode::GroupIdNotFound],
-            ErrorCode::GroupIdNotFound,
-        )
-        .await?;
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn delete_non_existent() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_non_existent(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_mixed_list() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn slash_and_empty_group_ids_are_distinct_groups() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::slash_and_empty_group_ids_are_distinct_groups(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "turso")]
-mod turso {
-    use crate::common::{self, StorageType, init_tracing};
-    use nisshi_broker::Result;
-    use nisshi_sans_io::ErrorCode;
-    use nisshi_storage::ArcDynStorage;
-    use rand::{RngExt as _, rng};
-    use url::Url;
-    use uuid::Uuid;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Turso,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn non_empty_group_then_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::non_empty_group_then_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_evicts_coordinator_cache() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_evicts_coordinator_cache(storage, Some(ErrorCode::GroupIdNotFound)).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_after_session_expiry() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_after_session_expiry(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_offsets_only_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_offsets_only_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cache_miss_with_live_member() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::cache_miss_with_live_member(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn stale_cache_on_another_broker() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::stale_cache_on_another_broker(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn storage_read_error() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::storage_read_error(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn mixed_request() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::mixed_request(
-            storage,
-            &[ErrorCode::GroupIdNotFound],
-            ErrorCode::GroupIdNotFound,
-        )
-        .await?;
-
-        Ok(())
-    }
-    #[tokio::test]
-    async fn delete_non_existent() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::delete_non_existent(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_mixed_list() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_mixed_list(storage, ErrorCode::GroupIdNotFound).await?;
-
-        Ok(())
     }
 }

@@ -46,9 +46,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod broker;
+mod commit_metadata;
 pub mod consumer_group;
 pub mod group;
 mod init_producer;
+mod metadata_max_size;
+pub mod offset;
 pub mod producer_id;
 pub mod random;
 pub mod transactions;
@@ -81,9 +84,14 @@ pub mod __private {
 ///   until it ends, such as a tracing guard.
 /// - `attributes` (optional): attributes for every test, such as `ignore = "..."`.
 /// - `without` (optional): areas, files and groups of cases to leave out. A name that the suite
-///   does not have fails the build.
+///   does not have fails the build. The groups, named `not_on_<engine>`, belong to Nisshi's own
+///   engines. Another caller leaves out areas and files, and skips a single test by its name,
+///   such as with a test filter of its test runner.
 ///
-/// The tests use `#[tokio::test]`, so the caller needs `tokio` as a dev-dependency.
+/// The tests use `#[tokio::test]`, so the caller needs `tokio` as a dev-dependency. The macro
+/// searches `without` once for each area, file and group, so a long `without` list needs a
+/// higher recursion limit than the compiler's default, such as `#![recursion_limit = "256"]` in
+/// the caller's crate.
 #[macro_export]
 macro_rules! storage_integration_tests {
     (
@@ -116,19 +124,14 @@ macro_rules! storage_integration_tests {
 macro_rules! __areas {
     ($config:tt) => {
         $crate::__area_consumer_group!($config);
+        $crate::__area_offset!($config);
         $crate::__area_producer_id!($config);
         $crate::__area_transactions!($config);
     };
 }
 
-/// Defines the `consumer_group` area, unless `without` names it.
-///
-/// Each case lists the arguments that its function takes, from the ones that `__case!` passes:
-/// `(cluster_id, broker_id, storage)`, `(broker_id, storage)` or `(storage)`. A case can start
-/// with attributes for its test on every engine, such as `#[ignore = "..."]`, and then with a
-/// group name in brackets, so that `without` can leave out the group. A group names the engines
-/// that leave it out, not what its cases test: `not_on_slatedb` holds the cases that SlateDB
-/// doesn't run, because the repository keeps SlateDB's test coverage as it is.
+/// Defines the `consumer_group` area, unless `without` names it. The case lists follow the rules
+/// of `__file!`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __area_consumer_group {
@@ -138,9 +141,91 @@ macro_rules! __area_consumer_group {
                 #[allow(unused_imports)]
                 use super::*;
 
+                $crate::__file!(consumer_group, cg_dynamic, [
+                    reject_empty_member_id_on_join(cluster_id, broker_id, storage),
+                    #[ignore]
+                    lifecycle(cluster_id, broker_id, storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, cg_static, [
+                    #[ignore]
+                    join_with_empty_member_id(cluster_id, broker_id, storage),
+                    #[ignore]
+                    rejoin_with_empty_member_id(cluster_id, broker_id, storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, consumer_group_describe, [
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    describe_non_existent_group(cluster_id, broker_id, storage),
+                    stored_group_answers_group_id_not_found(storage),
+                    error_row_omits_authorized_operations(storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, delete_groups, [
+                    non_empty_group_then_empty(storage),
+                    delete_evicts_coordinator_cache(storage),
+                    [not_on_slatedb] deleted_group_is_not_found(storage),
+                    delete_after_session_expiry(storage),
+                    delete_offsets_only_group(storage),
+                    cache_miss_with_live_member(storage),
+                    stale_cache_on_another_broker(storage),
+                    storage_read_error(storage),
+                    mixed_request(storage),
+                    delete_non_existent(storage),
+                    [not_on_in_memory, not_on_slatedb] unknown_group_is_not_found(storage),
+                    [not_on_in_memory] empty_group_id_is_not_found(storage),
+                    empty_group_id_mixed_list(storage),
+                    [not_on_turso] slash_and_empty_group_ids_are_distinct_groups(storage),
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    slash_in_group_id_does_not_break_committed_offset_topitions(storage),
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, describe_groups, [
+                    simple(storage),
+                    [not_on_slatedb] operations_omitted_unless_requested(storage),
+                    [not_on_slatedb] found_group_answers_supported_operations_when_asked(storage),
+                    [not_on_slatedb] unknown_group_answers_dead(storage),
+                    [not_on_slatedb] group_with_only_committed_offsets_is_empty(storage),
+                    [not_on_slatedb] group_whose_sessions_expired_is_described_as_empty(storage),
+                    [not_on_slatedb] stable_group_reports_each_member_and_the_protocol(storage),
+                    [not_on_slatedb] rebalancing_group_reports_members_without_metadata(storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, find_coordinator, [
+                    simple(broker_id, storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, group_across_brokers, [
+                    rebalances_end_in_one_generation_when_requests_alternate_brokers(storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, group_cache_miss, [
+                    simultaneous(storage),
+                    staggered(storage),
+                    restart(storage),
+                ], $config);
+
                 $crate::__file!(consumer_group, join_invalid_session_timeout, [
                     reject_invalid_session_timeout_on_join(cluster_id, broker_id, storage),
                     accept_boundary_session_timeout_on_join(cluster_id, broker_id, storage),
+                ], $config);
+
+                $crate::__file!(consumer_group, list_groups, [
+                    simple(storage),
+                    group_without_committed_offsets_is_listed_once(storage),
+                    group_with_committed_offsets_is_listed_once(storage),
+                    [not_on_slatedb] lists_each_group_with_its_state(storage),
+                    [not_on_slatedb] states_filter_lists_only_groups_in_that_state(storage),
+                    [not_on_slatedb] group_whose_sessions_expired_is_listed_as_empty(storage),
+                    [not_on_slatedb] group_past_its_join_deadline_is_listed_as_empty(storage),
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    empty_group_id_is_not_surfaced_as_phantom_group(storage),
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    empty_group_id_without_committed_offsets_is_listed(storage),
+                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
+                    state_only_group_ids_are_decoded(storage),
                 ], $config);
 
                 $crate::__file!(consumer_group, new_cg, [
@@ -153,13 +238,66 @@ macro_rules! __area_consumer_group {
                     [not_on_slatedb] consumer_next_action_24c(storage),
                     [not_on_slatedb] consumer_next_action_32c(storage),
                 ], $config);
+
+                $crate::__file!(consumer_group, rebalance_timing, [
+                    first_join_of_a_new_group_waits_for_the_initial_delay(storage),
+                    rebalance_ends_once_every_member_has_rejoined(storage),
+                    rebalance_across_brokers_ends_once_the_last_member_rejoins(storage),
+                ], $config);
+            }
+        );
+    };
+}
+
+/// Defines the `offset` area, unless `without` names it. The case lists follow the rules of
+/// `__file!`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __area_offset {
+    ($config:tt) => {
+        $crate::__unless_listed!(offset; $config;
+            pub mod offset {
+                #[allow(unused_imports)]
+                use super::*;
+
+                $crate::__file!(offset, offset_commit_fence, [
+                    commit_after_leaving_through_another_broker_is_fenced(
+                        cluster_id, broker_id, storage
+                    ),
+                    commit_whose_member_is_removed_during_the_commit_stores_nothing(
+                        cluster_id, broker_id, storage
+                    ),
+                ], $config);
+
+                $crate::__file!(offset, offset_commit_v1_timestamp, [
+                    offset_commit_stores_offsets_with_the_default_commit_timestamp(
+                        cluster_id, broker_id, storage
+                    ),
+                ], $config);
+
+                $crate::__file!(offset, offset_fetch_commit_metadata, [
+                    commit_returns_leader_epoch_and_metadata(cluster_id, broker_id, storage),
+                    commit_without_epoch_or_metadata_returns_defaults(
+                        cluster_id, broker_id, storage
+                    ),
+                    uncommitted_partition_returns_defaults(cluster_id, broker_id, storage),
+                    offset_commit_request_returns_leader_epoch_and_metadata(
+                        cluster_id, broker_id, storage
+                    ),
+                    commit_replaces_leader_epoch_and_metadata(cluster_id, broker_id, storage),
+                ], $config);
+
+                $crate::__file!(offset, offset_metadata_max_size, [
+                    offset_commit_rejects_metadata_over_the_limit(cluster_id, broker_id, storage),
+                    offset_commit_counts_characters_not_bytes(cluster_id, broker_id, storage),
+                ], $config);
             }
         );
     };
 }
 
 /// Defines the `producer_id` area, unless `without` names it. The case lists follow the rules of
-/// `__area_consumer_group!`.
+/// `__file!`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __area_producer_id {
@@ -181,7 +319,7 @@ macro_rules! __area_producer_id {
 
 /// Defines the `transactions` area, unless `without` names it. A case belongs here when it needs
 /// a transactional ID, so that an engine without transactions leaves out the whole area. The case
-/// lists follow the rules of `__area_consumer_group!`.
+/// lists follow the rules of `__file!`.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __area_transactions {
@@ -191,7 +329,7 @@ macro_rules! __area_transactions {
                 #[allow(unused_imports)]
                 use super::*;
 
-                $crate::__file!(transactions, init_producer_id, [
+                $crate::__file!(transactions, txn_init_producer_id, [
                     transactional_id_is_refused(cluster_id, broker_id, storage),
                     #[ignore = "InitProducerId refuses a transactional ID until the work in compat/librdkafka/FINDINGS.md item 6 is done"]
                     old_versions_bump_a_transactional_producer(cluster_id, broker_id, storage),
@@ -203,12 +341,59 @@ macro_rules! __area_transactions {
                     txn_claim_ongoing_txn_aborts_and_bumps(cluster_id, broker_id, storage),
                     txn_fenced_claim_leaves_ongoing_txn(cluster_id, broker_id, storage),
                 ], $config);
+
+                $crate::__file!(transactions, txn_offset_fetch_commit_metadata, [
+                    txn_offset_commit_returns_leader_epoch_and_metadata(
+                        cluster_id, broker_id, storage
+                    ),
+                    txn_offset_commit_replaces_leader_epoch_and_metadata(
+                        cluster_id, broker_id, storage
+                    ),
+                ], $config);
+
+                $crate::__file!(transactions, offset_fetch_require_stable, [
+                    pending_offset_is_unstable_with_require_stable(cluster_id, broker_id, storage),
+                    pending_offset_is_ignored_without_require_stable(
+                        cluster_id, broker_id, storage
+                    ),
+                    committed_transaction_offset_is_stable(cluster_id, broker_id, storage),
+                    aborted_transaction_offset_is_stable(cluster_id, broker_id, storage),
+                    pending_offset_of_another_group_is_stable(cluster_id, broker_id, storage),
+                    pending_offset_without_commit_is_unstable(cluster_id, broker_id, storage),
+                    reinitialized_producer_ends_pending_offset(cluster_id, broker_id, storage),
+                    deferred_commit_of_reinitialized_producer_keeps_offset_pending(
+                        cluster_id, broker_id, storage
+                    ),
+                ], $config);
+
+                $crate::__file!(transactions, txn_offset_metadata_max_size, [
+                    txn_offset_commit_rejects_metadata_over_the_limit(
+                        cluster_id, broker_id, storage
+                    ),
+                ], $config);
+
+                $crate::__file!(transactions, txn_offset_commit_fence, [
+                    unknown_member(cluster_id, broker_id, storage),
+                    illegal_generation(cluster_id, broker_id, storage),
+                    fenced_instance(cluster_id, broker_id, storage),
+                    current_member(cluster_id, broker_id, storage),
+                    group_completing_rebalance(cluster_id, broker_id, storage),
+                    without_member_fields(cluster_id, broker_id, storage),
+                    replaced_route_keeps_the_fence(cluster_id, broker_id, storage),
+                ], $config);
             }
         );
     };
 }
 
 /// Defines the module of one file, with one test for each case, unless `without` names the file.
+///
+/// Each case lists the arguments that its function takes, from the ones that `__case!` passes:
+/// `(cluster_id, broker_id, storage)`, `(broker_id, storage)` or `(storage)`. A case can start
+/// with attributes for its test on every engine, such as `#[ignore = "..."]`, and then with
+/// group names in brackets. Each group, `not_on_<engine>`, names one of Nisshi's engines that
+/// leaves out the case, not what the case tests, and that engine's `without` names the group. A
+/// case without a group runs on every engine.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __file {
@@ -218,7 +403,7 @@ macro_rules! __file {
         [
             $(
                 $(#[$case_attribute:meta])*
-                $([$group:ident])?
+                $([$($group:ident),+ $(,)?])?
                 $case:ident $arguments:tt
             ),* $(,)?
         ],
@@ -230,7 +415,7 @@ macro_rules! __file {
                 use super::*;
 
                 $(
-                    $crate::__in_group!(($($group)?); $config;
+                    $crate::__in_group!(($($($group),+)?); $config;
                         $crate::__case!(
                             $area, $file, [$($case_attribute),*] $case $arguments, $config
                         );
@@ -241,15 +426,17 @@ macro_rules! __file {
     };
 }
 
-/// Expands to the items after the second `;`, unless the case's group is in the config's
-/// `without` list. A case without a group always expands.
+/// Expands to the items after the second `;`, unless the config's `without` list holds one of
+/// the case's groups. A case without a group always expands.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __in_group {
     ((); $config:tt; $($item:tt)*) => { $($item)* };
-    (($group:ident); $config:tt; $($item:tt)*) => {
+    (($group:ident $(, $rest:ident)*); $config:tt; $($item:tt)*) => {
         $crate::__check_name!($group);
-        $crate::__unless_listed!($group; $config; $($item)*);
+        $crate::__unless_listed!($group; $config;
+            $crate::__in_group!(($($rest),*); $config; $($item)*);
+        );
     };
 }
 
@@ -322,8 +509,8 @@ macro_rules! __case {
 ///
 /// `macro_rules!` can't compare two names that it receives. It can compare a name with a word
 /// written into a rule, so each area, file and group has a rule of its own. These rules are the
-/// only list of names: `__check_name!` uses them too. A file name that two areas share, such as
-/// `init_producer_id`, leaves out the file in both.
+/// only list of names: `__check_name!` uses them too. Each file name is unique across areas, so
+/// that a name leaves out one file.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __unless_listed {
@@ -335,11 +522,67 @@ macro_rules! __unless_listed {
         $crate::__unless_listed!(@search $name; [$($without),*]; $($item)*);
     };
     (@search consumer_group; [consumer_group $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search offset; [offset $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search producer_id; [producer_id $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search transactions; [transactions $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search init_producer_id; [init_producer_id $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search new_cg; [new_cg $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_slatedb; [not_on_slatedb $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search not_on_in_memory; [not_on_in_memory $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search not_on_lite; [not_on_lite $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search not_on_pg; [not_on_pg $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search not_on_turso; [not_on_turso $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search cg_dynamic; [cg_dynamic $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search cg_static; [cg_static $(, $rest:ident)*]; $($item:tt)*) => {};
+    (
+        @search consumer_group_describe;
+        [consumer_group_describe $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (@search delete_groups; [delete_groups $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search describe_groups; [describe_groups $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search find_coordinator; [find_coordinator $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search group_across_brokers; [group_across_brokers $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search group_cache_miss; [group_cache_miss $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search list_groups; [list_groups $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search rebalance_timing; [rebalance_timing $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search offset_commit_fence; [offset_commit_fence $(, $rest:ident)*]; $($item:tt)*) => {};
+    (
+        @search offset_commit_v1_timestamp;
+        [offset_commit_v1_timestamp $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (
+        @search offset_fetch_commit_metadata;
+        [offset_fetch_commit_metadata $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (
+        @search offset_fetch_require_stable;
+        [offset_fetch_require_stable $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (
+        @search offset_metadata_max_size;
+        [offset_metadata_max_size $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (
+        @search txn_offset_commit_fence;
+        [txn_offset_commit_fence $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (@search txn_init_producer_id; [txn_init_producer_id $(, $rest:ident)*]; $($item:tt)*) => {};
+    (
+        @search txn_offset_fetch_commit_metadata;
+        [txn_offset_fetch_commit_metadata $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
+    (
+        @search txn_offset_metadata_max_size;
+        [txn_offset_metadata_max_size $(, $rest:ident)*];
+        $($item:tt)*
+    ) => {};
     (
         @search join_invalid_session_timeout;
         [join_invalid_session_timeout $(, $rest:ident)*];

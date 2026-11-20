@@ -14,4 +14,8 @@
 
 //! Cases that need a transactional ID. An engine without transactions leaves out this area.
 
-pub mod init_producer_id;
+pub mod offset_fetch_require_stable;
+pub mod txn_init_producer_id;
+pub mod txn_offset_commit_fence;
+pub mod txn_offset_fetch_commit_metadata;
+pub mod txn_offset_metadata_max_size;

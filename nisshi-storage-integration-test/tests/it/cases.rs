@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Each case runs on every engine, because the macro lists it.
+//! A case runs only if the macro lists it, so each `pub async fn` in a file of an area must be in
+//! that file's case list.
 
 use std::{
     fs, io,

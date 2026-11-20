@@ -84,7 +84,7 @@ Sweeps of the librdkafka integration test suite against
      supported`, so the advertised EndTxn versions may not cover what
      librdkafka needs.
    - The `old_versions_bump_a_transactional_producer` case
-     (`nisshi-storage-integration-test/src/transactions/init_producer_id.rs`)
+     (`nisshi-storage-integration-test/src/transactions/txn_init_producer_id.rs`)
      is ignored on every engine by one `#[ignore]` in the case list of the
      `storage_integration_tests!` macro (`nisshi-storage-integration-test/src/lib.rs`),
      with a reason that points here; CI never runs it, so remove that

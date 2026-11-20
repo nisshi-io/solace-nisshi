@@ -6480,6 +6480,7 @@ name = "nisshi-storage-integration-test"
 version = "0.8.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "nisshi-broker",
  "nisshi-sans-io",
@@ -6490,6 +6491,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
 ]
 
