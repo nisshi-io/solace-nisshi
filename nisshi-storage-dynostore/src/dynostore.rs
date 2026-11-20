@@ -2364,6 +2364,11 @@ impl DynoStore {
             // Under a hard limit, the GET asks for only the bytes left, as Kafka reads its log only
             // up to the limit. For a batch below the fetch offset, it asks for at least the batch's
             // header, which shows whether the batch ends before the fetch offset.
+            //
+            // The read learns a batch's size from this GET, instead of from a HEAD request first.
+            // A HEAD adds a request to every batch, to save part of the last batch of a read, and
+            // that costs more than the discarded bytes unless batches are large and the store
+            // bills each download.
             let max_size = (!first_may_exceed).then(|| {
                 if base_offset < bounds.offset {
                     bytes_left.max(batch_header_size)
@@ -2378,10 +2383,13 @@ impl DynoStore {
             };
 
             // If the object is larger than the range asked for, the batch does not fit. The read
-            // still downloads that range instead of dropping the response. The store sends the
-            // range either way, so a drop saves at most the bytes not yet received, and it costs a
-            // new connection, because the object store's HTTP client reuses a connection only
-            // after it reads the body to its end.
+            // still downloads that range instead of dropping the response. A drop saves little,
+            // because S3 bills the data that it streamed before the client stopped reading
+            // ([S3 pricing], note on data transfer). A drop also costs a new connection, because
+            // the object store's HTTP client reuses a connection only after it reads the body to
+            // its end.
+            //
+            // [S3 pricing]: https://aws.amazon.com/s3/pricing/
             let object = match object {
                 Some(object) if object.range.end < object.meta.size => {
                     let batch_start = self
