@@ -163,10 +163,10 @@ where
             //
             // [kafka-range-check]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L284-L296
             //
-            // Three differences from Kafka remain. Kafka answers once per user, and this loop
+            // Two differences from Kafka remain. Kafka answers once per user, and this loop
             // answers once per upsertion. Kafka answers DUPLICATE_RESOURCE for a user that the
-            // request names twice, and this loop does not. Kafka refuses a deletion for a refused
-            // user, and this loop runs it.
+            // request names more than once, in any mix of deletions and upsertions, and runs none
+            // of that user's items. This loop runs each item of such a user by its own rules.
             let refusals = iterations_refusals(&upsertions);
 
             for upsertion in upsertions {
@@ -252,6 +252,51 @@ mod tests {
     use super::*;
     use crate::storage_double::storage_double;
     use rama::extensions::Extensions;
+
+    #[test]
+    fn stored_is_none() -> Result<()> {
+        let answered = result("alice".into(), Ok(()));
+
+        assert_eq!("alice", answered.user);
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(answered.error_code)?);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_engine_is_unsupported_version_naming_the_engine() -> Result<()> {
+        let answered = result(
+            "alice".into(),
+            Err(Error::UserCredentialsUnsupported {
+                engine: "in-memory (memory://)".into(),
+            }),
+        );
+
+        assert_eq!(
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::try_from(answered.error_code)?
+        );
+        assert_eq!(
+            Some(
+                "The in-memory (memory://) storage engine can't store SCRAM credentials, so \
+                nothing was changed. SCRAM users need PostgreSQL or SQLite storage."
+            ),
+            answered.error_message.as_deref()
+        );
+        Ok(())
+    }
+
+    /// Any other storage failure is answered as before this engine check existed.
+    #[test]
+    fn other_failure_is_unchanged() -> Result<()> {
+        let answered = result("alice".into(), Err(Error::Message("broken".into())));
+
+        assert_eq!(
+            ErrorCode::UnsupportedSaslMechanism,
+            ErrorCode::try_from(answered.error_code)?
+        );
+        assert_eq!(Some(""), answered.error_message.as_deref());
+        Ok(())
+    }
 
     const SCRAM_SHA_256: i8 = 1;
     const SCRAM_SHA_512: i8 = 2;
