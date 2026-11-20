@@ -257,8 +257,10 @@ fn every_engine_building_file_is_listed() -> io::Result<()> {
         .collect();
     assert!(
         stale.is_empty(),
-        "tests/it/engine_building_files.rs lists files that no longer exist or no longer build an \
-         engine; remove them from its lists: {stale:?}"
+        "tests/it/engine_building_files.rs lists files that no longer exist, or in which the check \
+         no longer finds a name from ENGINE_BUILDERS: {stale:?}. If a file still builds an engine \
+         through a new helper, add the helper's name to ENGINE_BUILDERS. If not, remove the file \
+         from its list"
     );
 
     let mut seen = BTreeSet::new();

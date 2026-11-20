@@ -28,16 +28,13 @@ nisshi_storage_integration_test::storage_integration_tests! {
     without: [not_on_in_memory],
 }
 
-// The `not_on_lite`, `not_on_pg` and `not_on_turso` groups hold cases that run only on the
-// in-memory engine. Most of them check group IDs that are hard to store as an object store key,
-// such as the empty ID and IDs with a `/`. Lite also leaves out `cg_static`; no reason is
-// recorded for that.
+// No reason is recorded for why lite leaves out `cg_static`.
 #[cfg(feature = "libsql")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: lite,
     storage: crate::common::lite_storage,
     before_each: crate::common::init_tracing,
-    without: [cg_static, not_on_lite],
+    without: [cg_static],
 }
 
 #[cfg(feature = "postgres")]
@@ -45,7 +42,6 @@ nisshi_storage_integration_test::storage_integration_tests! {
     engine: pg,
     storage: crate::common::postgres_storage,
     before_each: crate::common::init_tracing,
-    without: [not_on_pg],
 }
 
 // SlateDB is deprecated, and `AGENTS.md` says to keep its tests and coverage as they are. This list

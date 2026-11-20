@@ -154,7 +154,6 @@ macro_rules! __area_consumer_group {
                 ], $config);
 
                 $crate::__file!(consumer_group, consumer_group_describe, [
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
                     describe_non_existent_group(cluster_id, broker_id, storage),
                     stored_group_answers_group_id_not_found(storage),
                     error_row_omits_authorized_operations(storage),
@@ -179,10 +178,8 @@ macro_rules! __area_consumer_group {
                     empty_group_id_mixed_list(storage),
                     [not_on_in_memory] empty_group_id_in_mixed_list_is_not_found(storage),
                     [not_on_turso] slash_and_empty_group_ids_are_distinct_groups(storage),
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
-                    slash_in_group_id_does_not_break_committed_offset_topitions(storage),
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
-                    delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage),
+                    [not_on_slatedb] slash_in_group_id_does_not_break_committed_offset_topitions(storage),
+                    [not_on_slatedb] delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage),
                 ], $config);
 
                 $crate::__file!(consumer_group, describe_groups, [
@@ -223,12 +220,9 @@ macro_rules! __area_consumer_group {
                     [not_on_slatedb] states_filter_lists_only_groups_in_that_state(storage),
                     [not_on_slatedb] group_whose_sessions_expired_is_listed_as_empty(storage),
                     [not_on_slatedb] group_past_its_join_deadline_is_listed_as_empty(storage),
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
-                    empty_group_id_is_not_surfaced_as_phantom_group(storage),
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
-                    empty_group_id_without_committed_offsets_is_listed(storage),
-                    [not_on_lite, not_on_pg, not_on_slatedb, not_on_turso]
-                    state_only_group_ids_are_decoded(storage),
+                    [not_on_slatedb] empty_group_id_is_not_surfaced_as_phantom_group(storage),
+                    [not_on_slatedb] empty_group_id_without_committed_offsets_is_listed(storage),
+                    [not_on_slatedb] state_only_group_ids_are_decoded(storage),
                 ], $config);
 
                 $crate::__file!(consumer_group, new_cg, [
@@ -532,8 +526,6 @@ macro_rules! __unless_listed {
     (@search new_cg; [new_cg $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_slatedb; [not_on_slatedb $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_in_memory; [not_on_in_memory $(, $rest:ident)*]; $($item:tt)*) => {};
-    (@search not_on_lite; [not_on_lite $(, $rest:ident)*]; $($item:tt)*) => {};
-    (@search not_on_pg; [not_on_pg $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_turso; [not_on_turso $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search cg_dynamic; [cg_dynamic $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search cg_static; [cg_static $(, $rest:ident)*]; $($item:tt)*) => {};

@@ -16,8 +16,8 @@
 //! without `nisshi-broker`'s test helpers.
 //!
 //! `nisshi-broker` already runs the whole suite on the same engine, so this call runs only a few
-//! files. It names each file that it leaves out, so that its `without` list is long enough to
-//! need the higher recursion limit that the macro's doc tells a caller to set.
+//! files. It names each file that it leaves out, so that the call has a long `without` list, as
+//! a caller with many files to leave out has.
 
 use std::sync::Arc;
 
@@ -46,9 +46,9 @@ async fn caller_built_engine(
         .await
 }
 
-// The files that the call runs take each of the macro's argument lists. `list_groups` has the
-// cases with the most groups, which nest the deepest search of the `without` list. The attribute
-// changes nothing: it is here so that a real test build compiles the `attributes` option.
+// The files that the call runs take each of the macro's argument lists, and `list_groups` has
+// cases in a group, which nest one more search of the `without` list. The attribute changes
+// nothing: it is here so that a real test build compiles the `attributes` option.
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: caller_engine,
     storage: caller_built_engine,
