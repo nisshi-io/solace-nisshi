@@ -40,7 +40,7 @@ use nisshi_sans_io::{
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::{Error, Result, Storage as _, TopicId, Topition};
+use nisshi_storage::{ByteLimit, Error, Result, Storage as _, TopicId, Topition};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
@@ -754,6 +754,50 @@ async fn fetch_skips_a_gap_to_the_batch_after_it() -> Result<(), Error> {
     assert_eq!(
         vec![20, 30],
         fetch_base_offsets(&storage, &topition, 15, MAX_BYTES, READ_TIME).await?
+    );
+
+    Ok(())
+}
+
+/// The partition holds batches at offsets 0-29 and 40-49, with a gap at 30-39. A fetch from offset
+/// 35, under a hard limit too small for the batch at 0, first finds that batch, because it is the
+/// last one before the gap. The fetch reads only that batch's header, sees that the batch ends at
+/// 29, skips it, and returns the batch at 40.
+#[tokio::test]
+async fn a_hard_limit_skips_a_batch_below_a_gap_that_does_not_fit() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, listing, topition) =
+        partition("a_hard_limit_skips_a_batch_below_a_gap_that_does_not_fit").await?;
+
+    // Batches at 0 (30 records, 361 bytes), 30 and 40 (10 records, 161 bytes each). Deleting the
+    // batch at 30 makes the gap, and backdating the writes makes the fetch skip it.
+    produce(&storage, &topition, 1, 30).await?;
+    produce(&storage, &topition, 2, 10).await?;
+    storage
+        .object_store
+        .delete(&batch_path(&storage.cluster, &topition, 30))
+        .await?;
+    listing.backdate_writes(BATCH_SETTLED_AFTER);
+
+    // The limit holds the batch at 40, but not the batch at 0.
+    let read = storage
+        .fetch_until_limit(
+            &topition,
+            35,
+            1,
+            ByteLimit::Hard(200),
+            IsolationLevel::ReadUncommitted,
+            Instant::now() + READ_TIME,
+        )
+        .await?;
+
+    assert_eq!(
+        vec![40],
+        read.batches
+            .iter()
+            .map(|batch| batch.base_offset)
+            .collect::<Vec<_>>()
     );
 
     Ok(())
