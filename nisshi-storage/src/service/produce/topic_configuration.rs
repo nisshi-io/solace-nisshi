@@ -143,7 +143,20 @@ impl TopicConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::produce::tests::support::configuration;
+    use crate::service::{
+        counting_storage::{CountingStorage, Listing},
+        produce::tests::support::configuration,
+    };
+
+    /// Reads the configuration of the topic `person` from a storage that holds `stored`, and
+    /// answers a read of named configs with only the configs of those names.
+    async fn read_from_named_configs(stored: &[(&str, &str)]) -> TopicConfiguration {
+        let storage = CountingStorage::new(Listing::Topics, &["person"]).with_topic_configs(stored);
+
+        TopicConfiguration::read(&storage, "person")
+            .await
+            .expect("a stored topic has a configuration")
+    }
 
     #[test]
     fn a_topic_validates_unless_it_turns_schema_validation_off() {
@@ -169,5 +182,35 @@ mod tests {
     #[test]
     fn the_tansu_alias_turns_schema_validation_off() {
         assert!(!configuration(&[("tansu.schema.validation", "false")]).validates_schema());
+    }
+
+    #[tokio::test]
+    async fn the_read_names_every_config_that_a_getter_reads() {
+        // Each value differs from the default of its getter, so a getter that reads nothing
+        // gives a different answer.
+        let configuration = read_from_named_configs(&[
+            (message_timestamp_type::KEY, "LogAppendTime"),
+            (max_message_bytes::KEY, "1234"),
+            (topic_config::LAKE_SINK, "true"),
+            (topic_config::SCHEMA_VALIDATION, "false"),
+        ])
+        .await;
+
+        assert_eq!(TimestampType::LogAppendTime, configuration.timestamp_type());
+        assert_eq!(1234, configuration.max_message_bytes());
+        assert!(configuration.lake_sink());
+        assert!(!configuration.schema_validation());
+    }
+
+    #[tokio::test]
+    async fn the_read_names_the_tansu_alias_of_every_aliased_config() {
+        let configuration = read_from_named_configs(&[
+            ("tansu.lake.sink", "true"),
+            ("tansu.schema.validation", "false"),
+        ])
+        .await;
+
+        assert!(configuration.lake_sink());
+        assert!(!configuration.schema_validation());
     }
 }

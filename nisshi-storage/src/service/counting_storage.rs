@@ -34,7 +34,7 @@ use nisshi_sans_io::{
     delete_records_request::DeleteRecordsTopic,
     delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
+    describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
@@ -143,6 +143,7 @@ pub(crate) struct CountingStorage {
     produce_all_calls: Arc<AtomicUsize>,
     gated_partitions: Option<BTreeSet<i32>>,
     config_gate: Option<Arc<Semaphore>>,
+    topic_configs: Vec<(String, String)>,
     parked: Arc<AtomicUsize>,
     produce_delay: Option<Duration>,
     partition_failure: Option<(i32, Error)>,
@@ -286,6 +287,19 @@ impl CountingStorage {
     pub(crate) fn with_config_gate(self, gate: Arc<Semaphore>) -> Self {
         Self {
             config_gate: Some(gate),
+            ..self
+        }
+    }
+
+    /// Returns this storage, with each topic that it holds having the configs `configs`, each a
+    /// name and its value. A read of named configs answers only the configs of those names, as the
+    /// libSQL, Turso and dynostore engines do, and a read of every config answers all of them.
+    pub(crate) fn with_topic_configs(self, configs: &[(&str, &str)]) -> Self {
+        Self {
+            topic_configs: configs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
             ..self
         }
     }
@@ -750,7 +764,7 @@ impl Storage for CountingStorage {
         &self,
         name: &str,
         resource: ConfigResource,
-        _keys: Option<&[String]>,
+        keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
         if matches!(resource, ConfigResource::Topic)
             && let Some(gate) = &self.config_gate
@@ -771,7 +785,23 @@ impl Storage for CountingStorage {
             ErrorCode::UnknownTopicOrPartition
         };
 
-        Ok(DescribeConfigsResult::default().error_code(error_code.into()))
+        let configs = if holds_topic && matches!(resource, ConfigResource::Topic) {
+            self.topic_configs
+                .iter()
+                .filter(|(config, _)| keys.is_none_or(|keys| keys.contains(config)))
+                .map(|(config, value)| {
+                    DescribeConfigsResourceResult::default()
+                        .name(config.clone())
+                        .value(Some(value.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(DescribeConfigsResult::default()
+            .error_code(error_code.into())
+            .configs(Some(configs)))
     }
 
     async fn describe_topic_partitions(
