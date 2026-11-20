@@ -20,13 +20,14 @@ use nisshi_sans_io::{
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use nisshi_service::FrameRouteBuilder;
-use rama::{Service, service::BoxService};
+use rama::{Layer, Service, service::BoxService};
 
 use crate::{Error, Result, coordinator::group::Coordinator};
 
-/// Wraps the registered route of `TxnOffsetCommit`: the group coordinator fences the commit, then
-/// the storage's route commits it. Fails with [`nisshi_service::Error::NoRouteToWrap`] when the
-/// route is not registered yet, so that a route table cannot leave the commit unfenced.
+/// Guards the registered route of `TxnOffsetCommit`: the group coordinator fences the commit,
+/// then the route commits it. The fence stays around the route when a later call replaces its
+/// handler. Fails with [`nisshi_service::Error::NoRouteToGuard`] when the route is not registered
+/// yet, so that a route table cannot leave the commit unfenced.
 pub fn fence_txn_offset_commit<C>(
     builder: FrameRouteBuilder<Error>,
     coordinator: C,
@@ -35,10 +36,31 @@ where
     C: Coordinator,
 {
     builder
-        .wrap_route(TxnOffsetCommitRequest::KEY, |inner| {
-            TxnOffsetCommitFenceService { coordinator, inner }.boxed()
-        })
+        .with_guard(
+            TxnOffsetCommitRequest::KEY,
+            TxnOffsetCommitFenceLayer { coordinator },
+        )
         .map_err(Into::into)
+}
+
+/// A [`Layer`] that puts [`TxnOffsetCommitFenceService`] around a route.
+#[derive(Clone, Debug)]
+pub struct TxnOffsetCommitFenceLayer<C> {
+    coordinator: C,
+}
+
+impl<C> Layer<BoxService<FrameInput, Frame, Error>> for TxnOffsetCommitFenceLayer<C>
+where
+    C: Coordinator,
+{
+    type Service = TxnOffsetCommitFenceService<C>;
+
+    fn layer(&self, inner: BoxService<FrameInput, Frame, Error>) -> Self::Service {
+        TxnOffsetCommitFenceService {
+            coordinator: self.coordinator.clone(),
+            inner,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

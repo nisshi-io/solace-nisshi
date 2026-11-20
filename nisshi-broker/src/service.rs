@@ -66,14 +66,12 @@ where
     .and_then(|builder| {
         coordinator::services(builder, coordinator.clone()).inspect(|builder| debug!(?builder))
     })
+    .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator.clone()))
     .and_then(auth::services)
     .and_then(|builder| match extend_routes {
         Some(extend_routes) => extend_routes.apply(builder, &coordinator, &extend_storage),
         None => Ok(builder),
     })
-    // The fence runs after the extension, so that it wraps the route that the extension
-    // leaves for TxnOffsetCommit, and a replacement of that route keeps the fence.
-    .and_then(|builder| txn_offset_commit::fence_txn_offset_commit(builder, coordinator))
 }
 
 #[allow(clippy::too_many_arguments)]

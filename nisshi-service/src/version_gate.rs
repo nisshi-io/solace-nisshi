@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, ops::RangeInclusive};
+use std::ops::RangeInclusive;
 
 use nisshi_sans_io::{
     AddPartitionsToTxnRequest, ApiKey as _, Body, Frame, FrameInput, ListOffsetsRequest,
     ProduceRequest, Request, RequestInput, RootMessageMeta,
 };
-use rama::{Layer, Service, layer::MapErrLayer};
-use tracing::{instrument, warn};
+use rama::{Layer, Service, layer::MapErrLayer, service::BoxService};
 
-use crate::{Error, FrameRequestLayer, FrameRequestService, FrameRouteBuilder};
+use crate::{Error, FrameRequestLayer, FrameRouteBuilder};
 
 /// The version range nisshi routes for each API whose handler implements only part of the
 /// Kafka protocol's own range for that API.
@@ -64,9 +63,10 @@ pub fn capped_range(api_key: i16) -> Option<RangeInclusive<i16>> {
 /// Returns the versions of `api_key` that a client can reach, or `None` for an `api_key` this
 /// build has no protocol metadata for.
 ///
-/// This is the range in [`CAPPED_API_VERSIONS`] for a capped API, because [`VersionGateLayer`]
-/// rejects every other version before a handler sees the request, and the protocol's own range
-/// for every other API.
+/// This is the range in [`CAPPED_API_VERSIONS`] for a capped API, because
+/// [`FrameRouteService`](crate::FrameRouteService) rejects every other version before a handler
+/// sees the request, and the protocol's own range for every other API. It describes the built-in
+/// handlers: [`FrameRouteBuilder::with_versions`] changes the range of a route in a route table.
 #[must_use]
 pub fn routable_range(api_key: i16) -> Option<RangeInclusive<i16>> {
     capped_range(api_key).or_else(|| protocol_range(api_key))
@@ -83,107 +83,33 @@ pub fn routable_max_version(api_key: i16) -> Option<i16> {
     routable_range(api_key).map(|range| *range.end())
 }
 
-fn protocol_range(api_key: i16) -> Option<RangeInclusive<i16>> {
+pub(crate) fn protocol_range(api_key: i16) -> Option<RangeInclusive<i16>> {
     RootMessageMeta::messages()
         .requests()
         .get(&api_key)
         .map(|meta| meta.version.valid.start..=meta.version.valid.end)
 }
 
-/// Fails unless `declared` is a subset of the protocol's own valid range for `api_key`.
-fn validate_capped_range(api_key: i16, declared: RangeInclusive<i16>) -> Result<(), Error> {
-    let protocol = protocol_range(api_key);
+/// Fails unless `declared` has a version and is a subset of `allowed`.
+pub(crate) fn validate_versions(
+    api_key: i16,
+    declared: RangeInclusive<i16>,
+    allowed: Option<RangeInclusive<i16>>,
+) -> Result<(), Error> {
+    if declared.is_empty() {
+        return Err(Error::EmptyVersionRange { api_key, declared });
+    }
 
-    if protocol.as_ref().is_some_and(|protocol| {
-        declared.start() >= protocol.start() && declared.end() <= protocol.end()
+    if allowed.as_ref().is_some_and(|allowed| {
+        declared.start() >= allowed.start() && declared.end() <= allowed.end()
     }) {
         Ok(())
     } else {
-        Err(Error::CapRangeExceedsProtocolRange {
+        Err(Error::VersionRangeNotAllowed {
             api_key,
             declared,
-            protocol,
+            allowed,
         })
-    }
-}
-
-/// A [`Layer`] that rejects a request whose version falls outside the range nisshi routes for
-/// its API, before [`FrameRequestLayer`] decodes the body into a handler's request type.
-#[derive(Clone, Debug)]
-pub struct VersionGateLayer {
-    api_key: i16,
-    supported: RangeInclusive<i16>,
-}
-
-impl VersionGateLayer {
-    pub fn new(api_key: i16, supported: RangeInclusive<i16>) -> Self {
-        Self { api_key, supported }
-    }
-}
-
-impl<S> Layer<S> for VersionGateLayer {
-    type Service = VersionGateService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            inner,
-            api_key: self.api_key,
-            supported: self.supported.clone(),
-        }
-    }
-}
-
-/// A [`Service`] built by [`VersionGateLayer`].
-#[derive(Clone)]
-pub struct VersionGateService<S> {
-    inner: S,
-    api_key: i16,
-    supported: RangeInclusive<i16>,
-}
-
-impl<S> fmt::Debug for VersionGateService<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(VersionGateService))
-            .field("api_key", &self.api_key)
-            .field("supported", &self.supported)
-            .finish()
-    }
-}
-
-impl<S> Service<FrameInput> for VersionGateService<S>
-where
-    S: Service<FrameInput, Output = Frame>,
-    S::Error: From<nisshi_sans_io::Error> + From<Error>,
-{
-    type Output = Frame;
-    type Error = S::Error;
-
-    #[instrument(skip_all)]
-    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
-        let api_version = req.frame.api_version()?;
-
-        if self.supported.contains(&api_version) {
-            return self.inner.serve(req).await;
-        }
-
-        // The broker closes the connection, as Kafka 3.9.1 does for a version it has not
-        // enabled ([SocketServer.scala#L1119-L1125]). `ApiVersions` advertises this range,
-        // so only a client that skips the negotiation sends such a version.
-        //
-        // [SocketServer.scala#L1119-L1125]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/network/SocketServer.scala#L1119-L1125
-        warn!(
-            api_key = self.api_key,
-            api_name = req.frame.api_name(),
-            api_version,
-            client_id = req.frame.client_id().ok().flatten(),
-            supported = ?self.supported,
-            "request version outside the supported range"
-        );
-
-        Err(S::Error::from(Error::UnsupportedVersion {
-            api_key: self.api_key,
-            api_version,
-        }))
     }
 }
 
@@ -191,15 +117,19 @@ impl<E> FrameRouteBuilder<E>
 where
     E: std::error::Error + From<nisshi_sans_io::Error> + From<Error> + Send + Sync + 'static,
 {
-    /// Registers `handler` as the route for `Q`, behind a [`VersionGateLayer`] with `Q`'s range
-    /// from [`CAPPED_API_VERSIONS`], and advertises that range in `ApiVersions`, so a client
-    /// never negotiates a version that this route rejects.
+    /// Registers `handler` as the route for `Q`, serving the range for `Q` from
+    /// [`CAPPED_API_VERSIONS`], which `ApiVersions` advertises, so a client never negotiates a
+    /// version that this route rejects.
     ///
     /// # Errors
     ///
     /// Fails with [`Error::UncappedApi`] when [`CAPPED_API_VERSIONS`] has no entry for `Q`, and
-    /// with [`Error::CapRangeExceedsProtocolRange`] when that entry is not a subset of the
-    /// protocol's own valid range.
+    /// with [`Error::VersionRangeNotAllowed`] when that entry is not a subset of the protocol's
+    /// own valid range.
+    ///
+    /// The route keeps that range as the versions that its handler implements: until
+    /// [`FrameRouteBuilder::wrap_route`] changes the handler, [`FrameRouteBuilder::with_versions`]
+    /// accepts only a range within it.
     pub fn with_capped_route<Q, S>(self, handler: S) -> Result<Self, Error>
     where
         Q: Request + TryFrom<Body>,
@@ -208,40 +138,34 @@ where
         S::Error: From<nisshi_sans_io::Error>,
         E: From<S::Error>,
     {
-        self.with_capped_route_layer::<Q, _, _>((), handler)
+        let supported = capped_range(Q::KEY).ok_or(Error::UncappedApi(Q::KEY))?;
+
+        let route = (MapErrLayer::new(E::from), FrameRequestLayer::<Q>::new())
+            .into_layer(handler)
+            .boxed();
+
+        self.with_route(Q::KEY, route)?
+            .with_capped_versions(Q::KEY, supported)
     }
 
-    /// As [`Self::with_capped_route`], with `layer` between the [`VersionGateLayer`] and the
-    /// decoding of the request frame, so that `layer` sees the request's version and the
-    /// encoded response.
+    /// As [`Self::with_capped_route`], with `guard` around the route, so that `guard` sees the
+    /// request's version and the encoded response.
     ///
     /// # Errors
     ///
     /// As [`Self::with_capped_route`].
-    pub fn with_capped_route_layer<Q, L, S>(self, layer: L, handler: S) -> Result<Self, Error>
+    pub fn with_capped_route_layer<Q, L, S>(self, guard: L, handler: S) -> Result<Self, Error>
     where
         Q: Request + TryFrom<Body>,
         <Q as TryFrom<Body>>::Error: Into<S::Error>,
         S: Service<RequestInput<Q>, Output = Q::Response>,
         S::Error: From<nisshi_sans_io::Error>,
         E: From<S::Error>,
-        L: Layer<FrameRequestService<S, Q>>,
-        L::Service: Service<FrameInput, Output = Frame, Error = S::Error>,
+        L: Layer<BoxService<FrameInput, Frame, E>> + Send + Sync + 'static,
+        L::Service: Service<FrameInput, Output = Frame, Error = E> + Send + Sync + 'static,
     {
-        let supported = capped_range(Q::KEY).ok_or(Error::UncappedApi(Q::KEY))?;
-        validate_capped_range(Q::KEY, supported.clone())?;
-
-        let service = (
-            VersionGateLayer::new(Q::KEY, supported.clone()),
-            MapErrLayer::new(E::from),
-            layer,
-            FrameRequestLayer::<Q>::new(),
-        )
-            .into_layer(handler)
-            .boxed();
-
-        self.with_capped_range(Q::KEY, *supported.start(), *supported.end())
-            .with_route(Q::KEY, service)
+        self.with_capped_route::<Q, S>(handler)?
+            .with_guard(Q::KEY, guard)
     }
 }
 
@@ -254,18 +178,41 @@ mod tests {
     #[test]
     fn every_capped_range_is_within_its_protocol_range() {
         for (api_key, range) in CAPPED_API_VERSIONS {
-            validate_capped_range(api_key, range).expect("a cap within the protocol range");
+            validate_versions(api_key, range, protocol_range(api_key))
+                .expect("a cap within the protocol range");
         }
     }
 
     #[test]
     fn declared_range_wider_than_protocol_range_fails_validation() {
-        let err = validate_capped_range(MetadataRequest::KEY, 0..=999)
-            .expect_err("0..=999 exceeds MetadataRequest's protocol range");
+        let err = validate_versions(
+            MetadataRequest::KEY,
+            0..=999,
+            protocol_range(MetadataRequest::KEY),
+        )
+        .expect_err("0..=999 exceeds MetadataRequest's protocol range");
 
         assert!(matches!(
             err,
-            Error::CapRangeExceedsProtocolRange {
+            Error::VersionRangeNotAllowed {
+                api_key,
+                ..
+            } if api_key == MetadataRequest::KEY
+        ));
+    }
+
+    #[test]
+    fn empty_declared_range_fails_validation() {
+        let err = validate_versions(
+            MetadataRequest::KEY,
+            RangeInclusive::new(5, 3),
+            protocol_range(MetadataRequest::KEY),
+        )
+        .expect_err("a range that starts at 5 and ends at 3 has no version");
+
+        assert!(matches!(
+            err,
+            Error::EmptyVersionRange {
                 api_key,
                 ..
             } if api_key == MetadataRequest::KEY

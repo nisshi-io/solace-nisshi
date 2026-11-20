@@ -263,10 +263,7 @@ mod version_gate;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
 
-pub use version_gate::{
-    CAPPED_API_VERSIONS, VersionGateLayer, VersionGateService, capped_range, routable_max_version,
-    routable_range,
-};
+pub use version_gate::{CAPPED_API_VERSIONS, capped_range, routable_max_version, routable_range};
 
 pub use input::TcpListenerInput;
 
@@ -320,20 +317,21 @@ impl AsRef<ProgressBar> for ProgressBarExtension {
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Auth(#[from] nisshi_auth::Error),
-    /// An entry in [`CAPPED_API_VERSIONS`] is not a subset of `protocol`, the Kafka protocol's
-    /// own valid range for `api_key` (`None` when this build has no protocol metadata for
-    /// `api_key`).
-    CapRangeExceedsProtocolRange {
+    DuplicateRoute(i16),
+    /// A version range for `api_key` has no version, because its start is above its end.
+    EmptyVersionRange {
         api_key: i16,
         declared: RangeInclusive<i16>,
-        protocol: Option<RangeInclusive<i16>>,
     },
-    DuplicateRoute(i16),
     FrameTooBig(usize),
     InvalidFrameLength(i32),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
+    /// [`FrameRouteBuilder::with_versions`] found no registered route of `api_key`.
+    NoRouteForVersions(i16),
+    /// [`FrameRouteBuilder::with_guard`] found no registered route of `api_key` to guard.
+    NoRouteToGuard(i16),
     /// [`FrameRouteBuilder::wrap_route`] found no registered route of `api_key` to wrap.
     NoRouteToWrap(i16),
     OneshotRecv(oneshot::error::RecvError),
@@ -370,6 +368,16 @@ pub enum Error {
     UnsupportedVersion {
         api_key: i16,
         api_version: i16,
+    },
+    /// A version range for `api_key` is not a subset of `allowed`: the versions that the
+    /// handler of the route implements when it is the handler of a capped API, otherwise the
+    /// Kafka protocol's own valid range for `api_key` (`None` when this build has no protocol
+    /// metadata for `api_key`). [`CAPPED_API_VERSIONS`] and [`FrameRouteBuilder::with_versions`]
+    /// both set such a range.
+    VersionRangeNotAllowed {
+        api_key: i16,
+        declared: RangeInclusive<i16>,
+        allowed: Option<RangeInclusive<i16>>,
     },
 }
 

@@ -32,8 +32,8 @@ use nisshi_broker::{
 use nisshi_sans_io::{
     ApiKey as _, ApiVersionsRequest, ApiVersionsResponse, DescribeClusterRequest,
     DescribeClusterResponse, ErrorCode, Frame, FrameInput, GetTelemetrySubscriptionsRequest,
-    GetTelemetrySubscriptionsResponse, Header, MetadataRequest, ProduceRequest, ProduceResponse,
-    RequestInput,
+    GetTelemetrySubscriptionsResponse, Header, MetadataRequest, MetadataResponse, ProduceRequest,
+    ProduceResponse, RequestInput, metadata_request::MetadataRequestTopic,
 };
 use nisshi_service::{FrameRequestLayer, ResponseService};
 use nisshi_storage::{ArcDynStorage, Storage as _};
@@ -201,6 +201,26 @@ fn produce_service() -> BoxService<FrameInput, Frame, Error> {
         .boxed()
 }
 
+/// A service that answers every Metadata with no topics.
+fn metadata_service() -> BoxService<FrameInput, Frame, Error> {
+    (
+        MapErrLayer::new(Error::from),
+        FrameRequestLayer::<MetadataRequest>::new(),
+    )
+        .into_layer(ResponseService::new(
+            |_: RequestInput<MetadataRequest>| -> Result<_, nisshi_service::Error> {
+                Ok(MetadataResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .brokers(Some([].into()))
+                    .cluster_id(Some("replaced".into()))
+                    .controller_id(Some(NODE_ID))
+                    .topics(Some([].into()))
+                    .cluster_authorized_operations(Some(i32::MIN)))
+            },
+        ))
+        .boxed()
+}
+
 /// Returns the API key, minimum version and maximum version that the broker at `addr` advertises
 /// for each API.
 async fn advertised_versions(addr: SocketAddr) -> Result<Vec<(i16, i16, i16)>> {
@@ -235,6 +255,26 @@ async fn advertised_api_keys(addr: SocketAddr) -> Result<Vec<i16>> {
         .into_iter()
         .map(|(api_key, _, _)| api_key)
         .collect())
+}
+
+async fn produce(addr: SocketAddr, api_version: i16) -> Result<ProduceResponse> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let frame = round_trip(
+        &mut stream,
+        ProduceRequest::KEY,
+        api_version,
+        1,
+        ProduceRequest::default()
+            .transactional_id(None)
+            .acks(1)
+            .timeout_ms(1_000)
+            .topic_data(Some([].into()))
+            .into(),
+    )
+    .await?;
+
+    ProduceResponse::try_from(frame.body).map_err(Into::into)
 }
 
 async fn describe_cluster(addr: SocketAddr) -> Result<DescribeClusterResponse> {
@@ -363,7 +403,7 @@ async fn replaced_route_answers_instead_of_the_built_in_route() -> Result<()> {
 }
 
 #[tokio::test]
-async fn replaced_produce_route_is_advertised_with_the_range_of_the_built_in_route() -> Result<()> {
+async fn replaced_produce_route_keeps_the_range_of_the_built_in_route() -> Result<()> {
     let _guard = init_tracing()?;
 
     timeout(TEST_TIMEOUT, async {
@@ -384,28 +424,111 @@ async fn replaced_produce_route_is_advertised_with_the_range_of_the_built_in_rou
         assert!(min_version > 0, "{min_version}");
 
         for api_version in [min_version, max_version] {
-            let mut stream = TcpStream::connect(broker.addr).await?;
-
-            let frame = round_trip(
-                &mut stream,
-                ProduceRequest::KEY,
-                api_version,
-                1,
-                ProduceRequest::default()
-                    .transactional_id(None)
-                    .acks(1)
-                    .timeout_ms(1_000)
-                    .topic_data(Some([].into()))
-                    .into(),
-            )
-            .await?;
-
-            assert_matches!(
-                ProduceResponse::try_from(frame.body),
-                Ok(response) if response.responses == Some([].into()),
+            assert_eq!(
+                Some([].into()),
+                produce(broker.addr, api_version).await?.responses,
                 "version {api_version}"
             );
         }
+
+        // The route table closes the connection for a version below the range, so the
+        // replacement never sees the request.
+        assert!(produce(broker.addr, min_version - 1).await.is_err());
+
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn extension_serves_and_advertises_the_versions_that_it_sets() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(Some(ExtendRoutes::new(|builder, _, _| {
+            builder
+                .wrap_route(ProduceRequest::KEY, |_built_in| produce_service())
+                .and_then(|builder| builder.with_versions(ProduceRequest::KEY, 0..=11))
+                .map_err(Into::into)
+        })))
+        .await?;
+
+        assert!(
+            advertised_versions(broker.addr)
+                .await?
+                .contains(&(ProduceRequest::KEY, 0, 11))
+        );
+
+        assert_eq!(Some([].into()), produce(broker.addr, 0).await?.responses);
+
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn extension_cannot_widen_a_capped_route_without_changing_its_handler() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    timeout(TEST_TIMEOUT, async {
+        let mut built = build_broker(Some(ExtendRoutes::new(|builder, _, _| {
+            builder
+                .with_versions(ProduceRequest::KEY, 0..=11)
+                .map_err(Into::into)
+        })))
+        .await?;
+
+        assert_matches!(
+            built.broker.serve(Instant::now()).await,
+            Err(Error::Service(nisshi_service::Error::VersionRangeNotAllowed { api_key, .. }))
+                if api_key == ProduceRequest::KEY
+        );
+
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn replaced_metadata_route_keeps_the_topic_id_layer() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    timeout(TEST_TIMEOUT, async {
+        let broker = spawn_broker(Some(ExtendRoutes::new(|builder, _, _| {
+            builder
+                .wrap_route(MetadataRequest::KEY, |_built_in| metadata_service())
+                .map_err(Into::into)
+        })))
+        .await?;
+
+        let mut stream = TcpStream::connect(broker.addr).await?;
+
+        // Metadata v10 refuses a topic ID and a null name. The replacement answers with no
+        // topics, so a topic in the response shows that the layer answered.
+        let frame = round_trip(
+            &mut stream,
+            MetadataRequest::KEY,
+            10,
+            1,
+            MetadataRequest::default()
+                .topics(Some(vec![
+                    MetadataRequestTopic::default()
+                        .topic_id(Some([7; 16]))
+                        .name(None),
+                ]))
+                .allow_auto_topic_creation(Some(false))
+                .include_cluster_authorized_operations(Some(false))
+                .include_topic_authorized_operations(Some(false))
+                .into(),
+        )
+        .await?;
+
+        let topics = MetadataResponse::try_from(frame.body)?
+            .topics
+            .unwrap_or_default();
+
+        assert_eq!(1, topics.len());
+        assert_eq!(i16::from(ErrorCode::InvalidRequest), topics[0].error_code);
 
         Ok(())
     })
