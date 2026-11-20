@@ -51,7 +51,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceEntry,
     ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
@@ -566,7 +566,7 @@ impl Storage for CountingStorage {
         _topition: &Topition,
         _offset: i64,
         _min_bytes: u32,
-        _max_bytes: u32,
+        _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched: crate::FetchedSender,
     ) -> Result<()> {

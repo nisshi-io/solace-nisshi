@@ -1138,7 +1138,7 @@ mod unreadable_groups {
         txn_offset_commit_response::TxnOffsetCommitResponseTopic,
     };
     use nisshi_storage::{
-        BrokerRegistrationRequest, CommittedOffset, GroupDetail, ListOffsetResponse,
+        BrokerRegistrationRequest, ByteLimit, CommittedOffset, GroupDetail, ListOffsetResponse,
         MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
         Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
         TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
@@ -1206,7 +1206,7 @@ mod unreadable_groups {
             topition: &'_ Topition,
             offset: i64,
             min_bytes: u32,
-            max_bytes: u32,
+            limit: ByteLimit,
             isolation: IsolationLevel,
             fetched_sender: nisshi_storage::FetchedSender,
         ) -> Result<()> {
@@ -1215,7 +1215,7 @@ mod unreadable_groups {
                     topition,
                     offset,
                     min_bytes,
-                    max_bytes,
+                    limit,
                     isolation,
                     fetched_sender,
                 )

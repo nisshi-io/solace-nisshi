@@ -42,7 +42,7 @@ macro_rules! storage_double {
                 _topition: &Topition,
                 _offset: i64,
                 _min_bytes: u32,
-                _max_bytes: u32,
+                _limit: ByteLimit,
                 _isolation_level: IsolationLevel,
                 $fetched_sender: FetchedSender,
             ) -> Result<()> $body

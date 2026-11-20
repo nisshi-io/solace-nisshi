@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use nisshi_sans_io::{
-    CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest, RequestInput,
+    ByteSize as _, CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest,
+    RequestInput,
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -81,6 +82,16 @@ const MESSAGES: [Bytes; 7] = [
     PARIATUR_EXCEPTEUR,
     CULPA_QUI,
 ];
+
+/// Returns the encoded size of a batch that holds one record of `value`.
+fn batch_size(value: &Bytes) -> Result<usize, Error> {
+    let batch = inflated::Batch::builder()
+        .record(Record::builder().value(Some(value.clone())))
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    Ok(batch.size_in_bytes()?)
+}
 
 #[derive(Clone)]
 pub(crate) struct LatencyIntroducingObjectStore<O> {
@@ -1322,7 +1333,9 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
                         ))]
                     .into(),
                 ))
-                .max_bytes(Some((LOREM_IPSUM.len() + EIUSMOD_TEMPOR.len()) as i32))
+                .max_bytes(Some(
+                    (batch_size(&LOREM_IPSUM)? + batch_size(&EIUSMOD_TEMPOR)?) as i32,
+                ))
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
         )
         .await?;
@@ -1481,7 +1494,9 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() ->
                         ))]
                     .into(),
                 ))
-                .max_bytes(Some((LOREM_IPSUM.len() + EIUSMOD_TEMPOR.len()) as i32))
+                .max_bytes(Some(
+                    (batch_size(&LOREM_IPSUM)? + batch_size(&EIUSMOD_TEMPOR)?) as i32,
+                ))
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
         )
         .await?;

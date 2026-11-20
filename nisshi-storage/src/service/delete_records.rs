@@ -368,12 +368,13 @@ mod tests {
 
     use super::{DELETE_RECORDS_CONCURRENCY, DeleteRecordsConcurrency, DeleteRecordsService};
     use crate::{
-        BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-        GroupDetail, LatencyIntroducingStorage, ListOffsetResponse, MetadataResponse,
-        NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceRequestBatcher,
-        ProducerIdResponse, Result, ScramCredential, SemaphoreProxy, Storage, TopicId, Topition,
-        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version, service::read_deadline::DELETE_RECORDS_DEADLINE,
+        BrokerRegistrationRequest, ByteLimit, CommittedOffset,
+        DELETE_RECORDS_INVALID_LOW_WATERMARK, Error, GroupDetail, LatencyIntroducingStorage,
+        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+        ProduceRequestBatcher, ProducerIdResponse, Result, ScramCredential, SemaphoreProxy,
+        Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+        TxnOffsetCommitRequest, UpdateError, Version,
+        service::read_deadline::DELETE_RECORDS_DEADLINE,
     };
 
     /// What the stub engine does with a partition.
@@ -543,7 +544,7 @@ mod tests {
             _topition: &Topition,
             _offset: i64,
             _min_bytes: u32,
-            _max_bytes: u32,
+            _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: crate::FetchedSender,
         ) -> Result<()> {
