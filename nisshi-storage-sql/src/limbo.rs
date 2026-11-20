@@ -3989,13 +3989,16 @@ mod tests {
                 );
             }
 
-            assert_eq!(
-                vec![StatementRow {
-                    offset: 0,
+            assert_matches!(
+                fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(50), 3)
+                    .await?
+                    .as_slice(),
+                [record_fetch::Row {
+                    offset_id: 0,
                     limit_reached: true,
-                    has_key: false,
+                    key: None,
+                    ..
                 }],
-                fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(50), 3).await?,
                 "{statement} within Hard(50)"
             );
         }
@@ -4230,19 +4233,10 @@ mod tests {
             fetched_rows_from(connection, statement, key, offset, limit, high_watermark)
                 .await?
                 .into_iter()
-                .filter(|row| !row.limit_reached)
-                .map(|row| row.offset)
+                .filter_map(record_fetch::Row::within_limit)
+                .map(|row| row.offset_id)
                 .collect(),
         )
-    }
-
-    /// One row that a fetch statement returns: a record, or, if `limit_reached` is set, a marker
-    /// for the first record, which did not fit a hard limit.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct StatementRow {
-        offset: i64,
-        limit_reached: bool,
-        has_key: bool,
     }
 
     /// Returns the rows that `statement` returns when it reads partition 0 from `offset` within
@@ -4255,7 +4249,7 @@ mod tests {
         offset: i64,
         limit: ByteLimit,
         high_watermark: i64,
-    ) -> Result<Vec<StatementRow>> {
+    ) -> Result<Vec<record_fetch::Row>> {
         let mut params = vec![
             Value::from("c"),
             Value::from("t"),
@@ -4270,19 +4264,16 @@ mod tests {
         params.push(Value::from(matches!(limit, ByteLimit::Soft(_))));
 
         let sql = sql_lookup(statement)?;
-        let mut rows = connection.prepare(&sql).await?.query(params).await?;
-        let columns = ResultColumns::new(statement, &rows);
-        let offset_index = columns.index("offset_id")?;
-        let limit_reached_index = columns.index("limit_reached")?;
-        let key_index = columns.index("key")?;
+        let rows = connection.prepare(&sql).await?.query(params).await?;
+        let mut rows = QueryRowCursor::<_, record_fetch::Row>::new(
+            ResultColumns::new(statement, &rows),
+            rows,
+            ColumnErrorCount::new(&SQL_ERROR, vec![]),
+        )?;
 
         let mut statement_rows = vec![];
         while let Some(row) = rows.next().await? {
-            statement_rows.push(StatementRow {
-                offset: row.get::<i64>(offset_index)?,
-                limit_reached: row.get::<i64>(limit_reached_index)? != 0,
-                has_key: !matches!(row.get_value(key_index)?, Value::Null),
-            });
+            statement_rows.push(row);
         }
 
         Ok(statement_rows)
