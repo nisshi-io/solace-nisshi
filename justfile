@@ -393,7 +393,7 @@ lakehouse-create-warehouse:
     curl {{ lakehouse_url }}/management/v1/warehouse -H "Content-Type: application/json" --data @etc/lakekeeper/create-default-warehouse.json
 
 lakehouse-migrate:
-    docker compose exec lakehouse-catalog /home/nonroot/iceberg-catalog migrate
+    docker compose exec lakehouse-catalog /home/nonroot/lakekeeper migrate
 
 docker-compose-up *args:
     docker compose --ansi never --progress plain up --no-color --quiet-pull --wait --detach {{ args }}
