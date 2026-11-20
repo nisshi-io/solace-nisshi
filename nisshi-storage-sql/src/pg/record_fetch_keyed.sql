@@ -13,7 +13,8 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea, bigint) as
+-- prepare record_fetch_keyed
+--   (text, text, integer, integer, integer, integer, bytea, bigint, boolean) as
 -- Each row holds one record with all of its headers, so that a read stopped after any row keeps
 -- only complete records.
 --
@@ -114,16 +115,21 @@ from
 
 candidates)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch.
+-- If $9 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $9 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
 --
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size. It does not compare offset_id
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
+--
+-- If $9 is false, a first row that does not fit $5 comes back as a marker: `limit_reached` is
+-- true, and the key, value and headers are null, so the query does not send their bytes. The caller needs
+-- the marker, because the key filter can match no row, and an empty result would not show that the
+-- first match did not fit.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -132,14 +138,17 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-s.k as key,
-s.v as value,
+case when s.bytes < $5 or $9 then s.k end as key,
+case when s.bytes < $5 or $9 then s.v end as value,
 s.producer_id,
 s.producer_epoch,
 
 -- The first half of headers holds the keys, and the second half the values.
-s.headers[1:cardinality(s.headers) / 2] as header_keys,
-s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] as header_values
+case when s.bytes < $5 or $9
+    then s.headers[1:cardinality(s.headers) / 2] end as header_keys,
+case when s.bytes < $5 or $9
+    then s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] end as header_values,
+not (s.bytes < $5 or $9) as limit_reached
 
 from
 

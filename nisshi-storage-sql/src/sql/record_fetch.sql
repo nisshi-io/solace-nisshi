@@ -13,7 +13,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch (text, text, integer, integer, integer, integer, integer) as
+-- prepare record_fetch (text, text, integer, integer, integer, integer, integer, integer) as
 -- A fetch reads at most $7 rows past the fetch offset (ROWS_PER_FETCH). The running byte total
 -- below covers every row that this query reads, so without the limit, one fetch costs as much as
 -- the whole backlog between the fetch offset and the high watermark, however few rows the client
@@ -84,13 +84,13 @@ and r.offset_id < $6
 order by r.offset_id
 limit $7) sized_rows)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch. The query finds the
--- first row by its ordinal, so that finding it does not depend on every record having a
--- non-zero size.
+-- If $8 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $8 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
+-- The query finds the first row by its ordinal, so that finding it does not depend on every
+-- record having a non-zero size.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -103,7 +103,11 @@ r.k as key,
 r.v as value,
 s.bytes,
 r.producer_id,
-r.producer_epoch
+r.producer_epoch,
+
+-- Every row holds a record. Only the keyed query returns a marker row (see
+-- record_fetch_keyed.sql).
+0 as limit_reached
 
 from
 
@@ -113,7 +117,7 @@ join record r on r.topition = s.topition and r.offset_id = s.offset_id
 where
 
 s.bytes < $5
-or s.ordinal = 1
+or (s.ordinal = 1 and $8)
 
 -- The rows must come out in offset order, because the engine builds record batches from them
 -- in the order that it reads them, and each record's offset delta counts from the first record
