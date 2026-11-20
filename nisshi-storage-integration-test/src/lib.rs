@@ -48,6 +48,7 @@
 pub mod broker;
 pub mod consumer_group;
 pub mod group;
+mod init_producer;
 pub mod producer_id;
 pub mod random;
 pub mod transactions;

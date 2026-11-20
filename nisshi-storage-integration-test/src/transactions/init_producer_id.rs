@@ -15,12 +15,9 @@
 //! Cases about producer IDs for a transactional ID, and the transactions of those producers.
 
 use crate::{
-    broker::register_broker,
-    producer_id::init_producer_id::{
-        TRANSACTION_TIMEOUT_MS, assert_failed, assert_ok, init_idempotent_producer,
-        request_decoded_at_version,
-    },
-    random::alphanumeric_string,
+    broker,
+    init_producer::{self, TRANSACTION_TIMEOUT_MS},
+    random,
 };
 use bytes::Bytes;
 use nisshi_broker::Result;
@@ -73,7 +70,7 @@ pub async fn transactional_id_is_refused(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let service = InitProducerIdService {
         storage: storage.clone(),
@@ -81,7 +78,7 @@ pub async fn transactional_id_is_refused(
     let txn = Uuid::now_v7().to_string();
 
     for api_version in 0..=5 {
-        let request = request_decoded_at_version(
+        let request = init_producer::request_decoded_at_version(
             InitProducerIdRequest::default()
                 .transactional_id(Some(txn.clone()))
                 .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
@@ -97,7 +94,7 @@ pub async fn transactional_id_is_refused(
             })
             .await?;
 
-        assert_failed(ErrorCode::TransactionalIdAuthorizationFailed, &response);
+        init_producer::assert_failed(ErrorCode::TransactionalIdAuthorizationFailed, &response);
     }
 
     // This call checks that no refused request reached the storage. The storage still serves a
@@ -105,7 +102,7 @@ pub async fn transactional_id_is_refused(
     // request and answers it with epoch 0, and answers each later request for the ID with the
     // next epoch. Epoch 0 here shows that the storage had not seen the ID before this call.
     let direct_storage_response = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&direct_storage_response);
+    init_producer::assert_ok(&direct_storage_response);
     assert_eq!(0, direct_storage_response.producer_epoch);
 
     Ok(())
@@ -119,7 +116,7 @@ pub async fn old_versions_bump_a_transactional_producer(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let service = InitProducerIdService { storage };
     let txn = Uuid::now_v7().to_string();
@@ -127,7 +124,7 @@ pub async fn old_versions_bump_a_transactional_producer(
     let mut previous: Option<InitProducerIdResponse> = None;
 
     for api_version in 0..=5 {
-        let request = request_decoded_at_version(
+        let request = init_producer::request_decoded_at_version(
             InitProducerIdRequest::default()
                 .transactional_id(Some(txn.clone()))
                 .transaction_timeout_ms(TRANSACTION_TIMEOUT_MS)
@@ -143,7 +140,7 @@ pub async fn old_versions_bump_a_transactional_producer(
             })
             .await?;
 
-        assert_ok(&response);
+        init_producer::assert_ok(&response);
 
         match previous {
             Some(previous) => {
@@ -165,12 +162,12 @@ pub async fn txn_claim_current_epoch_bumps(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
 
     let mut current = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&current);
+    init_producer::assert_ok(&current);
 
     for _ in 0..2 {
         let bumped = init_transactional_producer(
@@ -181,7 +178,7 @@ pub async fn txn_claim_current_epoch_bumps(
         )
         .await?;
 
-        assert_ok(&bumped);
+        init_producer::assert_ok(&bumped);
         assert_eq!(current.producer_id, bumped.producer_id);
         assert_eq!(current.producer_epoch + 1, bumped.producer_epoch);
 
@@ -197,20 +194,20 @@ pub async fn txn_claim_stale_epoch_is_fenced(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
 
     let stale = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&stale);
+    init_producer::assert_ok(&stale);
 
     let current = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&current);
+    init_producer::assert_ok(&current);
     assert_eq!(stale.producer_id, current.producer_id);
     assert_eq!(stale.producer_epoch + 1, current.producer_epoch);
 
     for epoch in [stale.producer_epoch, current.producer_epoch + 1] {
-        assert_failed(
+        init_producer::assert_failed(
             ErrorCode::ProducerFenced,
             &init_transactional_producer(&storage, &txn, current.producer_id, epoch).await?,
         );
@@ -219,7 +216,7 @@ pub async fn txn_claim_stale_epoch_is_fenced(
     let bumped =
         init_transactional_producer(&storage, &txn, current.producer_id, current.producer_epoch)
             .await?;
-    assert_ok(&bumped);
+    init_producer::assert_ok(&bumped);
     assert_eq!(current.producer_epoch + 1, bumped.producer_epoch);
 
     Ok(())
@@ -230,20 +227,20 @@ pub async fn txn_claim_other_id_is_fenced(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
     let other_txn = Uuid::now_v7().to_string();
 
     let producer = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&producer);
+    init_producer::assert_ok(&producer);
 
     let other = init_transactional_producer(&storage, &other_txn, -1, -1).await?;
-    assert_ok(&other);
+    init_producer::assert_ok(&other);
     assert_ne!(producer.producer_id, other.producer_id);
     assert_eq!(producer.producer_epoch, other.producer_epoch);
 
-    assert_failed(
+    init_producer::assert_failed(
         ErrorCode::ProducerFenced,
         &init_transactional_producer(&storage, &txn, other.producer_id, other.producer_epoch)
             .await?,
@@ -258,12 +255,12 @@ pub async fn txn_claim_unknown_txn_is_fresh(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
 
     let response = init_transactional_producer(&storage, &txn, 4_242, 3).await?;
-    assert_ok(&response);
+    init_producer::assert_ok(&response);
     assert!(response.producer_id > 0);
     assert_eq!(0, response.producer_epoch);
 
@@ -277,16 +274,16 @@ pub async fn mixed_shape_is_invalid_request(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
 
     for (producer_id, producer_epoch) in [(-1, 0), (5, -1)] {
-        assert_failed(
+        init_producer::assert_failed(
             ErrorCode::InvalidRequest,
-            &init_idempotent_producer(&storage, producer_id, producer_epoch).await?,
+            &init_producer::init_idempotent_producer(&storage, producer_id, producer_epoch).await?,
         );
-        assert_failed(
+        init_producer::assert_failed(
             ErrorCode::InvalidRequest,
             &init_transactional_producer(&storage, &txn, producer_id, producer_epoch).await?,
         );
@@ -317,7 +314,7 @@ const RECORDS: i32 = 3;
 
 /// Creates a topic with one partition, and returns that partition.
 async fn create_topition(storage: &impl Storage) -> Result<Topition> {
-    let name = alphanumeric_string(15);
+    let name = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -418,13 +415,13 @@ pub async fn txn_claim_ongoing_txn_aborts_and_bumps(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
     let topition = create_topition(&storage).await?;
 
     let producer = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&producer);
+    init_producer::assert_ok(&producer);
 
     produce_in_txn(&storage, &txn, &producer, &topition).await?;
 
@@ -440,7 +437,7 @@ pub async fn txn_claim_ongoing_txn_aborts_and_bumps(
         producer.producer_epoch,
     )
     .await?;
-    assert_ok(&bumped);
+    init_producer::assert_ok(&bumped);
     assert_eq!(producer.producer_id, bumped.producer_id);
     assert_eq!(producer.producer_epoch + 1, bumped.producer_epoch);
 
@@ -469,20 +466,20 @@ pub async fn txn_fenced_claim_leaves_ongoing_txn(
     broker_id: i32,
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
     let txn = Uuid::now_v7().to_string();
     let topition = create_topition(&storage).await?;
 
     let fenced = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&fenced);
+    init_producer::assert_ok(&fenced);
 
     let current = init_transactional_producer(&storage, &txn, -1, -1).await?;
-    assert_ok(&current);
+    init_producer::assert_ok(&current);
 
     produce_in_txn(&storage, &txn, &current, &topition).await?;
 
-    assert_failed(
+    init_producer::assert_failed(
         ErrorCode::ProducerFenced,
         &init_transactional_producer(&storage, &txn, fenced.producer_id, fenced.producer_epoch)
             .await?,

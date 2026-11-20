@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::{
-    broker::register_broker,
-    group::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, join, join_group},
-    random::alphanumeric_string,
+    broker,
+    group::{self, CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE},
+    random,
 };
 use nisshi_broker::{Result, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{ErrorCode, join_group_request::JoinGroupRequestProtocol};
@@ -54,17 +54,17 @@ pub async fn reject_invalid_session_timeout_on_join<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id.clone(), broker_id, &sc).await?;
+    broker::register_broker(cluster_id.clone(), broker_id, &sc).await?;
 
     for invalid_session_timeout_ms in [-1, 0, MAX_SESSION_TIMEOUT_MS + 1] {
         let mut controller = Controller::with_storage(sc.clone())?;
 
-        let group_id: String = alphanumeric_string(15);
-        let group_instance_id = format!("static-{}", alphanumeric_string(8));
+        let group_id: String = random::alphanumeric_string(15);
+        let group_instance_id = format!("static-{}", random::alphanumeric_string(8));
 
         let rejected = timeout(
             Duration::from_secs(5),
-            join_group(
+            group::join_group(
                 &mut controller,
                 Some(CLIENT_ID),
                 group_id.as_str(),
@@ -105,7 +105,7 @@ where
         // profile kills it.
         let joined = timeout(
             Duration::from_secs(10),
-            join(
+            group::join(
                 &mut controller,
                 group_id.as_str(),
                 None,
@@ -141,16 +141,16 @@ pub async fn accept_boundary_session_timeout_on_join<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id.clone(), broker_id, &sc).await?;
+    broker::register_broker(cluster_id.clone(), broker_id, &sc).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
 
-    let group_id: String = alphanumeric_string(15);
-    let group_instance_id = format!("static-{}", alphanumeric_string(8));
+    let group_id: String = random::alphanumeric_string(15);
+    let group_instance_id = format!("static-{}", random::alphanumeric_string(8));
 
     let accepted = timeout(
         Duration::from_secs(10),
-        join_group(
+        group::join_group(
             &mut controller,
             Some(CLIENT_ID),
             group_id.as_str(),

@@ -49,12 +49,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 
-use crate::random::alphanumeric_string;
+use crate::random;
 
 pub async fn one_consumer_session_delay_after_initial_join(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let group: String = alphanumeric_string(15);
+    let group: String = random::alphanumeric_string(15);
 
     let tp = [("t", 0..3)];
 
@@ -176,7 +176,7 @@ pub async fn one_consumer_session_delay_after_initial_join(
 }
 
 pub async fn one_consumer_next_action(storage: impl Storage + Clone) -> Result<()> {
-    let group: String = alphanumeric_string(15);
+    let group: String = random::alphanumeric_string(15);
 
     let tp = [("t", 0..3)];
 
@@ -246,7 +246,7 @@ pub async fn one_consumer_next_action(storage: impl Storage + Clone) -> Result<(
 }
 
 pub async fn two_consumer_next_action(storage: impl Storage + Clone) -> Result<()> {
-    let group: String = alphanumeric_string(15);
+    let group: String = random::alphanumeric_string(15);
 
     let tp = [("t", 0..3)];
 
@@ -405,7 +405,7 @@ async fn group_consumer_next_action(
     storage: impl Storage + Clone,
     consumers: Range<i32>,
 ) -> Result<()> {
-    let group: String = alphanumeric_string(15);
+    let group: String = random::alphanumeric_string(15);
 
     let partitions = 0..32;
 
@@ -530,7 +530,7 @@ async fn group_consumer_next_action(
 }
 
 pub async fn two_consumer_interleave_join(storage: impl Storage + Clone) -> Result<()> {
-    let group: String = alphanumeric_string(15);
+    let group: String = random::alphanumeric_string(15);
 
     let tp = [("t", 0..3)];
 
