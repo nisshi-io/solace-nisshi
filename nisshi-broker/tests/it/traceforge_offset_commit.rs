@@ -77,9 +77,9 @@ use nisshi_sans_io::{
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    ProducerIdResponse, ReadEnd, Result as StorageResult, ScramCredential, Storage, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -302,7 +302,7 @@ impl Storage for FaultInjectingStorage {
         limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
-    ) -> StorageResult<nisshi_storage::ReadEnd> {
+    ) -> StorageResult<ReadEnd> {
         self.inner
             .fetch(
                 topition,

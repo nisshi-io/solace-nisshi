@@ -55,7 +55,7 @@ use nisshi_sans_io::{
 use nisshi_storage::{
     BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, GroupDetailResponse,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version,
 };
@@ -221,8 +221,8 @@ impl Storage for Engine {
         _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched_sender: nisshi_storage::FetchedSender,
-    ) -> Result<nisshi_storage::ReadEnd> {
-        Ok(nisshi_storage::ReadEnd::Finished)
+    ) -> Result<ReadEnd> {
+        Ok(ReadEnd::Finished)
     }
 
     #[instrument(skip_all)]

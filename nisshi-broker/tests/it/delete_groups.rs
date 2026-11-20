@@ -1029,7 +1029,7 @@ mod unreadable_groups {
     use nisshi_storage::{
         BrokerRegistrationRequest, ByteLimit, CommittedOffset, GroupDetail, ListOffsetResponse,
         MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+        ReadEnd, Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
         TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
     };
     use url::Url;
@@ -1098,7 +1098,7 @@ mod unreadable_groups {
             limit: ByteLimit,
             isolation: IsolationLevel,
             fetched_sender: nisshi_storage::FetchedSender,
-        ) -> Result<nisshi_storage::ReadEnd> {
+        ) -> Result<ReadEnd> {
             self.storage
                 .fetch(
                     topition,
