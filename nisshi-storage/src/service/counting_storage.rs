@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A [`Storage`] for service tests that holds only topic names, counts the `metadata` calls that
+//! A [`Storage`] for service tests that holds topic names and their configs, counts the `metadata` calls that
 //! list every topic and those that look up named topics, records the topics that it creates and
 //! deletes, records each batch that it is asked to produce, and answers the broker's own
 //! registration.
@@ -34,7 +34,7 @@ use nisshi_sans_io::{
     delete_records_request::DeleteRecordsTopic,
     delete_records_response::DeleteRecordsTopicResult,
     describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
+    describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
     fetch_response::AbortedTransaction,
     incremental_alter_configs_request::AlterConfigsResource,
@@ -120,7 +120,7 @@ pub(crate) struct Produced {
     pub(crate) inflated: Option<inflated::Batch>,
 }
 
-/// A [`Storage`] that holds only topic names. Clones share their topics and counts.
+/// A [`Storage`] that holds topic names and their configs. Clones share their topics and counts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountingStorage {
     listing: Listing,
@@ -143,6 +143,8 @@ pub(crate) struct CountingStorage {
     produce_all_calls: Arc<AtomicUsize>,
     gated_partitions: Option<BTreeSet<i32>>,
     config_gate: Option<Arc<Semaphore>>,
+    topic_configs: Vec<(String, String)>,
+    described_keys: Arc<Mutex<Vec<Option<Vec<String>>>>>,
     parked: Arc<AtomicUsize>,
     produce_delay: Option<Duration>,
     partition_failure: Option<(i32, Error)>,
@@ -286,6 +288,19 @@ impl CountingStorage {
     pub(crate) fn with_config_gate(self, gate: Arc<Semaphore>) -> Self {
         Self {
             config_gate: Some(gate),
+            ..self
+        }
+    }
+
+    /// Returns this storage, with each topic that it holds having the configs `configs`, each a
+    /// name and its value. A read of named configs answers only the configs of those names, as the
+    /// libSQL, Turso and dynostore engines do, and a read of every config answers all of them.
+    pub(crate) fn with_topic_configs(self, configs: &[(&str, &str)]) -> Self {
+        Self {
+            topic_configs: configs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
             ..self
         }
     }
@@ -442,6 +457,11 @@ impl CountingStorage {
     /// The batches that `produce` and `produce_inflated` got, in order.
     pub(crate) fn produced(&self) -> Vec<Produced> {
         self.produced.lock().expect("produced").clone()
+    }
+
+    /// The `keys` of each `describe_config` call, in call order.
+    pub(crate) fn described_keys(&self) -> Vec<Option<Vec<String>>> {
+        self.described_keys.lock().expect("described_keys").clone()
     }
 
     /// The number of `metadata` calls that looked up named topics.
@@ -750,8 +770,12 @@ impl Storage for CountingStorage {
         &self,
         name: &str,
         resource: ConfigResource,
-        _keys: Option<&[String]>,
+        keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
+        self.described_keys
+            .lock()?
+            .push(keys.map(<[String]>::to_vec));
+
         if matches!(resource, ConfigResource::Topic)
             && let Some(gate) = &self.config_gate
         {
@@ -771,7 +795,23 @@ impl Storage for CountingStorage {
             ErrorCode::UnknownTopicOrPartition
         };
 
-        Ok(DescribeConfigsResult::default().error_code(error_code.into()))
+        let configs = if holds_topic && matches!(resource, ConfigResource::Topic) {
+            self.topic_configs
+                .iter()
+                .filter(|(config, _)| keys.is_none_or(|keys| keys.contains(config)))
+                .map(|(config, value)| {
+                    DescribeConfigsResourceResult::default()
+                        .name(config.clone())
+                        .value(Some(value.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(DescribeConfigsResult::default()
+            .error_code(error_code.into())
+            .configs(Some(configs)))
     }
 
     async fn describe_topic_partitions(
