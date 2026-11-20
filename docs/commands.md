@@ -270,7 +270,8 @@ The mechanism name is not case sensitive, so Kafka's `SCRAM-SHA-512` works too. 
 stops when the broker asks for fewer than 4096 iterations, which is the minimum that Kafka's
 client enforces, or for more than 65,536, which is four times the most that a Kafka broker
 asks for. A user that `nisshi user create --iterations` made with a count outside that range
-cannot log in with these commands. Each connection
+cannot log in with these commands. The broker refuses an iteration count outside 4096 to
+16384 when it creates a user, as Kafka 3.9.1 does. Each connection
 logs in once, as it opens, and a broker that limits the session lifetime has the command open a
 new connection, which logs in again, a little before the limit. `proxy` has none of these
 options.
