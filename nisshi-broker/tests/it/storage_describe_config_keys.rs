@@ -259,6 +259,13 @@ macro_rules! engine_tests {
     };
 }
 
+#[cfg(feature = "dynostore")]
+mod memory {
+    use crate::common::memory_storage;
+
+    engine_tests!(memory_storage);
+}
+
 #[cfg(feature = "libsql")]
 mod lite {
     use crate::common::lite_storage;
