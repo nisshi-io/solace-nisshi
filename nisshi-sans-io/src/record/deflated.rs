@@ -59,14 +59,22 @@ impl ByteSize for Frame {
 /// `RecordBatch.sizeInBytes` measures the same span.
 impl ByteSize for Batch {
     fn size_in_bytes(&self) -> Result<usize> {
-        // base_offset
-        Ok(size_of::<i64>()
-            // batch_length
-            + size_of::<i32>()
-            + FIXED_BATCH_LENGTH
-            + self.record_data.len())
+        Ok(BATCH_OVERHEAD + self.record_data.len())
     }
 }
+
+/// The encoded size of a batch that holds no records: every field from `base_offset` to
+/// `record_count`. Kafka's [`DefaultRecordBatch.RECORD_BATCH_OVERHEAD`] has the same value, 61.
+///
+/// [`DefaultRecordBatch.RECORD_BATCH_OVERHEAD`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
+pub const BATCH_OVERHEAD: usize =
+    // base_offset
+    size_of::<i64>()
+    // batch_length
+    + size_of::<i32>()
+    + FIXED_BATCH_LENGTH;
+
+const _: () = assert!(BATCH_OVERHEAD == 61);
 
 impl TryFrom<crate::record::inflated::Frame> for Frame {
     type Error = Error;
@@ -150,108 +158,71 @@ impl From<Batch> for Bytes {
 
 impl TryFrom<Bytes> for Batch {
     type Error = Error;
-    fn try_from(mut encoded: Bytes) -> result::Result<Self, Self::Error> {
-        let base_offset = encoded.try_get_i64()?;
-        let batch_length = encoded.try_get_i32()?;
 
-        let partition_leader_epoch = encoded.try_get_i32()?;
-        let magic = encoded.try_get_i8()?;
-        let crc = encoded.try_get_u32()?;
+    fn try_from(encoded: Bytes) -> result::Result<Self, Self::Error> {
+        let mut batch = Self::try_from_header(&encoded)?;
 
-        debug!(base_offset, batch_length);
+        debug!(batch.base_offset, batch.batch_length);
 
-        let crc_data_size = usize::try_from(batch_length)
-            .map_err(Into::into)
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&partition_leader_epoch))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| {
-                        debug!(
-                            batch_length,
-                            size_of_val = size_of_val(&partition_leader_epoch),
-                            ?err
-                        )
-                    })
-            })
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&magic))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| {
-                        debug!(batch_length, size_of_val = size_of_val(&magic), ?err)
-                    })
-            })
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&crc))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| debug!(batch_length, size_of_val = size_of_val(&crc), ?err))
-            })?;
+        // `batch_length` counts the fixed fields after itself, and the record data.
+        let record_data_size = usize::try_from(batch.batch_length)
+            .map_err(Error::from)?
+            .checked_sub(FIXED_BATCH_LENGTH)
+            .ok_or(Error::Overflow)?;
+        let end = BATCH_OVERHEAD + record_data_size;
 
-        debug!(crc_data_size, encoded = encoded.len(), crc);
+        debug!(record_data_size, encoded = encoded.len());
 
-        if crc_data_size > encoded.len() {
+        if end > encoded.len() {
             return Err(Error::Overflow);
         }
 
-        let crc_data = &encoded[..crc_data_size];
-
+        // The CRC covers every byte after the `crc` field: the fixed fields from `attributes` on,
+        // and the record data.
         let computed = {
             let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-            digest.update(crc_data);
+            digest.update(&encoded[BATCH_OVERHEAD - FIXED_CRC_HEADER_LENGTH..end]);
 
             digest.finalize() as u32
         };
 
-        if computed != crc {
-            error!(crc, computed);
+        if computed != batch.crc {
+            error!(batch.crc, computed);
         }
 
-        let attributes = encoded.try_get_i16()?;
-        let last_offset_delta = encoded.try_get_i32()?;
-        let base_timestamp = encoded.try_get_i64()?;
-        let max_timestamp = encoded.try_get_i64()?;
-        let producer_id = encoded.try_get_i64()?;
-        let producer_epoch = encoded.try_get_i16()?;
-        let base_sequence = encoded.try_get_i32()?;
-        let record_count = encoded.try_get_u32()?;
-
-        let record_data_size =
-            usize::try_from(batch_length)
-                .map_err(Into::into)
-                .and_then(|batch_length| {
-                    batch_length
-                        .checked_sub(FIXED_BATCH_LENGTH)
-                        .ok_or(Error::Overflow)
-                })?;
-
-        debug!(record_data_size, encoded = encoded.len(), computed);
-
-        if record_data_size > encoded.len() {
-            return Err(Error::Overflow);
-        }
-
-        let record_data = encoded.slice(..record_data_size);
-
-        let batch = Batch {
-            base_offset,
-            batch_length,
-            partition_leader_epoch,
-            magic,
-            crc,
-            attributes,
-            last_offset_delta,
-            base_timestamp,
-            max_timestamp,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            record_count,
-            record_data,
-        };
+        batch.record_data = encoded.slice(BATCH_OVERHEAD..end);
 
         Ok(batch)
+    }
+}
+
+impl Batch {
+    /// Returns the batch whose encoding starts with `encoded`, with the fields of its header and
+    /// no record data. `encoded` needs to hold only the batch's first [`BATCH_OVERHEAD`] bytes, so
+    /// a reader can read a batch's header without downloading its records.
+    ///
+    /// The returned batch serves only to read those fields: its `record_count` counts records that
+    /// its empty `record_data` does not hold, so its encoding is not a valid batch. The function
+    /// does not check `crc`, because the CRC covers the records too. Returns [`Error::TryGet`] when
+    /// `encoded` holds fewer than [`BATCH_OVERHEAD`] bytes.
+    pub fn try_from_header(mut encoded: &[u8]) -> Result<Self> {
+        // The fields are read in their order in the encoding.
+        Ok(Self {
+            base_offset: encoded.try_get_i64()?,
+            batch_length: encoded.try_get_i32()?,
+            partition_leader_epoch: encoded.try_get_i32()?,
+            magic: encoded.try_get_i8()?,
+            crc: encoded.try_get_u32()?,
+            attributes: encoded.try_get_i16()?,
+            last_offset_delta: encoded.try_get_i32()?,
+            base_timestamp: encoded.try_get_i64()?,
+            max_timestamp: encoded.try_get_i64()?,
+            producer_id: encoded.try_get_i64()?,
+            producer_epoch: encoded.try_get_i16()?,
+            base_sequence: encoded.try_get_i32()?,
+            record_count: encoded.try_get_u32()?,
+            record_data: Bytes::new(),
+        })
     }
 }
 
@@ -2031,6 +2002,59 @@ mod tests {
             .and_then(TryInto::try_into)?;
 
         assert_eq!(batch.crc, batch.computed_crc());
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_from_header_reads_every_header_field_without_the_records() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch: Batch = inflated::Batch::builder()
+            .base_offset(10)
+            .record(
+                Record::builder()
+                    .offset_delta(0)
+                    .value(Bytes::from_static(LOREM).into()),
+            )
+            .record(
+                Record::builder()
+                    .offset_delta(4)
+                    .value(Bytes::from_static(LOREM).into()),
+            )
+            .last_offset_delta(4)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let encoded = Bytes::from(batch.clone());
+
+        // The header-only decode gives the full decode's batch without its record data.
+        assert_eq!(
+            Batch {
+                record_data: Bytes::new(),
+                ..batch
+            },
+            Batch::try_from_header(&encoded[..BATCH_OVERHEAD])?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_from_header_rejects_bytes_that_end_before_the_records() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let encoded = Bytes::from(batch);
+
+        assert_matches!(
+            Batch::try_from_header(&encoded[..BATCH_OVERHEAD - 1]),
+            Err(Error::TryGet(_))
+        );
 
         Ok(())
     }
