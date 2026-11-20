@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A [`Storage`] for service tests that holds only topic names, counts the `metadata` calls that
+//! A [`Storage`] for service tests that holds topic names and their configs, counts the `metadata` calls that
 //! list every topic and those that look up named topics, records the topics that it creates and
 //! deletes, records each batch that it is asked to produce, and answers the broker's own
 //! registration.
@@ -120,7 +120,7 @@ pub(crate) struct Produced {
     pub(crate) inflated: Option<inflated::Batch>,
 }
 
-/// A [`Storage`] that holds only topic names. Clones share their topics and counts.
+/// A [`Storage`] that holds topic names and their configs. Clones share their topics and counts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountingStorage {
     listing: Listing,
@@ -144,6 +144,7 @@ pub(crate) struct CountingStorage {
     gated_partitions: Option<BTreeSet<i32>>,
     config_gate: Option<Arc<Semaphore>>,
     topic_configs: Vec<(String, String)>,
+    described_keys: Arc<Mutex<Vec<Option<Vec<String>>>>>,
     parked: Arc<AtomicUsize>,
     produce_delay: Option<Duration>,
     partition_failure: Option<(i32, Error)>,
@@ -458,6 +459,11 @@ impl CountingStorage {
         self.produced.lock().expect("produced").clone()
     }
 
+    /// The `keys` of each `describe_config` call, in call order.
+    pub(crate) fn described_keys(&self) -> Vec<Option<Vec<String>>> {
+        self.described_keys.lock().expect("described_keys").clone()
+    }
+
     /// The number of `metadata` calls that looked up named topics.
     pub(crate) fn lookups(&self) -> usize {
         *self.lookups.lock().expect("lookups")
@@ -766,6 +772,10 @@ impl Storage for CountingStorage {
         resource: ConfigResource,
         keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
+        self.described_keys
+            .lock()?
+            .push(keys.map(<[String]>::to_vec));
+
         if matches!(resource, ConfigResource::Topic)
             && let Some(gate) = &self.config_gate
         {
