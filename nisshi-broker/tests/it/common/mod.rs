@@ -285,6 +285,20 @@ pub(crate) async fn postgres_storage(
     .await
 }
 
+pub(crate) async fn turso_storage(
+    cluster: impl Into<String> + Clone,
+    node: i32,
+) -> Result<ArcDynStorage> {
+    storage_container(
+        StorageType::Turso,
+        cluster,
+        node,
+        Url::parse("tcp://127.0.0.1/")?,
+        None,
+    )
+    .await
+}
+
 /// Runs `future` to its end on a single-threaded Tokio runtime of its own, for code that needs a
 /// Tokio runtime, such as a storage read with a deadline, called from outside one.
 pub(crate) fn block_on_tokio<F: Future>(future: F) -> F::Output {

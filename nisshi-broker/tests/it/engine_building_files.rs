@@ -34,6 +34,7 @@ const ENGINE_BUILDERS: &[&str] = &[
     "lite_storage",
     "slate_storage",
     "postgres_storage",
+    "turso_storage",
     "EngineFactory",
     "StorageContainer::builder",
     "Broker::builder",
@@ -80,16 +81,13 @@ const NOT_YET_MOVED: &[&str] = &[
     "group_across_brokers",
     "group_cache_miss",
     "incremental_alter_configs",
-    "init_producer_id",
     "internal_topic_names",
     "internal_topics",
-    "join_invalid_session_timeout",
     "list_groups",
     "list_offsets",
     "list_offsets_after_retention",
     "log_append_time",
     "metadata",
-    "new_cg",
     "offset_commit_fence",
     "offset_commit_v1_timestamp",
     "offset_fetch_commit_metadata",
@@ -206,7 +204,11 @@ const NO_SHARED_CASE: &[&str] = &[
     "traceforge_produce_object_store_fault",
 ];
 
+/// The file that runs `nisshi-storage-integration-test` on each of Nisshi's engines.
+const RUNS_THE_SUITE: &[&str] = &["storage_integration"];
+
 const LISTS: &[&[&str]] = &[
+    RUNS_THE_SUITE,
     NOT_YET_MOVED,
     TESTS_THE_ENGINE,
     ENGINE_DOES_NOT_MATTER,

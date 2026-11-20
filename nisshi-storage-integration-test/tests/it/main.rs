@@ -16,4 +16,5 @@
 
 #![allow(clippy::expect_used)]
 
+pub mod cases;
 pub mod dependencies;

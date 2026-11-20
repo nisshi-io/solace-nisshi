@@ -83,11 +83,12 @@ Sweeps of the librdkafka integration test suite against
    - 0129's `abort_transaction` fails with `EndTxnRequest (KIP-98) not
      supported`, so the advertised EndTxn versions may not cover what
      librdkafka needs.
-   - The `old_versions_bump_a_transactional_producer` test is ignored on
-     each engine in `nisshi-broker/tests/it/init_producer_id.rs` (in
-     memory, lite, slatedb and pg), with a reason that points here; CI
-     never runs it, so remove those `#[ignore]`s when the refusal is
-     lifted. The Turso engine's ignore has its own reason.
+   - The `old_versions_bump_a_transactional_producer` case
+     (`nisshi-storage-integration-test/src/transactions/init_producer_id.rs`)
+     is ignored on every engine by one `#[ignore]` in the case list of the
+     `storage_integration_tests!` macro (`nisshi-storage-integration-test/src/lib.rs`),
+     with a reason that points here; CI never runs it, so remove that
+     `#[ignore]` when the refusal is lifted.
 
 7. **Consumer group edge cases** — one extra rebalance versus Kafka in
    max-poll-exceeded scenarios (0091, 0093); commit-during-rebalance

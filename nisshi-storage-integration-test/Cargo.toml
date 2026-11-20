@@ -23,6 +23,9 @@ nisshi-service.workspace = true
 nisshi-storage.workspace = true
 rama.workspace = true
 rand.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [lints]

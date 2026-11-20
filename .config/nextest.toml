@@ -29,7 +29,8 @@ test-group = "berg"
 # CI selects this profile with NEXTEST_PROFILE=ci; local runs keep the
 # default profile. A test still running after 5 minutes is killed rather
 # than holding the runner until the job times out. The slowest test,
-# new_cg::pg::consumer_next_action_32c, takes about 62 s.
+# storage_integration::pg::consumer_group::new_cg::consumer_next_action_32c,
+# takes about 62 s.
 [profile.ci]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
