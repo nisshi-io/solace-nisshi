@@ -3965,7 +3965,7 @@ mod tests {
     /// and a 100-byte header with 2 bytes of framing. Under a soft limit of 50 bytes, the fetch
     /// statements return the first record. Under a hard limit of 50 bytes they return only a
     /// marker row for the first record, and its key is null. Under a hard limit of 250 bytes they
-    /// return the first two records.
+    /// return the first two records, and a marker row for the third.
     #[tokio::test]
     async fn fetch_returns_an_oversized_first_record_only_for_a_soft_limit() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4004,6 +4004,31 @@ mod tests {
                     ..
                 }],
                 "{statement} within Hard(50)"
+            );
+
+            assert_matches!(
+                fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(250), 3)
+                    .await?
+                    .as_slice(),
+                [
+                    record_fetch::Row {
+                        offset_id: 0,
+                        limit_reached: false,
+                        ..
+                    },
+                    record_fetch::Row {
+                        offset_id: 1,
+                        limit_reached: false,
+                        ..
+                    },
+                    record_fetch::Row {
+                        offset_id: 2,
+                        limit_reached: true,
+                        key: None,
+                        ..
+                    }
+                ],
+                "{statement} within Hard(250)"
             );
         }
 

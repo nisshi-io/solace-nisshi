@@ -2457,8 +2457,14 @@ impl DynoStore {
             data.send_batch(batch).await?;
             first_may_exceed = false;
 
+            // The batch's size is at least the bytes left of the limit, so no later batch fits. The
+            // read stopped at its limit only if records remain below the high watermark.
             if size >= bytes_left {
-                break;
+                return Ok(if base_offset < bounds.high_watermark {
+                    ReadEnd::ReachedLimit
+                } else {
+                    ReadEnd::Finished
+                });
             }
 
             bytes_left -= size;

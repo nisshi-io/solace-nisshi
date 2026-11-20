@@ -99,21 +99,27 @@ attributes,
 timestamp,
 k,
 v,
-(sum(
-    7
-    + coalesce(length(k), 0)
-    + coalesce(length(v), 0)
-    + coalesce((select sum(coalesce(length(e), 0)) from unnest(headers) as e), 0)
-    + coalesce(cardinality(headers), 0)
-) over (order by offset_id))::bigint as bytes,
+row_bytes,
+(sum(row_bytes) over (order by offset_id))::bigint as bytes,
 row_number() over (order by offset_id) as ordinal,
 producer_id,
 producer_epoch,
 headers
 
+from (
+
+select
+
+candidates.*,
+7
+    + coalesce(length(k), 0)
+    + coalesce(length(v), 0)
+    + coalesce((select sum(coalesce(length(e), 0)) from unnest(headers) as e), 0)
+    + coalesce(cardinality(headers), 0) as row_bytes
+
 from
 
-candidates)
+candidates) sized_rows)
 
 -- If $9 is true, the query returns the first row even when that row alone is larger than $5. The
 -- caller sets $9 for a soft limit, so that a consumer gets past a record larger than its fetch
@@ -126,10 +132,12 @@ candidates)
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
 --
--- If $9 is false, a first row that does not fit $5 comes back as a marker: `limit_reached` is
--- true, and the key, value and headers are null, so the query does not send their bytes. The caller needs
--- the marker, because the key filter can match no row, and an empty result would not show that the
--- first match did not fit.
+-- The query sends a row, with its key, value and headers, if the row's `bytes`, the size of
+-- the rows up to and including it, is less than $5, or if it is the first row and $9 is true.
+-- It also returns the first row that it does not send, as a marker: `limit_reached` is true, and
+-- the key, value and headers are null, so the query does not send their bytes. Without the
+-- marker, a result that stopped at $5 looks the same as one that ended at $6 or at the row limit
+-- $8.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -138,17 +146,17 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-case when s.bytes < $5 or $9 then s.k end as key,
-case when s.bytes < $5 or $9 then s.v end as value,
+case when s.bytes < $5 or (s.ordinal = 1 and $9) then s.k end as key,
+case when s.bytes < $5 or (s.ordinal = 1 and $9) then s.v end as value,
 s.producer_id,
 s.producer_epoch,
 
 -- The first half of headers holds the keys, and the second half the values.
-case when s.bytes < $5 or $9
+case when s.bytes < $5 or (s.ordinal = 1 and $9)
     then s.headers[1:cardinality(s.headers) / 2] end as header_keys,
-case when s.bytes < $5 or $9
+case when s.bytes < $5 or (s.ordinal = 1 and $9)
     then s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] end as header_values,
-not (s.bytes < $5 or $9) as limit_reached
+not (s.bytes < $5 or (s.ordinal = 1 and $9)) as limit_reached
 
 from
 
@@ -156,7 +164,11 @@ sized s
 
 where
 
-s.bytes < $5
-or s.ordinal = 1
+-- The query returns the first row, and each row after a row that it sends: `s.bytes - s.row_bytes`
+-- is the `bytes` of the row before. `bytes` grows with every row, so the last row returned is the
+-- first row that the query does not send: the marker.
+s.ordinal = 1
+or s.bytes - s.row_bytes < $5
+or (s.ordinal = 2 and $9)
 
 order by s.offset_id;
