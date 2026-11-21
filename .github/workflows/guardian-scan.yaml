@@ -493,7 +493,7 @@ jobs:
     permissions:
       contents: read
       id-token: write    # OIDC, to assume manifest_aws_role
-    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@cb2443adc94d370db25bb0c7d42ffa0fdbc2e4df # main 2026-11-11, untagged
+    uses: SolaceDev/solace-public-workflows/.github/workflows/update-manifest.yaml@5a7b42c8eaeb1bcec89fa6246ccd0e581ccefb4c # main 2026-11-11, untagged
     with:
       table_name: solace-cloud-manifest
       manifest_aws_role: arn:aws:iam::868978040651:role/github-solace-cloud-manifest-rw
