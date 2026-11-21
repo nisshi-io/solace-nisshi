@@ -14288,7 +14288,9 @@ pub(crate) mod tests {
     /// A topic and its keyed view each hold 3 records with a 200-byte value. Under a soft limit of
     /// 1 byte, a read from offset 0 sends the first record and then stops at its limit before the
     /// second. A read under a hard limit of 1 MiB sends every record, and a read from offset 3, the
-    /// high watermark, sends nothing: neither stops at its limit.
+    /// high watermark, sends nothing: neither stops at its limit. The query counts each record as
+    /// 212 bytes, so a hard limit of 636 bytes holds all three, and that read does not stop at its
+    /// limit either.
     #[tokio::test]
     async fn a_read_reports_a_stop_at_its_limit_after_records() -> Result<()> {
         let Some((storage, topition)) = storage_with_empty_topic().await? else {
@@ -14330,6 +14332,7 @@ pub(crate) mod tests {
             for (offset, limit, read_end) in [
                 (0, ByteLimit::Soft(1), ReadEnd::ReachedLimit),
                 (0, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+                (0, ByteLimit::Hard(636), ReadEnd::Finished),
                 (3, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
             ] {
                 // The test keeps the receiver, because a read fails with `UnableToSend` once its
