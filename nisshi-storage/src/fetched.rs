@@ -96,9 +96,8 @@ impl FetchedDataSender {
 /// How a [`Storage::fetch`] read ended.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReadEnd {
-    /// The read ended before its [`ByteLimit`] stopped it: at the high watermark, or the last
-    /// stable offset for `ReadCommitted`, or at a limit of the storage engine's own, such as the
-    /// rows of one read.
+    /// The read ended before its [`ByteLimit`] stopped it: at the high watermark, at the last
+    /// stable offset for `ReadCommitted`, or at the engine's own cap on one read.
     #[default]
     Finished,
     /// The read stopped before a record or batch that does not fit its [`ByteLimit`], so the
