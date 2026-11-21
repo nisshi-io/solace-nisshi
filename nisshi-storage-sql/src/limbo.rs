@@ -3961,7 +3961,8 @@ mod tests {
     /// and a 100-byte header with 2 bytes of framing. Under a soft limit of 50 bytes, the fetch
     /// statements return the first record. Under a hard limit of 50 bytes they return only a
     /// marker row for the first record, and its key is null. Under a hard limit of 250 bytes they
-    /// return the first two records, and a marker row for the third.
+    /// return the first two records, and a marker row for the third. A hard limit of 220 bytes,
+    /// the size of exactly two records, also returns both.
     #[tokio::test]
     async fn fetch_returns_an_oversized_first_record_only_for_a_soft_limit() -> Result<()> {
         let _guard = init_tracing()?;
@@ -3981,6 +3982,7 @@ mod tests {
                 (ByteLimit::Soft(50), vec![0]),
                 (ByteLimit::Hard(50), vec![]),
                 (ByteLimit::Hard(250), vec![0, 1]),
+                (ByteLimit::Hard(220), vec![0, 1]),
             ] {
                 assert_eq!(
                     expected,
@@ -4092,8 +4094,8 @@ mod tests {
     }
 
     /// A record with no value and no headers still costs the 7 bytes of the smallest record, and
-    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 4 records whose running
-    /// total stays under it, where a statement that counts 1 byte for each returns all 10.
+    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 5 records whose running
+    /// total stays within it, where a statement that counts 1 byte for each returns all 10.
     #[tokio::test]
     async fn fetch_counts_a_fixed_cost_for_every_record() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4113,7 +4115,7 @@ mod tests {
 
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
-                vec![0, 1, 2, 3],
+                vec![0, 1, 2, 3, 4],
                 fetched_offsets_from(&connection, statement, key, 0, ByteLimit::Soft(40), 10)
                     .await?,
                 "{statement}"

@@ -152,7 +152,7 @@ group by h.offset_id)
 -- every row of it, keys and values included, instead of streaming them.
 --
 -- The query sends a row, with its key, value and headers, if the row's `bytes`, the size of
--- the rows up to and including it, is less than $5, or if it is the first row and $8 is true.
+-- the rows up to and including it, is at most $5, or if it is the first row and $8 is true.
 -- It also returns the first row that it does not send, as a marker: `limit_reached` is true, and
 -- the key, value and headers are null, so the query does not send their bytes. Without the
 -- marker, a result that stopped at $5 looks the same as one that ended at $6 or at the row limit
@@ -165,13 +165,13 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-case when s.bytes < $5 or (s.ordinal = 1 and $8) then s.k end as key,
-case when s.bytes < $5 or (s.ordinal = 1 and $8) then s.v end as value,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then s.k end as key,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then s.v end as value,
 s.producer_id,
 s.producer_epoch,
-case when s.bytes < $5 or (s.ordinal = 1 and $8) then h.header_keys end as header_keys,
-case when s.bytes < $5 or (s.ordinal = 1 and $8) then h.header_values end as header_values,
-not (s.bytes < $5 or (s.ordinal = 1 and $8)) as limit_reached
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then h.header_keys end as header_keys,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then h.header_values end as header_values,
+not (s.bytes <= $5 or (s.ordinal = 1 and $8)) as limit_reached
 
 from
 
@@ -184,7 +184,7 @@ where
 -- is the `bytes` of the row before. `bytes` grows with every row, so the last row returned is the
 -- first row that the query does not send: the marker.
 s.ordinal = 1
-or s.bytes - s.row_bytes < $5
+or s.bytes - s.row_bytes <= $5
 or (s.ordinal = 2 and $8)
 
 order by s.offset_id;
