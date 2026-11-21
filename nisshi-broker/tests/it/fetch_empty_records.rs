@@ -25,7 +25,7 @@ use crate::{
 };
 use bytes::Bytes;
 use nisshi_broker::Result;
-use nisshi_sans_io::record::{Record, inflated};
+use nisshi_sans_io::record::{Record, deflated::BATCH_OVERHEAD, inflated};
 use nisshi_storage::{Storage, Topition};
 use rand::{prelude::*, rng};
 use url::Url;
@@ -60,10 +60,11 @@ where
     Ok(())
 }
 
-/// A record with no value and no headers costs 7 bytes, 8 with the 1 byte key of a virtual
-/// topic's record, so a `max_bytes` of 70 returns the 9 or 8 records whose running total stays
-/// under it. A `max_bytes` of 1 still returns the first record (KIP-74). The test reads from the
-/// engine, not through `FetchService`, which reads again until the response's `max_bytes` is spent.
+/// A record with no value and no headers is 7 bytes, or 8 bytes with the 1-byte key of a virtual
+/// topic's record, and their batch adds a 61-byte header. So a `max_bytes` of 61 + 70 bytes returns
+/// 10 plain records or 8 keyed ones. A `max_bytes` of 1 still returns the first record (KIP-74).
+/// The test reads from the engine directly, because `FetchService` reads again until the response's
+/// `max_bytes` is spent.
 pub async fn empty_records_count_toward_max_bytes<C, G>(
     cluster_id: C,
     broker_id: i32,
@@ -76,14 +77,14 @@ where
     register_broker(cluster_id, broker_id, &sc).await?;
 
     // a keyed fetch of a virtual topic reads through its own statement
-    for (keyed, returned) in [(false, 9), (true, 8)] {
+    for (keyed, returned) in [(false, 10), (true, 8)] {
         let (topition, fetched) = create_topic(&sc, keyed).await?;
 
         produce_empty_records(&sc, &topition, keyed, 100).await?;
 
         assert_eq!(
             (0..returned).collect::<Vec<_>>(),
-            fetched_offsets(&sc, &fetched, 0, 70).await?,
+            fetched_offsets(&sc, &fetched, 0, u32::try_from(BATCH_OVERHEAD)? + 70).await?,
             "keyed: {keyed}"
         );
 

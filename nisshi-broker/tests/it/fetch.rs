@@ -25,8 +25,8 @@ use crate::common::{self, StorageType, alphanumeric_string, init_tracing, regist
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    BatchAttribute, Compression, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
-    ListOffset, NULL_TOPIC_ID, RequestInput,
+    BatchAttribute, ByteSize as _, Compression, ErrorCode, FetchRequest, FetchResponse,
+    IsolationLevel, ListOffset, NULL_TOPIC_ID, RequestInput,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     fetch_request::{FetchPartition, FetchTopic},
@@ -1698,11 +1698,92 @@ where
     Ok(())
 }
 
-/// A response holds at most `max_bytes` and one batch, however many
-/// partitions it lists. A partition that returns a batch larger than its
-/// `partition_max_bytes` spends the batch's size from the response's
-/// `max_bytes`, not only its own limit.
-pub async fn oversized_records_spend_the_response_max_bytes<C, G>(
+/// Partition 0 is empty, partition 1 holds a 200 KiB record, and partitions 2 and 3 hold small
+/// records. The Fetch has a `max_bytes` of 100 KiB and a `partition_max_bytes` of 1 KiB. Partition
+/// 1 returns its record, although the record exceeds both limits, because it is the first
+/// partition with records. Partitions 2 and 3 return nothing, because that record used up the
+/// response's `max_bytes`.
+pub async fn an_oversized_first_batch_counts_in_full_against_the_response_max_bytes<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(4)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    // Partition 0 stays empty, so partition 1 is the first non-empty one.
+    let oversized = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from(vec![b'x'; 200 * 1024]))))
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    _ = sc
+        .produce(None, &Topition::new(topic_name.clone(), 1), oversized)
+        .await?;
+
+    // Each of these records fits its partition's 1 KiB limit, so the response leaves them out only
+    // because partition 1's record left no room in the response's `max_bytes`.
+    for partition in 2..4 {
+        produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), partition), 1)
+            .await?;
+    }
+
+    let partitions = partition_data(
+        fetch_offsets_within(
+            &sc,
+            &topic_name,
+            &[(0, 0), (1, 0), (2, 0), (3, 0)],
+            500,
+            1,
+            100 * 1024,
+            1024,
+        )
+        .await?,
+    );
+    assert_eq!(4, partitions.len());
+
+    let mut offsets = vec![];
+    for partition in &partitions {
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partition.error_code)?,
+            "partition {}",
+            partition.partition_index
+        );
+        offsets.push(record_offsets(partition)?);
+    }
+    // Partition 1's 200 KiB record is larger than the response's 100 KiB `max_bytes`, so the record
+    // leaves no room for the other partitions.
+    assert_eq!(vec![vec![], vec![0], vec![], vec![]], offsets);
+
+    Ok(())
+}
+
+/// Partition 0 holds a small record, and partitions 1 to 3 each hold a 200 KiB record. The Fetch
+/// has a `partition_max_bytes` of 1 KiB. Partition 0 returns its record. Partitions 1 to 3 return
+/// nothing, because only the first partition with records may exceed its limit. Kafka reads them
+/// the same way, with `minOneMessage` set to false ([ReplicaManager.scala#L1731-L1740]).
+///
+/// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
+pub async fn a_later_partition_returns_no_batch_larger_than_its_limit<C, G>(
     cluster_id: C,
     broker_id: i32,
     sc: G,
@@ -1759,10 +1840,6 @@ where
     );
     assert_eq!(4, partitions.len());
 
-    // Partition 1 returns its record although the record is larger than its
-    // 1 KiB limit. Kafka returns nothing there, because only the first
-    // non-empty partition may exceed a limit. The record spends the rest of
-    // the 100 KiB, so partitions 2 and 3 return nothing.
     let mut offsets = vec![];
     for partition in &partitions {
         assert_eq!(
@@ -1773,14 +1850,192 @@ where
         );
         offsets.push(record_offsets(partition)?);
     }
-    assert_eq!(vec![vec![0], vec![0], vec![], vec![]], offsets);
+    assert_eq!(vec![vec![0], vec![], vec![], vec![]], offsets);
 
     Ok(())
 }
 
-/// The first partition of a request returns at most its
-/// `partition_max_bytes` and one batch, as every other partition does, and
-/// not the request's whole `max_bytes`.
+/// Partition 0 holds a small record, and partition 1 holds a 200 KiB record. The Fetch has a
+/// `min_bytes` of 1,000, a `partition_max_bytes` of 1 KiB and a `max_wait` of 10 seconds.
+/// Partition 1 returns nothing, because its record does not fit, but its 1 KiB limit counts toward
+/// `min_bytes`, as Kafka counts the bytes available up to each partition's limit
+/// ([DelayedFetch.scala#L108-L110]). So the Fetch answers at once instead of waiting 10 seconds.
+///
+/// [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
+pub async fn a_partition_at_its_hard_limit_counts_toward_min_bytes<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    const MAX_WAIT: Duration = Duration::from_secs(10);
+
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(2)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    produce_single_record_batches(&sc, &Topition::new(topic_name.clone(), 0), 1).await?;
+
+    let oversized = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from(vec![b'x'; 200 * 1024]))))
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    _ = sc
+        .produce(None, &Topition::new(topic_name.clone(), 1), oversized)
+        .await?;
+
+    let started_at = Instant::now();
+
+    // Partition 0 returns fewer than `min_bytes` alone, and partition 1's limit of 1,024 bytes
+    // brings the bytes available above it.
+    let partitions = partition_data(
+        fetch_offsets_within(
+            &sc,
+            &topic_name,
+            &[(0, 0), (1, 0)],
+            i32::try_from(MAX_WAIT.as_millis())?,
+            1_000,
+            100 * 1024,
+            1024,
+        )
+        .await?,
+    );
+
+    assert!(
+        started_at.elapsed() < MAX_WAIT / 2,
+        "the Fetch waited {:?}",
+        started_at.elapsed()
+    );
+
+    let mut offsets = vec![];
+    for partition in &partitions {
+        offsets.push(record_offsets(partition)?);
+    }
+    assert_eq!(vec![vec![0], vec![]], offsets);
+
+    Ok(())
+}
+
+/// Two partitions each hold 1,200 records of 1,000 bytes, more than their 1 MiB
+/// `partition_max_bytes`. Each partition returns records that fill its limit to within one record,
+/// and never past it. The SQL engines count each record a few bytes smaller than its encoding, so
+/// this also checks that the broker drops the records that the engines let past the limit.
+pub async fn every_partition_returns_the_records_that_fit_its_limit<C, G>(
+    cluster_id: C,
+    broker_id: i32,
+    sc: G,
+) -> Result<()>
+where
+    C: Into<String>,
+    G: Storage + Clone,
+{
+    const PARTITION_MAX_BYTES: i32 = 1024 * 1024;
+
+    register_broker(cluster_id, broker_id, &sc).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    _ = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(2)
+                .replication_factor(0)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let batch: deflated::Batch = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from(vec![b'x'; 1_000]))))
+        .build()
+        .and_then(TryInto::try_into)?;
+
+    // A full partition leaves less room than one more record. A one-record batch is at least that
+    // size, also when an engine rebuilds the records into larger batches.
+    let one_record_batch_size = batch.size_in_bytes()?;
+
+    // Each partition holds more records than fit its limit.
+    for partition in 0..2 {
+        for _ in 0..1_200 {
+            _ = sc
+                .produce(
+                    None,
+                    &Topition::new(topic_name.clone(), partition),
+                    batch.clone(),
+                )
+                .await?;
+        }
+    }
+
+    // The Fetch answers after its first round, because `min_bytes` is 1, so a long `max_wait`
+    // does not slow the test. It gives each read time to fill its limit on a slow machine,
+    // where a read cut short by its deadline would return fewer records than fit.
+    let partitions = partition_data(
+        fetch_offsets_within(
+            &sc,
+            &topic_name,
+            &[(0, 0), (1, 0)],
+            30_000,
+            1,
+            50 * 1024 * 1024,
+            PARTITION_MAX_BYTES,
+        )
+        .await?,
+    );
+    assert_eq!(2, partitions.len());
+
+    for partition in &partitions {
+        let size: usize = partition.records.as_ref().map_or(Ok(0), |frame| {
+            frame
+                .batches
+                .iter()
+                .map(|batch| batch.size_in_bytes())
+                .sum::<nisshi_sans_io::Result<usize>>()
+        })?;
+
+        assert!(
+            !record_offsets(partition)?.is_empty(),
+            "partition {}",
+            partition.partition_index
+        );
+        assert!(
+            size <= usize::try_from(PARTITION_MAX_BYTES)?,
+            "partition {}: {size} bytes of batches",
+            partition.partition_index
+        );
+        assert!(
+            size + one_record_batch_size > usize::try_from(PARTITION_MAX_BYTES)?,
+            "partition {}: {size} bytes of batches leave room for another record",
+            partition.partition_index
+        );
+    }
+
+    Ok(())
+}
+
+/// The record data of the first partition of a request stays within its `partition_max_bytes`, not
+/// the request's whole `max_bytes`, unless its first batch alone is larger. The partition then
+/// returns only that batch.
 pub async fn first_partition_keeps_to_its_partition_max_bytes<C, G>(
     cluster_id: C,
     broker_id: i32,
@@ -1947,7 +2202,8 @@ where
     // One round reads the whole batch at most, which leaves `min_bytes`
     // unmet. A round that started with the bytes that the round before it
     // spent would have a tenth of a batch to read.
-    let max_bytes = i32::try_from(batch.record_data.len() + batch.record_data.len() / 10)?;
+    let batch_size = batch.size_in_bytes()?;
+    let max_bytes = i32::try_from(batch_size + batch_size / 10)?;
 
     _ = sc
         .produce(None, &Topition::new(topic_name.clone(), 0), batch)
@@ -2187,13 +2443,59 @@ mod pg {
     }
 
     #[tokio::test]
-    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+    async fn an_oversized_first_batch_counts_in_full_against_the_response_max_bytes() -> Result<()>
+    {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
 
-        super::oversized_records_spend_the_response_max_bytes(
+        super::an_oversized_first_batch_counts_in_full_against_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_later_partition_returns_no_batch_larger_than_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_later_partition_returns_no_batch_larger_than_its_limit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_partition_at_its_hard_limit_counts_toward_min_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_partition_at_its_hard_limit_counts_toward_min_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_partition_returns_the_records_that_fit_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::every_partition_returns_the_records_that_fit_its_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2432,13 +2734,59 @@ mod in_memory {
     }
 
     #[tokio::test]
-    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+    async fn an_oversized_first_batch_counts_in_full_against_the_response_max_bytes() -> Result<()>
+    {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
 
-        super::oversized_records_spend_the_response_max_bytes(
+        super::an_oversized_first_batch_counts_in_full_against_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_later_partition_returns_no_batch_larger_than_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_later_partition_returns_no_batch_larger_than_its_limit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_partition_at_its_hard_limit_counts_toward_min_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_partition_at_its_hard_limit_counts_toward_min_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_partition_returns_the_records_that_fit_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::every_partition_returns_the_records_that_fit_its_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2692,13 +3040,59 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+    async fn an_oversized_first_batch_counts_in_full_against_the_response_max_bytes() -> Result<()>
+    {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
 
-        super::oversized_records_spend_the_response_max_bytes(
+        super::an_oversized_first_batch_counts_in_full_against_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_later_partition_returns_no_batch_larger_than_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_later_partition_returns_no_batch_larger_than_its_limit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_partition_at_its_hard_limit_counts_toward_min_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_partition_at_its_hard_limit_counts_toward_min_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_partition_returns_the_records_that_fit_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::every_partition_returns_the_records_that_fit_its_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,
@@ -2832,13 +3226,59 @@ mod turso {
     }
 
     #[tokio::test]
-    async fn oversized_records_spend_the_response_max_bytes() -> Result<()> {
+    async fn an_oversized_first_batch_counts_in_full_against_the_response_max_bytes() -> Result<()>
+    {
         let _guard = init_tracing()?;
 
         let cluster_id = Uuid::now_v7();
         let broker_id = rng().random_range(0..i32::MAX);
 
-        super::oversized_records_spend_the_response_max_bytes(
+        super::an_oversized_first_batch_counts_in_full_against_the_response_max_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_later_partition_returns_no_batch_larger_than_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_later_partition_returns_no_batch_larger_than_its_limit(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_partition_at_its_hard_limit_counts_toward_min_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::a_partition_at_its_hard_limit_counts_toward_min_bytes(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_partition_returns_the_records_that_fit_its_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::every_partition_returns_the_records_that_fit_its_limit(
             cluster_id,
             broker_id,
             storage_container(cluster_id, broker_id).await?,

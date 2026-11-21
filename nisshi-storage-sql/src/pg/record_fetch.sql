@@ -16,7 +16,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch (text, text, integer, integer, integer, integer, bigint) as
+-- prepare record_fetch (text, text, integer, integer, integer, integer, bigint, boolean) as
 -- Each row holds one record with all of its headers, so that a read stopped after any row keeps
 -- only complete records.
 --
@@ -89,22 +89,28 @@ attributes,
 timestamp,
 k,
 v,
-(sum(
-    7
+row_bytes,
+(sum(row_bytes) over (order by offset_id))::bigint as bytes,
+row_number() over (order by offset_id) as ordinal,
+producer_id,
+producer_epoch
+
+from (
+
+select
+
+candidates.*,
+7
     + coalesce(length(k), 0)
     + coalesce(length(v), 0)
     + (select coalesce(sum(coalesce(length(h.k), 0) + coalesce(length(h.v), 0) + 2), 0)
        from header h
        where h.topition = candidates.topition
-       and h.offset_id = candidates.offset_id)
-) over (order by offset_id))::bigint as bytes,
-row_number() over (order by offset_id) as ordinal,
-producer_id,
-producer_epoch
+       and h.offset_id = candidates.offset_id) as row_bytes
 
 from
 
-candidates),
+candidates) sized_rows),
 
 -- The headers of each record, in produce order. A record without headers has no row here.
 headers as (
@@ -134,16 +140,23 @@ and h.offset_id < $6
 
 group by h.offset_id)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch.
+-- If $8 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $8 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
 --
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size. It does not compare offset_id
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
+--
+-- The query sends a row, with its key, value and headers, if the row's `bytes`, the size of
+-- the rows up to and including it, is at most $5, or if it is the first row and $8 is true.
+-- It also returns the first row that it does not send, as a marker: `limit_reached` is true, and
+-- the key, value and headers are null, so the query does not send their bytes. Without the
+-- marker, a result that stopped at $5 looks the same as one that ended at $6 or at the row limit
+-- $7.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -152,12 +165,13 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-s.k as key,
-s.v as value,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then s.k end as key,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then s.v end as value,
 s.producer_id,
 s.producer_epoch,
-h.header_keys,
-h.header_values
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then h.header_keys end as header_keys,
+case when s.bytes <= $5 or (s.ordinal = 1 and $8) then h.header_values end as header_values,
+not (s.bytes <= $5 or (s.ordinal = 1 and $8)) as limit_reached
 
 from
 
@@ -166,7 +180,11 @@ left join headers h on h.offset_id = s.offset_id
 
 where
 
-s.bytes < $5
-or s.ordinal = 1
+-- The query returns the first row, and each row after a row that it sends: `s.bytes - s.row_bytes`
+-- is the `bytes` of the row before. `bytes` grows with every row, so the last row returned is the
+-- first row that the query does not send: the marker.
+s.ordinal = 1
+or s.bytes - s.row_bytes <= $5
+or (s.ordinal = 2 and $8)
 
 order by s.offset_id;

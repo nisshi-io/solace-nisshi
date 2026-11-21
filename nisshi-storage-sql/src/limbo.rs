@@ -75,14 +75,14 @@ use nisshi_schema::{
     redact_url,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
     DeleteRecordsConcurrency, Error, FetchedRecord, FetchedSender, GroupDetail, ListOffsetRequest,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProduceEpoch, ProducerIdResponse, Result, ScramCredential, Storage, StoredEpochs,
-    TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
-    delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip, max_message_bytes,
-    producer_claim,
+    OffsetStage, ProduceEpoch, ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage,
+    StoredEpochs, TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
+    config::apply_op, delete_records_cutoff, epoch_is_exhausted, inflate, lake_skip,
+    max_message_bytes, producer_claim,
 };
 use opentelemetry::{
     KeyValue,
@@ -1760,10 +1760,11 @@ impl Storage for Engine {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
+        let max_bytes = limit.bytes();
         debug!(?topition, offset, min_bytes, max_bytes, ?isolation_level);
 
         let offset_stage = self.offset_stage(topition).await?;
@@ -1784,6 +1785,10 @@ impl Storage for Engine {
             max_bytes
         );
 
+        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+        let first_may_exceed = limit.is_soft();
+        let mut read_end = ReadEnd::Finished;
+
         let c = self.connection().await?;
 
         let mut records = self
@@ -1798,23 +1803,28 @@ impl Storage for Engine {
                     (max_bytes as i64),
                     high_watermark,
                     ROWS_PER_FETCH,
+                    first_may_exceed,
                 ),
             )
             .await
             .inspect_err(|err| error!(?err))?;
 
-        let mut data = fetched_sender.send_offsets(offset_stage).await?;
+        while let Some(row) = records.next().await? {
+            let Some(record_fetch::Row {
+                offset_id: offset,
+                attributes,
+                timestamp,
+                key,
+                value,
+                producer_id,
+                producer_epoch,
+                ..
+            }) = row.within_limit()
+            else {
+                read_end = ReadEnd::ReachedLimit;
+                continue;
+            };
 
-        while let Some(record_fetch::Row {
-            offset_id: offset,
-            attributes,
-            timestamp,
-            key,
-            value,
-            producer_id,
-            producer_epoch,
-        }) = records.next().await?
-        {
             debug!(offset, ?timestamp);
             debug!(key_len = ?key.as_ref().map(Bytes::len));
             debug!(value_len = ?value.as_ref().map(Bytes::len));
@@ -1839,7 +1849,7 @@ impl Storage for Engine {
             .await?;
         }
 
-        Ok(())
+        Ok(read_end)
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -3848,24 +3858,31 @@ mod tests {
 
         for (statement, key) in FETCH_STATEMENTS {
             let fetch_from = |offset, max_bytes| {
-                fetched_offsets_from(&connection, statement, key, offset, max_bytes, RECORDS)
+                fetched_offsets_from(
+                    &connection,
+                    statement,
+                    key,
+                    offset,
+                    ByteLimit::Soft(max_bytes),
+                    RECORDS,
+                )
             };
 
             assert_eq!(
                 (0..ROWS_PER_FETCH).collect::<Vec<_>>(),
-                fetch_from(0, i64::MAX).await?,
+                fetch_from(0, u32::MAX).await?,
                 "{statement}: one read must stop at the row limit",
             );
 
             assert_eq!(
                 (ROWS_PER_FETCH..RECORDS).collect::<Vec<_>>(),
-                fetch_from(ROWS_PER_FETCH, i64::MAX).await?,
+                fetch_from(ROWS_PER_FETCH, u32::MAX).await?,
                 "{statement}: a read from the last offset must return the rest",
             );
 
             assert_eq!(
                 (40..40 + ROWS_PER_FETCH).collect::<Vec<_>>(),
-                fetch_from(40, i64::MAX).await?,
+                fetch_from(40, u32::MAX).await?,
                 "{statement}: the row limit counts from the fetch offset",
             );
 
@@ -3901,7 +3918,7 @@ mod tests {
                 "record_fetch_keyed.sql",
                 Some(b"k"),
                 0,
-                i64::MAX,
+                ByteLimit::Soft(u32::MAX),
                 RECORDS
             )
             .await?,
@@ -3934,10 +3951,87 @@ mod tests {
             {
                 assert_eq!(
                     expected,
-                    fetched_offsets(&connection, statement, key, max_bytes).await?,
+                    fetched_offsets(&connection, statement, key, ByteLimit::Soft(max_bytes))
+                        .await?,
                     "{statement} within {max_bytes}"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// The statements count each record as 110 bytes: the 7 bytes of every record, a 1-byte key,
+    /// and a 100-byte header with 2 bytes of framing. Under a soft limit of 50 bytes, the fetch
+    /// statements return the first record. Under a hard limit of 50 bytes they return only a
+    /// marker row for the first record, and its key is null. Under a hard limit of 250 bytes they
+    /// return the first two records, and a marker row for the third. A hard limit of 220 bytes,
+    /// the size of exactly two records, also returns both.
+    #[tokio::test]
+    async fn fetch_returns_an_oversized_first_record_only_for_a_soft_limit() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let db = turso::Builder::new_local(":memory:").build().await?;
+        let connection = db.connect()?;
+
+        create_fetch_tables(&connection).await?;
+        insert_records_with_headers(
+            &connection,
+            &[(Value::Blob(b"h".to_vec()), Value::Blob(vec![0; 99]))],
+        )
+        .await?;
+
+        for (statement, key) in FETCH_STATEMENTS {
+            for (limit, expected) in [
+                (ByteLimit::Soft(50), vec![0]),
+                (ByteLimit::Hard(50), vec![]),
+                (ByteLimit::Hard(250), vec![0, 1]),
+                (ByteLimit::Hard(220), vec![0, 1]),
+            ] {
+                assert_eq!(
+                    expected,
+                    fetched_offsets(&connection, statement, key, limit).await?,
+                    "{statement} within {limit:?}"
+                );
+            }
+
+            assert_matches!(
+                fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(50), 3)
+                    .await?
+                    .as_slice(),
+                [record_fetch::Row {
+                    offset_id: 0,
+                    limit_reached: true,
+                    key: None,
+                    ..
+                }],
+                "{statement} within Hard(50)"
+            );
+
+            assert_matches!(
+                fetched_rows_from(&connection, statement, key, 0, ByteLimit::Hard(250), 3)
+                    .await?
+                    .as_slice(),
+                [
+                    record_fetch::Row {
+                        offset_id: 0,
+                        limit_reached: false,
+                        ..
+                    },
+                    record_fetch::Row {
+                        offset_id: 1,
+                        limit_reached: false,
+                        ..
+                    },
+                    record_fetch::Row {
+                        offset_id: 2,
+                        limit_reached: true,
+                        key: None,
+                        ..
+                    }
+                ],
+                "{statement} within Hard(250)"
+            );
         }
 
         Ok(())
@@ -3962,7 +4056,7 @@ mod tests {
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
                 vec![0],
-                fetched_offsets(&connection, statement, key, 150).await?,
+                fetched_offsets(&connection, statement, key, ByteLimit::Soft(150)).await?,
                 "{statement}"
             );
         }
@@ -3995,7 +4089,7 @@ mod tests {
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
                 vec![0],
-                fetched_offsets(&connection, statement, key, 110).await?,
+                fetched_offsets(&connection, statement, key, ByteLimit::Soft(110)).await?,
                 "{statement}"
             );
         }
@@ -4004,8 +4098,8 @@ mod tests {
     }
 
     /// A record with no value and no headers still costs the 7 bytes of the smallest record, and
-    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 4 records whose running
-    /// total stays under it, where a statement that counts 1 byte for each returns all 10.
+    /// the key of 1 byte, so 8 bytes. A budget of 40 bytes returns the 5 records whose running
+    /// total stays within it, where a statement that counts 1 byte for each returns all 10.
     #[tokio::test]
     async fn fetch_counts_a_fixed_cost_for_every_record() -> Result<()> {
         let _guard = init_tracing()?;
@@ -4025,15 +4119,18 @@ mod tests {
 
         for (statement, key) in FETCH_STATEMENTS {
             assert_eq!(
-                vec![0, 1, 2, 3],
-                fetched_offsets_from(&connection, statement, key, 0, 40, 10).await?,
+                vec![0, 1, 2, 3, 4],
+                fetched_offsets_from(&connection, statement, key, 0, ByteLimit::Soft(40), 10)
+                    .await?,
                 "{statement}"
             );
 
-            // the first record is returned whatever its size (KIP-74)
+            // Under a soft limit, the statement returns the first record whatever its size
+            // (KIP-74).
             assert_eq!(
                 vec![0],
-                fetched_offsets_from(&connection, statement, key, 0, 1, 10).await?,
+                fetched_offsets_from(&connection, statement, key, 0, ByteLimit::Soft(1), 10)
+                    .await?,
                 "{statement}"
             );
         }
@@ -4141,47 +4238,76 @@ mod tests {
     }
 
     /// Returns the offsets that `statement` selects when it reads partition 0 from offset 0
-    /// within `max_bytes`, up to a high watermark of 3. `key` is the key that a keyed statement
+    /// within `limit`, up to a high watermark of 3. `key` is the key that a keyed statement
     /// filters on.
     async fn fetched_offsets(
         connection: &Connection,
-        statement: &str,
+        statement: &'static str,
         key: Option<&[u8]>,
-        max_bytes: i64,
+        limit: ByteLimit,
     ) -> Result<Vec<i64>> {
-        fetched_offsets_from(connection, statement, key, 0, max_bytes, 3).await
+        fetched_offsets_from(connection, statement, key, 0, limit, 3).await
     }
 
     /// Returns the offsets that `statement` selects when it reads partition 0 from `offset`
-    /// within `max_bytes`, up to `high_watermark`, with the row limit that a fetch binds. `key`
-    /// is the key that a keyed statement filters on.
+    /// within `limit`, up to `high_watermark`, with the row limit that a fetch binds. `key` is the
+    /// key that a keyed statement filters on.
     async fn fetched_offsets_from(
         connection: &Connection,
-        statement: &str,
+        statement: &'static str,
         key: Option<&[u8]>,
         offset: i64,
-        max_bytes: i64,
+        limit: ByteLimit,
         high_watermark: i64,
     ) -> Result<Vec<i64>> {
+        Ok(
+            fetched_rows_from(connection, statement, key, offset, limit, high_watermark)
+                .await?
+                .into_iter()
+                .filter_map(record_fetch::Row::within_limit)
+                .map(|row| row.offset_id)
+                .collect(),
+        )
+    }
+
+    /// Returns the rows that `statement` returns when it reads partition 0 from `offset` within
+    /// `limit`, up to `high_watermark`, with the row limit that a fetch binds. `key` is the key
+    /// that a keyed statement filters on.
+    async fn fetched_rows_from(
+        connection: &Connection,
+        statement: &'static str,
+        key: Option<&[u8]>,
+        offset: i64,
+        limit: ByteLimit,
+        high_watermark: i64,
+    ) -> Result<Vec<record_fetch::Row>> {
         let mut params = vec![
             Value::from("c"),
             Value::from("t"),
             Value::from(0),
             Value::from(offset),
-            Value::from(max_bytes),
+            Value::from(i64::from(limit.bytes())),
             Value::from(high_watermark),
         ];
         params.extend(key.map(|key| Value::Blob(key.to_vec())));
         params.push(Value::from(ROWS_PER_FETCH));
+        // The statement's last parameter lets the first record exceed a soft limit.
+        params.push(Value::from(matches!(limit, ByteLimit::Soft(_))));
 
         let sql = sql_lookup(statement)?;
-        let mut rows = connection.prepare(&sql).await?.query(params).await?;
-        let mut offsets = vec![];
+        let rows = connection.prepare(&sql).await?.query(params).await?;
+        let mut rows = QueryRowCursor::<_, record_fetch::Row>::new(
+            ResultColumns::new(statement, &rows),
+            rows,
+            ColumnErrorCount::new(&SQL_ERROR, vec![]),
+        )?;
+
+        let mut statement_rows = vec![];
         while let Some(row) = rows.next().await? {
-            offsets.push(row.get::<i64>(0)?);
+            statement_rows.push(row);
         }
 
-        Ok(offsets)
+        Ok(statement_rows)
     }
 
     /// Runs `sql` as the engine runs an `insert ... returning`: prepare, query, then read the

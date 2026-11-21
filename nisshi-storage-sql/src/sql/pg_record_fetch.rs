@@ -57,6 +57,18 @@ sql_row! {
         /// The values of the record's headers, in the order of `header_keys`. It is null for a
         /// record without headers.
         header_values: Option<Vec<Option<bytes::Bytes>>>,
+        /// Whether the row only marks that the fetch stopped at its hard limit before this record.
+        /// The key, value and headers of a marker row are null.
+        limit_reached: bool,
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Row {
+    /// Returns the row, or `None` if the row only marks that the fetch stopped at its hard limit
+    /// before this record.
+    pub(crate) fn within_limit(self) -> Option<Self> {
+        (!self.limit_reached).then_some(self)
     }
 }
 

@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::min, sync::LazyLock};
+use std::sync::LazyLock;
 
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
     metadata_response::MetadataResponseTopic,
-    record::deflated::{Batch, Frame},
+    record::deflated::{BATCH_OVERHEAD, Batch, Frame},
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
@@ -29,13 +29,14 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     Error, METER, OffsetStage, Result, STORAGE_FAILURE_WARN_INTERVAL, Storage, StorageOperation,
     TopicId, Topition, WarnLimit,
-    fetched::FetchUntilDeadline as _,
+    fetched::{ByteLimit, FetchUntilDeadline as _},
     service::{
         read_deadline::{ReadDeadline, ReadWait, TimedOut},
         read_share::{FetchReadShare, warn_timeout_at_client_share},
         storage_error_code,
     },
 };
+use fetch_round::FetchRound;
 use validation::ValidatedFetchRequest;
 
 /// Partition reads whose fetch offset falls outside the partition, by
@@ -99,6 +100,7 @@ static FETCH_AHEAD_OF_CACHED_HIGH_WATERMARK: LazyLock<Counter<u64>> = LazyLock::
         .build()
 });
 
+mod fetch_round;
 pub(super) mod validation;
 
 /// Partitions that a Fetch answers with `UNKNOWN_TOPIC_OR_PARTITION` although
@@ -296,44 +298,89 @@ impl<G> ApiKey for FetchService<G> {
     const KEY: i16 = FetchRequest::KEY;
 }
 
+/// A partition's answer to a Fetch, with how the partition's reads ended.
+#[derive(Debug)]
+struct PartitionRead {
+    /// The partition's answer.
+    data: PartitionData,
+    /// The limit that a read of the partition stopped at, if the read stopped before a record or
+    /// batch that did not fit. The partition then holds records after the ones it returned.
+    reached_limit: Option<ByteLimit>,
+    /// Whether a read failed after the partition had records. The partition answers with those
+    /// records and no error code.
+    read_failed: bool,
+}
+
+impl PartitionRead {
+    /// Returns a read whose answer, `data`, holds no records, such as an error code. Such a read
+    /// neither reached its limit nor failed.
+    fn without_records(data: PartitionData) -> Self {
+        debug_assert!(data.records.is_none(), "{data:?}");
+
+        Self {
+            data,
+            reached_limit: None,
+            read_failed: false,
+        }
+    }
+}
+
+/// One partition read of a Fetch: the partition that the client asked for, and the limit, the
+/// deadline and the other settings that its [`FetchRound`] gives the read.
+#[derive(Debug)]
+struct PartitionFetch<'a> {
+    /// The name of the partition's topic.
+    topic: &'a str,
+    /// The partition as the client asked for it.
+    request: &'a FetchPartition,
+    /// The limit on the bytes that the read returns.
+    limit: ByteLimit,
+    /// When the partition's reads must finish.
+    deadline: Instant,
+    /// The Fetch's `min_bytes`.
+    min_bytes: u32,
+    /// The Fetch's isolation level.
+    isolation: IsolationLevel,
+}
+
 impl<G> FetchService<G>
 where
     G: Storage,
 {
-    /// Reads one partition of a Fetch and returns the partition's answer by its partition deadline.
-    /// `left` is the number of partitions that the Fetch still has to read, this one included.
+    /// Reads one partition of a Fetch and returns the partition's answer by the partition's
+    /// deadline.
     ///
     /// The read runs until the partition deadline, not until `max_wait` ends, because `max_wait`
     /// limits only how long a Fetch waits for new records ([ReplicaManager.scala#L1523-L1563]). A
     /// read that reaches the partition deadline answers with what it finished.
     ///
-    /// A read that fails after the partition has records sets `read_failed`, and the partition
-    /// answers with those records. A read that fails before the partition has records answers the
-    /// partition with an error code, and the other partitions of the Fetch are still answered.
+    /// If a read fails after the partition has records, the partition answers with those records,
+    /// and [`PartitionRead::read_failed`] is set. If a read fails before that, the partition
+    /// answers with an error code. Either way, the other partitions of the Fetch are answered.
     ///
     /// [ReplicaManager.scala#L1523-L1563]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1523-L1563
-    #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, min_bytes, isolation, fetch_partition, read_failed),
-        fields(partition = fetch_partition.partition)
+        skip_all,
+        fields(
+            topic = partition.topic,
+            partition = partition.request.partition,
+            limit = ?partition.limit,
+        )
     )]
-    async fn fetch_partition(
-        &self,
-        fetch_deadline: Instant,
-        left: usize,
-        min_bytes: u32,
-        max_bytes: &mut u32,
-        is_first_non_empty: bool,
-        isolation: IsolationLevel,
-        topic: &str,
-        fetch_partition: &FetchPartition,
-        read_failed: &mut bool,
-    ) -> Result<PartitionData>
+    async fn fetch_partition(&self, partition: PartitionFetch<'_>) -> Result<PartitionRead>
     where
         G: Storage,
     {
+        let PartitionFetch {
+            topic,
+            request: fetch_partition,
+            limit,
+            deadline: partition_deadline,
+            min_bytes,
+            isolation,
+        } = partition;
+
         let started_at = Instant::now();
-        let partition_deadline = next_partition_deadline(fetch_deadline, left);
 
         let partition_index = fetch_partition.partition;
         let tp = Topition::new(topic, partition_index);
@@ -350,16 +397,19 @@ where
                 .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::OffsetStage));
+                    return Ok(PartitionRead::without_records(Self::unknown_to_storage(
+                        &tp,
+                        StorageOperation::OffsetStage,
+                    )));
                 }
                 Ok(Ok(offset_stage)) => offset_stage,
                 Ok(Err(error)) => {
-                    return Ok(Self::storage_failure(
+                    return Ok(PartitionRead::without_records(Self::storage_failure(
                         &tp,
                         StorageOperation::OffsetStage,
                         fetch_offset,
                         &error,
-                    ));
+                    )));
                 }
                 Err(reason) => {
                     log_timed_out(
@@ -369,7 +419,10 @@ where
                         reason,
                         started_at,
                     );
-                    return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
+                    return Ok(PartitionRead::without_records(Self::unknown_offsets(
+                        partition_index,
+                        ErrorCode::None,
+                    )));
                 }
             };
 
@@ -379,13 +432,13 @@ where
         // fetching this offset does so at round-trip speed: the counter, not
         // a log line per fetch, is what makes it visible.
         if fetch_offset < offset_stage.log_start() {
-            return Ok(Self::out_of_bounds(
+            return Ok(PartitionRead::without_records(Self::out_of_bounds(
                 topic,
                 partition_index,
                 fetch_offset,
                 &offset_stage,
                 "below_log_start",
-            ));
+            )));
         }
 
         // Above the log end offset, the records are not written yet, and Kafka answers
@@ -412,19 +465,19 @@ where
                 .await
             {
                 Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
-                    return Ok(Self::unknown_to_storage(
+                    return Ok(PartitionRead::without_records(Self::unknown_to_storage(
                         &tp,
                         StorageOperation::CurrentOffsetStage,
-                    ));
+                    )));
                 }
                 Ok(Ok(current)) => current,
                 Ok(Err(error)) => {
-                    return Ok(Self::storage_failure(
+                    return Ok(PartitionRead::without_records(Self::storage_failure(
                         &tp,
                         StorageOperation::CurrentOffsetStage,
                         fetch_offset,
                         &error,
-                    ));
+                    )));
                 }
                 Err(reason) => {
                     log_timed_out(
@@ -434,7 +487,10 @@ where
                         reason,
                         started_at,
                     );
-                    return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
+                    return Ok(PartitionRead::without_records(Self::unknown_offsets(
+                        partition_index,
+                        ErrorCode::None,
+                    )));
                 }
             }
         } else {
@@ -442,24 +498,24 @@ where
         };
 
         if fetch_offset > offset_stage.high_watermark() {
-            return Ok(Self::out_of_bounds(
+            return Ok(PartitionRead::without_records(Self::out_of_bounds(
                 topic,
                 partition_index,
                 fetch_offset,
                 &offset_stage,
                 "above_high_watermark",
-            ));
+            )));
         }
 
         // The log can have been deleted from, between the two reads.
         if fetch_offset < offset_stage.log_start() {
-            return Ok(Self::out_of_bounds(
+            return Ok(PartitionRead::without_records(Self::out_of_bounds(
                 topic,
                 partition_index,
                 fetch_offset,
                 &offset_stage,
                 "below_log_start",
-            ));
+            )));
         }
 
         if ahead_of_cached_high_watermark {
@@ -467,155 +523,97 @@ where
                 .add(1, &[KeyValue::new("topic", topic.to_owned())]);
         }
 
-        let mut batches = Vec::new();
-
-        let mut offset = fetch_offset;
-
-        loop {
-            // With no bytes left, only the first non-empty partition reads,
-            // once: storage returns at least one batch, so the consumer
-            // makes progress whatever its limits. Kafka reads it with
-            // `minOneMessage` ([LogSegment.java#L439-L447]). For Fetch v2 and
-            // older, Kafka sets `hardMaxBytesLimit` ([FetchParams.java#L72-L74]),
-            // reads without `minOneMessage` and returns nothing at a limit of
-            // 0. Nisshi returns one batch there too, because the service does
-            // not see the request version. That is looser, and harmless.
-            //
-            // [LogSegment.java#L439-L447]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L447
-            // [FetchParams.java#L72-L74]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/FetchParams.java#L72-L74
-            if *max_bytes == 0 && !(is_first_non_empty && batches.is_empty()) {
-                break;
-            }
-
-            debug!(offset);
-
-            let read = self
-                .storage
-                .fetch_until_deadline_or_failure(
+        // With a soft limit, the read returns its first record or batch even when it is larger
+        // than the limit, and even when the limit is 0. Kafka reads the same way with
+        // `minOneMessage` ([LogSegment.java#L439-L447]). For Fetch v2 and older, Kafka sets
+        // `hardMaxBytesLimit` ([FetchParams.java#L72-L74]), reads without `minOneMessage`, and
+        // returns nothing when the limit is 0. Nisshi returns one batch there too, because the
+        // service does not see the request version. That is looser than Kafka, and harmless.
+        //
+        // [LogSegment.java#L439-L447]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L447
+        // [FetchParams.java#L72-L74]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/FetchParams.java#L72-L74
+        let read = match self
+            .storage
+            .fetch_until_limit(
+                &tp,
+                fetch_offset,
+                min_bytes,
+                limit,
+                isolation,
+                partition_deadline,
+            )
+            .await
+        {
+            Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
+                return Ok(PartitionRead::without_records(Self::unknown_to_storage(
                     &tp,
-                    offset,
-                    min_bytes,
-                    *max_bytes,
-                    isolation,
-                    partition_deadline,
-                )
-                .await;
+                    StorageOperation::Fetch,
+                )));
+            }
+            // Kafka answers a failed read in the partition's error code, and still answers the
+            // other partitions of the Fetch ([`ReplicaManager.readFromLog`]).
+            //
+            // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
+            Err(error) => {
+                return Ok(PartitionRead::without_records(Self::storage_failure(
+                    &tp,
+                    StorageOperation::Fetch,
+                    fetch_offset,
+                    &error,
+                )));
+            }
+            Ok(read) => read,
+        };
 
-            let read = match read {
-                Err(Error::Api(ErrorCode::UnknownTopicOrPartition)) => {
-                    return Ok(Self::unknown_to_storage(&tp, StorageOperation::Fetch));
-                }
-                // An earlier read of this partition returned records, so the partition answers
-                // with them instead of with the read's error code. The consumer's next Fetch then
-                // starts after them.
-                Err(error) if !batches.is_empty() => {
-                    error!(?tp, offset, ?error, "fetch read failed after earlier reads");
-                    *read_failed = true;
-                    break;
-                }
-                // Kafka answers a failed read in the partition's error code, and still answers
-                // the other partitions of the Fetch ([`ReplicaManager.readFromLog`]).
-                //
-                // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
-                Err(error) => {
-                    return Ok(Self::storage_failure(
-                        &tp,
-                        StorageOperation::Fetch,
-                        offset,
-                        &error,
-                    ));
-                }
-                Ok(read) => read,
-            };
+        // The offset after the last record returned. A batch can have gaps from compaction, so
+        // this is not the fetch offset plus the record count.
+        let offset = read
+            .batches
+            .iter()
+            .map(|batch| batch.max_offset() + 1)
+            .max()
+            .unwrap_or(fetch_offset);
 
-            if let Some(error) = &read.failed {
-                *read_failed = true;
+        if let Some(error) = &read.failed {
+            let records: u32 = read.batches.iter().map(|batch| batch.record_count).sum();
 
-                // The read failed after its last record, so the next Fetch starts there.
-                let failed_at = read
-                    .batches
-                    .iter()
-                    .map(|batch| batch.max_offset() + 1)
-                    .max()
-                    .unwrap_or(offset);
-                let records: u32 = read.batches.iter().map(|batch| batch.record_count).sum();
+            error!(
+                ?tp,
+                fetch_offset,
+                failed_at = offset,
+                records,
+                ?error,
+                "fetch read failed after it sent records"
+            );
+        }
 
-                error!(
+        if let Some(reason) = read.timed_out {
+            // Reads that returned nothing by the deadline leave the consumer where it was, so they
+            // log a warning. Reads cut short after returning batches still move the consumer on,
+            // so they log at debug.
+            if read.batches.is_empty() {
+                log_timed_out(
+                    &tp,
+                    StorageOperation::Fetch,
+                    fetch_offset,
+                    reason,
+                    started_at,
+                );
+            } else {
+                debug!(
                     ?tp,
-                    offset,
-                    failed_at,
-                    records,
-                    ?error,
-                    "fetch read failed after it sent records"
+                    fetch_offset,
+                    elapsed = ?started_at.elapsed(),
+                    "fetch read stopped at its deadline"
                 );
             }
-
-            // The reported offsets must bound every record in `batches`. Offsets only grow, so
-            // the maximum of each offset bounds the records of every read. The loop does not
-            // replace the stage with the read's, because a read can send an older stage than the
-            // one that the service read before the loop.
-            if let Some(read_offset_stage) = read.offsets {
-                offset_stage = OffsetStage {
-                    last_stable: offset_stage.last_stable.max(read_offset_stage.last_stable),
-                    high_watermark: offset_stage
-                        .high_watermark
-                        .max(read_offset_stage.high_watermark),
-                    log_start: offset_stage.log_start.max(read_offset_stage.log_start),
-                };
-            }
-
-            if let Some(reason) = read.timed_out {
-                // A partition whose reads returned nothing by its deadline makes no progress for
-                // its consumer, so it warns. A read cut short with batches still moves the
-                // consumer on, so it logs at debug.
-                if batches.is_empty() && read.batches.is_empty() {
-                    log_timed_out(&tp, StorageOperation::Fetch, offset, reason, started_at);
-                } else {
-                    debug!(
-                        ?tp,
-                        offset,
-                        elapsed = ?started_at.elapsed(),
-                        "fetch read stopped at its deadline"
-                    );
-                }
-            }
-
-            let mut fetched = read.batches;
-
-            debug!(?tp, ?offset, ?fetched);
-
-            *max_bytes =
-                u32::try_from(fetched.byte_size()).map(|bytes| max_bytes.saturating_sub(bytes))?;
-
-            if fetched.is_empty() {
-                break;
-            }
-
-            // the offset after the last one returned; a batch can have gaps
-            // (compaction), so this is not the record count
-            if let Some(latest) = fetched
-                .iter()
-                .map(|batch| batch.max_offset() + 1)
-                .max()
-                .inspect(|latest| debug!(latest))
-            {
-                offset = latest;
-            }
-
-            batches.append(&mut fetched);
-
-            // The loop ends at the partition deadline instead of starting another read, because a
-            // read started after the deadline returns no batches and counts as timed out.
-            if read.timed_out.is_some() || Instant::now() >= partition_deadline {
-                break;
-            }
-
-            // The loop ends after a failed read instead of starting another, so that it does not
-            // send more reads to storage that is failing.
-            if read.failed.is_some() {
-                break;
-            }
         }
+
+        if let Some(read_offset_stage) = read.offsets {
+            offset_stage = offset_stage.latest(read_offset_stage);
+        }
+
+        let batches = read.batches;
 
         // Each engine bounds the records that it sends by the offset stage that it sent first, so
         // the stage already covers `offset`, the offset after the last record. The assertion makes
@@ -632,8 +630,12 @@ where
             offset_stage = offset_stage.with_high_watermark_at_least(offset);
         }
 
-        Ok(Self::partition_data(partition_index, offset_stage, batches))
-            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        Ok(PartitionRead {
+            data: Self::partition_data(partition_index, offset_stage, batches),
+            reached_limit: read.reached_limit.then_some(limit),
+            read_failed: read.failed.is_some(),
+        })
+        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
     fn partition_data(
@@ -901,23 +903,17 @@ where
             .records(None)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, min_bytes, isolation, fetch))]
+    /// Reads the partitions of one topic of a Fetch in `round`.
+    #[instrument(skip(self, round, fetch))]
     async fn fetch_topic(
         &self,
-        fetch_deadline: Instant,
-        left: &mut usize,
-        min_bytes: u32,
-        max_bytes: &mut u32,
-        isolation: IsolationLevel,
+        round: &mut FetchRound,
         fetch: &FetchTopic,
-        is_first_non_empty: &mut bool,
-        read_failed: &mut bool,
     ) -> Result<FetchableTopicResponse> {
         let metadata = match self.storage.metadata(Some(&[fetch.into()])).await {
             Ok(metadata) => metadata,
             Err(error) => {
-                *left = left.saturating_sub(fetch.partitions.as_ref().map_or(0, Vec::len));
+                round.skip_partitions(fetch.partitions.as_ref().map_or(0, Vec::len));
 
                 return Ok(Self::metadata_failure(fetch, &error));
             }
@@ -950,7 +946,7 @@ where
                 if !usize::try_from(fetch_partition.partition)
                     .is_ok_and(|index| index < partition_count)
                 {
-                    *left = left.saturating_sub(1);
+                    round.skip_partitions(1);
                     outside_topic += 1;
                     partitions.push(Self::unknown_partition(fetch_partition.partition));
 
@@ -962,58 +958,13 @@ where
                     continue;
                 }
 
-                // Every partition reads within its own limit and what is left
-                // of `max_bytes`, the first one included
-                // ([ReplicaManager.scala#L1633]).
-                //
-                // [ReplicaManager.scala#L1633]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1633
-                let mut partition_bytes =
-                    min(fetch_partition.partition_max_bytes as u32, *max_bytes);
-                debug!(partition_bytes, is_first_non_empty);
-
-                let partition = self
-                    .fetch_partition(
-                        fetch_deadline,
-                        *left,
-                        min_bytes,
-                        &mut partition_bytes,
-                        *is_first_non_empty,
-                        isolation,
-                        name,
-                        fetch_partition,
-                        read_failed,
-                    )
+                let read = round
+                    .read_partition(name, fetch_partition, |partition| {
+                        self.fetch_partition(partition)
+                    })
                     .await?;
 
-                *left = left.saturating_sub(1);
-
-                // A partition answered with no records, an empty or failed
-                // one, leaves the next partition first.
-                *is_first_non_empty = *is_first_non_empty
-                    && partition
-                        .records
-                        .as_ref()
-                        .is_none_or(|records| records.batches.is_empty());
-
-                debug!(partition_bytes, is_first_non_empty);
-
-                // The partition spends the bytes that it returned, not only its
-                // own limit. A storage read can exceed its limit by one batch
-                // (`Storage::fetch`), so a partition can exceed
-                // `partition_max_bytes` by one batch. When the response spends
-                // that batch as well, the response holds at most `max_bytes` and
-                // one batch, however many partitions the request lists. Kafka
-                // lets only the first non-empty partition exceed a limit
-                // ([ReplicaManager.scala#L1731-L1740]). Storage cannot tell the
-                // first read of the first non-empty partition from any other
-                // read, so here every partition with a limit above 0 can. A
-                // partition with no limit left reads only while it is the
-                // first non-empty one (see `fetch_partition`).
-                //
-                // [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
-                *max_bytes = max_bytes.saturating_sub(u32::try_from(partition.byte_size())?);
-
-                partitions.push(partition);
+                partitions.push(read.data);
             }
 
             if outside_topic > 0 {
@@ -1051,7 +1002,7 @@ where
                 );
             }
 
-            *left = left.saturating_sub(fetch.partitions.as_ref().map_or(0, Vec::len));
+            round.skip_partitions(fetch.partitions.as_ref().map_or(0, Vec::len));
 
             // Kafka answers each partition of a topic ID that it cannot resolve to a name with
             // `UNKNOWN_TOPIC_ID`, and each partition of a name that it does not know with
@@ -1103,46 +1054,21 @@ where
             loop {
                 responses.clear();
 
-                // Every round reads every partition again from its fetch
-                // offset, and answers with only its own records. So each
-                // round starts with the whole `max_bytes`, and only its own
-                // bytes count toward `min_bytes`. Kafka also counts the bytes
-                // available at each check, not a sum over the checks
-                // ([DelayedFetch.scala]).
-                //
-                // [DelayedFetch.scala]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L74-L148
-                let mut round_max_bytes = max_bytes;
-                let mut is_first_non_empty = true;
-                let mut read_failed = false;
-
-                let mut left = topics
-                    .iter()
-                    .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
-                    .sum::<usize>();
+                let mut round =
+                    FetchRound::new(topics, max_bytes, fetch_deadline, min_bytes, isolation);
 
                 let fetch_started_at = Instant::now();
                 for fetch in topics.iter() {
-                    let fetch_response = self
-                        .fetch_topic(
-                            fetch_deadline,
-                            &mut left,
-                            min_bytes,
-                            &mut round_max_bytes,
-                            isolation,
-                            fetch,
-                            &mut is_first_non_empty,
-                            &mut read_failed,
-                        )
-                        .await?;
+                    let fetch_response = self.fetch_topic(&mut round, fetch).await?;
 
                     responses.push(fetch_response);
                 }
 
-                let bytes = u32::try_from(responses.byte_size())?;
+                let round_end = round.end();
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
-                debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
+                debug!(?iteration, ?max_wait, ?remaining, ?round_end, ?min_bytes);
 
                 if remaining.is_zero() {
                     break;
@@ -1152,7 +1078,7 @@ where
                 // ([DelayedFetch.scala#L147]).
                 //
                 // [DelayedFetch.scala#L147]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L147
-                if bytes >= min_bytes {
+                if round_end.reached_min_bytes {
                     break;
                 }
 
@@ -1171,7 +1097,7 @@ where
                 //
                 // [`ReplicaManager.readFromLog`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1698-L1727
                 // [`ReplicaManager.fetchMessages`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1550-L1558
-                if read_failed {
+                if round_end.read_failed {
                     debug!(
                         ?iteration,
                         "partition read failed, not waiting for min_bytes"
@@ -1333,9 +1259,10 @@ where
     }
 }
 
+/// A batch counts as its encoded size, header included.
 impl ByteSize for Batch {
     fn byte_size(&self) -> u64 {
-        self.record_data.len() as u64
+        (BATCH_OVERHEAD + self.record_data.len()) as u64
     }
 }
 
@@ -1388,7 +1315,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{FETCH_DEADLINE_OVERHEAD, FetchService, ReadWait, TimedOut, fetch_deadline};
+    use super::{
+        ByteLimit, ByteSize as _, FETCH_DEADLINE_OVERHEAD, FetchService, PartitionFetch, ReadWait,
+        TimedOut, fetch_deadline,
+    };
     use crate::{
         Error, FetchValidationLayer, OffsetStage, Result, StorageOperation, Topition,
         fetched::FetchedSender,
@@ -1493,10 +1423,10 @@ mod tests {
             _topition: &Topition,
             offset: i64,
             _min_bytes: u32,
-            _max_bytes: u32,
+            _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             fetched_sender: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             let calls = {
                 let mut call_offsets = self.call_offsets.lock()?;
                 call_offsets.push(offset);
@@ -1537,7 +1467,7 @@ mod tests {
                 reader_stopped.await;
             }
 
-            Ok(())
+            Ok(ReadEnd::Finished)
         }
 
         async fn current_offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
@@ -1600,24 +1530,22 @@ mod tests {
         isolation: IsolationLevel,
         fetch_offset: i64,
     ) -> Result<PartitionData> {
-        let mut remaining = max_bytes;
+        let request = FetchPartition::default()
+            .partition(0)
+            .fetch_offset(fetch_offset)
+            .partition_max_bytes(max_bytes as i32);
 
         FetchService { storage }
-            .fetch_partition(
-                fetch_deadline(Instant::now(), max_wait),
-                1,
-                1,
-                &mut remaining,
-                true,
+            .fetch_partition(PartitionFetch {
+                topic: "abc",
+                request: &request,
+                limit: ByteLimit::Soft(max_bytes),
+                deadline: fetch_deadline(Instant::now(), max_wait),
+                min_bytes: 1,
                 isolation,
-                "abc",
-                &FetchPartition::default()
-                    .partition(0)
-                    .fetch_offset(fetch_offset)
-                    .partition_max_bytes(max_bytes as i32),
-                &mut false,
-            )
+            })
             .await
+            .map(|read| read.data)
     }
 
     async fn fetch_partition(
@@ -2496,14 +2424,14 @@ mod tests {
             topition: &Topition,
             _offset: i64,
             _min_bytes: u32,
-            max_bytes: u32,
+            limit: ByteLimit,
             _isolation_level: IsolationLevel,
             fetched_sender: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             self.calls.lock()?.push(Call {
                 topic: topition.topic().into(),
                 partition: topition.partition(),
-                max_bytes,
+                max_bytes: limit.bytes(),
             });
 
             let _read_end = ReadEndRecorder {
@@ -2529,9 +2457,11 @@ mod tests {
                 Read::Batch(batch) => {
                     let batches = vec![batch];
                     let offset_stage = covering_stage(PARTITION_STAGE, &batches);
-                    send_batches(fetched_sender, offset_stage, batches).await
+                    send_batches(fetched_sender, offset_stage, batches)
+                        .await
+                        .map(|()| ReadEnd::Finished)
                 }
-                Read::Empty => Ok(()),
+                Read::Empty => Ok(ReadEnd::Finished),
                 Read::Stall => pending().await,
                 Read::SendThenStall(batch) => {
                     let mut data = fetched_sender
@@ -2543,7 +2473,7 @@ mod tests {
                     // would send nothing more, so its caller would stop waiting at once.
                     pending::<()>().await;
                     drop(data);
-                    Ok(())
+                    Ok(ReadEnd::Finished)
                 }
                 Read::SendThenFail(batch) => {
                     let mut data = fetched_sender
@@ -2983,7 +2913,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_read_uses_none_of_max_bytes() -> Result<()> {
         let first = batch(0, &[0])?;
-        let size = u32::try_from(first.record_data.len())?;
+        let size = u32::try_from(first.byte_size())?;
 
         let storage = Partitions::new([
             (0, vec![Read::Batch(first), Read::Stall]),
@@ -3037,7 +2967,7 @@ mod tests {
         const PARTITION_MAX_BYTES: i32 = 1024;
 
         let record_batch = batch(0, &[0])?;
-        let round_bytes = 2 * u32::try_from(record_batch.record_data.len())?;
+        let round_bytes = 2 * u32::try_from(record_batch.byte_size())?;
 
         // Each round reads a batch from each partition, then reads nothing
         // from the next offset. The script holds more rounds than the long
@@ -3158,6 +3088,241 @@ mod tests {
         Ok(())
     }
 
+    /// Fetches the first `partitions` partitions at offset 0, each with a limit of
+    /// `partition_max_bytes`, and returns how many batches each partition answers with.
+    async fn batches_within_partition_max_bytes(
+        storage: Partitions,
+        partitions: i32,
+        partition_max_bytes: u32,
+    ) -> Result<Vec<usize>> {
+        let partition_max_bytes = i32::try_from(partition_max_bytes)?;
+
+        let responses = FetchService { storage }
+            .fetch(
+                MAX_WAIT,
+                1,
+                u32::try_from(MAX_BYTES)?,
+                IsolationLevel::ReadUncommitted,
+                &[FetchTopic::default()
+                    .topic(Some(TOPIC.into()))
+                    .partitions(Some(
+                        (0..partitions)
+                            .map(|partition| {
+                                FetchPartition::default()
+                                    .partition(partition)
+                                    .fetch_offset(0)
+                                    .partition_max_bytes(partition_max_bytes)
+                            })
+                            .collect(),
+                    ))],
+            )
+            .await?;
+
+        Ok(responses
+            .into_iter()
+            .flat_map(|topic| topic.partitions.unwrap_or_default())
+            .map(|partition| batches(&partition))
+            .collect())
+    }
+
+    /// The partition holds two batches, and the storage double returns one batch per read. With a
+    /// limit that holds both batches, the partition returns both. With a limit one byte smaller,
+    /// it returns only the first, because the second read is under a hard limit and the second
+    /// batch does not fit. Kafka lets only the first read of the first non-empty partition exceed
+    /// a limit ([ReplicaManager.scala#L1731-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
+    #[tokio::test(start_paused = true)]
+    async fn a_later_read_returns_only_the_batches_that_fit_the_limit() -> Result<()> {
+        let first = batch(0, &[0])?;
+        let second = batch(1, &[0])?;
+        let both = u32::try_from(first.byte_size() + second.byte_size())?;
+
+        let storage = Partitions::new([(0, vec![Read::Batch(first), Read::Batch(second)])]);
+
+        assert_eq!(
+            vec![2],
+            batches_within_partition_max_bytes(storage.clone(), 1, both).await?
+        );
+
+        // With a limit one byte short of both batches, the second read stops at the second batch
+        // and returns nothing.
+        let storage = Partitions::new([(
+            0,
+            vec![Read::Batch(batch(0, &[0])?), Read::Batch(batch(1, &[0])?)],
+        )]);
+
+        assert_eq!(
+            vec![1],
+            batches_within_partition_max_bytes(storage.clone(), 1, both - 1).await?
+        );
+
+        // The service reads only twice, because another read would stop at the same batch.
+        assert_eq!(2, storage.calls(0).len());
+
+        Ok(())
+    }
+
+    /// Partition 0 is empty, and partitions 1 and 2 each hold a batch one byte larger than the
+    /// limit. Partition 1 returns its batch, because it is the first partition with records.
+    /// Partition 2 returns nothing. Kafka reads partition 2 the same way, with `minOneMessage` set
+    /// to false ([ReplicaManager.scala#L1731-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
+    #[tokio::test(start_paused = true)]
+    async fn only_the_first_non_empty_partition_exceeds_its_limit() -> Result<()> {
+        let record_batch = batch(0, &[0])?;
+        let one_byte_short = u32::try_from(record_batch.byte_size())? - 1;
+
+        let storage = Partitions::new([
+            (0, vec![]),
+            (1, vec![Read::Batch(record_batch.clone())]),
+            (2, vec![Read::Batch(record_batch)]),
+        ]);
+
+        assert_eq!(
+            vec![0, 1, 0],
+            batches_within_partition_max_bytes(storage, 3, one_byte_short).await?
+        );
+
+        Ok(())
+    }
+
+    /// Partitions 0 and 2 each hold a batch that fits the limit, and partition 1 a batch that does
+    /// not. Partition 1 returns nothing, and partition 2 still returns its batch, because a
+    /// partition that stops at its limit does not end the round.
+    #[tokio::test(start_paused = true)]
+    async fn a_partition_after_one_at_its_limit_returns_its_batch() -> Result<()> {
+        let fits = batch(0, &[0])?;
+        let limit = u32::try_from(fits.byte_size())?;
+
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(fits.clone())]),
+            (1, vec![Read::Batch(batch(0, &[0, 1])?)]),
+            (2, vec![Read::Batch(fits)]),
+        ]);
+
+        assert_eq!(
+            vec![1, 0, 1],
+            batches_within_partition_max_bytes(storage, 3, limit).await?
+        );
+
+        Ok(())
+    }
+
+    /// The response's `max_bytes` holds two partition limits. Partitions 0 and 2 each hold a batch
+    /// that fits a partition's limit, and partition 1 a batch that does not. Partition 1 returns
+    /// nothing but spends its whole limit, so partition 2 has no bytes left, is not read, and
+    /// returns nothing. Kafka subtracts the start of partition 1's batch that it returns
+    /// ([ReplicaManager.scala#L1736-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
+    #[tokio::test(start_paused = true)]
+    async fn a_partition_at_its_limit_spends_its_limit_of_the_response() -> Result<()> {
+        let fits = batch(0, &[0])?;
+        let partition_max_bytes = i32::try_from(fits.byte_size())?;
+
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(fits.clone())]),
+            (1, vec![Read::Batch(batch(0, &[0, 1])?)]),
+            (2, vec![Read::Batch(fits)]),
+        ]);
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            1,
+            u32::try_from(2 * partition_max_bytes)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..3)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(partition_max_bytes)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![1, 0, 0],
+            responses
+                .into_iter()
+                .flat_map(|topic| topic.partitions.unwrap_or_default())
+                .map(|partition| batches(&partition))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(0, storage.calls(2).len());
+
+        Ok(())
+    }
+
+    /// Partition 0 holds a batch that fits the limit, and partition 1 a batch that does not.
+    /// `min_bytes` is one byte more than partition 0's batch. Partition 1 returns nothing, but its
+    /// whole limit counts toward `min_bytes`, so the Fetch answers at once instead of waiting for
+    /// `max_wait`. Kafka counts the bytes available up to each partition's limit
+    /// ([DelayedFetch.scala#L108-L110]).
+    ///
+    /// [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
+    #[tokio::test(start_paused = true)]
+    async fn a_partition_at_its_limit_counts_its_limit_toward_min_bytes() -> Result<()> {
+        let small = batch(0, &[0])?;
+        let small_size = small.byte_size();
+        // Partition 0's batch fits the limit, and partition 1's batch is larger than it.
+        let partition_max_bytes = i32::try_from(small_size + 1)?;
+
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(small)]),
+            (1, vec![Read::Batch(batch(0, &[0, 1, 2])?)]),
+        ]);
+
+        let started_at = Instant::now();
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            // Partition 0's batch alone is below `min_bytes`.
+            u32::try_from(small_size + 1)?,
+            u32::try_from(MAX_BYTES)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..2)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(partition_max_bytes)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        assert_eq!(Duration::ZERO, started_at.elapsed());
+        assert_eq!(
+            vec![1, 0],
+            responses
+                .into_iter()
+                .flat_map(|topic| topic.partitions.unwrap_or_default())
+                .map(|partition| batches(&partition))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, storage.calls(1).len());
+
+        Ok(())
+    }
+
     /// A Fetch with `max_wait` of zero reads its partitions before it answers, as Kafka
     /// does, and each read may run until its partition deadline, whatever `max_wait` is.
     #[tokio::test(start_paused = true)]
@@ -3207,7 +3372,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exactly_min_bytes_answers_at_once() -> Result<()> {
         let record_batch = batch(0, &[0])?;
-        let size = i32::try_from(record_batch.record_data.len())?;
+        let size = i32::try_from(record_batch.byte_size())?;
 
         for (min_bytes, script) in [(size, vec![Read::Batch(record_batch)]), (0, vec![])] {
             let (_, elapsed) = fetch_with_min_bytes(

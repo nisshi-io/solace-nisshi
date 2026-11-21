@@ -495,11 +495,11 @@ mod tests {
 
     use super::{LIST_OFFSETS_CONCURRENCY, ListOffsetsService};
     use crate::{
-        BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
-        MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-        Result, ScramCredential, SemaphoreProxy, Storage, StorageOperation, TopicId, Topition,
-        TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-        Version,
+        BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail,
+        ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+        ProducerIdResponse, ReadEnd, Result, ScramCredential, SemaphoreProxy, Storage,
+        StorageOperation, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+        TxnOffsetCommitRequest, UpdateError, Version,
         service::{
             RequestChannelService, bounded_channel,
             read_deadline::{LIST_OFFSETS_READ_DEADLINE, ReadDeadline, ReadWait, TimedOut},
@@ -583,10 +583,10 @@ mod tests {
             _topition: &Topition,
             _offset: i64,
             _min_bytes: u32,
-            _max_bytes: u32,
+            _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: crate::FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             unimplemented!()
         }
 

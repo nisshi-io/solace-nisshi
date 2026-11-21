@@ -44,11 +44,11 @@ use nisshi_sans_io::{
 };
 use nisshi_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use nisshi_storage::{
-    AutoCreateRefusals, BrokerRegistrationRequest, CommittedOffset, GroupDetail, KnownTopics,
-    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, ScramCredential, Storage, TopicCreationConfig, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    AutoCreateRefusals, BrokerRegistrationRequest, ByteLimit, CommittedOffset, GroupDetail,
+    KnownTopics, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, ReadEnd, ScramCredential, Storage, TopicCreationConfig,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use rsasl::{
@@ -913,10 +913,10 @@ impl Storage for Engine {
         _topition: &Topition,
         _offset: i64,
         _min_bytes: u32,
-        _max_bytes: u32,
+        _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched: nisshi_storage::FetchedSender,
-    ) -> nisshi_storage::Result<()> {
+    ) -> nisshi_storage::Result<ReadEnd> {
         unimplemented!()
     }
 

@@ -45,9 +45,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version, fetched::FetchedSender,
 };
@@ -209,10 +209,10 @@ where
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.introduce_latency().await?;
 
         self.storage
@@ -220,7 +220,7 @@ where
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )
