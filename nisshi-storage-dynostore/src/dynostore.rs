@@ -2383,11 +2383,12 @@ impl DynoStore {
             };
 
             // If the object is larger than the range asked for, the batch does not fit. The read
-            // still downloads that range instead of dropping the response. A drop saves little,
-            // because S3 bills the data that it streamed before the client stopped reading
-            // ([S3 pricing], note on data transfer). A drop also costs a new connection, because
-            // the object store's HTTP client reuses a connection only after it reads the body to
-            // its end.
+            // still downloads the whole range, instead of closing the connection as soon as the
+            // response shows the object's size. Closing early saves little, because S3 bills the
+            // data that it streamed before it saw the connection close ([S3 pricing], note on
+            // data transfer). Closing early also costs a new connection for the next request,
+            // because the object store's HTTP client reuses a connection only after it reads a
+            // body to its end.
             //
             // [S3 pricing]: https://aws.amazon.com/s3/pricing/
             let object = match object {
