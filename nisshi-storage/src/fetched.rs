@@ -1120,6 +1120,82 @@ mod tests {
         Ok(())
     }
 
+    /// A storage double over a 3-record partition, whose read sends only the record at its fetch
+    /// offset, if there is one, and records the limit that it was given.
+    #[derive(Debug, Default)]
+    struct SendsOneRecordPerRead {
+        limits: std::sync::Mutex<Vec<ByteLimit>>,
+    }
+
+    storage_double!(SendsOneRecordPerRead {
+        async fn fetch(
+            &self,
+            _topition: &Topition,
+            offset: i64,
+            _min_bytes: u32,
+            limit: ByteLimit,
+            _isolation_level: IsolationLevel,
+            fetched_sender: FetchedSender,
+        ) -> Result<ReadEnd> {
+            self.limits.lock()?.push(limit);
+
+            let mut data = fetched_sender
+                .send_offsets(OffsetStage {
+                    last_stable: 3,
+                    high_watermark: 3,
+                    log_start: 0,
+                })
+                .await?;
+
+            if offset < 3 {
+                data.send_record(record(offset, 1_000, 0)).await?;
+            }
+
+            Ok(ReadEnd::Finished)
+        }
+
+        async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
+            unimplemented!()
+        }
+
+        async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+            unimplemented!()
+        }
+    });
+
+    /// The engine sends one record per read, so a soft limit of 1,000 bytes takes a read for each
+    /// of the 3 records, and one more that finds the end of the partition. Only the first read may
+    /// send a record larger than its limit, so it gets a soft limit, and the reads after it get a
+    /// hard limit.
+    #[tokio::test]
+    async fn only_the_first_read_of_a_soft_limit_gets_a_soft_limit() -> Result<()> {
+        let storage = SendsOneRecordPerRead::default();
+
+        let read = storage
+            .fetch_until_limit(
+                &Topition::new("abc", 0),
+                0,
+                0,
+                ByteLimit::Soft(1_000),
+                IsolationLevel::ReadUncommitted,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await?;
+
+        assert_eq!(vec![vec![0, 1, 2]], record_offsets(&read.batches)?);
+        assert_matches!(
+            storage.limits.lock()?.as_slice(),
+            [
+                ByteLimit::Soft(1_000),
+                ByteLimit::Hard(_),
+                ByteLimit::Hard(_),
+                ByteLimit::Hard(_)
+            ]
+        );
+
+        Ok(())
+    }
+
     /// A storage double whose read sends `records` records, yields once, and then sets `ended` and
     /// returns.
     #[derive(Debug)]
