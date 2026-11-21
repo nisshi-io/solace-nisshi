@@ -3428,6 +3428,60 @@ mod tests {
         Ok(())
     }
 
+    /// The response's `max_bytes` holds two partition limits. Partitions 0 and 2 each hold a batch
+    /// that fits a partition's limit, and partition 1 a batch that does not. Partition 1 returns
+    /// nothing but spends its whole limit, so partition 2 has no bytes left, is not read, and
+    /// returns nothing. Kafka subtracts the start of partition 1's batch that it returns
+    /// ([ReplicaManager.scala#L1736-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
+    #[tokio::test(start_paused = true)]
+    async fn a_partition_at_its_limit_spends_its_limit_of_the_response() -> Result<()> {
+        let fits = batch(0, &[0])?;
+        let partition_max_bytes = i32::try_from(fits.byte_size())?;
+
+        let storage = Partitions::new([
+            (0, vec![Read::Batch(fits.clone())]),
+            (1, vec![Read::Batch(batch(0, &[0, 1])?)]),
+            (2, vec![Read::Batch(fits)]),
+        ]);
+
+        let responses = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            1,
+            u32::try_from(2 * partition_max_bytes)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(
+                    (0..3)
+                        .map(|partition| {
+                            FetchPartition::default()
+                                .partition(partition)
+                                .fetch_offset(0)
+                                .partition_max_bytes(partition_max_bytes)
+                        })
+                        .collect(),
+                ))],
+        )
+        .await?;
+
+        assert_eq!(
+            vec![1, 0, 0],
+            responses
+                .into_iter()
+                .flat_map(|topic| topic.partitions.unwrap_or_default())
+                .map(|partition| batches(&partition))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(0, storage.calls(2).len());
+
+        Ok(())
+    }
+
     /// Partition 0 holds a batch that fits the limit, and partition 1 a batch that does not.
     /// `min_bytes` is one byte more than partition 0's batch. Partition 1 returns nothing, but its
     /// whole limit counts toward `min_bytes`, so the Fetch answers at once instead of waiting for

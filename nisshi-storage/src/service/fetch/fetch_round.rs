@@ -170,15 +170,25 @@ impl FetchRound {
         self.partitions_left = self.partitions_left.saturating_sub(1);
         self.read_failed |= partition_read.read_failed;
 
+        // A partition that stopped at its limit spends its whole limit, also the part that it did
+        // not return. Kafka returns the start of the batch that does not fit, which the client
+        // drops, and subtracts it ([ReplicaManager.scala#L1736-L1740]). If the round subtracted
+        // only the bytes returned, each later partition whose next batch does not fit would read
+        // its whole limit again. Dynostore downloads that limit and discards it, so a Fetch of many
+        // such partitions would download many times its `max_bytes`.
+        //
         // The first partition with records can return a batch larger than `bytes_left`, so
-        // `bytes_left` stops at 0. A batch that did not fit a partition's limit is not subtracted,
-        // because the partition does not return it. Kafka returns the start of that batch, which
-        // the client drops, and subtracts it ([ReplicaManager.scala#L1736-L1740]).
+        // `bytes_left` stops at 0.
         //
         // [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
+        let spent = match partition_read.reached_limit {
+            Some(limit) => returned.max(u64::from(limit.bytes())),
+            None => returned,
+        };
+
         self.bytes_left = self
             .bytes_left
-            .saturating_sub(u32::try_from(returned).unwrap_or(u32::MAX));
+            .saturating_sub(u32::try_from(spent).unwrap_or(u32::MAX));
 
         // Only a partition that returned records makes the limits of the next partitions hard.
         self.has_records |= partition_read
@@ -194,9 +204,6 @@ impl FetchRound {
         // than the partition's limit.
         //
         // [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
-        self.available_bytes += match partition_read.reached_limit {
-            Some(limit) => returned.max(u64::from(limit.bytes())),
-            None => returned,
-        };
+        self.available_bytes += spent;
     }
 }
