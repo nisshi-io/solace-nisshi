@@ -123,12 +123,12 @@ impl S3Partition {
     }
 
     /// Deletes every object of the partition's cluster, so that the bucket does not grow with each
-    /// run.
+    /// run. A test calls it before its assertions, so that a failed test also deletes its objects.
     async fn delete(self) -> Result<()> {
         let object_store = AmazonS3Builder::from_env()
             .with_bucket_name(BUCKET)
             .build()?;
-        let cluster = Path::from(self.storage.cluster.as_str());
+        let cluster = Path::from(format!("clusters/{}", self.storage.cluster));
 
         let locations = object_store
             .list(Some(&cluster))
@@ -156,15 +156,21 @@ async fn a_limit_larger_than_the_objects_returns_every_batch() -> Result<()> {
     let _guard = init_tracing()?;
 
     let partition = S3Partition::create().await?;
+    let limits = [ByteLimit::Soft(1024 * 1024), ByteLimit::Hard(1024 * 1024)];
 
-    for limit in [ByteLimit::Soft(1024 * 1024), ByteLimit::Hard(1024 * 1024)] {
-        let read = partition.fetch_from(0, limit).await?;
+    let mut reads = Vec::new();
+    for limit in limits {
+        reads.push(partition.fetch_from(0, limit).await?);
+    }
 
+    partition.delete().await?;
+
+    for (limit, read) in limits.iter().zip(reads) {
         assert_eq!(vec![0, 1, 2], base_offsets(&read), "{limit:?}");
         assert!(!read.reached_limit, "{limit:?}");
     }
 
-    partition.delete().await
+    Ok(())
 }
 
 /// A fetch whose limit ends inside a batch downloads only part of that batch, and returns the
@@ -178,18 +184,25 @@ async fn a_batch_that_does_not_fit_stops_the_fetch() -> Result<()> {
     let partition = S3Partition::create().await?;
     let [first, second, third] = partition.sizes;
 
-    for (limit, expected) in [
+    let cases = [
         (ByteLimit::Soft(1), vec![0]),
         (ByteLimit::Hard(first + second + third / 2), vec![0, 1]),
         (ByteLimit::Hard(first / 2), vec![]),
-    ] {
-        let read = partition.fetch_from(0, limit).await?;
+    ];
 
-        assert_eq!(expected, base_offsets(&read), "{limit:?}");
+    let mut reads = Vec::new();
+    for (limit, _) in &cases {
+        reads.push(partition.fetch_from(0, *limit).await?);
+    }
+
+    partition.delete().await?;
+
+    for ((limit, expected), read) in cases.iter().zip(reads) {
+        assert_eq!(*expected, base_offsets(&read), "{limit:?}");
         assert!(read.reached_limit, "{limit:?}");
     }
 
-    partition.delete().await
+    Ok(())
 }
 
 /// A fetch from offset 3, inside the third batch, finds the batch by a listing. Under a hard limit
@@ -202,13 +215,16 @@ async fn a_mid_batch_fetch_reads_its_batch_by_a_ranged_get() -> Result<()> {
     let partition = S3Partition::create().await?;
     let [_, _, third] = partition.sizes;
 
-    let read = partition.fetch_from(3, ByteLimit::Hard(third / 2)).await?;
-    assert!(read.batches.is_empty());
-    assert!(read.reached_limit);
+    let within_half = partition.fetch_from(3, ByteLimit::Hard(third / 2)).await?;
+    let within_double = partition.fetch_from(3, ByteLimit::Hard(third * 2)).await?;
 
-    let read = partition.fetch_from(3, ByteLimit::Hard(third * 2)).await?;
-    assert_eq!(vec![2], base_offsets(&read));
-    assert!(!read.reached_limit);
+    partition.delete().await?;
 
-    partition.delete().await
+    assert!(within_half.batches.is_empty());
+    assert!(within_half.reached_limit);
+
+    assert_eq!(vec![2], base_offsets(&within_double));
+    assert!(!within_double.reached_limit);
+
+    Ok(())
 }

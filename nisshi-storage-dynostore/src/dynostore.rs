@@ -2230,8 +2230,9 @@ impl DynoStore {
         let path = batch_path(&self.cluster, topition, base_offset);
 
         // The object store rejects a range of zero bytes.
+        let range = max_size.map(|max_size| GetRange::Bounded(0..max_size.max(1)));
         let options = GetOptions {
-            range: max_size.map(|max_size| GetRange::Bounded(0..max_size.max(1))),
+            range: range.clone(),
             ..GetOptions::default()
         };
 
@@ -2239,7 +2240,7 @@ impl DynoStore {
             Ok(object) => Ok(Some(object)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => {
-                error!(?error, ?topition, base_offset, "reading batch");
+                error!(?error, ?topition, base_offset, ?range, "reading batch");
                 Err(Error::Api(ErrorCode::KafkaStorageError))
             }
         }
