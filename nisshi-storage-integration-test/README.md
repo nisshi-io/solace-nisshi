@@ -20,7 +20,7 @@ crate, such as `tests/it/main.rs`; in any other module it has no effect.
 
 ```rust
 // The macro searches the `without` list once for each area, file and group of the suite, so
-// a list of 18 names or more needs a higher limit than the compiler's default.
+// a long list can need a higher limit than the compiler's default.
 #![recursion_limit = "256"]
 
 use nisshi_storage::ArcDynStorage;
