@@ -90,7 +90,7 @@ pub mod __private {
 ///   such as with a test filter of its test runner.
 ///
 /// The tests use `#[tokio::test]`, so the caller needs `tokio` as a dev-dependency. The macro
-/// searches `without` once for each area, file and group, so a long `without` list needs a
+/// searches `without` once for each area, file and group, so a long `without` list can need a
 /// higher recursion limit than the compiler's default, such as `#![recursion_limit = "256"]` in
 /// the caller's crate.
 #[macro_export]
