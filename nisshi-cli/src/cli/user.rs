@@ -14,12 +14,13 @@
 
 use crate::{Result, env_var_exp_parser::UrlParser};
 use bytes::{Bytes, BytesMut};
-use clap::{Subcommand, ValueEnum};
+use clap::{Subcommand, ValueEnum, builder::RangedI64ValueParser, value_parser};
 use nisshi_client::{Client, ConnectionManager};
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ErrorCode, ScramMechanism,
     alter_user_scram_credentials_request::{ScramCredentialDeletion, ScramCredentialUpsertion},
 };
+use nisshi_storage::{MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::{Rng as _, rng};
 use sha2::{Sha256, Sha512};
@@ -28,6 +29,12 @@ use tracing::debug;
 use url::Url;
 
 use super::{DEFAULT_BROKER, Outcome, client_security::ClientSecurity, output::Output};
+
+/// Takes the iteration counts that the broker accepts in a credential, so that a count outside
+/// the range fails here and names the range, instead of failing at the broker.
+fn iterations_parser() -> RangedI64ValueParser<u32> {
+    value_parser!(u32).range(i64::from(MIN_SCRAM_ITERATIONS)..=i64::from(MAX_SCRAM_ITERATIONS))
+}
 
 #[derive(Clone, Debug, Subcommand)]
 pub(super) enum Command {
@@ -43,9 +50,9 @@ pub(super) enum Command {
         /// Password
         password: String,
 
-        // Iterations
-        #[arg(long, default_value = "8192")]
-        iterations: Option<u32>,
+        /// PBKDF2 iterations of the credential, from 4096 to 16384, the range that the broker accepts
+        #[arg(long, default_value = "8192", value_parser = iterations_parser())]
+        iterations: u32,
 
         // Mode
         #[arg(long, value_enum, default_value = "scram512")]
@@ -121,7 +128,6 @@ impl From<&Mechanism> for i8 {
 
 impl Command {
     const DEFAULT_SALT_LEN: usize = 32;
-    const DEFAULT_ITERATIONS: u32 = 2u32.pow(14);
 
     fn security(&self) -> &ClientSecurity {
         match self {
@@ -154,16 +160,14 @@ impl Command {
                 let mut salt = BytesMut::zeroed(Self::DEFAULT_SALT_LEN);
                 rng().fill_bytes(&mut salt);
 
-                let iterations = iterations.unwrap_or(Self::DEFAULT_ITERATIONS);
-
                 mechanism
-                    .salted_password(password.as_bytes(), iterations, &salt[..])
+                    .salted_password(password.as_bytes(), *iterations, &salt[..])
                     .ok()
                     .map(|salted_password| {
                         [ScramCredentialUpsertion::default()
                             .name(name.into())
                             .mechanism(mechanism.into())
-                            .iterations(iterations as i32)
+                            .iterations(*iterations as i32)
                             .salt(salt.into())
                             .salted_password(salted_password)]
                         .into()
@@ -274,6 +278,7 @@ fn report(response: &AlterUserScramCredentialsResponse, out: &mut impl Write) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory as _, Parser};
     use nisshi_sans_io::alter_user_scram_credentials_response::AlterUserScramCredentialsResult;
 
     fn result(user: &str, error_code: ErrorCode, message: &str) -> AlterUserScramCredentialsResult {
@@ -359,5 +364,64 @@ mod tests {
             &result[..]
         );
         Ok(())
+    }
+
+    #[derive(Debug, Parser)]
+    struct Wrapper {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn parsed_iterations(iterations: Option<&str>) -> Result<u32, clap::Error> {
+        let mut args = vec!["user", "create", "alice", "secret"];
+        if let Some(iterations) = iterations {
+            args.extend(["--iterations", iterations]);
+        }
+
+        Wrapper::try_parse_from(args).map(|wrapper| match wrapper.command {
+            Command::Create { iterations, .. } => iterations,
+            Command::Delete { .. } => unreachable!("the arguments name `create`"),
+        })
+    }
+
+    #[test]
+    fn iterations_default_to_8192() {
+        assert_eq!(8192, parsed_iterations(None).expect("the default parses"));
+    }
+
+    #[test]
+    fn iterations_from_the_minimum_to_the_maximum_are_accepted() {
+        for iterations in [4096, 8192, 16384] {
+            assert_eq!(
+                iterations,
+                parsed_iterations(Some(&iterations.to_string())).expect("in range")
+            );
+        }
+    }
+
+    #[test]
+    fn iterations_outside_the_range_fail_naming_the_range() {
+        for iterations in ["0", "4095", "16385", "4294967295"] {
+            let error = parsed_iterations(Some(iterations)).expect_err(iterations);
+
+            assert_eq!(clap::error::ErrorKind::ValueValidation, error.kind());
+            assert!(
+                error.to_string().contains("4096..=16384"),
+                "{iterations}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_help_names_the_iterations_range_and_default() {
+        let mut wrapper = Wrapper::command();
+        let help = wrapper
+            .find_subcommand_mut("create")
+            .expect("the create subcommand")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("from 4096 to 16384"), "{help}");
+        assert!(help.contains("[default: 8192]"), "{help}");
     }
 }
