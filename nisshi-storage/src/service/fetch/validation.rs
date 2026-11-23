@@ -129,6 +129,25 @@ impl TryFrom<FetchRequest> for ValidatedFetchRequest {
                 topics: topics.clone(),
             })?;
 
+        // Stricter than Kafka, which fails only a partition that has records to read, with
+        // UNKNOWN_SERVER_ERROR ([LogSegment.java#L427-L428]). No real client sends a negative
+        // limit.
+        //
+        // [LogSegment.java#L427-L428]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L427-L428
+        let negative_partition_max_bytes = topics
+            .iter()
+            .flat_map(|topic| topic.partitions.iter().flatten())
+            .map(|partition| partition.partition_max_bytes)
+            .find(|partition_max_bytes| *partition_max_bytes < 0);
+
+        if let Some(partition_max_bytes) = negative_partition_max_bytes {
+            return Err(MalformedFetchRequest {
+                field: "partition_max_bytes",
+                value: i64::from(partition_max_bytes),
+                topics,
+            });
+        }
+
         // Kafka waits for at most `max_bytes`, so that a round that fills
         // `max_bytes` ends the wait ([KafkaApis.scala#L1043-L1044]).
         //
@@ -381,6 +400,23 @@ mod tests {
             ))
     }
 
+    /// Returns `request` with `partition_max_bytes` as the limit of each of its partitions.
+    fn with_partition_max_bytes(
+        mut request: FetchRequest,
+        partition_max_bytes: i32,
+    ) -> FetchRequest {
+        for partition in request
+            .topics
+            .iter_mut()
+            .flatten()
+            .flat_map(|topic| topic.partitions.iter_mut().flatten())
+        {
+            partition.partition_max_bytes = partition_max_bytes;
+        }
+
+        request
+    }
+
     /// Every malformed whole-request field is answered `INVALID_REQUEST` without calling the
     /// inner service, and the answer survives an encode/decode round trip at the versions
     /// that differ in how the response is laid out.
@@ -393,6 +429,7 @@ mod tests {
             request_with(Some(0), -1, 0, None),
             request_with(Some(0), 0, -1, None),
             request_with(Some(0), 0, 0, Some(-1)),
+            with_partition_max_bytes(request_with(Some(0), 0, 0, None), -1),
         ] {
             let inner = CountingInner::default();
             let service = FetchValidationLayer::new().layer(inner.clone());

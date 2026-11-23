@@ -152,6 +152,8 @@ impl FetchRound {
     /// [ReplicaManager.scala#L1633]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1633
     /// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
     fn limit_for(&self, partition_max_bytes: i32) -> ByteLimit {
+        // The Fetch's validation rejects a negative `partition_max_bytes`.
+        debug_assert!(partition_max_bytes >= 0, "{partition_max_bytes}");
         let bytes = min(partition_max_bytes as u32, self.bytes_left);
 
         if self.has_records {
