@@ -17,7 +17,10 @@ command = "etc/worktree-services.sh up"
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.scripts]]
-filter = "package(nisshi-broker) | package(nisshi-storage-sql) | package(nisshi-schema)"
+filter = """
+package(nisshi-broker) | package(nisshi-storage-sql) | package(nisshi-schema)
+  | (package(nisshi-storage-dynostore) & test(/^dynostore::tests::[a-z_]+_s3::/))
+"""
 setup = "worktree-services"
 
 # Each Iceberg test runs a query engine and opens connections to the catalog
@@ -82,14 +85,16 @@ default-filter = "test(/^topic_admin::topic_lifecycle::/) | test(=every_test_fil
 # NISSHI_WORKTREE_SERVICES=0, so the worktree-services setup script, which this
 # profile inherits from the default one, starts nothing. It leaves out the
 # nisshi-broker tests that need Postgres (the `pg` modules, and three files that
-# use Postgres throughout) and the nisshi-schema tests that need the Iceberg
-# catalog and MinIO. The nisshi-storage-sql Postgres tests stay in, because they
-# skip themselves when Postgres is down. CI runs the full suite.
+# use Postgres throughout), the nisshi-schema tests that need the Iceberg
+# catalog and MinIO, and the nisshi-storage-dynostore tests that need MinIO. The
+# nisshi-storage-sql Postgres tests stay in, because they skip themselves when
+# Postgres is down. CI runs the full suite.
 [profile.fast]
 default-filter = """
 not (
     (binary_id(nisshi-broker::it) & test(/(^|::)pg(_|::|$)|^produce_idempotent_race::|^produce_row_locks::|^authentication_storage::postgres_starts$/))
   | binary_id(nisshi-schema::berg)
   | (package(nisshi-schema) & kind(lib) & test(/^lake::berg::tests::create_(duplicate_)?(namespace|table)$/))
+  | (package(nisshi-storage-dynostore) & test(/^dynostore::tests::[a-z_]+_s3::/))
 )
 """
