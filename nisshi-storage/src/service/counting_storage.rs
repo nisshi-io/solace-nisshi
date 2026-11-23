@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A [`Storage`] for service tests that holds topic names and their configs, counts the `metadata` calls that
-//! list every topic and those that look up named topics, records the topics that it creates and
-//! deletes, records each batch that it is asked to produce, and answers the broker's own
-//! registration.
+//! A [`Storage`] for service tests that holds topic names and their configs, counts the
+//! `metadata` calls that list every topic and those that look up named topics, records the topics
+//! that it creates and deletes, records each batch that it is asked to produce, and answers the
+//! broker's own registration.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -292,9 +292,9 @@ impl CountingStorage {
         }
     }
 
-    /// Returns this storage, with each topic that it holds having the configs `configs`, each a
-    /// name and its value. A read of named configs answers only the configs of those names, as the
-    /// libSQL, Turso and dynostore engines do, and a read of every config answers all of them.
+    /// Returns this storage, with every topic that it holds answering `configs`, each a name and
+    /// its value. A read of named configs answers only the configs of those names, as an engine
+    /// that filters by name does, and a read of every config answers all of them.
     pub(crate) fn with_topic_configs(self, configs: &[(&str, &str)]) -> Self {
         Self {
             topic_configs: configs

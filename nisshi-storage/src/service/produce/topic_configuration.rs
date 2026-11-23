@@ -233,7 +233,10 @@ mod tests {
             topic_config::LAKE_SINK,
             topic_config::SCHEMA_VALIDATION,
         ] {
-            assert!(keys.iter().any(|key| key == name), "{name}");
+            assert!(
+                keys.iter().any(|key| key == name),
+                "the read did not name {name}; it named {keys:?}"
+            );
         }
     }
 }
