@@ -277,18 +277,19 @@ pub use service::{
     DescribeUserScramCredentialsService, FetchService, FetchValidationLayer,
     FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, KnownTopics, LIST_OFFSETS_CONCURRENCY, ListGroupsService,
-    ListOffsetsService, ListPartitionReassignmentsService, MAX_SCRAM_ITERATIONS,
-    MIN_SCRAM_ITERATIONS, MalformedCreateTopicsRequest, MalformedFetchRequest, MetadataService,
-    OutcomeSender, PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
-    ProduceRequestValidationService, ProduceService, ProduceTopic, ProduceTopicService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, SchemaValidationLayer, SchemaValidationService, StillRunning,
-    StorePartitionService, StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
-    UnknownPartitionLayer, UnknownPartitionService, ValidatedCreateTopicsRequest,
-    ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic, bounded_channel,
-    describe_groups_response, inflate_produced, list_groups_response, wait_for_detached_writes,
+    ListOffsetsService, ListPartitionReassignmentsService, MalformedCreateTopicsRequest,
+    MalformedFetchRequest, MetadataService, OutcomeSender, PRODUCE_CONCURRENCY, PartitionProduce,
+    ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceService, ProduceTopic,
+    ProduceTopicService, Request, RequestChannelService, RequestLayer, RequestReceiver,
+    RequestSender, RequestService, RequestStorageService, Response, SchemaValidationLayer,
+    SchemaValidationService, StillRunning, StorePartitionService, StoredPartitions, TimestampLayer,
+    TimestampService, TopicConfiguration, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService, UnknownPartitionLayer, UnknownPartitionService,
+    ValidatedCreateTopicsRequest, ValidatedFetchRequest, ValidatedProduceRequest, ValidatedTopic,
+    bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
+    wait_for_detached_writes,
 };
+pub use service::{MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS};
 
 #[cfg(feature = "dynostore")]
 mod os;

@@ -169,14 +169,17 @@ where
             //
             // [kafka-range-check]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L284-L296
             //
-            // Two differences from Kafka remain, because it answers DUPLICATE_RESOURCE for a user
-            // that the request names twice, and runs none of that user's items:
+            // Two differences from Kafka remain. Kafka answers once per user, and this loop
+            // answers once per upsertion. Kafka answers DUPLICATE_RESOURCE for a user that the
+            // request names more than once, and runs none of that user's items. This loop
+            // handles such a user as follows:
             //
-            // - A deletion and an out-of-range upsertion for one user: this service deletes the
-            //   credential and refuses the new one, so a delete-then-add rotation with a bad
-            //   count ends with no credential.
-            // - A valid upsertion followed by a refused one for one user: this service answers
-            //   both with the refused message.
+            // - A deletion and an out-of-range upsertion: this service deletes the credential
+            //   and refuses the new one, so a delete-then-add rotation with a bad count ends
+            //   with no credential.
+            // - A valid upsertion and a refused one: this service answers both with the refused
+            //   message.
+            // - Two valid upsertions with different mechanisms: this service stores both.
             let refusals = iterations_refusals(&upsertions);
 
             for upsertion in upsertions {
