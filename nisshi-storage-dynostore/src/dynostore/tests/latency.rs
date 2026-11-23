@@ -14,7 +14,7 @@
 
 use std::{
     fmt::{Debug, Display},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use crate::dynostore::{DynoStore, tests::init_tracing};
@@ -41,7 +41,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tracing::{debug, instrument};
 use url::Url;
 
@@ -480,7 +480,7 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(RequestInput {
             request: FetchRequest::default()
@@ -501,7 +501,7 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
             extensions: extensions.clone(),
         })
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > LATENCY_INTRODUCED,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
@@ -732,7 +732,7 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency_reads_every_batch() -> Result<
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(RequestInput {
             request: FetchRequest::default()
@@ -753,7 +753,7 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency_reads_every_batch() -> Result<
             extensions: extensions.clone(),
         })
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > LATENCY_INTRODUCED,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
@@ -881,7 +881,7 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency_reads_every_batch() -> Result<
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(RequestInput {
             request: FetchRequest::default()
@@ -902,7 +902,7 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency_reads_every_batch() -> Result<
             extensions: extensions.clone(),
         })
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > LATENCY_INTRODUCED,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
@@ -1022,7 +1022,7 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(
             FetchRequest::default()
@@ -1041,7 +1041,7 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
         )
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > LATENCY_INTRODUCED,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
@@ -1164,7 +1164,7 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(
             FetchRequest::default()
@@ -1184,7 +1184,7 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
         )
         .await?;
 
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > MAX_WAIT,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
@@ -1307,7 +1307,7 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(
             FetchRequest::default()
@@ -1326,7 +1326,7 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
         )
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
     assert!(
         elapsed > LATENCY_INTRODUCED,
         "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
@@ -1466,7 +1466,7 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() ->
         assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
     }
 
-    let started_at = SystemTime::now();
+    let started_at = Instant::now();
     let response = fetch
         .serve(
             FetchRequest::default()
@@ -1485,7 +1485,7 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait_reads_up_to_max_bytes() ->
                 .max_wait_ms(MAX_WAIT.as_millis() as i32),
         )
         .await?;
-    let elapsed = started_at.elapsed()?;
+    let elapsed = started_at.elapsed();
 
     assert!(
         elapsed > LATENCY_INTRODUCED,
