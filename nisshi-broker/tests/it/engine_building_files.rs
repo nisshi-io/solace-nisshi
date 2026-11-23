@@ -115,6 +115,7 @@ const TESTS_THE_ENGINE: &[&str] = &[
     "produce_idempotent_sequence_wrap",
     "produce_inflated",
     "replication_factor",
+    "storage_describe_config_keys",
     "storage_group_version",
     "topic",
     "topic_config_aliases",
