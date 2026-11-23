@@ -22,20 +22,20 @@ use nisshi_sans_io::{
 use rama::Service;
 use rsasl::mechanisms::scram::tools::derive_keys;
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use tracing::{debug, instrument, warn};
 
 /// The smallest iteration count in a SCRAM-SHA-256 or SCRAM-SHA-512 credential that
 /// [Kafka 3.9.1 accepts][kafka-minimum].
 ///
 /// [kafka-minimum]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/scram/internals/ScramMechanism.java#L32-L33
-const MIN_SCRAM_ITERATIONS: i32 = 4096;
+pub const MIN_SCRAM_ITERATIONS: i32 = 4096;
 
 /// The largest iteration count in a SCRAM-SHA-256 or SCRAM-SHA-512 credential that
 /// [Kafka 3.9.1 accepts][kafka-maximum].
 ///
 /// [kafka-maximum]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L58
-const MAX_SCRAM_ITERATIONS: i32 = 16384;
+pub const MAX_SCRAM_ITERATIONS: i32 = 16384;
 
 /// Returns Kafka's message for an iteration count outside `MIN_SCRAM_ITERATIONS` to
 /// `MAX_SCRAM_ITERATIONS`, and `None` for a count inside it.
@@ -58,17 +58,23 @@ fn iterations_refusals(upsertions: &[ScramCredentialUpsertion]) -> BTreeMap<Stri
     let mut refusals = BTreeMap::new();
 
     for upsertion in upsertions {
-        if ScramMechanism::try_from(upsertion.mechanism).is_err() {
+        let Ok(mechanism) = ScramMechanism::try_from(upsertion.mechanism) else {
             continue;
-        }
+        };
 
-        if let Some(message) = unacceptable_iterations_message(upsertion.iterations) {
+        let Some(message) = unacceptable_iterations_message(upsertion.iterations) else {
+            continue;
+        };
+
+        if let Entry::Vacant(refusal) = refusals.entry(upsertion.name.clone()) {
             warn!(
+                user = upsertion.name.as_str(),
+                ?mechanism,
                 iterations = upsertion.iterations,
                 "iteration count out of range, answering UNACCEPTABLE_CREDENTIAL"
             );
 
-            _ = refusals.entry(upsertion.name.clone()).or_insert(message);
+            _ = refusal.insert(message);
         }
     }
 
@@ -163,10 +169,14 @@ where
             //
             // [kafka-range-check]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L284-L296
             //
-            // Two differences from Kafka remain. Kafka answers once per user, and this loop
-            // answers once per upsertion. Kafka answers DUPLICATE_RESOURCE for a user that the
-            // request names more than once, in any mix of deletions and upsertions, and runs none
-            // of that user's items. This loop runs each item of such a user by its own rules.
+            // Two differences from Kafka remain, because it answers DUPLICATE_RESOURCE for a user
+            // that the request names twice, and runs none of that user's items:
+            //
+            // - A deletion and an out-of-range upsertion for one user: this service deletes the
+            //   credential and refuses the new one, so a delete-then-add rotation with a bad
+            //   count ends with no credential.
+            // - A valid upsertion followed by a refused one for one user: this service answers
+            //   both with the refused message.
             let refusals = iterations_refusals(&upsertions);
 
             for upsertion in upsertions {
@@ -507,6 +517,90 @@ mod tests {
             ErrorCode::try_from(results[0].error_code)?
         );
         assert_refused(&results[1], "alice", "Too few iterations")?;
+        Ok(())
+    }
+
+    /// The same user and mechanism named twice is not Kafka's DUPLICATE_RESOURCE here: both
+    /// items get the refused message, and neither reaches storage.
+    #[tokio::test]
+    async fn the_same_user_and_mechanism_twice_with_one_refused_count_refuses_both() -> Result<()> {
+        let results = serve(vec![
+            upsertion("alice", SCRAM_SHA_256, 4095),
+            upsertion("alice", SCRAM_SHA_256, 8192),
+        ])
+        .await?;
+
+        assert_eq!(2, results.len());
+        assert_refused(&results[0], "alice", "Too few iterations")?;
+        assert_refused(&results[1], "alice", "Too few iterations")?;
+        Ok(())
+    }
+
+    /// The fields of each WARN event that this layer saw.
+    #[derive(Clone, Default)]
+    struct Fields(std::sync::Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct Recorded(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Recorded {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            _ = self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+
+            let mut recorded = Recorded(BTreeMap::new());
+            event.record(&mut recorded);
+            self.0
+                .lock()
+                .expect("the lock is not poisoned")
+                .push(recorded.0);
+        }
+    }
+
+    /// Serves `upsertions` and returns the fields of each WARN event that the service logged.
+    async fn logged_fields(
+        upsertions: Vec<ScramCredentialUpsertion>,
+    ) -> Result<Vec<BTreeMap<String, String>>> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let fields = Fields::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(fields.clone()));
+
+        _ = serve(upsertions).await?;
+
+        let logged = fields.0.lock().expect("the lock is not poisoned").clone();
+        Ok(logged)
+    }
+
+    #[tokio::test]
+    async fn a_user_with_two_refused_upsertions_is_logged_once_with_the_first_refusal() -> Result<()>
+    {
+        let logged = logged_fields(vec![
+            upsertion("alice", SCRAM_SHA_256, 100),
+            upsertion("alice", SCRAM_SHA_512, 20000),
+            upsertion("bob", SCRAM_SHA_512, 20000),
+        ])
+        .await?;
+
+        assert_eq!(2, logged.len(), "{logged:?}");
+        assert_eq!(Some("\"alice\""), logged[0].get("user").map(String::as_str));
+        assert_eq!(
+            Some("Scram256"),
+            logged[0].get("mechanism").map(String::as_str)
+        );
+        assert_eq!(Some("100"), logged[0].get("iterations").map(String::as_str));
+        assert_eq!(Some("\"bob\""), logged[1].get("user").map(String::as_str));
         Ok(())
     }
 }

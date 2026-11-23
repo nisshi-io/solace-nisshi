@@ -58,7 +58,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-pub use alter_user_scram_credentials::AlterUserScramCredentialsService;
+pub use alter_user_scram_credentials::{
+    AlterUserScramCredentialsService, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS,
+};
 use async_trait::async_trait;
 pub use consumer_group_describe::ConsumerGroupDescribeService;
 pub use create_acls::CreateAclsService;
