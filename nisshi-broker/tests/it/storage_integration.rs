@@ -28,13 +28,11 @@ nisshi_storage_integration_test::storage_integration_tests! {
     without: [not_on_in_memory],
 }
 
-// No reason is recorded for why lite leaves out `cg_static`.
 #[cfg(feature = "libsql")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: lite,
     storage: crate::common::lite_storage,
     before_each: crate::common::init_tracing,
-    without: [cg_static],
 }
 
 #[cfg(feature = "postgres")]
@@ -65,10 +63,11 @@ nisshi_storage_integration_test::storage_integration_tests! {
     ],
 }
 
-// Turso runs only some of the suite until #866 is done. The `offset` area, which holds
-// `offset_fetch_commit_metadata`, and the files `txn_offset_fetch_commit_metadata` and
-// `offset_fetch_require_stable` wait for #866. No reason is recorded for the other areas, files
-// and groups in this list.
+// Turso leaves out every name in this list until #866 is done. Nisshi has not run these areas,
+// files and groups on Turso, so the list records no known failure. When a file passes on Turso,
+// remove its name.
+//
+// [#866]: https://github.com/nisshi-io/solace-nisshi/issues/866
 #[cfg(feature = "turso")]
 nisshi_storage_integration_test::storage_integration_tests! {
     engine: turso,
