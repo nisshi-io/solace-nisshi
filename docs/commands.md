@@ -215,9 +215,10 @@ $ nisshi perf taxi produce --duration 5s --output json
 - `perf produce` prints an `interval` object each time its metrics are exported, every 60 seconds
   unless `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds) says otherwise, and a `summary` last, even
   when the run is shorter than an interval. `elapsed_ms`, `records_sent`, `bytes_sent` and the rates
-  of an `interval` are for that interval, and the summary's are for the whole run. The rates are
-  `null` when no time has elapsed. `latency_ms` is for the run so far in both, and is `null` until
-  a request was answered.
+  of an `interval` are for that interval, and the summary's are for the whole run. `records_sent`
+  counts the records of the batches the broker accepted, and `bytes_sent` counts the bytes written
+  to the broker, including requests it refused. The rates are `null` when no time has elapsed.
+  `latency_ms` is for the run so far in both, and is `null` until a request was answered.
 - Both print the summary whenever a producer started, so also after a refusal (a refused login
   or a refused produce request), with zeros if nothing was accepted. Neither prints anything when
   the tool fails before that: an unreachable broker, a missing schema.

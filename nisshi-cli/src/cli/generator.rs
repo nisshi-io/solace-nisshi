@@ -68,10 +68,11 @@ pub(super) struct Arg {
     #[arg(hide_env_values = true, long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     otlp_endpoint_url: Option<EnvVarExp<Url>>,
 
-    /// What to print on stdout: `table` prints nothing, `json` prints one JSON object when the run
-    /// ends: {"type":"summary","elapsed_ms","batches_produced","records_produced"}, counting the
-    /// batches that the broker accepted. A refused produce request ends the run with exit status 4
-    /// and the summary is printed all the same
+    /// What to print on stdout: nothing (`table`) or one JSON summary when the run ends (`json`)
+    ///
+    /// `json` prints {"type":"summary","elapsed_ms","batches_produced","records_produced"},
+    /// counting the batches that the broker accepted. A refused produce request ends the run with
+    /// exit status 4 and the summary is printed all the same
     #[arg(long, value_enum, default_value_t = Output::Table)]
     output: Output,
 

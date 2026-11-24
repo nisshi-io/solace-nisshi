@@ -694,10 +694,9 @@ impl Info {
         (seconds > 0.0).then(|| self.records_sent() as f64 / seconds)
     }
 
-    /// The report as one line of JSON. Unlike the text, it divides by the elapsed time with its
-    /// fraction, and has `null` where there is nothing to divide by or nothing was sampled,
-    /// never NaN or infinity. The latency is over the run so far, not over the interval: a
-    /// minimum or a maximum can't be taken apart by interval.
+    /// The report as one line of JSON. It has `null` where there is nothing to divide by or
+    /// nothing was sampled, never NaN or infinity. The latency is over the run so far, not over
+    /// the interval: a minimum or a maximum can't be taken apart by interval.
     fn json_line(&self, kind: ReportKind) -> String {
         let seconds = self.elapsed().as_secs_f64();
         let per_second = |count: u64| (seconds > 0.0).then(|| count as f64 / seconds);
@@ -720,12 +719,14 @@ impl Info {
         .to_string()
     }
 
-    fn bandwidth(&self) -> Byte {
-        self.bytes_sent()
-            .checked_div(self.elapsed().as_secs())
-            .map_or(Byte::with_iec_prefix(0, Prefix::None), |throughput| {
-                Byte::with_iec_prefix(throughput, Prefix::None)
-            })
+    /// The bytes per second over the elapsed time with its fraction, or `None` when no time has
+    /// elapsed.
+    fn bandwidth(&self) -> Option<Byte> {
+        let seconds = self.elapsed().as_secs_f64();
+
+        (seconds > 0.0).then(|| {
+            Byte::with_iec_prefix((self.bytes_sent() as f64 / seconds) as u64, Prefix::None)
+        })
     }
 }
 
@@ -752,12 +753,15 @@ impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "elapsed: {}, {} records sent, {} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
+            "elapsed: {}, {} records sent, {} records/s, ({}), latency: {} min, {:.1}ms avg, {} max",
             self.elapsed().format_duration(),
             self.records_sent(),
             self.records_sent_per_second()
                 .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
-            self.bandwidth().format_iec(),
+            self.bandwidth().map_or_else(
+                || "-".to_owned(),
+                |bandwidth| format!("{}/s", bandwidth.format_iec())
+            ),
             self.current
                 .latency
                 .min
@@ -949,10 +953,12 @@ mod tests {
         let mut info = Info::new(now);
         info.current.observation.taken_at = now;
         info.current.observation.record_count = 5;
+        info.current.observation.bytes_sent = 500;
 
         assert_eq!(None, info.records_sent_per_second());
+        assert_eq!(None, info.bandwidth().map(|bandwidth| bandwidth.0));
         let line = info.to_string();
-        assert!(line.contains("5 records sent, - records/s"), "{line}");
+        assert!(line.contains("5 records sent, - records/s, (-)"), "{line}");
         assert!(!line.contains("NaN") && !line.contains("inf"), "{line}");
     }
 
@@ -962,8 +968,14 @@ mod tests {
         let mut info = Info::new(now.checked_sub(Duration::from_millis(500)).unwrap());
         info.current.observation.taken_at = now;
         info.current.observation.record_count = 50;
+        info.current.observation.bytes_sent = 51_200;
 
         assert_eq!(Some(100.0), info.records_sent_per_second());
+        // Whole seconds would round the half second down to zero and show 0 B/s beside a
+        // records/s of 100.
+        assert_eq!(Some(102_400), info.bandwidth().map(|bandwidth| bandwidth.0));
+        let line = info.to_string();
+        assert!(line.contains("100.0 records/s, (100 KiB/s)"), "{line}");
     }
 
     #[test]
@@ -1085,7 +1097,7 @@ mod tests {
         };
 
         assert_eq!(elapsed, info.elapsed());
-        assert_eq!(5_555, info.bandwidth().0);
+        assert_eq!(Some(5_555), info.bandwidth().map(|bandwidth| bandwidth.0));
         assert_eq!(Some(111f64), info.records_sent_per_second());
     }
 
@@ -1110,7 +1122,7 @@ mod tests {
         };
 
         assert_eq!(elapsed, info.elapsed());
-        assert_eq!(16_364, info.bandwidth().0);
+        assert_eq!(Some(16_364), info.bandwidth().map(|bandwidth| bandwidth.0));
         assert_eq!(Some(164f64), info.records_sent_per_second());
     }
 }

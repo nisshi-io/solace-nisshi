@@ -26,7 +26,7 @@ pub(super) enum JsonOnly {
 /// How a command prints its result, chosen with `--output`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub(super) enum Output {
-    /// Aligned columns for people to read
+    /// Text for people to read
     #[default]
     Table,
     /// JSON for scripts

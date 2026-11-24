@@ -55,13 +55,16 @@ pub(super) enum Command {
         #[arg(long, default_value = "1m", value_parser=clap::value_parser!(human_units::Duration))]
         duration: Option<human_units::Duration>,
 
-        /// How to print the report: `table` prints a line of text for each interval and one for the
-        /// run, `json` prints one JSON object on a line for each interval and a last one for the run:
-        /// {"type":"interval"|"summary","elapsed_ms","records_sent","bytes_sent",
+        /// How to print the report: a line of text (`table`) or a JSON object (`json`) for each
+        /// interval and one for the run
+        ///
+        /// `json` prints {"type":"interval"|"summary","elapsed_ms","records_sent","bytes_sent",
         /// "records_per_second","bytes_per_second","latency_ms":{"min","mean","max"}}. The rates
         /// are null when no time has elapsed and the latency is null until a request was
-        /// answered. The latency is over the run so far, not over the interval. The first
-        /// produce request that the broker refuses ends the run with exit status 4
+        /// answered. The latency is over the run so far, not over the interval. `records_sent`
+        /// counts the records of the batches the broker accepted, and `bytes_sent` counts the
+        /// bytes written to the broker, including requests it refused. The first produce
+        /// request that the broker refuses ends the run with exit status 4
         #[arg(long, value_enum, default_value_t = Output::Table)]
         output: Output,
     },
