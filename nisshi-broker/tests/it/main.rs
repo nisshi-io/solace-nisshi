@@ -128,6 +128,7 @@ pub mod storage_create_acls;
 pub mod storage_delete_acls;
 pub mod storage_describe_acls;
 pub mod storage_describe_cluster;
+pub mod storage_describe_config_keys;
 pub mod storage_describe_configs;
 pub mod storage_fetch;
 pub mod storage_group_version;
