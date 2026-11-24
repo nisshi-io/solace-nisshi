@@ -39,9 +39,9 @@
 //! # fn main() {}
 //! ```
 //!
-//! The crate's API and its test names may change in any commit. A file that moves, splits or is
-//! renamed also changes which cases a `without` name leaves out. A caller updates its call and
-//! its skip list when it moves to a newer Nisshi.
+//! The crate isn't published. Its API and its test names may change in any commit. A file that
+//! moves, splits or is renamed also changes which cases a `without` name leaves out. A caller
+//! updates its call and its skip list when it moves to a newer Nisshi.
 
 // The cases are tests, and a test fails on an unexpected value, as nisshi-broker's tests do.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

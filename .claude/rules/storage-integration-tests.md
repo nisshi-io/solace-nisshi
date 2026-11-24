@@ -9,9 +9,9 @@ paths:
 `nisshi-storage-integration-test` holds the tests of Nisshi code that runs on top of a storage
 engine, such as the group coordinator (`Controller`) or a request handler (`XxxService`). Any
 engine can run them: Nisshi runs them on its own engines in
-`nisshi-broker/tests/it/storage_integration.rs`, and an engine outside Nisshi runs them on its
-own. One question decides where a test goes: **if the test failed on someone's engine, whose code
-would the bug be in?**
+`nisshi-broker/tests/it/storage_integration.rs`, and an engine outside Nisshi can run them on its
+own (the crate isn't published; see its README). One question decides where a test goes: **if the
+test failed on someone's engine, whose code would the bug be in?**
 
 - **Nisshi's code running on the engine:** the test goes in the suite. Only Nisshi knows what that
   code expects of the engine, and every engine needs the check.

@@ -10,7 +10,9 @@ in the engine that it tests. Nisshi runs the suite on its own engines in
 `nisshi-broker/tests/it/storage_integration.rs`, and an engine outside Nisshi can run it the same
 way.
 
-The crate isn't published (`publish = false`). Depend on it through Git or a path.
+The crate isn't published (`publish = false`), and there is no plan yet to publish it. Depend on it
+through Git or a path, and take every `nisshi-*` crate from the same revision, so that your engine
+implements the `Storage` trait that the suite uses.
 
 ## Run the suite on an engine
 
