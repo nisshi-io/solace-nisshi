@@ -81,6 +81,9 @@ crc-fast.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
 # Path only, so that `cargo publish` leaves it out: the crate is not published.
+# The crate depends on `nisshi-broker`, so use it only from `tests/`, never from a unit test in
+# `src/`. A unit test is compiled into a second copy of `nisshi-broker`, and the suite's types
+# come from the first, so the two don't match.
 nisshi-storage-integration-test = { path = "../nisshi-storage-integration-test" }
 nisshi-storage-sql = { workspace = true, features = ["test-support"] }
 nisshi-storage.workspace = true
