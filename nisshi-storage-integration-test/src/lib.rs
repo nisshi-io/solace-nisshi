@@ -177,7 +177,7 @@ macro_rules! __area_consumer_group {
                     [not_on_in_memory] empty_group_id_is_not_found(storage),
                     empty_group_id_mixed_list(storage),
                     [not_on_in_memory] empty_group_id_in_mixed_list_is_not_found(storage),
-                    [not_on_turso] slash_and_empty_group_ids_are_distinct_groups(storage),
+                    slash_and_empty_group_ids_are_distinct_groups(storage),
                     [not_on_slatedb] slash_in_group_id_does_not_break_committed_offset_topitions(storage),
                     [not_on_slatedb] delete_topic_removes_offsets_of_slash_and_empty_group_ids(storage),
                 ], $config);
@@ -526,7 +526,6 @@ macro_rules! __unless_listed {
     (@search new_cg; [new_cg $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_slatedb; [not_on_slatedb $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_in_memory; [not_on_in_memory $(, $rest:ident)*]; $($item:tt)*) => {};
-    (@search not_on_turso; [not_on_turso $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search cg_dynamic; [cg_dynamic $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search cg_static; [cg_static $(, $rest:ident)*]; $($item:tt)*) => {};
     (

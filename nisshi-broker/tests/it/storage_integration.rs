@@ -63,9 +63,9 @@ nisshi_storage_integration_test::storage_integration_tests! {
     ],
 }
 
-// Turso leaves out every name in this list until #866 is done. Nisshi has not run these areas,
-// files and groups on Turso, so the list records no known failure. When a file passes on Turso,
-// remove its name.
+// Turso leaves out every name in this list until [#866] is done. Nisshi has not run these areas
+// and files on Turso, so the list records no known failure. When a file passes on Turso, remove
+// its name.
 //
 // [#866]: https://github.com/nisshi-io/solace-nisshi/issues/866
 #[cfg(feature = "turso")]
@@ -74,9 +74,7 @@ nisshi_storage_integration_test::storage_integration_tests! {
     storage: crate::common::turso_storage,
     before_each: crate::common::init_tracing,
     without: [
-        not_on_turso,
         cg_dynamic,
-        cg_static,
         consumer_group_describe,
         describe_groups,
         find_coordinator,
