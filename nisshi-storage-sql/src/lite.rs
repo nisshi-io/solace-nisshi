@@ -4192,6 +4192,10 @@ impl Storage for Delegate {
             let mut configs = vec![];
 
             while let Some(topic_configuration_select::Row { name, value }) = rows.next().await? {
+                if keys.is_some_and(|keys| !keys.is_empty() && !keys.contains(&name)) {
+                    continue;
+                }
+
                 configs.push(
                     DescribeConfigsResourceResult::default()
                         .name(name)
