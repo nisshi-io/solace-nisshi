@@ -50,7 +50,8 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   so a name shared by two areas can't leave out only one of them.
 - **Assert Kafka's behaviour.** When one of Nisshi's engines answers differently from Kafka, keep
   the Kafka assertion and tag the case `not_on_<engine>` for that engine. Write the reason at the
-  engine's call in `storage_integration.rs`. Don't loosen the assertion to accept every engine's
+  engine's call in `storage_integration.rs`, and if the case already ran on that engine, lower
+  the engine's floor in `TEST_FLOORS` there. Don't loosen the assertion to accept every engine's
   answer: the other engines would no longer pin the right one. `unknown_group_is_not_found` and
   `empty_group_id_is_not_found` in `delete_groups` show the form. When a case also checks
   something that every engine must pass, so that no engine can leave it out, it may accept more
@@ -87,6 +88,10 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   read a `mod name;` or a folder. If a list names something that is not a case of the file, fix
   or remove the entry. If the message names a missing `@search` rule, add the area's or file's
   rule to `__unless_listed!`, before the rule that steps over a name.
+- **`every_engine_gets_at_least_its_floor_of_tests`**
+  (`nisshi-broker/tests/it/storage_integration.rs`): an engine gets fewer tests than its floor in
+  `TEST_FLOORS`. If the change leaves out or removes those cases on purpose, lower the floor in the
+  same change. If not, check the engine's `without` list and the rules of `__unless_listed!`.
 - **`dependencies_include_no_engine`** (`tests/it/dependencies.rs`): remove the engine crate, or
   the engine feature of `nisshi-broker`, from the crate's `[dependencies]`.
 - **"recursion limit reached while expanding `__in_group!`"**: a long `without` list needs
