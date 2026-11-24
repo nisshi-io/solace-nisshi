@@ -21,7 +21,7 @@ name: ci
 # cap; it keeps per-push runner time and queue time down. So:
 #
 # - Tier A runs on every pull_request push: fmt, clippy, rust-version, typos,
-#   shellcheck, third-party-license, the memory leg of each compat suite,
+#   shellcheck, lock-downgrade, third-party-license, the memory leg of each compat suite,
 #   `test` on postgres:16 (the oldest version the project tests), and ci-gate.
 # - Tier B runs once per merge-queue entry (`merge_group`) and, trimmed, on
 #   push to main: the full build-storage/build-storage-lake matrix, `test` on
@@ -41,7 +41,8 @@ name: ci
 #
 # The push to main repeats a tree that the merge queue has already tested, so
 # it runs only the jobs that save a cache (see the first paragraph), plus
-# `changes`, `typos`, `shellcheck` and ci-gate. `github.ref !=
+# `changes`, `typos`, `shellcheck`, `lock-downgrade` (whose steps skip there)
+# and ci-gate. `github.ref !=
 # 'refs/heads/main'` turns off every other job. pull_request, merge_group
 # and tag runs do not have that ref, so they run what they ran before.
 # ci-gate's "Only trimmed jobs skipped on main" step names the jobs that may
@@ -675,6 +676,53 @@ jobs:
           docker build --target base --output "type=local,dest=${RUNNER_TEMP}/base" .
           find "${RUNNER_TEMP}/base/image/etc/ssl" -type f -exec cat {} + > "${RUNNER_TEMP}/image-ca-certificates.pem"
           bash .github/scripts/check-ca-bundle.sh "${RUNNER_TEMP}/image-ca-certificates.pem"
+  # Fails when the PR's Cargo.lock or fuzz/Cargo.lock moves a package or a
+  # dependency edge to a lower version than the base branch. `cargo update -p`
+  # can re-point crates that it was not asked to update at older copies
+  # already in the lockfile (rust-lang/cargo#14446). The job has no `needs` on
+  # `changes`, so it runs on every pull request. A merge-queue entry and a
+  # push to main skip its steps and pass, because the PR run already compared
+  # the lockfiles with main.
+  lock-downgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The PR's merge commit and its first parent, the base it compares with.
+          fetch-depth: 2
+      - name: Check the lockfiles for downgrades
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -I .github/scripts/check-lock-downgrade.test.py
+          # A missing base fails the job, because each git command below would
+          # otherwise read the error as "nothing to compare" and pass.
+          git rev-parse --verify --quiet 'HEAD^1^{commit}' >/dev/null || {
+            echo "::error::The checkout is not the PR's merge commit, so the check cannot find the base."
+            exit 2
+          }
+          rc=0
+          for lock in Cargo.lock fuzz/Cargo.lock; do
+            changed=0
+            git diff --quiet HEAD^1 HEAD -- "$lock" || changed=$?
+            if [ "$changed" -eq 0 ]; then continue; fi
+            if [ "$changed" -ne 1 ]; then exit 2; fi
+            # A lockfile that the PR adds or deletes has nothing to compare.
+            if [ -z "$(git ls-tree HEAD^1 -- "$lock")" ] || [ ! -f "$lock" ]; then continue; fi
+            git show "HEAD^1:$lock" > "$RUNNER_TEMP/base.lock"
+            r=0
+            python3 -I .github/scripts/check-lock-downgrade.py "$RUNNER_TEMP/base.lock" "$lock" || r=$?
+            if [ "$r" -eq 1 ]; then
+              echo "::error file=$lock::$lock moves the dependencies above to lower versions than main. Point each edge back at main's version, as .github/AGENTS.md describes."
+            fi
+            # Exit 2 (could not run) outranks exit 1 (downgrade found).
+            if [ "$r" -gt "$rc" ]; then rc=$r; fi
+          done
+          exit "$rc"
   third-party-license:
     if: needs.changes.outputs.rust == 'true'
     needs: [changes]
@@ -1188,6 +1236,7 @@ jobs:
       - typos
       - shellcheck
       - image-ca-certificates
+      - lock-downgrade
       - third-party-license
       - src
       - smoke

@@ -50,25 +50,16 @@ def write(directory, name, text):
     return path
 
 
-def run(*args, body=""):
+def run(*args):
     process = subprocess.run(
-        [sys.executable, "-I", CHECK, *args], capture_output=True, text=True, env={"PR_BODY": body}
+        [sys.executable, "-I", CHECK, *args], capture_output=True, text=True, env={}
     )
     return process.returncode, process.stdout.splitlines()
 
 
-def check(base, head, body=""):
+def check(base, head):
     with tempfile.TemporaryDirectory() as d:
-        return run(write(d, "base.lock", base), write(d, "head.lock", head), body=body)
-
-
-def restored(base, head):
-    """Returns the head lockfile after `--restore`, and the exit code of that run."""
-    with tempfile.TemporaryDirectory() as d:
-        base_path, head_path = write(d, "base.lock", base), write(d, "head.lock", head)
-        code, _ = run("--restore", base_path, head_path)
-        with open(head_path, newline="") as f:
-            return code, f.read()
+        return run(write(d, "base.lock", base), write(d, "head.lock", head))
 
 
 class Refusals(unittest.TestCase):
@@ -129,21 +120,8 @@ class Refusals(unittest.TestCase):
         head = lock(*WINDOWS_SYS, ("rustix", "1.1.7", ["windows-sys 0.52.0"]))
         self.assertEqual(check(REPOINTED_BASE, head), (1, [REPOINTED_LINE]))
 
-    def test_acknowledgement_of_another_crate(self):
-        self.assertEqual(
-            check(REPOINTED_BASE, REPOINTED_HEAD, "allow-lock-downgrade: windows"), (1, [REPOINTED_LINE])
-        )
-
-    def test_acknowledgement_inside_a_line(self):
-        body = "Do not write this: allow-lock-downgrade: windows-sys"
-        self.assertEqual(check(REPOINTED_BASE, REPOINTED_HEAD, body), (1, [REPOINTED_LINE]))
-
 
 class Passes(unittest.TestCase):
-    def test_acknowledged_downgrade_with_crlf_line_ends(self):
-        body = "Why.\r\n\r\nallow-lock-downgrade: windows-sys\r\n"
-        self.assertEqual(check(REPOINTED_BASE, REPOINTED_HEAD, body), (0, []))
-
     def test_clean_upgrade(self):
         base = lock(("tokio", "1.53.3", []), ("app", "0.1.0", ["tokio"]))
         head = lock(("tokio", "1.54.1", []), ("app", "0.1.0", ["tokio"]))
@@ -206,69 +184,6 @@ class CouldNotRun(unittest.TestCase):
     def test_wrong_argument_count(self):
         self.assertEqual(run("only-one.lock")[0], 2)
 
-    def test_restore_with_an_invalid_lockfile(self):
-        self.assertEqual(restored("not = [toml", lock())[0], 2)
-
-
-class Restore(unittest.TestCase):
-    def test_puts_each_downgraded_edge_back(self):
-        base = lock(*WINDOWS_SYS, ("rustix", "1.1.6", ["windows-sys 0.61.2"]), ("tokio", "1.53.3", []))
-        head = lock(*WINDOWS_SYS, ("rustix", "1.1.6", ["windows-sys 0.52.0"]), ("tokio", "1.54.1", []))
-        want = lock(*WINDOWS_SYS, ("rustix", "1.1.6", ["windows-sys 0.61.2"]), ("tokio", "1.54.1", []))
-        self.assertEqual(restored(base, head), (0, want))
-
-    def test_keeps_an_edge_whose_base_copy_is_gone(self):
-        # The head holds windows-sys 0.52.0 and 0.60.0, so the edge carries a version that
-        # the restore could match. The base's 0.61.2 is gone, so the edge stays, and the
-        # restore reports the downgrade that it left.
-        base = lock(*WINDOWS_SYS, ("rustix", "1.1.6", ["windows-sys 0.61.2"]))
-        head = lock(("windows-sys", "0.52.0", []), ("windows-sys", "0.60.0", []),
-                    ("rustix", "1.1.6", ["windows-sys 0.60.0"]))
-        self.assertEqual(restored(base, head), (1, head))
-
-    def test_restores_only_the_lower_of_two_renamed_copies(self):
-        copies = [("indexmap", "1.9.2", []), ("indexmap", "1.9.3", []), ("indexmap", "2.14.2", [])]
-        base = lock(*copies, ("serde_with", "3.24.0", ["indexmap 1.9.3", "indexmap 2.14.2"]))
-        head = lock(*copies, ("serde_with", "3.24.0", ["indexmap 1.9.2", "indexmap 2.14.2"]))
-        self.assertEqual(restored(base, head), (0, base))
-
-    def test_restores_two_edges_to_one_crate_in_one_pass(self):
-        # The first edge moves back to 1.0.0, which is the version of the second edge
-        # before it moves back to 2.0.0, so the edits must not run one after the other.
-        copies = [("x", "0.9.0", []), ("x", "1.0.0", []), ("x", "2.0.0", [])]
-        base = lock(*copies, ("a", "1.0.0", ["x 1.0.0", "x 2.0.0"]))
-        head = lock(*copies, ("a", "1.0.0", ["x 0.9.0", "x 1.0.0"]))
-        self.assertEqual(restored(base, head), (0, base))
-
-    def test_keeps_the_source_of_an_edge(self):
-        git = "git+https://example.com/windows-sys#0123abc"
-        copies = [("windows-sys", "0.52.0", [], git), ("windows-sys", "0.61.2", [], git),
-                  ("windows-sys", "0.61.2", [], REGISTRY)]
-        base = lock(*copies, ("rustix", "1.1.6", [f"windows-sys 0.61.2 ({git})"]))
-        head = lock(*copies, ("rustix", "1.1.6", [f"windows-sys 0.52.0 ({git})"]))
-        self.assertEqual(restored(base, head), (0, base))
-
-    def test_leaves_a_dependency_whose_name_starts_with_the_crate_name(self):
-        copies = [*WINDOWS_SYS, ("windows-sys-extra", "0.52.0", []), ("windows-sys-extra", "0.61.2", [])]
-        base = lock(*copies, ("rustix", "1.1.6", ["windows-sys 0.61.2", "windows-sys-extra 0.52.0"]))
-        head = lock(*copies, ("rustix", "1.1.6", ["windows-sys 0.52.0", "windows-sys-extra 0.52.0"]))
-        self.assertEqual(restored(base, head), (0, base))
-
-    def test_skips_a_package_that_only_the_head_has(self):
-        base = lock(*WINDOWS_SYS, ("rustix", "1.1.6", ["windows-sys 0.61.2"]))
-        head = lock(*WINDOWS_SYS, ("new", "0.1.0", ["windows-sys 0.52.0"]),
-                    ("rustix", "1.1.6", ["windows-sys 0.52.0"]))
-        want = lock(*WINDOWS_SYS, ("new", "0.1.0", ["windows-sys 0.52.0"]),
-                    ("rustix", "1.1.6", ["windows-sys 0.61.2"]))
-        self.assertEqual(restored(base, head), (0, want))
-
-    def test_keeps_crlf_line_ends(self):
-        head = REPOINTED_HEAD.replace("\n", "\r\n")
-        self.assertEqual(restored(REPOINTED_BASE, head), (0, REPOINTED_BASE.replace("\n", "\r\n")))
-
-    def test_keeps_a_missing_final_line_end(self):
-        self.assertEqual(restored(REPOINTED_BASE, REPOINTED_HEAD.rstrip("\n")),
-                         (0, REPOINTED_BASE.rstrip("\n")))
 
 
 if __name__ == "__main__":

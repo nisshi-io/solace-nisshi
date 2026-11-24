@@ -6,22 +6,15 @@ copies already in the lockfile, and it reports none of it
 (https://github.com/rust-lang/cargo/issues/14446). Dependabot runs the same command.
 
 Usage: check-lock-downgrade.py BASE_LOCK HEAD_LOCK
-       check-lock-downgrade.py --restore BASE_LOCK HEAD_LOCK
-Env:   PR_BODY  the pull request description. Each `allow-lock-downgrade: <crate>` line in
-                it accepts every downgrade of that crate.
-Exit:  0 no unacknowledged downgrade, 1 at least one, 2 the check could not run.
+Exit:  0 no downgrade, 1 at least one, 2 the check could not run.
 
-The check prints one line per unacknowledged downgrade on stdout, and nothing else.
-`--restore` rewrites HEAD_LOCK: it points each downgraded edge back at the base version, if
-HEAD_LOCK still holds that copy. It then prints each downgrade that is left, which needs a
-person, and exits 1 if one is left.
+The check prints one line per downgrade on stdout, and nothing else.
 Test:  python3 -I .github/scripts/check-lock-downgrade.test.py
 """
 
-import os
-import re
 import sys
 from collections import defaultdict
+import re
 
 try:
     import tomllib
@@ -30,13 +23,11 @@ except ImportError:
     print("::error::check-lock-downgrade.py needs Python 3.11 or later", file=sys.stderr)
     sys.exit(2)
 
-ALLOW = re.compile(r"^[ \t]*allow-lock-downgrade:[ \t]*([A-Za-z0-9_-]+)[ \t]*$", re.M)
 # The check prints names and versions from the head lockfile, which the pull request
 # controls. These patterns reject any other character, so that a printed line cannot hold a
 # line break and reach the runner as a workflow command.
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
-DEPENDENCY_LINE = re.compile(r' "([A-Za-z0-9_-]+) ([0-9A-Za-z.+-]+)( \([^)]*\))?",')
 
 
 def version_key(version):
@@ -100,21 +91,21 @@ def newest(versions):
 
 
 def downgrades(base, head):
-    """Returns (crate, message) for each downgrade from the base to the head lockfile."""
+    """Returns one sorted message for each downgrade from the base to the head lockfile."""
     (base_versions, base_edges), (head_versions, head_edges) = base, head
     found = set()
     for name in base_versions.keys() & head_versions.keys():
         before, after = newest(base_versions[name]), newest(head_versions[name])
         if version_key(after) < version_key(before):
-            found.add((name, f"{name}: {before} -> {after}"))
+            found.add(f"{name}: {before} -> {after}")
             continue
         for before, after in by_line(base_versions[name], head_versions[name]):
             if version_key(after) < version_key(before):
-                found.add((name, f"{name}: {before} -> {after}"))
+                found.add(f"{name}: {before} -> {after}")
     for owner in base_edges.keys() & head_edges.keys():
         for dep, before, after in edge_downgrades(base_edges[owner], head_edges[owner]):
-            found.add((dep, f"{dep}: {before} -> {after} (edge from {owner[0]})"))
-    return sorted(found, key=lambda f: f[1])
+            found.add(f"{dep}: {before} -> {after} (edge from {owner[0]})")
+    return sorted(found)
 
 
 def by_line(before, after):
@@ -145,56 +136,19 @@ def edge_downgrades(base_deps, head_deps):
                 yield dep, b, h
 
 
-def restore(base_path, head_path):
-    """Points each downgraded edge in the head lockfile back at the base version.
-
-    Returns the downgrades that are left.
-    """
-    base = load(base_path)
-    head_versions, head_edges = load(head_path)
-    with open(head_path, newline="") as f:
-        text = f.read()
-    line_end = "\r\n" if "\r\n" in text else "\n"
-    # The edit works on the text, not on parsed TOML, so that every other byte stays as cargo
-    # wrote it.
-    blocks = text.replace("\r\n", "\n").split("\n[[package]]\n")
-    for i, block in enumerate(blocks[1:], 1):
-        owner = owner_key(tomllib.loads(block))
-        if owner not in base[1]:
-            continue
-        moves = {(dep, after): before
-                 for dep, before, after in edge_downgrades(base[1][owner], head_edges[owner])
-                 if before in head_versions[dep]}
-        lines = block.split("\n")
-        # Each line changes at most once, so that one edge's base version does not match the
-        # next edit, when it equals the head version of another edge to the same crate.
-        for j, line in enumerate(lines):
-            match = DEPENDENCY_LINE.fullmatch(line)
-            if match and (match[1], match[2]) in moves:
-                lines[j] = f' "{match[1]} {moves[match[1], match[2]]}{match[3] or ""}",'
-        blocks[i] = "\n".join(lines)
-    with open(head_path, "w", newline="") as f:
-        f.write("\n[[package]]\n".join(blocks).replace("\n", line_end))
-    return downgrades(base, load(head_path))
-
-
 def main(argv):
-    restoring = len(argv) == 4 and argv[1] == "--restore"
-    if not restoring and len(argv) != 3:
+    if len(argv) != 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    base_path, head_path = argv[-2:]
     try:
-        found = restore(base_path, head_path) if restoring else downgrades(load(base_path), load(head_path))
+        found = downgrades(load(argv[1]), load(argv[2]))
     except Exception as e:
         # Any failure is "could not run" (2), never "downgrade found" (1).
         print(f"::error::check-lock-downgrade.py cannot read the lockfiles: {e!r}", file=sys.stderr)
         return 2
-    allowed = set() if restoring else set(ALLOW.findall(os.environ.get("PR_BODY", "").replace("\r", "")))
-    refused = [message for crate, message in found if crate not in allowed]
-    for message in refused:
+    for message in found:
         print(message)
-    return 1 if refused else 0
+    return 1 if found else 0
 
 
 if __name__ == "__main__":
