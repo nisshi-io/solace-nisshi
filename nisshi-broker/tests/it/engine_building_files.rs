@@ -21,13 +21,22 @@
 
 use std::{collections::BTreeSet, fs, io, path::Path};
 
-/// Text that shows that a file builds a concrete engine: Nisshi's engine builders in `common`,
-/// the storage and broker builders, the engine crates, and the engines' URL schemes.
+use proc_macro2::{Ident, TokenStream, TokenTree};
+use syn::{
+    Attribute, LitStr, Macro, Meta, MetaList, Path as SynPath, PathSegment,
+    visit::{self, Visit},
+};
+
+/// Names that show that a file builds a concrete engine: Nisshi's engine builders in `common`,
+/// the engine factories, and the engine crates. A name counts when an identifier in the
+/// code contains it, as `spawn_broker_on` contains `spawn_broker`, and not when it is only in a
+/// comment. A longer name counts because a missed file passes silently, and a false match only
+/// asks for the file to be listed.
 ///
 /// When a helper in `common` builds an engine, add its name here. This test reads only the files
 /// directly in `tests/it`, so it finds a call of the helper, and it does not find the engine that
 /// the helper builds.
-const ENGINE_BUILDERS: &[&str] = &[
+const ENGINE_NAMES: &[&str] = &[
     "StorageType",
     "storage_container",
     "memory_storage",
@@ -36,14 +45,26 @@ const ENGINE_BUILDERS: &[&str] = &[
     "postgres_storage",
     "turso_storage",
     "EngineFactory",
-    "StorageContainer::builder",
-    "Broker::builder",
-    "Broker::<",
     "spawn_broker",
     "nisshi_storage_dynostore",
     "nisshi_storage_null",
     "nisshi_storage_slatedb",
     "nisshi_storage_sql",
+];
+
+/// Pairs of consecutive path segments that build an engine, as in `Broker::builder`. A pair
+/// counts when the first segment ends with the listed one, as `MemoryBroker::builder` does, for
+/// the same reason as in `ENGINE_NAMES`.
+const ENGINE_PATHS: &[[&str; 2]] = &[["StorageContainer", "builder"], ["Broker", "builder"]];
+
+/// Types that build an engine when the code gives them generic arguments, as in
+/// `Broker::<G, S>::new` or in a type such as `Broker<G, S>`. A type counts when its name ends with
+/// the listed one, as in `ENGINE_PATHS`. Inside a macro call, the check sees only the form
+/// `Broker::<`.
+const ENGINE_GENERIC_TYPES: &[&str] = &["Broker"];
+
+/// URL schemes that name an engine when a string literal contains them.
+const ENGINE_URL_SCHEMES: &[&str] = &[
     "memory://",
     "null://",
     "postgres://",
@@ -202,6 +223,114 @@ const LISTS: &[&[&str]] = &[
     NO_SHARED_CASE,
 ];
 
+/// Records whether the code it visits builds a concrete engine.
+#[derive(Default)]
+struct EngineFinder {
+    found: bool,
+}
+
+impl EngineFinder {
+    fn name(&mut self, name: &str) {
+        self.found |= ENGINE_NAMES.iter().any(|listed| name.contains(listed));
+    }
+
+    fn path(&mut self, first: &str, second: &str) {
+        self.found |= ENGINE_PATHS.iter().any(|[listed_first, listed_second]| {
+            first.ends_with(listed_first) && second == *listed_second
+        });
+    }
+
+    fn generic_type(&mut self, name: &str) {
+        self.found |= ENGINE_GENERIC_TYPES
+            .iter()
+            .any(|listed| name.ends_with(listed));
+    }
+
+    fn string(&mut self, value: &str) {
+        self.found |= ENGINE_URL_SCHEMES
+            .iter()
+            .any(|scheme| value.contains(scheme));
+    }
+
+    /// Scans the tokens of a macro call, which `syn` leaves unparsed.
+    fn tokens(&mut self, stream: TokenStream) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+
+        for (index, tree) in trees.iter().enumerate() {
+            match tree {
+                TokenTree::Ident(ident) => {
+                    self.name(&ident.to_string());
+
+                    if let [TokenTree::Punct(first), TokenTree::Punct(second), next] =
+                        &trees[(index + 1).min(trees.len())..(index + 4).min(trees.len())]
+                        && first.as_char() == ':'
+                        && second.as_char() == ':'
+                    {
+                        match next {
+                            TokenTree::Ident(next) => {
+                                self.path(&ident.to_string(), &next.to_string());
+                            }
+                            TokenTree::Punct(next) if next.as_char() == '<' => {
+                                self.generic_type(&ident.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                TokenTree::Literal(literal) => {
+                    if let Ok(literal) = syn::parse_str::<LitStr>(&literal.to_string()) {
+                        self.string(&literal.value());
+                    }
+                }
+                TokenTree::Group(group) => self.tokens(group.stream()),
+                TokenTree::Punct(_) => {}
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for EngineFinder {
+    fn visit_attribute(&mut self, attribute: &'ast Attribute) {
+        // A doc comment reaches `syn` as a `doc` attribute, and its text is not code.
+        if attribute.path().is_ident("doc") {
+            return;
+        }
+
+        // The default visitor does not read the tokens of an attribute's argument list.
+        if let Meta::List(MetaList { tokens, .. }) = &attribute.meta {
+            self.tokens(tokens.clone());
+        }
+        visit::visit_attribute(self, attribute);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        self.name(&ident.to_string());
+    }
+
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        for pair in path.segments.iter().collect::<Vec<_>>().windows(2) {
+            self.path(&pair[0].ident.to_string(), &pair[1].ident.to_string());
+        }
+        visit::visit_path(self, path);
+    }
+
+    fn visit_path_segment(&mut self, segment: &'ast PathSegment) {
+        if !segment.arguments.is_none() {
+            self.generic_type(&segment.ident.to_string());
+        }
+        visit::visit_path_segment(self, segment);
+    }
+
+    fn visit_lit_str(&mut self, literal: &'ast LitStr) {
+        self.string(&literal.value());
+    }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        self.tokens(mac.tokens.clone());
+        visit::visit_macro(self, mac);
+    }
+}
+
 /// Returns the name of each file in `tests/it` that builds a concrete engine.
 fn engine_building_files() -> io::Result<BTreeSet<String>> {
     let mut files = BTreeSet::new();
@@ -216,21 +345,28 @@ fn engine_building_files() -> io::Result<BTreeSet<String>> {
             continue;
         }
 
-        // This file holds every text in `ENGINE_BUILDERS`, but it does not build an engine.
+        // This file holds every name in the lists above, but it does not build an engine.
         if stem == "engine_building_files" {
             continue;
         }
 
-        let source = fs::read_to_string(&path)?;
-        if ENGINE_BUILDERS
-            .iter()
-            .any(|builder| source.contains(builder))
+        if builds_engine(&fs::read_to_string(&path)?)
+            .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?
         {
             _ = files.insert(stem.to_owned());
         }
     }
 
     Ok(files)
+}
+
+/// Returns whether the Rust source builds a concrete engine.
+fn builds_engine(source: &str) -> syn::Result<bool> {
+    let file = syn::parse_file(source)?;
+
+    let mut finder = EngineFinder::default();
+    finder.visit_file(&file);
+    Ok(finder.found)
 }
 
 /// Each file that builds a concrete engine is on one list, so that a reviewer sees why it builds
@@ -259,9 +395,9 @@ fn every_engine_building_file_is_listed() -> io::Result<()> {
     assert!(
         stale.is_empty(),
         "tests/it/engine_building_files.rs lists files that no longer exist, or in which the check \
-         no longer finds a name from ENGINE_BUILDERS: {stale:?}. If a file still builds an engine \
-         through a new helper, add the helper's name to ENGINE_BUILDERS. If not, remove the file \
-         from its list"
+         no longer finds an engine name, path, generic type or URL scheme: {stale:?}. If a file \
+         still builds an engine through a new helper, add the helper's name to ENGINE_NAMES. If \
+         not, remove the file from its list"
     );
 
     let mut seen = BTreeSet::new();
@@ -275,5 +411,57 @@ fn every_engine_building_file_is_listed() -> io::Result<()> {
         "tests/it/engine_building_files.rs lists these files under more than one reason: {twice:?}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn longer_name_that_contains_an_engine_name_builds_an_engine() -> syn::Result<()> {
+    assert!(builds_engine(
+        "fn f() { spawn_broker_with_authentication(x); }"
+    )?);
+    Ok(())
+}
+
+#[test]
+fn path_whose_first_segment_ends_with_a_listed_one_builds_an_engine() -> syn::Result<()> {
+    assert!(builds_engine("fn f() { MemoryBroker::builder(); }")?);
+    Ok(())
+}
+
+#[test]
+fn engine_name_in_a_macro_call_builds_an_engine() -> syn::Result<()> {
+    assert!(builds_engine("engine_tests!(memory_storage);")?);
+    Ok(())
+}
+
+#[test]
+fn string_that_contains_a_url_scheme_builds_an_engine() -> syn::Result<()> {
+    assert!(builds_engine(
+        r#"const NAME: &str = "in-memory (memory://)";"#
+    )?);
+    Ok(())
+}
+
+#[test]
+fn url_scheme_in_a_doc_comment_does_not_build_an_engine() -> syn::Result<()> {
+    assert!(!builds_engine("/// Runs on `null://`.\nfn f() {}")?);
+    Ok(())
+}
+
+#[test]
+fn engine_name_in_an_attribute_argument_builds_an_engine() -> syn::Result<()> {
+    assert!(builds_engine("#[test_case(memory_storage)]\nfn f() {}")?);
+    Ok(())
+}
+
+#[test]
+fn engine_name_in_a_comment_does_not_build_an_engine() -> syn::Result<()> {
+    assert!(!builds_engine("// memory_storage\nfn f() {}")?);
+    Ok(())
+}
+
+#[test]
+fn file_without_an_engine_name_does_not_build_an_engine() -> syn::Result<()> {
+    assert!(!builds_engine("fn f() { let broker = 1; }")?);
     Ok(())
 }

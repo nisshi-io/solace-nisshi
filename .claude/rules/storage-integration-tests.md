@@ -75,7 +75,7 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   suite if they check Nisshi's code on any engine. If not, add the file to the list whose doc
   comment gives its reason. The check also fails for a listed file in which it no longer finds an
   engine builder, or that is on two lists. If such a file still builds an engine through a new
-  helper, add the helper's name to `ENGINE_BUILDERS`.
+  helper, add the helper's name to `ENGINE_NAMES`.
 - **`every_case_is_registered`** (`tests/it/cases.rs`): add the case to its file's `__file!` list.
   If the message names a missing `@search` rule, add the area's or file's rule to
   `__unless_listed!`, before the rule that steps over a name.
