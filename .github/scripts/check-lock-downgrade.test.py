@@ -91,6 +91,17 @@ class Refusals(unittest.TestCase):
         head = lock(("x", "1.4.1", []), ("x", "2.0.0", []))
         self.assertEqual(check(base, head), (1, ["x: 1.4.2 -> 1.4.1"]))
 
+    def test_older_zero_minor_line_goes_down_while_the_newest_stays(self):
+        # Below 1.0.0, each minor version is a semver line of its own.
+        base = lock(("x", "0.1.5", []), ("x", "0.2.0", []))
+        head = lock(("x", "0.1.4", []), ("x", "0.2.0", []))
+        self.assertEqual(check(base, head), (1, ["x: 0.1.5 -> 0.1.4"]))
+
+    def test_prerelease_number_goes_down(self):
+        # Semver compares numeric pre-release identifiers as numbers, so rc.10 is above rc.2.
+        base = lock(("x", "1.0.0-rc.10", []))
+        self.assertEqual(check(base, lock(("x", "1.0.0-rc.2", []))), (1, ["x: 1.0.0-rc.10 -> 1.0.0-rc.2"]))
+
     def test_edge_repointed_to_an_older_copy(self):
         self.assertEqual(check(REPOINTED_BASE, REPOINTED_HEAD), (1, [REPOINTED_LINE]))
 
@@ -142,6 +153,14 @@ class Passes(unittest.TestCase):
         copies = [("indexmap", "1.9.3", []), ("indexmap", "2.14.2", [])]
         base = lock(*copies, ("serde_with", "3.24.0", ["indexmap 1.9.3", "indexmap 2.14.2"]))
         head = lock(*copies, ("serde_with", "3.24.0", ["indexmap 1.9.3"]))
+        self.assertEqual(check(base, head), (0, []))
+
+    def test_package_adds_an_edge_to_an_older_copy(self):
+        # In version order, the new edge to indexmap 1 would pair with the old edge to
+        # indexmap 2 and read as a downgrade.
+        copies = [("indexmap", "1.9.3", []), ("indexmap", "2.14.2", [])]
+        base = lock(*copies, ("serde_with", "3.24.0", ["indexmap 2.14.2"]))
+        head = lock(*copies, ("serde_with", "3.24.0", ["indexmap 1.9.3", "indexmap 2.14.2"]))
         self.assertEqual(check(base, head), (0, []))
 
     def test_build_metadata_does_not_change_precedence(self):
