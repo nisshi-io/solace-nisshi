@@ -30,10 +30,12 @@ tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
 # Only `tests/it/outside_caller.rs` uses an engine crate, to build its own engine as a caller
 # does. A dev-dependency is not passed on to the crate's callers.
-[dev-dependencies]
 nisshi-storage-dynostore.workspace = true
+proc-macro2.workspace = true
+syn.workspace = true
 
 [lints]
 workspace = true

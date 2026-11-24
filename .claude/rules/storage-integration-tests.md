@@ -35,10 +35,14 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   storage)`, `(broker_id, storage)` or `(storage)`, in that order, and returns a `Result`. For
   other arguments, write a small `pub async fn` with one of these lists that calls the shared
   function, as `new_cg::consumer_next_action_08c` does.
-- **Register each case in the macro.** Add the case to its file's `__file!` list in `src/lib.rs`.
-  A case that the macro doesn't list runs nowhere, and `tests/it/cases.rs` fails. A new file also
-  needs a `pub mod` line in its area's module and a rule in `__unless_listed!`. A new area needs
-  its `__area_<area>!` macro, a call in `__areas!` and a rule in `__unless_listed!`.
+- **Register each case in the macro.** A case is a `pub async fn` at the top level of its file.
+  Add it to its file's `__file!` list in `src/lib.rs`. A case that the macro doesn't list runs
+  nowhere, and `tests/it/cases.rs` fails. It also fails for any other visible free function in
+  the file outside a private module, and for a listed name that is not a case of the file, so keep
+  a helper private, put it in a private module, or put it in a shared module at the root of `src`.
+  The check does not examine a method in an `impl`. A new file also needs a `pub mod` line in its
+  area's module and a rule in `__unless_listed!`. A new area needs its `__area_<area>!` macro, a
+  call in `__areas!` and a rule in `__unless_listed!`.
 - **Put a case that needs a transactional ID in `transactions`.** An engine without transactions
   leaves out that one area. When a file has cases of both kinds, split it, and name the
   transactional half `txn_<file>`, as `txn_offset_fetch_commit_metadata` is.
@@ -77,8 +81,12 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   engine builder, or that is on two lists. If such a file still builds an engine through a new
   helper, add the helper's name to `ENGINE_NAMES`.
 - **`every_case_is_registered`** (`tests/it/cases.rs`): add the case to its file's `__file!` list.
-  If the message names a missing `@search` rule, add the area's or file's rule to
-  `__unless_listed!`, before the rule that steps over a name.
+  If the message says a free function is visible but is not a top-level `pub async fn`, make it a
+  case, make it private, or move it to a private module or to a shared module at the root of
+  `src`. A case file is a single `.rs` file with its modules inline, because the check does not
+  read a `mod name;` or a folder. If a list names something that is not a case of the file, fix
+  or remove the entry. If the message names a missing `@search` rule, add the area's or file's
+  rule to `__unless_listed!`, before the rule that steps over a name.
 - **`dependencies_include_no_engine`** (`tests/it/dependencies.rs`): remove the engine crate, or
   the engine feature of `nisshi-broker`, from the crate's `[dependencies]`.
 - **"recursion limit reached while expanding `__in_group!`"**: a long `without` list needs
