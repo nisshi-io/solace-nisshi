@@ -50,18 +50,29 @@ jobs:
           set -euo pipefail
           python3 --version
           python3 -I .github/scripts/check-lock-downgrade.test.py
+          # A missing base fails the job, because each git command below would
+          # otherwise read the error as "nothing to compare" and pass.
+          git rev-parse --verify --quiet 'HEAD^1^{commit}' >/dev/null || {
+            echo "::error::The checkout is not the PR's merge commit, so the check cannot find the base."
+            exit 2
+          }
           rc=0
           for lock in Cargo.lock fuzz/Cargo.lock; do
-            if git diff --quiet HEAD^1 HEAD -- "$lock"; then continue; fi
+            changed=0
+            git diff --quiet HEAD^1 HEAD -- "$lock" || changed=$?
+            if [ "$changed" -eq 0 ]; then continue; fi
+            if [ "$changed" -ne 1 ]; then exit 2; fi
             # A lockfile that the PR adds or deletes has nothing to compare.
-            if ! git cat-file -e "HEAD^1:$lock" 2>/dev/null || [ ! -f "$lock" ]; then continue; fi
+            if [ -z "$(git ls-tree HEAD^1 -- "$lock")" ] || [ ! -f "$lock" ]; then continue; fi
             git show "HEAD^1:$lock" > "$RUNNER_TEMP/base.lock"
             r=0
             python3 -I .github/scripts/check-lock-downgrade.py "$RUNNER_TEMP/base.lock" "$lock" || r=$?
+            if [ "$r" -eq 1 ]; then
+              # A re-run keeps the description of the event that started it, so
+              # only an edit of the description reaches the check.
+              echo "::error file=$lock::$lock moves the dependencies above to lower versions. Repair it with --restore as .github/AGENTS.md describes, or edit the PR description to add an allow-lock-downgrade: <crate> line for each crate."
+            fi
             # Exit 2 (could not run) outranks exit 1 (downgrade found).
             if [ "$r" -gt "$rc" ]; then rc=$r; fi
           done
-          if [ "$rc" -eq 1 ]; then
-            echo "::error::Cargo.lock moves the edges above to lower versions. Repair it with .github/scripts/check-lock-downgrade.py --restore <base lockfile> Cargo.lock, or add an allow-lock-downgrade: <crate> line to the PR description."
-          fi
           exit "$rc"

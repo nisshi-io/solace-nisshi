@@ -13,7 +13,8 @@ Exit:  0 no unacknowledged downgrade, 1 at least one, 2 the check could not run.
 
 The check prints one line per unacknowledged downgrade on stdout, and nothing else.
 `--restore` rewrites HEAD_LOCK: it points each downgraded edge back at the base version, if
-HEAD_LOCK still holds that copy. A downgrade whose base copy is gone needs a person.
+HEAD_LOCK still holds that copy. It then prints each downgrade that is left, which needs a
+person, and exits 1 if one is left.
 Test:  python3 -I .github/scripts/check-lock-downgrade.test.py
 """
 
@@ -30,6 +31,12 @@ except ImportError:
     sys.exit(2)
 
 ALLOW = re.compile(r"^[ \t]*allow-lock-downgrade:[ \t]*([A-Za-z0-9_-]+)[ \t]*$", re.M)
+# The check prints names and versions from the head lockfile, which the pull request
+# controls. These patterns reject any other character, so that a printed line cannot hold a
+# line break and reach the runner as a workflow command.
+NAME = re.compile(r"[A-Za-z0-9_-]+")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
+DEPENDENCY_LINE = re.compile(r' "([A-Za-z0-9_-]+) ([0-9A-Za-z.+-]+)( \([^)]*\))?",')
 
 
 def version_key(version):
@@ -59,20 +66,27 @@ def owner_key(package):
     return package["name"], semver_line(package["version"]), package.get("source", "")
 
 
+def checked(pattern, value):
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ValueError(f"invalid name or version in the lockfile: {value!r}")
+    return value
+
+
 def load(path):
     """Returns the lockfile's versions of each crate, and the dependency edges of each package."""
     with open(path, "rb") as f:
         packages = tomllib.load(f).get("package", [])
     versions = defaultdict(set)
     for package in packages:
-        versions[package["name"]].add(package["version"])
+        versions[checked(NAME, package["name"])].add(checked(VERSION, package["version"]))
     edges = {}
     for package in packages:
         deps = defaultdict(list)
         for dep in package.get("dependencies", []):
             name, _, rest = dep.partition(" ")
+            checked(NAME, name)
             if rest:
-                deps[name].append(rest.split(" ")[0])
+                deps[name].append(checked(VERSION, rest.split(" ")[0]))
             else:
                 # Cargo writes a bare name when the lockfile holds one version of the crate.
                 (only,) = versions[name]
@@ -94,10 +108,7 @@ def downgrades(base, head):
         if version_key(after) < version_key(before):
             found.add((name, f"{name}: {before} -> {after}"))
             continue
-        lines = {semver_line(v) for v in base_versions[name]} & {semver_line(v) for v in head_versions[name]}
-        for line in lines:
-            before = newest(v for v in base_versions[name] if semver_line(v) == line)
-            after = newest(v for v in head_versions[name] if semver_line(v) == line)
+        for before, after in by_line(base_versions[name], head_versions[name]):
             if version_key(after) < version_key(before):
                 found.add((name, f"{name}: {before} -> {after}"))
     for owner in base_edges.keys() & head_edges.keys():
@@ -106,62 +117,80 @@ def downgrades(base, head):
     return sorted(found, key=lambda f: f[1])
 
 
+def by_line(before, after):
+    """Yields (newest base version, newest head version) for each semver line that both hold."""
+    for line in {semver_line(v) for v in before} & {semver_line(v) for v in after}:
+        yield (newest(v for v in before if semver_line(v) == line),
+               newest(v for v in after if semver_line(v) == line))
+
+
 def edge_downgrades(base_deps, head_deps):
     """Yields (crate, base version, head version) for each edge of one package that moved down.
 
     A package can depend on two versions of one crate under two names. Its edges to that crate
-    pair up in version order. When their count changed, only the newest edges compare.
+    pair up in version order.
     """
     for dep in sorted(base_deps.keys() & head_deps.keys()):
         before = sorted(base_deps[dep], key=version_key)
         after = sorted(head_deps[dep], key=version_key)
-        pairs = zip(before, after) if len(before) == len(after) else [(before[-1], after[-1])]
+        if len(before) == len(after):
+            pairs = zip(before, after)
+        else:
+            # The package added or dropped an edge to the crate, so version order does not
+            # pair the edges. They compare within each semver line instead, so that a
+            # dropped edge does not read as a downgrade of the edge below it.
+            pairs = by_line(before, after)
         for b, h in pairs:
             if version_key(h) < version_key(b):
                 yield dep, b, h
 
 
 def restore(base_path, head_path):
-    """Points each downgraded edge in the head lockfile back at the base version."""
-    _, base_edges = load(base_path)
+    """Points each downgraded edge in the head lockfile back at the base version.
+
+    Returns the downgrades that are left.
+    """
+    base = load(base_path)
     head_versions, head_edges = load(head_path)
     with open(head_path, newline="") as f:
         text = f.read()
+    line_end = "\r\n" if "\r\n" in text else "\n"
     # The edit works on the text, not on parsed TOML, so that every other byte stays as cargo
     # wrote it.
-    blocks = text.split("\n[[package]]\n")
+    blocks = text.replace("\r\n", "\n").split("\n[[package]]\n")
     for i, block in enumerate(blocks[1:], 1):
-        package = tomllib.loads(block)
-        owner = owner_key(package)
-        if owner not in base_edges:
+        owner = owner_key(tomllib.loads(block))
+        if owner not in base[1]:
             continue
-        for dep, before, after in edge_downgrades(base_edges[owner], head_edges[owner]):
-            if before in head_versions[dep]:
-                edge = re.compile(rf'^ "{re.escape(dep)} {re.escape(after)}( \([^)]*\))?",$', re.M)
-                block = edge.sub(lambda m: f' "{dep} {before}{m.group(1) or ""}",', block, count=1)
-        blocks[i] = block
+        moves = {(dep, after): before
+                 for dep, before, after in edge_downgrades(base[1][owner], head_edges[owner])
+                 if before in head_versions[dep]}
+        lines = block.split("\n")
+        # Each line changes at most once, so that one edge's base version does not match the
+        # next edit, when it equals the head version of another edge to the same crate.
+        for j, line in enumerate(lines):
+            match = DEPENDENCY_LINE.fullmatch(line)
+            if match and (match[1], match[2]) in moves:
+                lines[j] = f' "{match[1]} {moves[match[1], match[2]]}{match[3] or ""}",'
+        blocks[i] = "\n".join(lines)
     with open(head_path, "w", newline="") as f:
-        f.write("\n[[package]]\n".join(blocks))
+        f.write("\n[[package]]\n".join(blocks).replace("\n", line_end))
+    return downgrades(base, load(head_path))
 
 
 def main(argv):
-    if len(argv) == 4 and argv[1] == "--restore":
-        try:
-            restore(argv[2], argv[3])
-        except Exception as e:
-            print(f"::error::check-lock-downgrade.py cannot restore the edges: {e!r}", file=sys.stderr)
-            return 2
-        return 0
-    if len(argv) != 3:
+    restoring = len(argv) == 4 and argv[1] == "--restore"
+    if not restoring and len(argv) != 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    base_path, head_path = argv[-2:]
     try:
-        found = downgrades(load(argv[1]), load(argv[2]))
+        found = restore(base_path, head_path) if restoring else downgrades(load(base_path), load(head_path))
     except Exception as e:
         # Any failure is "could not run" (2), never "downgrade found" (1).
-        print(f"::error::check-lock-downgrade.py cannot compare the lockfiles: {e!r}", file=sys.stderr)
+        print(f"::error::check-lock-downgrade.py cannot read the lockfiles: {e!r}", file=sys.stderr)
         return 2
-    allowed = set(ALLOW.findall(os.environ.get("PR_BODY", "").replace("\r", "")))
+    allowed = set() if restoring else set(ALLOW.findall(os.environ.get("PR_BODY", "").replace("\r", "")))
     refused = [message for crate, message in found if crate not in allowed]
     for message in refused:
         print(message)
