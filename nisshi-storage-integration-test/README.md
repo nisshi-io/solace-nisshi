@@ -81,8 +81,8 @@ tests (`cargo nextest run -p nisshi-storage-integration-test`) check that:
 
 - the crate depends on no engine (`tests/it/dependencies.rs`);
 - every `pub async fn` at the top level of a file of an area is a case in the macro, the file
-  holds no other visible free function outside a private module, and every listed case exists
-  (`tests/it/cases.rs`);
+  holds no other visible free function outside a private module, and no macro in place of an item
+  there, and every listed case exists (`tests/it/cases.rs`);
 - an outside caller can run the suite on its own engine (`tests/it/outside_caller.rs`).
 
 Clippy also stops the crate's code from calling the storage or broker builders, which build an

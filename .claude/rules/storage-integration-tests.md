@@ -40,9 +40,12 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   nowhere, and `tests/it/cases.rs` fails. It also fails for any other visible free function in
   the file outside a private module, and for a listed name that is not a case of the file, so keep
   a helper private, put it in a private module, or put it in a shared module at the root of `src`.
-  The check does not examine a method in an `impl`. A new file also needs a `pub mod` line in its
-  area's module and a rule in `__unless_listed!`. A new area needs its `__area_<area>!` macro, a
-  call in `__areas!` and a rule in `__unless_listed!`.
+  The check also fails for a macro call or `macro_rules!` that stands in place of an item, at the
+  top level of the file or in a module that is not private, because the check does not see a case
+  that a macro generates. So write each case out as a `pub async fn`. The check does not examine a
+  method in an `impl`. A new file also needs a `pub mod` line in its area's module and a rule in
+  `__unless_listed!`. A new area needs its `__area_<area>!` macro, a call in `__areas!` and a rule
+  in `__unless_listed!`.
 - **Put a case that needs a transactional ID in `transactions`.** An engine without transactions
   leaves out that one area. When a file has cases of both kinds, split it, and name the
   transactional half `txn_<file>`, as `txn_offset_fetch_commit_metadata` is.
@@ -85,9 +88,11 @@ startup and shutdown tests, and tests of one engine or of a faulty engine, stay 
   If the message says a free function is visible but is not a top-level `pub async fn`, make it a
   case, make it private, or move it to a private module or to a shared module at the root of
   `src`. A case file is a single `.rs` file with its modules inline, because the check does not
-  read a `mod name;` or a folder. If a list names something that is not a case of the file, fix
-  or remove the entry. If the message names a missing `@search` rule, add the area's or file's
-  rule to `__unless_listed!`, before the rule that steps over a name.
+  read a `mod name;` or a folder. If the message names a macro, write each case that it generates
+  as a top-level `pub async fn`, or move the macro to a private module or to a shared module at
+  the root of `src`. If a list names something that is not a case of the file, fix or remove the
+  entry. If the message names a missing `@search` rule, add the area's or file's rule to
+  `__unless_listed!`, before the rule that steps over a name.
 - **`every_engine_gets_at_least_its_floor_of_tests`**
   (`nisshi-broker/tests/it/storage_integration.rs`): an engine gets fewer tests than its floor in
   `TEST_FLOORS`. If the change leaves out or removes those cases on purpose, lower the floor in the

@@ -15,9 +15,11 @@
 //! A case runs only if the macro lists it. Each `pub async fn` at the top level of a file of an
 //! area is a case, so it must be in that file's case list, and each name in the list must be a
 //! case of the file. Any other visible free function in the file, outside a private module, fails
-//! the check, so that a case in another form does not go unchecked. The check does not examine a
-//! method in an `impl`. A caller leaves out an area or a file only if the macro can find its name
-//! in a `without` list, so each area and file must have a rule that finds it.
+//! the check, so that a case in another form does not go unchecked. A macro in place of an item,
+//! at the top level or in an inline module that is not private, fails the check too, because the
+//! check does not expand it, so it does not see a case that the macro generates. The check does
+//! not examine a method in an `impl`. A caller leaves out an area or a file only if the macro can
+//! find its name in a `without` list, so each area and file must have a rule that finds it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,21 +39,28 @@ const STEP_OVER_RULE: &[&str] = &[
     "@", "search", "$", "name", ":", "ident", ";", "[", "$", "other", ":", "ident",
 ];
 
-/// The free functions of a case file whose visibility is not inherited, outside a private module.
-/// Nothing in a private module is reachable from the macro, so a helper there may be `pub(super)`.
+/// The items of a case file that the check reads: its visible free functions outside a private
+/// module, and the items it cannot see into: a module declared as `mod name;` and a macro. Nothing
+/// in a private module is reachable from the macro, so a helper there may be `pub(super)`.
 #[derive(Default)]
-struct VisibleFunctions {
+struct CaseFileItems {
     /// Each `pub async fn` at the top level of the file.
     cases: Vec<String>,
     /// Each other visible free function, at any depth of inline modules that are not private.
     misplaced: Vec<String>,
     /// Each module that the file declares as `mod name;`. The check does not read its functions.
     out_of_line_modules: Vec<String>,
+    /// Each macro in place of an item, at the top level or in an inline module that is not
+    /// private, as its path and `!`, followed by the name that a `macro_rules!` defines. The
+    /// check does not expand a macro, so it does not see the functions that the macro generates.
+    macros: Vec<String>,
 }
 
-impl VisibleFunctions {
-    /// Adds the visible free functions of `items` and of the inline modules in them that are not
-    /// private. A method, a private function and a function in a private module are never added.
+impl CaseFileItems {
+    /// Adds the visible free functions and the macros in place of an item of `items`, and of the
+    /// inline modules in them that are not private. The walk enters only those modules, so a
+    /// method, a private function, and anything in a function body, an `impl`, an initializer or
+    /// a private module are never added.
     fn add_items(&mut self, items: &[Item], top_level: bool) {
         for item in items {
             match item {
@@ -74,17 +83,30 @@ impl VisibleFunctions {
                     }
                     Some(_) => {}
                 },
+                Item::Macro(ItemMacro { ident, mac, .. }) => {
+                    let segments: Vec<String> = mac
+                        .path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .collect();
+                    let path = segments.join("::");
+                    self.macros.push(match ident {
+                        Some(defined) => format!("{path}! {defined}"),
+                        None => format!("{path}!"),
+                    });
+                }
                 _ => {}
             }
         }
     }
 }
 
-/// Returns the visible functions of the Rust source of a case file.
-fn visible_functions(source: &str) -> syn::Result<VisibleFunctions> {
-    let mut functions = VisibleFunctions::default();
-    functions.add_items(&syn::parse_file(source)?.items, true);
-    Ok(functions)
+/// Returns the items of the Rust source of a case file that the check reads.
+fn case_file_items(source: &str) -> syn::Result<CaseFileItems> {
+    let mut items = CaseFileItems::default();
+    items.add_items(&syn::parse_file(source)?.items, true);
+    Ok(items)
 }
 
 /// What the macro registers, read from its tokens, so that a comment registers nothing.
@@ -339,8 +361,10 @@ fn stems(directory: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 /// warns about it, because an unused public function is not a warning. Each area is a directory
 /// in `src`, and each `.rs` file in it holds cases. A visible free function outside a private
 /// module that is not a top-level `pub async fn` fails the check, because the check does not count
-/// it as a case. An entry of an area that is not a `.rs` file, and a `mod name;` in a case file,
-/// fail the check too, because the check does not read the functions in them.
+/// it as a case. An entry of an area that is not a `.rs` file, a `mod name;` in a case file, and a
+/// macro in place of an item, at the top level of a case file or in an inline module that is not
+/// private, fail the check too, because the check does not read the functions in them or that
+/// they generate.
 ///
 /// An area or a file also needs its rule in `__unless_listed!`, or no caller can leave it out.
 #[test]
@@ -384,14 +408,14 @@ fn every_case_is_registered() -> io::Result<()> {
                 ));
             }
 
-            let functions = visible_functions(&fs::read_to_string(&path)?)
+            let items = case_file_items(&fs::read_to_string(&path)?)
                 .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
             let listed = registrations
                 .case_list(&area, &file)
                 .cloned()
                 .unwrap_or_default();
 
-            for case in &functions.cases {
+            for case in &items.cases {
                 if !listed.contains(case) {
                     unregistered.push(format!(
                         "src/{area}/{file}.rs: `{case}` is not in the file's `__file!` list"
@@ -399,7 +423,7 @@ fn every_case_is_registered() -> io::Result<()> {
                 }
             }
 
-            for function in &functions.misplaced {
+            for function in &items.misplaced {
                 unregistered.push(format!(
                     "src/{area}/{file}.rs: `{function}` is visible but is not a top-level `pub \
                      async fn`; make it a case, make it private, or move it to a private module \
@@ -407,15 +431,24 @@ fn every_case_is_registered() -> io::Result<()> {
                 ));
             }
 
-            for module in &functions.out_of_line_modules {
+            for module in &items.out_of_line_modules {
                 unregistered.push(format!(
                     "src/{area}/{file}.rs: the check does not read the functions of `mod \
                      {module};`; write the module inline in the file"
                 ));
             }
 
+            for mac in &items.macros {
+                unregistered.push(format!(
+                    "src/{area}/{file}.rs: the check does not read the functions that a macro \
+                     generates, so it does not check `{mac}`; write each case as a top-level `pub \
+                     async fn`, or move the macro to a private module or to a shared module at \
+                     the root of src"
+                ));
+            }
+
             for name in &listed {
-                if !functions.cases.contains(name) {
+                if !items.cases.contains(name) {
                     unregistered.push(format!(
                         "src/{area}/{file}.rs: the file's `__file!` list names `{name}`, which is \
                          not a case of the file"
@@ -471,87 +504,122 @@ macro_rules! __unless_listed {
 
 #[test]
 fn top_level_pub_async_fn_is_a_case() -> syn::Result<()> {
-    let functions = visible_functions("pub async fn case(storage: S) -> Result<()> { Ok(()) }")?;
-    assert_eq!(functions.cases, ["case"]);
-    assert!(functions.misplaced.is_empty());
+    let items = case_file_items("pub async fn case(storage: S) -> Result<()> { Ok(()) }")?;
+    assert_eq!(items.cases, ["case"]);
+    assert!(items.misplaced.is_empty());
     Ok(())
 }
 
 #[test]
 fn case_over_several_lines_with_an_attribute_is_a_case() -> syn::Result<()> {
-    let functions =
-        visible_functions("#[allow(unused)]\npub\nasync fn case(\n    storage: S,\n) {}")?;
-    assert_eq!(functions.cases, ["case"]);
+    let items = case_file_items("#[allow(unused)]\npub\nasync fn case(\n    storage: S,\n) {}")?;
+    assert_eq!(items.cases, ["case"]);
     Ok(())
 }
 
 #[test]
 fn private_async_fn_is_ignored() -> syn::Result<()> {
-    let functions = visible_functions("async fn helper() {}")?;
-    assert!(functions.cases.is_empty());
-    assert!(functions.misplaced.is_empty());
+    let items = case_file_items("async fn helper() {}")?;
+    assert!(items.cases.is_empty());
+    assert!(items.misplaced.is_empty());
     Ok(())
 }
 
 #[test]
 fn pub_crate_async_fn_is_misplaced() -> syn::Result<()> {
-    let functions = visible_functions("pub(crate) async fn case() {}")?;
-    assert!(functions.cases.is_empty());
-    assert_eq!(functions.misplaced, ["case"]);
+    let items = case_file_items("pub(crate) async fn case() {}")?;
+    assert!(items.cases.is_empty());
+    assert_eq!(items.misplaced, ["case"]);
     Ok(())
 }
 
 #[test]
 fn pub_async_fn_in_a_nested_module_is_misplaced() -> syn::Result<()> {
-    let functions = visible_functions("pub mod nested { pub async fn case() {} }")?;
-    assert!(functions.cases.is_empty());
-    assert_eq!(functions.misplaced, ["case"]);
+    let items = case_file_items("pub mod nested { pub async fn case() {} }")?;
+    assert!(items.cases.is_empty());
+    assert_eq!(items.misplaced, ["case"]);
     Ok(())
 }
 
 #[test]
 fn function_in_a_private_module_is_ignored() -> syn::Result<()> {
-    let functions = visible_functions(
-        "mod private { pub(super) fn helper() {} pub async fn unreachable() {} }",
-    )?;
-    assert!(functions.cases.is_empty());
-    assert!(functions.misplaced.is_empty());
+    let items =
+        case_file_items("mod private { pub(super) fn helper() {} pub async fn unreachable() {} }")?;
+    assert!(items.cases.is_empty());
+    assert!(items.misplaced.is_empty());
     Ok(())
 }
 
 #[test]
 fn out_of_line_module_is_reported() -> syn::Result<()> {
-    let functions = visible_functions("pub mod outside;")?;
-    assert_eq!(functions.out_of_line_modules, ["outside"]);
+    let items = case_file_items("pub mod outside;")?;
+    assert_eq!(items.out_of_line_modules, ["outside"]);
+    Ok(())
+}
+
+#[test]
+fn macro_in_place_of_an_item_is_reported() -> syn::Result<()> {
+    let items = case_file_items(
+        "macro_rules! case { ($name:ident) => { pub async fn $name() {} }; }\n\
+         case!(generated);\n\
+         tokio::task_local! { static ID: u32; }\n\
+         pub mod nested { inner!(); }",
+    )?;
+    assert_eq!(
+        items.macros,
+        ["macro_rules! case", "case!", "tokio::task_local!", "inner!"]
+    );
+    // The check does not expand `case!`, so it does not see the case that the call generates.
+    assert!(items.cases.is_empty());
+    Ok(())
+}
+
+#[test]
+fn macro_in_a_function_or_a_private_module_is_ignored() -> syn::Result<()> {
+    let items = case_file_items(
+        "pub async fn case() { assert!(true); }\n\
+         mod private { macro_rules! helper { () => {}; } helper!(); }",
+    )?;
+    assert!(items.macros.is_empty());
+    Ok(())
+}
+
+#[test]
+fn macro_in_an_initializer_or_an_impl_is_ignored() -> syn::Result<()> {
+    let items = case_file_items(
+        "const NAME: &str = concat!(\"a\", \"b\");\n\
+         struct Engine; impl Engine { fn helper() { assert!(true); } }",
+    )?;
+    assert!(items.macros.is_empty());
     Ok(())
 }
 
 #[test]
 fn top_level_pub_fn_is_misplaced() -> syn::Result<()> {
-    let functions = visible_functions("pub fn helper() {}")?;
-    assert!(functions.cases.is_empty());
-    assert_eq!(functions.misplaced, ["helper"]);
+    let items = case_file_items("pub fn helper() {}")?;
+    assert!(items.cases.is_empty());
+    assert_eq!(items.misplaced, ["helper"]);
     Ok(())
 }
 
 #[test]
 fn method_in_an_impl_is_ignored() -> syn::Result<()> {
-    let functions = visible_functions(
+    let items = case_file_items(
         "struct Engine; impl Engine { pub async fn method(&self) {} fn helper() {} }",
     )?;
-    assert!(functions.cases.is_empty());
-    assert!(functions.misplaced.is_empty());
+    assert!(items.cases.is_empty());
+    assert!(items.misplaced.is_empty());
     Ok(())
 }
 
 #[test]
 fn pub_async_fn_in_a_string_or_a_comment_is_ignored() -> syn::Result<()> {
-    let functions = visible_functions(
+    let items = case_file_items(
         "const SOURCE: &str = \"\npub async fn in_a_string() {}\n\";\n/*\npub async fn \
          in_a_comment() {}\n*/",
     )?;
-    assert!(functions.cases.is_empty());
-    assert!(functions.misplaced.is_empty());
+    assert!(items.cases.is_empty());
+    assert!(items.misplaced.is_empty());
     Ok(())
 }
 
