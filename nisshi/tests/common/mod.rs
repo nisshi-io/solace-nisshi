@@ -196,6 +196,14 @@ impl Drop for Broker {
     }
 }
 
+/// A TCP port with nothing listening on it.
+pub(crate) fn closed_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .expect("free port")
+}
+
 /// Runs `nisshi` with `args` and no input, and returns its output.
 pub(crate) fn run(args: &[&str]) -> Output {
     finish(

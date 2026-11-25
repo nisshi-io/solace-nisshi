@@ -20,8 +20,8 @@
 
 mod common;
 
-use common::{Broker, run, schema_registry};
-use std::{net::TcpListener, thread};
+use common::{Broker, closed_port, run, schema_registry};
+use std::thread;
 
 const TOOLS: [&[&str]; 5] = [
     &["topic", "list"],
@@ -88,14 +88,6 @@ fn a_refusal_by_the_broker_is_4() {
         "{\"value\": 1}\n",
     );
     assert_eq!(Some(4), output.status.code(), "{output:?}");
-}
-
-/// A TCP port with nothing listening on it.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .expect("free port")
 }
 
 /// Runs each tool against a port nobody listens on. A client retries a refused connection for 30
@@ -258,6 +250,46 @@ fn a_refused_produce_ends_generator_and_perf_with_4() {
         started.elapsed() < std::time::Duration::from_secs(20),
         "a refusal ends the run before its duration: {:?}",
         started.elapsed()
+    );
+}
+
+/// A run that produced everything it was asked to, and then could not export its metrics, ends
+/// with 1: the run was asked for metrics with `--otlp-endpoint-url` and gave none.
+#[test]
+fn a_collector_that_is_down_when_a_successful_generator_run_ends_is_1() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("collector-down");
+
+    let output = broker.run(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "1",
+            "--duration-seconds",
+            "1",
+            "--otlp-endpoint-url",
+            &format!("http://127.0.0.1:{}", closed_port()),
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(1), output.status.code(), "{output:?}");
+    // The export fails after the run, so the summary still prints.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"type\":\"summary\""),
+        "{output:?}"
+    );
+    // The 1 is the failed export's, and nothing else's.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("were not exported"),
+        "{output:?}"
     );
 }
 

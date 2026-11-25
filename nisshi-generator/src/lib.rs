@@ -52,7 +52,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span};
+use tracing::{Instrument, Level, debug, error, span, warn};
 use url::Url;
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
@@ -537,17 +537,32 @@ impl Generate {
 
         debug!(?cancellation);
 
+        // The producers stop here however the run ended, an interrupt or a signal included, so
+        // that the summary counts what was produced up to `elapsed` and the flush below runs
+        // with no producer still sending.
+        token.cancel();
+
         // Before the flush and the grace period below, which are not time spent producing.
         let elapsed = started.elapsed();
 
         if let Some(meter_provider) = meter_provider {
-            meter_provider
+            let flushed = meter_provider
                 .force_flush()
-                .inspect(|force_flush| debug!(?force_flush))?;
-
-            meter_provider
+                .inspect(|force_flush| debug!(?force_flush));
+            let shut_down = meter_provider
                 .shutdown()
-                .inspect(|shutdown| debug!(?shutdown))?;
+                .inspect(|shutdown| debug!(?shutdown));
+
+            // The flush runs before the summary below, so a failed flush must not end the run
+            // here. Its error stands as the run's error only when no refusal is held already,
+            // because a refusal names what the broker did, and that is the more specific answer.
+            if let Err(error) = flushed.and(shut_down) {
+                warn!(?error, "the metrics of the run were not exported");
+
+                if failure.is_none() {
+                    failure = Some(error.into());
+                }
+            }
         }
 
         if let Some(CancelKind::Timeout) = cancellation {

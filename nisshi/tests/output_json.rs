@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{Broker, schema_registry};
+use common::{Broker, closed_port, schema_registry};
 use serde_json::Value;
 use std::process::Output;
 
@@ -328,4 +328,37 @@ fn a_refused_produce_still_prints_the_json_summary_and_exits_4() {
 
     assert_eq!(Some(4), output.status.code(), "{output:?}");
     assert_eq!(0, json(&output)["records_produced"], "{output:?}");
+}
+
+/// The metrics are flushed when the run ends. A collector that is down then must neither drop
+/// the summary nor turn the refusal's 4 into the export error's 1.
+#[test]
+fn a_refused_produce_prints_the_json_summary_and_exits_4_when_the_collector_is_down() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json-refused-collector-down");
+
+    let output = broker.run(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--partition",
+            "7",
+            "--otlp-endpoint-url",
+            &format!("http://127.0.0.1:{}", closed_port()),
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
+    assert_eq!("summary", json(&output)["type"], "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("UnknownTopicOrPartition"),
+        "{output:?}"
+    );
 }

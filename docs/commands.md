@@ -221,7 +221,9 @@ $ nisshi perf taxi produce --duration 5s --output json
   `latency_ms` is for the run so far in both, and is `null` until a request was answered.
 - Both print the summary whenever a producer started, so also after a refusal (a refused login
   or a refused produce request), with zeros if nothing was accepted. Neither prints anything when
-  the tool fails before that: an unreachable broker, a missing schema.
+  the tool fails before that: an unreachable broker, a missing schema. With `--otlp-endpoint-url`,
+  a `generator` run whose metrics can't be exported when it ends still prints its summary, and
+  ends with 1 unless the broker refused it, which ends it with 4.
 
 ```shell
 $ nisshi topic create taxi --output json

@@ -61,7 +61,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 use url::Url;
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -455,9 +455,18 @@ impl Perf {
         // shutdown: cancel it however the run ended, an interrupt or a signal included.
         token.cancel();
 
-        meter_provider
+        // A failed shutdown stands as the run's error only when no refusal is held already,
+        // because a refusal names what the broker did, and that is the more specific answer.
+        if let Err(error) = meter_provider
             .shutdown()
-            .inspect(|shutdown| debug!(?shutdown))?;
+            .inspect(|shutdown| debug!(?shutdown))
+        {
+            warn!(?error, "the metrics of the run were not exported");
+
+            if failure.is_none() {
+                failure = Some(error.into());
+            }
+        }
 
         if let Some(CancelKind::Timeout) = cancellation {
             sleep(Duration::from_secs(5)).await;
