@@ -64,6 +64,7 @@ writes it to the socket.
 | | `nisshi-perf` | Performance producer and consumer |
 | | `nisshi-otel` | OpenTelemetry setup shared by the commands |
 | Tests | `nisshi-smoke-test` | Runs the Apache Kafka command line tools against a broker |
+| | `nisshi-storage-integration-test` | Tests of the broker on a storage engine that the caller passes in. Not published |
 | | `nisshi-fuzz-harness` | The checks that the fuzz targets and their tests share |
 | | `fuzz` | cargo-fuzz targets for the codec and the storage handlers |
 
@@ -134,6 +135,8 @@ describes.
 
 [CONTRIBUTING](CONTRIBUTING.md) explains how to build and test, and which checks CI runs on each
 storage engine. In short: each of `nisshi-broker`, `nisshi-sans-io` and `nisshi-service` has one
-integration test binary, `tests/it/`, with a file per feature or Kafka API; `nisshi-smoke-test`
+integration test binary, `tests/it/`, with a file per feature or Kafka API;
+`nisshi-storage-integration-test` holds the broker tests that run on any storage engine, and
+`nisshi-broker` runs them on each of its engines; `nisshi-smoke-test`
 runs the Kafka command line tools against a real broker; `compat/` runs the librdkafka and franz-go
 test suites; and `fuzz/` fuzzes the codec and the storage handlers.

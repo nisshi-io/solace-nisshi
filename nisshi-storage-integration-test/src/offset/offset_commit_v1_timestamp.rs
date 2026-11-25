@@ -18,7 +18,7 @@
 //!
 //! [`OffsetAndMetadata.fromRequest`]: https://github.com/apache/kafka/blob/3.9.1/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/OffsetAndMetadata.java#L159-L172
 
-use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
+use crate::{broker, random};
 use nisshi_broker::{
     Result,
     coordinator::group::{Coordinator as _, OffsetCommit, administrator::Controller},
@@ -29,9 +29,6 @@ use nisshi_sans_io::{
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
 };
 use nisshi_storage::{Storage, Topition};
-use rand::{RngExt as _, rng};
-use url::Url;
-use uuid::Uuid;
 
 const OFFSET: i64 = 10;
 
@@ -46,9 +43,9 @@ pub async fn offset_commit_stores_offsets_with_the_default_commit_timestamp<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
 
-    let topic = alphanumeric_string(15);
+    let topic = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -63,7 +60,7 @@ where
         .await?;
 
     let controller = Controller::with_storage(storage.clone())?;
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     let topics = [OffsetCommitRequestTopic::default()
         .name(topic.clone())
@@ -114,45 +111,3 @@ where
 
     Ok(())
 }
-
-macro_rules! backend {
-    ($name:ident, $feature:literal, $storage_type:expr) => {
-        #[cfg(feature = $feature)]
-        mod $name {
-            use nisshi_storage::ArcDynStorage;
-
-            use super::*;
-
-            async fn storage_container(cluster_id: Uuid, broker_id: i32) -> Result<ArcDynStorage> {
-                common::storage_container(
-                    $storage_type,
-                    cluster_id,
-                    broker_id,
-                    Url::parse("tcp://127.0.0.1/")?,
-                    None,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn offset_commit_stores_offsets_with_the_default_commit_timestamp() -> Result<()>
-            {
-                let _guard = init_tracing()?;
-
-                let cluster_id = Uuid::now_v7();
-                let broker_id = rng().random_range(0..i32::MAX);
-
-                super::offset_commit_stores_offsets_with_the_default_commit_timestamp(
-                    cluster_id,
-                    broker_id,
-                    storage_container(cluster_id, broker_id).await?,
-                )
-                .await
-            }
-        }
-    };
-}
-
-backend!(in_memory, "dynostore", StorageType::InMemory);
-backend!(lite, "libsql", StorageType::Lite);
-backend!(pg, "postgres", StorageType::Postgres);

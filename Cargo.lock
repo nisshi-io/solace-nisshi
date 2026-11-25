@@ -6009,6 +6009,7 @@ dependencies = [
  "nisshi-service",
  "nisshi-storage",
  "nisshi-storage-dynostore",
+ "nisshi-storage-integration-test",
  "nisshi-storage-null",
  "nisshi-storage-slatedb",
  "nisshi-storage-sql",
@@ -6018,6 +6019,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pbkdf2 0.12.2",
  "pretty_assertions",
+ "proc-macro2",
  "rama",
  "rand 0.10.3",
  "rcgen",
@@ -6029,6 +6031,7 @@ dependencies = [
  "slatedb",
  "snap",
  "socket2",
+ "syn 3.0.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -6470,6 +6473,29 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "nisshi-storage-integration-test"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "nisshi-broker",
+ "nisshi-sans-io",
+ "nisshi-service",
+ "nisshi-storage",
+ "nisshi-storage-dynostore",
+ "proc-macro2",
+ "rama",
+ "rand 0.10.3",
+ "syn 3.0.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "url",
  "uuid",
 ]

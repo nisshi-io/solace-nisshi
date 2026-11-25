@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{
-    alphanumeric_string, init_tracing, lite_storage, memory_storage, postgres_storage,
-    slate_storage,
-};
+use crate::random;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::{Duration, SystemTime},
@@ -31,14 +28,13 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic, join_group_response::JoinGroupResponseMember,
 };
 use nisshi_storage::{
-    ArcDynStorage, GroupDetail, GroupMember, GroupRebalance, GroupState, JoinPhase,
-    ListGroupsService, OffsetCommitRequest, PendingSync, Storage, Topition,
+    GroupDetail, GroupMember, GroupRebalance, GroupState, JoinPhase, ListGroupsService,
+    OffsetCommitRequest, PendingSync, Storage, Topition,
 };
 use rama::{Service, extensions::Extensions};
 use rand::{prelude::*, rng};
-use uuid::Uuid;
 
-async fn simple(storage: impl Storage + Clone) -> Result<()> {
+pub async fn simple(storage: impl Storage + Clone) -> Result<()> {
     let service = ListGroupsService { storage };
 
     let response = service
@@ -57,10 +53,10 @@ async fn simple(storage: impl Storage + Clone) -> Result<()> {
 /// A group that the coordinator has stored, but that has not committed an offset, must be listed
 /// exactly once, because Kafka lists every group the coordinator knows. A group has no committed
 /// offset until its first commit, and an operator must be able to find it before then.
-async fn group_without_committed_offsets_is_listed_once(
+pub async fn group_without_committed_offsets_is_listed_once(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     _ = storage
         .update_group(&group_id, GroupDetail::default(), None)
@@ -80,9 +76,11 @@ async fn group_without_committed_offsets_is_listed_once(
 
 /// A group that the coordinator has stored, and that has committed an offset, must be listed
 /// once, not once for its state and once for its offsets.
-async fn group_with_committed_offsets_is_listed_once(storage: impl Storage + Clone) -> Result<()> {
-    let topic_name = alphanumeric_string(15);
-    let group_id = alphanumeric_string(15);
+pub async fn group_with_committed_offsets_is_listed_once(
+    storage: impl Storage + Clone,
+) -> Result<()> {
+    let topic_name = random::alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -192,7 +190,7 @@ struct StoredGroupIds {
 
 /// Stores `detail` under a new group id, and returns that id.
 async fn store_group(storage: &impl Storage, detail: GroupDetail) -> Result<String> {
-    let group_id = alphanumeric_string(15);
+    let group_id = random::alphanumeric_string(15);
 
     _ = storage
         .update_group(&group_id, detail, None)
@@ -204,9 +202,9 @@ async fn store_group(storage: &impl Storage, detail: GroupDetail) -> Result<Stri
 
 /// Stores a group in each state that `ListGroups` reports, and returns their ids.
 async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroupIds> {
-    let member_id = alphanumeric_string(15);
+    let member_id = random::alphanumeric_string(15);
 
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -274,7 +272,7 @@ async fn store_group_in_each_state(storage: &impl Storage) -> Result<StoredGroup
     )
     .await?;
 
-    let offsets_only = alphanumeric_string(15);
+    let offsets_only = random::alphanumeric_string(15);
     _ = commit_offset(storage, &topic_name, &offsets_only).await?;
 
     Ok(StoredGroupIds {
@@ -322,7 +320,7 @@ async fn listed_state_by_group(
 /// Listing the groups must show each group's state, so an operator can see which groups are
 /// running, idle or rebalancing. The broker must answer `ListGroups` with the state of each
 /// group, from the group's stored detail.
-async fn lists_each_group_with_its_state(storage: impl Storage + Clone) -> Result<()> {
+pub async fn lists_each_group_with_its_state(storage: impl Storage + Clone) -> Result<()> {
     let groups = store_group_in_each_state(&storage).await?;
 
     // `ListGroups` reports a group that has committed offsets and no stored detail as `Empty`.
@@ -342,7 +340,7 @@ async fn lists_each_group_with_its_state(storage: impl Storage + Clone) -> Resul
 /// Listing the groups in a state must show only the groups in that state, so an operator can find
 /// the groups that are running. The broker must leave out of `ListGroups` each group whose state
 /// is not in the request's state filter.
-async fn states_filter_lists_only_groups_in_that_state(
+pub async fn states_filter_lists_only_groups_in_that_state(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let groups = store_group_in_each_state(&storage).await?;
@@ -361,10 +359,10 @@ async fn states_filter_lists_only_groups_in_that_state(
 /// their sessions expire, as Kafka lists it, so an operator can find the abandoned group. The
 /// broker must remove each member whose session has expired before it reports the group's state,
 /// also when no member has sent a request since.
-async fn group_whose_sessions_expired_is_listed_as_empty(
+pub async fn group_whose_sessions_expired_is_listed_as_empty(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let member_id = alphanumeric_string(15);
+    let member_id = random::alphanumeric_string(15);
 
     let mut detail = detail_with_one_member(
         &member_id,
@@ -396,7 +394,7 @@ async fn group_whose_sessions_expired_is_listed_as_empty(
 /// Kafka ends the phase at its deadline. A group whose last member leaves during the initial
 /// rebalance delay keeps its join phase in storage until a request ends it. The broker must end
 /// the phase before it reports the group's state, so the group is listed as `Empty`.
-async fn group_past_its_join_deadline_is_listed_as_empty(
+pub async fn group_past_its_join_deadline_is_listed_as_empty(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     let group_id = store_group(
@@ -438,11 +436,10 @@ async fn group_past_its_join_deadline_is_listed_as_empty(
 /// This commits an offset under group id `""`, then asserts `list_groups`
 /// reports a group with id exactly `""` and does not report any phantom
 /// group under a name a doubled-slash key could plausibly decode to.
-#[cfg(feature = "dynostore")]
-async fn empty_group_id_is_not_surfaced_as_phantom_group(
+pub async fn empty_group_id_is_not_surfaced_as_phantom_group(
     storage: impl Storage + Clone,
 ) -> Result<()> {
-    let topic_name = alphanumeric_string(15);
+    let topic_name = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -492,8 +489,7 @@ async fn empty_group_id_is_not_surfaced_as_phantom_group(
 /// A group with the empty id and only a state object must be listed once, as `""`. On dynostore
 /// that state object is `%empty.json`, because the empty id is stored as the sentinel `%empty`,
 /// and `list_groups` must decode the sentinel instead of listing a group named `%empty`.
-#[cfg(feature = "dynostore")]
-async fn empty_group_id_without_committed_offsets_is_listed(
+pub async fn empty_group_id_without_committed_offsets_is_listed(
     storage: impl Storage + Clone,
 ) -> Result<()> {
     _ = storage
@@ -523,9 +519,8 @@ async fn empty_group_id_without_committed_offsets_is_listed(
 /// must remove the `.json` before it decodes the id. A group named `foo.json` must stay distinct
 /// from the state object of a group named `foo`, and an id with reserved characters must be
 /// listed as it was stored.
-#[cfg(feature = "dynostore")]
-async fn state_only_group_ids_are_decoded(storage: impl Storage + Clone) -> Result<()> {
-    let base = alphanumeric_string(15);
+pub async fn state_only_group_ids_are_decoded(storage: impl Storage + Clone) -> Result<()> {
+    let base = random::alphanumeric_string(15);
     let group_ids = [base.clone(), format!("{base}.json"), format!("{base}/a%b")];
 
     for group_id in &group_ids {
@@ -549,430 +544,4 @@ async fn state_only_group_ids_are_decoded(storage: impl Storage + Clone) -> Resu
     }
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        memory_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_without_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_with_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lists_each_group_with_its_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::lists_each_group_with_its_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::states_filter_lists_only_groups_in_that_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_is_not_surfaced_as_phantom_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_is_not_surfaced_as_phantom_group(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_group_id_without_committed_offsets_is_listed() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::empty_group_id_without_committed_offsets_is_listed(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn state_only_group_ids_are_decoded() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::state_only_group_ids_are_decoded(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        lite_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_without_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_with_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lists_each_group_with_its_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::lists_each_group_with_its_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::states_filter_lists_only_groups_in_that_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        slate_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_without_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_with_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        postgres_storage(cluster, node).await
-    }
-
-    #[tokio::test]
-    async fn simple() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::simple(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_without_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_without_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_with_committed_offsets_is_listed_once() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_with_committed_offsets_is_listed_once(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lists_each_group_with_its_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::lists_each_group_with_its_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn states_filter_lists_only_groups_in_that_state() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::states_filter_lists_only_groups_in_that_state(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_whose_sessions_expired_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_whose_sessions_expired_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn group_past_its_join_deadline_is_listed_as_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let storage = storage_container(cluster_id, broker_id).await?;
-
-        super::group_past_its_join_deadline_is_listed_as_empty(storage).await?;
-
-        Ok(())
-    }
 }

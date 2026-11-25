@@ -1,0 +1,40 @@
+// Copyright (c) Solace Corporation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Registers a broker with the storage engine, as a broker does when it starts.
+
+use nisshi_broker::Result;
+use nisshi_storage::{BrokerRegistrationRequest, Storage};
+use uuid::Uuid;
+
+/// Registers the broker `broker_id` of the cluster `cluster_id` with the engine, under a new
+/// incarnation ID, as a broker does when it starts.
+pub async fn register_broker(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    sc: &impl Storage,
+) -> Result<()> {
+    let incarnation_id = Uuid::now_v7();
+
+    let broker_registration = BrokerRegistrationRequest {
+        broker_id,
+        cluster_id: cluster_id.into(),
+        incarnation_id,
+        rack: None,
+    };
+
+    sc.register_broker(broker_registration)
+        .await
+        .map_err(Into::into)
+}

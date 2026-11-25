@@ -16,7 +16,7 @@
 //! nothing, as Kafka does (KIP-447). Without the check, a zombie producer whose consumer lost its
 //! partitions in a rebalance could still move their offsets.
 
-use std::{assert_matches, slice, time::Duration};
+use std::{assert_matches, slice, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use nisshi_broker::{
@@ -38,13 +38,11 @@ use nisshi_storage::{
 use rama::{
     Layer as _, Service as _, extensions::Extensions, layer::MapErrLayer, service::BoxService,
 };
-use rand::{RngExt as _, rng};
-use url::Url;
-use uuid::Uuid;
 
-use crate::common::{
-    JoinResponse, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string, join, register_broker,
-    sync_group,
+use crate::{
+    broker,
+    group::{self, JoinResponse, PROTOCOL_TYPE, RANGE},
+    random,
 };
 
 const SESSION_TIMEOUT_MS: i32 = 45_000;
@@ -73,30 +71,26 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(storage_type: StorageType) -> Result<Self> {
-        Self::with_extend_routes(storage_type, None).await
+    async fn new(
+        cluster_id: impl Into<String>,
+        broker_id: i32,
+        storage: impl Storage,
+    ) -> Result<Self> {
+        Self::with_extend_routes(cluster_id, broker_id, storage, None).await
     }
 
     /// A fixture whose route table `extend_routes` changes, when there is one.
     async fn with_extend_routes(
-        storage_type: StorageType,
+        cluster_id: impl Into<String>,
+        broker_id: i32,
+        storage: impl Storage,
         extend_routes: Option<ExtendRoutes<Controller<ArcDynStorage>, ArcDynStorage>>,
     ) -> Result<Self> {
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
+        let storage: ArcDynStorage = Arc::new(storage);
 
-        let storage = crate::common::storage_container(
-            storage_type,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await?;
+        broker::register_broker(cluster_id, broker_id, &storage).await?;
 
-        register_broker(cluster, node, &storage).await?;
-
-        let topic = alphanumeric_string(15);
+        let topic = random::alphanumeric_string(15);
         _ = storage
             .create_topic(
                 CreatableTopic::default()
@@ -109,7 +103,7 @@ impl Fixture {
             )
             .await?;
 
-        let transaction_id = alphanumeric_string(10);
+        let transaction_id = random::alphanumeric_string(10);
         let producer = storage
             .init_producer(
                 Some(transaction_id.as_str()),
@@ -119,7 +113,7 @@ impl Fixture {
             )
             .await?;
 
-        let group = alphanumeric_string(15);
+        let group = random::alphanumeric_string(15);
 
         assert_eq!(
             ErrorCode::None,
@@ -157,7 +151,7 @@ impl Fixture {
 
     /// Forms the group with one member, which joins and syncs.
     async fn form_group(&mut self, group_instance_id: Option<&str>) -> Result<JoinResponse> {
-        let member = join(
+        let member = group::join(
             &mut self.broker,
             &self.group,
             None,
@@ -168,7 +162,7 @@ impl Fixture {
         )
         .await?;
 
-        let synced = sync_group(
+        let synced = group::sync_group(
             &mut self.broker,
             &self.group,
             member.generation(),
@@ -272,8 +266,12 @@ impl Fixture {
 
 /// A commit from a member that is not in the group is refused, and its offset is not applied when
 /// the transaction commits.
-async fn unknown_member(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn unknown_member(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
     let _member = fixture.form_group(None).await?;
 
     assert_eq!(
@@ -290,8 +288,12 @@ async fn unknown_member(storage_type: StorageType) -> Result<()> {
 }
 
 /// A member in the wrong generation is refused.
-async fn illegal_generation(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn illegal_generation(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
     let member = fixture.form_group(None).await?;
 
     assert_eq!(
@@ -308,8 +310,12 @@ async fn illegal_generation(storage_type: StorageType) -> Result<()> {
 }
 
 /// A static member's ID with another member's group instance ID is refused.
-async fn fenced_instance(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn fenced_instance(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
     let member = fixture.form_group(Some("instance-a")).await?;
 
     assert_eq!(
@@ -324,8 +330,12 @@ async fn fenced_instance(storage_type: StorageType) -> Result<()> {
 
 /// The member in the group's current generation commits, and the offset applies when the
 /// transaction commits.
-async fn current_member(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn current_member(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
     let member = fixture.form_group(None).await?;
 
     assert_eq!(
@@ -345,8 +355,12 @@ async fn current_member(storage_type: StorageType) -> Result<()> {
 
 /// A commit without a generation or a member, from a client on TxnOffsetCommit v0 to v2, is not
 /// checked against the group, also when the group has members.
-async fn without_member_fields(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn without_member_fields(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
     let _member = fixture.form_group(None).await?;
 
     assert_eq!(
@@ -365,11 +379,15 @@ async fn without_member_fields(storage_type: StorageType) -> Result<()> {
 /// A transactional commit is not refused while the group waits for its leader's assignment, where
 /// an `OffsetCommit` gets REBALANCE_IN_PROGRESS: Kafka does not hold a transactional commit to the
 /// group's state, and the Java producer treats that error as fatal.
-async fn group_completing_rebalance(storage_type: StorageType) -> Result<()> {
-    let mut fixture = Fixture::new(storage_type).await?;
+pub async fn group_completing_rebalance(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
+    let mut fixture = Fixture::new(cluster_id, broker_id, storage).await?;
 
     // The member joins and does not sync, so the group waits for the leader's assignment.
-    let member = join(
+    let member = group::join(
         &mut fixture.broker,
         &fixture.group,
         None,
@@ -408,9 +426,15 @@ fn accepting_commit_service() -> BoxService<FrameInput, Frame, Error> {
 
 /// A route that an extension puts in place of the TxnOffsetCommit route is still wrapped by the
 /// fence, so a member in the wrong generation is refused before the replacement runs.
-async fn replaced_route_keeps_the_fence(storage_type: StorageType) -> Result<()> {
+pub async fn replaced_route_keeps_the_fence(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    storage: impl Storage,
+) -> Result<()> {
     let mut fixture = Fixture::with_extend_routes(
-        storage_type,
+        cluster_id,
+        broker_id,
+        storage,
         Some(ExtendRoutes::new(|builder, _, _| {
             builder
                 .wrap_route(TxnOffsetCommitRequest::KEY, |_built_in| {
@@ -443,62 +467,3 @@ async fn replaced_route_keeps_the_fence(storage_type: StorageType) -> Result<()>
 
     Ok(())
 }
-
-macro_rules! engine_tests {
-    ($engine:ident, $storage_type:expr) => {
-        mod $engine {
-            use super::*;
-
-            #[tokio::test]
-            async fn unknown_member() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::unknown_member($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn illegal_generation() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::illegal_generation($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn fenced_instance() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::fenced_instance($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn current_member() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::current_member($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn group_completing_rebalance() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::group_completing_rebalance($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn without_member_fields() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::without_member_fields($storage_type).await
-            }
-
-            #[tokio::test]
-            async fn replaced_route_keeps_the_fence() -> Result<()> {
-                let _guard = crate::common::init_tracing()?;
-                super::replaced_route_keeps_the_fence($storage_type).await
-            }
-        }
-    };
-}
-
-#[cfg(feature = "dynostore")]
-engine_tests!(in_memory, StorageType::InMemory);
-
-#[cfg(feature = "libsql")]
-engine_tests!(lite, StorageType::Lite);
-
-#[cfg(feature = "postgres")]
-engine_tests!(pg, StorageType::Postgres);

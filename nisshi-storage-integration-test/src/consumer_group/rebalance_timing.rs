@@ -36,14 +36,11 @@ use nisshi_storage::{
     RequestStorageService, Storage, bounded_channel,
 };
 use rama::Service as _;
-use rand::{prelude::*, rng};
 use tokio::{task::JoinHandle, time::sleep};
-use url::Url;
-use uuid::Uuid;
 
-use crate::common::{
-    self, JoinResponse, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string, heartbeat,
-    init_tracing, join, sync_group,
+use crate::{
+    group::{self, JoinResponse, PROTOCOL_TYPE, RANGE},
+    random,
 };
 
 /// The Java client's default `session.timeout.ms`.
@@ -113,7 +110,7 @@ where
     let group = group.to_owned();
 
     tokio::spawn(async move {
-        join(
+        group::join(
             &mut controller,
             &group,
             None,
@@ -141,7 +138,7 @@ where
     let protocols = member.protocols().to_vec();
 
     tokio::spawn(async move {
-        join(
+        group::join(
             &mut controller,
             &group,
             Some(&member_id),
@@ -183,7 +180,7 @@ where
     };
 
     tokio::spawn(async move {
-        let response = sync_group(
+        let response = group::sync_group(
             &mut controller,
             &group,
             member.generation(),
@@ -260,7 +257,7 @@ where
     let deadline = Instant::now() + HEARTBEAT_WAIT;
 
     loop {
-        let response = heartbeat(
+        let response = group::heartbeat(
             &mut controller,
             group,
             member.generation(),
@@ -284,12 +281,12 @@ where
 
 /// The first member of a new group waits for `group.initial.rebalance.delay.ms`, so that other
 /// members can join the same generation, and no longer.
-async fn first_join_of_a_new_group_waits_for_the_initial_delay<G>(storage: G) -> Result<()>
+pub async fn first_join_of_a_new_group_waits_for_the_initial_delay<G>(storage: G) -> Result<()>
 where
     G: Storage + Clone,
 {
     let controller = Controller::with_storage(storage)?;
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let started_at = Instant::now();
     let member = spawn_join(&controller, &group).await??;
@@ -314,12 +311,12 @@ where
 /// The leader of a stable group rejoins, which starts a rebalance. The follower learns of it from
 /// its heartbeat and rejoins. The join phase ends as soon as both have rejoined, without a fixed
 /// wait, and starts the next generation.
-async fn rebalance_ends_once_every_member_has_rejoined<G>(storage: G) -> Result<()>
+pub async fn rebalance_ends_once_every_member_has_rejoined<G>(storage: G) -> Result<()>
 where
     G: Storage + Clone,
 {
     let controller = Controller::with_storage(storage)?;
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let (leader, follower) = form_group_of_two(&controller, &group).await?;
 
@@ -346,7 +343,7 @@ where
 /// rejoins, the others rejoin one after another, each on its own broker. The join phase ends as
 /// soon as the last member rejoins, on whichever broker it uses. While a join is held and nothing
 /// changes, the brokers only read the group: a held request doesn't write it on each poll.
-async fn rebalance_across_brokers_ends_once_the_last_member_rejoins<G>(storage: G) -> Result<()>
+pub async fn rebalance_across_brokers_ends_once_the_last_member_rejoins<G>(storage: G) -> Result<()>
 where
     G: Storage + Clone + 'static,
 {
@@ -358,7 +355,7 @@ where
         Controller::with_storage(shared.clone())?,
         Controller::with_storage(shared)?,
     ];
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let joins = (0..MEMBERS)
         .map(|index| spawn_join(&brokers[index % 2], &group))
@@ -429,55 +426,3 @@ where
 
     Ok(())
 }
-
-macro_rules! backend {
-    ($name:ident, $feature:literal, $storage_type:expr) => {
-        #[cfg(feature = $feature)]
-        mod $name {
-            use nisshi_storage::ArcDynStorage;
-
-            use super::*;
-
-            async fn storage_container() -> Result<ArcDynStorage> {
-                common::storage_container(
-                    $storage_type,
-                    Uuid::now_v7(),
-                    rng().random_range(0..i32::MAX),
-                    Url::parse("tcp://127.0.0.1/")?,
-                    None,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn first_join_of_a_new_group_waits_for_the_initial_delay() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::first_join_of_a_new_group_waits_for_the_initial_delay(
-                    storage_container().await?,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn rebalance_ends_once_every_member_has_rejoined() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::rebalance_ends_once_every_member_has_rejoined(storage_container().await?)
-                    .await
-            }
-
-            #[tokio::test]
-            async fn rebalance_across_brokers_ends_once_the_last_member_rejoins() -> Result<()> {
-                let _guard = init_tracing()?;
-                super::rebalance_across_brokers_ends_once_the_last_member_rejoins(
-                    storage_container().await?,
-                )
-                .await
-            }
-        }
-    };
-}
-
-backend!(in_memory, "dynostore", StorageType::InMemory);
-backend!(lite, "libsql", StorageType::Lite);
-backend!(pg, "postgres", StorageType::Postgres);
-backend!(slatedb, "slatedb", StorageType::SlateDb);

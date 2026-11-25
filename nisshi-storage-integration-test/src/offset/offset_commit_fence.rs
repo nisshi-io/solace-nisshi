@@ -45,13 +45,12 @@ use nisshi_storage::{
     bounded_channel,
 };
 use rama::Service as _;
-use rand::{prelude::*, rng};
-use url::Url;
 use uuid::Uuid;
 
-use crate::common::{
-    self, JoinResponse, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string, init_tracing, join,
-    leave, register_broker, sync_group,
+use crate::{
+    broker,
+    group::{self, JoinResponse, PROTOCOL_TYPE, RANGE},
+    random,
 };
 
 const SESSION_TIMEOUT_MS: i32 = 45_000;
@@ -72,7 +71,7 @@ async fn create_topic<G>(storage: &G) -> Result<String>
 where
     G: Storage,
 {
-    let topic = alphanumeric_string(15);
+    let topic = random::alphanumeric_string(15);
 
     _ = storage
         .create_topic(
@@ -94,7 +93,7 @@ async fn form_group<G>(broker: &mut Controller<G>, group: &str) -> Result<JoinRe
 where
     G: Storage + Clone,
 {
-    let member = join(
+    let member = group::join(
         broker,
         group,
         None,
@@ -105,7 +104,7 @@ where
     )
     .await?;
 
-    let synced = sync_group(
+    let synced = group::sync_group(
         broker,
         group,
         member.generation(),
@@ -193,7 +192,7 @@ where
 /// A member forms a group on broker A, which caches the group. The member then leaves through
 /// broker B, and commits an offset through A with the generation that it had. A's cache still
 /// holds the member, but storage doesn't, so the commit is rejected and stores nothing.
-async fn commit_after_leaving_through_another_broker_is_fenced<G>(
+pub async fn commit_after_leaving_through_another_broker_is_fenced<G>(
     cluster_id: Uuid,
     broker_id: i32,
     storage: G,
@@ -201,16 +200,16 @@ async fn commit_after_leaving_through_another_broker_is_fenced<G>(
 where
     G: Storage + Clone + 'static,
 {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
     let topic = create_topic(&storage).await?;
 
     let mut broker_a = Controller::new(storage.clone(), GROUP_COORDINATOR);
     let mut broker_b = Controller::new(storage.clone(), GROUP_COORDINATOR);
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let member = form_group(&mut broker_a, &group).await?;
 
-    let left = leave(&mut broker_b, &group, member.id(), None).await?;
+    let left = group::leave(&mut broker_b, &group, member.id(), None).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(left.error_code)?);
 
     assert_eq!(
@@ -272,7 +271,7 @@ where
 /// Another broker removes a member while the member's commit is in progress: after the commit has
 /// read the group, and before its conditional write of the group. The write loses, and the commit
 /// is checked again against the group without the member, so it is rejected and stores nothing.
-async fn commit_whose_member_is_removed_during_the_commit_stores_nothing<G>(
+pub async fn commit_whose_member_is_removed_during_the_commit_stores_nothing<G>(
     cluster_id: Uuid,
     broker_id: i32,
     storage: G,
@@ -280,7 +279,7 @@ async fn commit_whose_member_is_removed_during_the_commit_stores_nothing<G>(
 where
     G: Storage + Clone + 'static,
 {
-    register_broker(cluster_id, broker_id, &storage).await?;
+    broker::register_broker(cluster_id, broker_id, &storage).await?;
     let topic = create_topic(&storage).await?;
 
     let removal = Removal::default();
@@ -288,7 +287,7 @@ where
         interfering_storage(storage.clone(), removal.clone()),
         GROUP_COORDINATOR,
     );
-    let group = alphanumeric_string(15);
+    let group = random::alphanumeric_string(15);
 
     let member = form_group(&mut broker, &group).await?;
 
@@ -307,59 +306,3 @@ where
 
     assert_no_offset_stored(&storage, &group, &topic).await
 }
-
-macro_rules! backend {
-    ($name:ident, $feature:literal, $storage_type:expr) => {
-        #[cfg(feature = $feature)]
-        mod $name {
-            use nisshi_storage::ArcDynStorage;
-
-            use super::*;
-
-            async fn storage_container(cluster_id: Uuid, broker_id: i32) -> Result<ArcDynStorage> {
-                common::storage_container(
-                    $storage_type,
-                    cluster_id,
-                    broker_id,
-                    Url::parse("tcp://127.0.0.1/")?,
-                    None,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn commit_after_leaving_through_another_broker_is_fenced() -> Result<()> {
-                let _guard = init_tracing()?;
-                let cluster_id = Uuid::now_v7();
-                let broker_id = rng().random_range(0..i32::MAX);
-
-                super::commit_after_leaving_through_another_broker_is_fenced(
-                    cluster_id,
-                    broker_id,
-                    storage_container(cluster_id, broker_id).await?,
-                )
-                .await
-            }
-
-            #[tokio::test]
-            async fn commit_whose_member_is_removed_during_the_commit_stores_nothing() -> Result<()>
-            {
-                let _guard = init_tracing()?;
-                let cluster_id = Uuid::now_v7();
-                let broker_id = rng().random_range(0..i32::MAX);
-
-                super::commit_whose_member_is_removed_during_the_commit_stores_nothing(
-                    cluster_id,
-                    broker_id,
-                    storage_container(cluster_id, broker_id).await?,
-                )
-                .await
-            }
-        }
-    };
-}
-
-backend!(in_memory, "dynostore", StorageType::InMemory);
-backend!(lite, "libsql", StorageType::Lite);
-backend!(pg, "postgres", StorageType::Postgres);
-backend!(slatedb, "slatedb", StorageType::SlateDb);

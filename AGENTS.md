@@ -14,6 +14,7 @@ Before your first edit of a file that a row covers, read the file that the row n
 | Before you edit any `.rs` file | `.claude/rules/modules.md` |
 | Before you edit any `.rs` or `.sh` file or a `justfile` | `.claude/rules/naming.md` |
 | Before you edit anything under `nisshi-smoke-test/` | `.claude/rules/smoke-tests.md` |
+| Before you edit anything under `nisshi-broker/tests/it/` or `nisshi-storage-integration-test/` | `.claude/rules/storage-integration-tests.md` |
 | Before you edit anything under `nisshi-storage-sql/` | `.claude/rules/sql-queries.md` |
 | Before you edit any `.rs` file | `.claude/rules/testable-design.md` |
 | Before you edit any `.rs` file | `.claude/rules/unit-test-layout.md` |
@@ -100,6 +101,7 @@ Cargo workspace (members, including `nisshi-fuzz-harness`, are listed in the roo
 | `nisshi-storage-null` | Storage factory for `null://`, a stub backend with no message persistence |
 | `nisshi-storage-slatedb` | Storage factory for `slatedb://` (SlateDB, a KV store on object storage) |
 | `nisshi-storage-sql` | Storage factories for `postgres://` and `sqlite://` (PostgreSQL, libSQL) |
+| `nisshi-storage-integration-test` | Tests of the broker on a storage engine that the caller passes in; `nisshi-broker` runs them on each engine in `tests/it/storage_integration.rs`. Not published |
 | `nisshi-schema` | Schema registry + Iceberg/Delta/Parquet lake integration |
 | `nisshi-client` | Async Kafka protocol client (rama service layers) |
 | `nisshi-model` | Kafka JSON protocol definitions (used in build.rs) |

@@ -15,9 +15,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{
-    self, CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string,
-    heartbeat, join, join_group, register_broker, sync_group,
+use crate::{
+    broker,
+    group::{self, CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE},
+    random,
 };
 use bytes::Bytes;
 use nisshi_broker::{Result, coordinator::group::administrator::Controller};
@@ -26,10 +27,7 @@ use nisshi_sans_io::{
     sync_group_request::SyncGroupRequestAssignment,
 };
 use nisshi_storage::Storage;
-use rand::{prelude::*, rng};
 use tracing::debug;
-use url::Url;
-use uuid::Uuid;
 
 pub async fn reject_empty_member_id_on_join<G>(
     cluster_id: impl Into<String>,
@@ -39,7 +37,7 @@ pub async fn reject_empty_member_id_on_join<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id, broker_id, &sc).await?;
+    broker::register_broker(cluster_id, broker_id, &sc).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
 
@@ -48,7 +46,7 @@ where
     let group_instance_id = None;
     let reason = None;
 
-    let group_id: String = alphanumeric_string(15);
+    let group_id: String = random::alphanumeric_string(15);
     debug!(?group_id);
 
     let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
@@ -65,7 +63,7 @@ where
 
     // join dynamic group without a member id
     //
-    let member_id_required = join_group(
+    let member_id_required = group::join_group(
         &mut controller,
         Some(CLIENT_ID),
         group_id.as_str(),
@@ -99,7 +97,7 @@ pub async fn lifecycle<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) 
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id, broker_id, &sc).await?;
+    broker::register_broker(cluster_id, broker_id, &sc).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
 
@@ -107,12 +105,12 @@ where
     let rebalance_timeout_ms = Some(300_000);
     let group_instance_id = None;
 
-    let group_id: String = alphanumeric_string(15);
+    let group_id: String = random::alphanumeric_string(15);
     debug!(?group_id);
 
     // 1st member
     //
-    let first_member = join(
+    let first_member = group::join(
         &mut controller,
         group_id.as_str(),
         None,
@@ -124,7 +122,7 @@ where
     .await?;
     debug!(?first_member);
 
-    let first_member_assignment_01 = common::random_bytes(15);
+    let first_member_assignment_01 = random::random_bytes(15);
 
     let assignments = [SyncGroupRequestAssignment::default()
         .member_id(first_member.id().into())
@@ -132,7 +130,7 @@ where
 
     // sync to form the group
     //
-    let sync_response = sync_group(
+    let sync_response = group::sync_group(
         &mut controller,
         group_id.as_str(),
         first_member.generation(),
@@ -153,7 +151,7 @@ where
 
     // heartbeat establishing leadership of current generation
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         first_member.generation(),
@@ -165,7 +163,7 @@ where
 
     // 2nd member joins
     //
-    let second_member = join(
+    let second_member = group::join(
         &mut controller,
         group_id.as_str(),
         None,
@@ -179,7 +177,7 @@ where
 
     // 2nd member on sync is told that the group is rebalancing
     //
-    let sync_response = sync_group(
+    let sync_response = group::sync_group(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -199,7 +197,7 @@ where
 
     // rebalance in progress on heartbeat from leader with previous generation
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         first_member.generation(),
@@ -214,7 +212,7 @@ where
 
     // 2nd member rejoins due to rebalance
     //
-    let second_member = join(
+    let second_member = group::join(
         &mut controller,
         group_id.as_str(),
         Some(second_member.id()),
@@ -229,7 +227,7 @@ where
 
     // first member rejoins as leader
     //
-    let first_member = join(
+    let first_member = group::join(
         &mut controller,
         group_id.as_str(),
         Some(first_member.id()),
@@ -246,8 +244,8 @@ where
     //
     assert_eq!(first_member.generation(), second_member.generation());
 
-    let first_member_assignment_02 = common::random_bytes(15);
-    let second_member_assignment_02 = common::random_bytes(15);
+    let first_member_assignment_02 = random::random_bytes(15);
+    let second_member_assignment_02 = random::random_bytes(15);
 
     let assignments = [
         SyncGroupRequestAssignment::default()
@@ -260,7 +258,7 @@ where
 
     // 1st member leader sync to form and assign the group
     //
-    let sync_response = sync_group(
+    let sync_response = group::sync_group(
         &mut controller,
         group_id.as_str(),
         first_member.generation(),
@@ -281,7 +279,7 @@ where
 
     // 2st member receives group assignments
     //
-    let sync_response = sync_group(
+    let sync_response = group::sync_group(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -302,7 +300,7 @@ where
 
     // 1st member heartbeat
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         first_member.generation(),
@@ -314,7 +312,7 @@ where
 
     // 2nd member heartbeat
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -326,7 +324,7 @@ where
 
     // 1st member leaves the group
     //
-    let leave_response = common::leave(
+    let leave_response = group::leave(
         &mut controller,
         group_id.as_str(),
         first_member.id(),
@@ -340,7 +338,7 @@ where
 
     // 2nd member heartbeat resulting in rebalance in progress
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -355,7 +353,7 @@ where
 
     // 2nd member rejoins due to rebalance as leader
     //
-    let second_member = join(
+    let second_member = group::join(
         &mut controller,
         group_id.as_str(),
         Some(second_member.id()),
@@ -368,7 +366,7 @@ where
     debug!(?second_member);
     assert!(second_member.is_leader());
 
-    let second_member_assignment_03 = common::random_bytes(15);
+    let second_member_assignment_03 = random::random_bytes(15);
 
     let assignments = [SyncGroupRequestAssignment::default()
         .member_id(second_member.id().into())
@@ -376,7 +374,7 @@ where
 
     // 2nd member leader sync to reform and assign the group
     //
-    let sync_response = sync_group(
+    let sync_response = group::sync_group(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -397,7 +395,7 @@ where
 
     // 2nd member heartbeat
     //
-    let HeartbeatResponse { error_code, .. } = heartbeat(
+    let HeartbeatResponse { error_code, .. } = group::heartbeat(
         &mut controller,
         group_id.as_str(),
         second_member.generation(),
@@ -408,212 +406,4 @@ where
     assert_eq!(ErrorCode::None, ErrorCode::try_from(error_code)?);
 
     Ok(())
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Postgres,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_empty_member_id_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_empty_member_id_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn lifecycle() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::lifecycle(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_empty_member_id_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_empty_member_id_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn lifecycle() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::lifecycle(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Lite,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_empty_member_id_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_empty_member_id_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn lifecycle() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::lifecycle(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::SlateDb,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_empty_member_id_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_empty_member_id_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn lifecycle() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::lifecycle(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

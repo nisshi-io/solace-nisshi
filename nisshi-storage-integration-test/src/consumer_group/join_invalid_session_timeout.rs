@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{
-    self, CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string,
-    join, join_group, register_broker,
+use crate::{
+    broker,
+    group::{self, CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE},
+    random,
 };
 use nisshi_broker::{Result, coordinator::group::administrator::Controller};
 use nisshi_sans_io::{ErrorCode, join_group_request::JoinGroupRequestProtocol};
 use nisshi_storage::Storage;
-use rand::{prelude::*, rng};
 use tokio::time::{Duration, timeout};
-use url::Url;
-use uuid::Uuid;
 
 // Kafka's `group.max.session.timeout.ms` default. Nisshi has no equivalent config,
 // so this is the boundary the fix hardcodes (see administrator.rs).
@@ -56,17 +54,17 @@ pub async fn reject_invalid_session_timeout_on_join<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id.clone(), broker_id, &sc).await?;
+    broker::register_broker(cluster_id.clone(), broker_id, &sc).await?;
 
     for invalid_session_timeout_ms in [-1, 0, MAX_SESSION_TIMEOUT_MS + 1] {
         let mut controller = Controller::with_storage(sc.clone())?;
 
-        let group_id: String = alphanumeric_string(15);
-        let group_instance_id = format!("static-{}", alphanumeric_string(8));
+        let group_id: String = random::alphanumeric_string(15);
+        let group_instance_id = format!("static-{}", random::alphanumeric_string(8));
 
         let rejected = timeout(
             Duration::from_secs(5),
-            join_group(
+            group::join_group(
                 &mut controller,
                 Some(CLIENT_ID),
                 group_id.as_str(),
@@ -107,7 +105,7 @@ where
         // profile kills it.
         let joined = timeout(
             Duration::from_secs(10),
-            join(
+            group::join(
                 &mut controller,
                 group_id.as_str(),
                 None,
@@ -143,16 +141,16 @@ pub async fn accept_boundary_session_timeout_on_join<G>(
 where
     G: Storage + Clone,
 {
-    register_broker(cluster_id.clone(), broker_id, &sc).await?;
+    broker::register_broker(cluster_id.clone(), broker_id, &sc).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
 
-    let group_id: String = alphanumeric_string(15);
-    let group_instance_id = format!("static-{}", alphanumeric_string(8));
+    let group_id: String = random::alphanumeric_string(15);
+    let group_instance_id = format!("static-{}", random::alphanumeric_string(8));
 
     let accepted = timeout(
         Duration::from_secs(10),
-        join_group(
+        group::join_group(
             &mut controller,
             Some(CLIENT_ID),
             group_id.as_str(),
@@ -175,208 +173,4 @@ where
     assert_eq!(accepted.member_id, accepted.leader);
 
     Ok(())
-}
-
-#[cfg(feature = "postgres")]
-mod pg {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Postgres,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_invalid_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_invalid_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn accept_boundary_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::accept_boundary_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_invalid_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_invalid_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn accept_boundary_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::accept_boundary_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::Lite,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_invalid_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_invalid_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn accept_boundary_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::accept_boundary_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use nisshi_storage::ArcDynStorage;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String> + Clone,
-        node: i32,
-    ) -> Result<ArcDynStorage> {
-        common::storage_container(
-            StorageType::SlateDb,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_invalid_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_invalid_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn accept_boundary_session_timeout_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::accept_boundary_session_timeout_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

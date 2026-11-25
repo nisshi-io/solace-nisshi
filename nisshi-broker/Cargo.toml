@@ -80,15 +80,22 @@ anyhow.workspace = true
 crc-fast.workspace = true
 nisshi-schema.workspace = true
 nisshi-storage-dynostore = { workspace = true, features = ["test-support"] }
+# Path only, so that `cargo publish` leaves it out: the crate is not published.
+# The crate depends on `nisshi-broker`, so use it only from `tests/`, never from a unit test in
+# `src/`. A unit test is compiled into a second copy of `nisshi-broker`, and the suite's types
+# come from the first, so the two don't match.
+nisshi-storage-integration-test = { path = "../nisshi-storage-integration-test" }
 nisshi-storage-sql = { workspace = true, features = ["test-support"] }
 nisshi-storage.workspace = true
 object_store.workspace = true
 pbkdf2.workspace = true
 pretty_assertions.workspace = true
+proc-macro2.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
 slatedb.workspace = true
 snap.workspace = true
+syn = { workspace = true, features = ["visit"] }
 tempfile.workspace = true
 tokio-postgres.workspace = true
 traceforge.workspace = true
