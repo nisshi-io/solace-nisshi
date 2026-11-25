@@ -224,6 +224,13 @@ fn a_refused_produce_ends_generator_and_perf_with_4() {
         String::from_utf8_lossy(&perf.stderr).contains("UnknownTopicOrPartition"),
         "perf: {perf:?}"
     );
+    // The text summary of a refused run is a line of zeros, so it says which line it is.
+    assert!(
+        String::from_utf8_lossy(&perf.stdout)
+            .lines()
+            .any(|line| line.starts_with("summary: ")),
+        "perf: {perf:?}"
+    );
 
     let generator = broker.run_unaided(
         &[

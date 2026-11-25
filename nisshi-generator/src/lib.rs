@@ -85,8 +85,11 @@ pub enum Error {
 
 impl Error {
     /// Whether the broker refused the login, the TLS connection or a produce request, or the
-    /// client refused what the broker offered. The run ends with the error: a refusal repeats on
-    /// every batch, so going on would only count refusals.
+    /// client refused what the broker offered. The run ends with the first refusal, a transient
+    /// error code such as `KafkaStorageError` or `RequestTimedOut` included. Kafka's own producer
+    /// retries those, and this tool does not: a retry would hide an outage of the broker or its
+    /// storage in the numbers of a run that measures the broker. The exit status and the code
+    /// on stderr show it instead.
     fn is_refusal(&self) -> bool {
         match self {
             Self::Api(_) => true,
@@ -140,22 +143,32 @@ pub enum ReportFormat {
 
 /// What a run produced, printed as one line of JSON with [`ReportFormat::Json`].
 ///
-/// Only batches that the broker accepted are counted.
+/// Only batches that the broker accepted are counted. A batch whose answer the run did not wait
+/// for, because it ended first, is not counted, so the topic may hold up to one more batch per
+/// producer. `error_code` is the code of the produce request that ended the run, as the broker
+/// sent it, or 0 when the broker refused none.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Summary {
     r#type: &'static str,
     elapsed_ms: u64,
     batches_produced: u64,
     records_produced: u64,
+    error_code: i16,
 }
 
 impl Summary {
-    fn new(elapsed: Duration, batches_produced: u64, records_produced: u64) -> Self {
+    fn new(
+        elapsed: Duration,
+        batches_produced: u64,
+        records_produced: u64,
+        error_code: ErrorCode,
+    ) -> Self {
         Self {
             r#type: "summary",
             elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             batches_produced,
             records_produced,
+            error_code: error_code.into(),
         }
     }
 
@@ -301,7 +314,7 @@ pub async fn produce(
             if partition.error_code != i16::from(ErrorCode::None) {
                 let code = ErrorCode::try_from(partition.error_code)
                     .unwrap_or(ErrorCode::UnknownServerError);
-                error!(topic = %topic.name, partition = partition.index, ?code, message = ?partition.error_message, "the broker refused the produce request");
+                error!(topic = %topic.name, partition = partition.index, ?code, error_code = partition.error_code, error_message = ?partition.error_message, "the broker refused the produce request");
                 return Err(Error::Api(code));
             }
         }
@@ -447,6 +460,9 @@ impl Generate {
                             let produce_start = SystemTime::now();
 
                             tokio::select! {
+                                // A produce request still waiting for its answer is dropped
+                                // here, so the broker may store a batch that the counters
+                                // never see.
                                 cancelled = token.cancelled() => {
                                     debug!(?cancelled);
                                     break
@@ -545,6 +561,30 @@ impl Generate {
         // Before the flush and the grace period below, which are not time spent producing.
         let elapsed = started.elapsed();
 
+        // Each producer ends at its next await once the token is cancelled, so this waits for
+        // the request each one had in flight to be dropped, and for nothing else. The counters
+        // are final after it.
+        while set.join_next().await.is_some() {}
+
+        if self.configuration.report == ReportFormat::Json {
+            let error_code = match &failure {
+                Some(Error::Api(code)) => *code,
+                _ => ErrorCode::None,
+            };
+
+            let summary = Summary::new(
+                elapsed,
+                batches_produced.load(Ordering::Relaxed),
+                records_produced.load(Ordering::Relaxed),
+                error_code,
+            );
+
+            // A closed stdout does not fail a run that already did its work.
+            _ = writeln!(io::stdout(), "{}", summary.to_json()).inspect_err(|error| debug!(?error));
+        }
+
+        // The flush waits out the export's own timeouts when the collector does not answer, so
+        // it runs after the summary, which is final once the producers have ended.
         if let Some(meter_provider) = meter_provider {
             let flushed = meter_provider
                 .force_flush()
@@ -553,8 +593,7 @@ impl Generate {
                 .shutdown()
                 .inspect(|shutdown| debug!(?shutdown));
 
-            // The flush runs before the summary below, so a failed flush must not end the run
-            // here. Its error stands as the run's error only when no refusal is held already,
+            // A failed flush stands as the run's error only when no refusal is held already,
             // because a refusal names what the broker did, and that is the more specific answer.
             if let Err(error) = flushed.and(shut_down) {
                 warn!(?error, "the metrics of the run were not exported");
@@ -567,24 +606,6 @@ impl Generate {
 
         if let Some(CancelKind::Timeout) = cancellation {
             sleep(Duration::from_secs(5)).await;
-        }
-
-        debug!(abort = set.len());
-        set.abort_all();
-
-        while !set.is_empty() {
-            _ = set.join_next().await;
-        }
-
-        if self.configuration.report == ReportFormat::Json {
-            let summary = Summary::new(
-                elapsed,
-                batches_produced.load(Ordering::Relaxed),
-                records_produced.load(Ordering::Relaxed),
-            );
-
-            // A closed stdout does not fail a run that already did its work.
-            _ = writeln!(io::stdout(), "{}", summary.to_json()).inspect_err(|error| debug!(?error));
         }
 
         failure.map_or(Ok(ErrorCode::None), Err)
@@ -771,7 +792,7 @@ mod tests {
 
     #[test]
     fn the_summary_is_one_json_object() {
-        let summary = Summary::new(Duration::from_millis(1500), 3, 30);
+        let summary = Summary::new(Duration::from_millis(1500), 3, 30, ErrorCode::None);
         let json: serde_json::Value = serde_json::from_str(&summary.to_json()).unwrap();
 
         assert_eq!(
@@ -780,8 +801,22 @@ mod tests {
                 "elapsed_ms": 1500,
                 "batches_produced": 3,
                 "records_produced": 30,
+                "error_code": 0,
             }),
             json
         );
+    }
+
+    #[test]
+    fn the_summary_has_the_error_code_that_ended_the_run() {
+        let summary = Summary::new(
+            Duration::from_millis(1500),
+            3,
+            30,
+            ErrorCode::UnknownTopicOrPartition,
+        );
+        let json: serde_json::Value = serde_json::from_str(&summary.to_json()).unwrap();
+
+        assert_eq!(3, json["error_code"], "{json}");
     }
 }

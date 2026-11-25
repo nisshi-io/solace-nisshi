@@ -198,21 +198,21 @@ fn perf_prints_a_json_object_for_each_interval_and_a_summary() {
 
     let (summary, intervals) = lines.split_last().expect("a summary");
     assert_eq!("summary", summary["type"], "{output:?}");
-    assert!(summary["records_sent"].as_u64().unwrap() > 0, "{summary}");
+    assert!(summary["records_produced"].as_u64().unwrap() > 0, "{summary}");
     assert!(!intervals.is_empty(), "{output:?}");
     for interval in intervals {
         assert_eq!("interval", interval["type"], "{interval}");
-        assert!(interval["records_sent"].is_u64(), "{interval}");
+        assert!(interval["records_produced"].is_u64(), "{interval}");
     }
 
     // The summary covers the whole run, not the last interval: it holds at least what the
     // intervals add up to, and a run of 3 s, not of the 500 ms of an interval.
     let interval_records: u64 = intervals
         .iter()
-        .map(|interval| interval["records_sent"].as_u64().unwrap())
+        .map(|interval| interval["records_produced"].as_u64().unwrap())
         .sum();
     assert!(
-        summary["records_sent"].as_u64().unwrap() >= interval_records,
+        summary["records_produced"].as_u64().unwrap() >= interval_records,
         "{output:?}"
     );
     let elapsed_ms = summary["elapsed_ms"].as_u64().unwrap();
@@ -327,7 +327,10 @@ fn a_refused_produce_still_prints_the_json_summary_and_exits_4() {
     _ = std::fs::remove_dir_all(&registry);
 
     assert_eq!(Some(4), output.status.code(), "{output:?}");
-    assert_eq!(0, json(&output)["records_produced"], "{output:?}");
+    let summary = json(&output);
+    assert_eq!(0, summary["records_produced"], "{output:?}");
+    // UNKNOWN_TOPIC_OR_PARTITION is 3.
+    assert_eq!(3, summary["error_code"], "{output:?}");
 }
 
 /// The metrics are flushed when the run ends. A collector that is down then must neither drop

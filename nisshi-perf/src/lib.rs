@@ -23,10 +23,7 @@ use std::{
     num::{NonZero, NonZeroU32},
     ops::AddAssign,
     pin::Pin,
-    sync::{
-        Arc, LazyLock, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -92,8 +89,11 @@ pub enum Error {
 
 impl Error {
     /// Whether the broker refused the login, the TLS connection or a produce request, or the
-    /// client refused what the broker offered. The run ends with the error: a refusal repeats on
-    /// every batch, so going on would only count refusals.
+    /// client refused what the broker offered. The run ends with the first refusal, a transient
+    /// error code such as `KafkaStorageError` or `RequestTimedOut` included. Kafka's own producer
+    /// retries those, and this tool does not: a retry would hide an outage of the broker or its
+    /// storage in the numbers of a run that measures the broker. The exit status and the code
+    /// on stderr show it instead.
     fn is_refusal(&self) -> bool {
         match self {
             Self::Api(_) => true,
@@ -131,12 +131,13 @@ pub enum CancelKind {
 /// How the report of a run is printed on stdout.
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ReportFormat {
-    /// A line of text for a person to read, for each interval and one for the whole run.
+    /// A line of text for a person to read, for each interval and one for the whole run, which
+    /// starts with `summary: `.
     #[default]
     Text,
 
     /// One JSON object on a line for each interval, with `"type": "interval"`, and a last one
-    /// for the whole run, with `"type": "summary"`.
+    /// for the whole run, with `"type": "summary"` and the `error_code` that ended it.
     Json,
 }
 
@@ -313,9 +314,12 @@ impl Perf {
 
     pub async fn main(self) -> Result<ErrorCode> {
         let token = CancellationToken::new();
+        let started_at = SystemTime::now();
+        let totals = Arc::new(Mutex::new(None));
 
         let meter_provider = {
-            let exporter = MetricExporter::new(token.clone(), self.report);
+            let exporter =
+                MetricExporter::new(started_at, token.clone(), totals.clone(), self.report);
             let meter_provider = SdkMeterProvider::builder()
                 .with_periodic_exporter(exporter)
                 .build();
@@ -451,16 +455,39 @@ impl Perf {
 
         debug!(?cancellation);
 
-        // The exporter prints the summary of the whole run when the token is cancelled, on a
-        // shutdown: cancel it however the run ended, an interrupt or a signal included.
+        // The producers stop here however the run ended, an interrupt or a signal included, so
+        // that the summary counts what was produced up to `ended_at`.
         token.cancel();
+        let ended_at = SystemTime::now();
+
+        // Each producer ends at its next await once the token is cancelled, so this waits for
+        // the request each one had in flight to be dropped, and for nothing else.
+        while set.join_next().await.is_some() {}
+
+        // The shutdown exports the counters one last time, into `totals`, so the summary below
+        // sees every batch that was counted.
+        let shut_down = meter_provider
+            .shutdown()
+            .inspect(|shutdown| debug!(?shutdown));
+
+        let error_code = match &failure {
+            Some(Error::Api(code)) => *code,
+            _ => ErrorCode::None,
+        };
+
+        let summary = summary(
+            started_at,
+            ended_at,
+            totals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_default(),
+        );
+        print_report(self.report, &summary, ReportKind::Summary { error_code });
 
         // A failed shutdown stands as the run's error only when no refusal is held already,
         // because a refusal names what the broker did, and that is the more specific answer.
-        if let Err(error) = meter_provider
-            .shutdown()
-            .inspect(|shutdown| debug!(?shutdown))
-        {
+        if let Err(error) = shut_down {
             warn!(?error, "the metrics of the run were not exported");
 
             if failure.is_none() {
@@ -472,15 +499,37 @@ impl Perf {
             sleep(Duration::from_secs(5)).await;
         }
 
-        debug!(abort = set.len());
-        set.abort_all();
-
-        while !set.is_empty() {
-            _ = set.join_next().await;
-        }
-
         failure.map_or(Ok(ErrorCode::None), Err)
     }
+}
+
+/// The report of the whole run, from `started_at` to `ended_at`, over the last exported
+/// `totals`.
+fn summary(started_at: SystemTime, ended_at: SystemTime, totals: ObservationLatency) -> Info {
+    let mut info = Info::new(started_at);
+    info.current = ObservationLatency {
+        observation: Observation {
+            taken_at: ended_at,
+            ..totals.observation
+        },
+        latency: totals.latency,
+    };
+    info
+}
+
+/// The line of the report for `info`, as `report` prints it.
+fn report_line(report: ReportFormat, info: &Info, kind: ReportKind) -> String {
+    match (report, kind) {
+        (ReportFormat::Text, ReportKind::Interval) => info.to_string(),
+        (ReportFormat::Text, ReportKind::Summary { .. }) => format!("summary: {info}"),
+        (ReportFormat::Json, kind) => info.json_line(kind),
+    }
+}
+
+/// Prints a line of the report. A closed stdout does not fail the run.
+fn print_report(report: ReportFormat, info: &Info, kind: ReportKind) {
+    _ = writeln!(io::stdout(), "{}", report_line(report, info, kind))
+        .inspect_err(|error| debug!(?error));
 }
 
 #[derive(Clone, Debug)]
@@ -546,7 +595,7 @@ impl Producer {
                     let code = ErrorCode::try_from(partition.error_code)
                         .unwrap_or(ErrorCode::UnknownServerError);
 
-                    error!(topic = %topic.name, partition = partition.index, ?code, message = ?partition.error_message, "the broker refused the produce request");
+                    error!(topic = %topic.name, partition = partition.index, ?code, error_code = partition.error_code, error_message = ?partition.error_message, "the broker refused the produce request");
 
                     return Err(Error::Api(code));
                 }
@@ -596,6 +645,8 @@ impl Producer {
         let produce_start = SystemTime::now();
 
         tokio::select! {
+            // A produce request still waiting for its answer is dropped here, so the broker may
+            // store a batch that the counters never see.
             cancelled = self.token.cancelled() => {
                 debug!(?cancelled);
                 return Ok(false)
@@ -688,7 +739,8 @@ impl Info {
                 .unwrap_or_default()
     }
 
-    fn records_sent(&self) -> u64 {
+    /// The records of the batches that the broker accepted.
+    fn records_produced(&self) -> u64 {
         self.current.observation.record_count
             - self
                 .previous
@@ -697,10 +749,10 @@ impl Info {
     }
 
     /// The rate over the elapsed time with its fraction, or `None` when no time has elapsed.
-    fn records_sent_per_second(&self) -> Option<f64> {
+    fn records_produced_per_second(&self) -> Option<f64> {
         let seconds = self.elapsed().as_secs_f64();
 
-        (seconds > 0.0).then(|| self.records_sent() as f64 / seconds)
+        (seconds > 0.0).then(|| self.records_produced() as f64 / seconds)
     }
 
     /// The report as one line of JSON. It has `null` where there is nothing to divide by or
@@ -712,20 +764,25 @@ impl Info {
         let milliseconds =
             |duration: Option<Duration>| duration.map(|duration| duration.as_millis() as u64);
 
-        serde_json::json!({
+        let mut line = serde_json::json!({
             "type": kind.name(),
             "elapsed_ms": self.elapsed().as_millis() as u64,
-            "records_sent": self.records_sent(),
+            "records_produced": self.records_produced(),
             "bytes_sent": self.bytes_sent(),
-            "records_per_second": per_second(self.records_sent()),
+            "records_per_second": per_second(self.records_produced()),
             "bytes_per_second": per_second(self.bytes_sent()),
             "latency_ms": {
                 "min": milliseconds(self.current.latency.min),
                 "mean": self.current.latency.mean,
                 "max": milliseconds(self.current.latency.max),
             },
-        })
-        .to_string()
+        });
+
+        if let ReportKind::Summary { error_code } = kind {
+            line["error_code"] = i16::from(error_code).into();
+        }
+
+        line.to_string()
     }
 
     /// The bytes per second over the elapsed time with its fraction, or `None` when no time has
@@ -739,21 +796,22 @@ impl Info {
     }
 }
 
-/// Which line of the report a JSON object is.
+/// Which line of the report this is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReportKind {
     /// What happened since the previous line.
     Interval,
 
-    /// What happened in the whole run.
-    Summary,
+    /// What happened in the whole run. `error_code` is the code of the produce request that
+    /// ended it, or [`ErrorCode::None`] when the broker refused none.
+    Summary { error_code: ErrorCode },
 }
 
 impl ReportKind {
     fn name(self) -> &'static str {
         match self {
             Self::Interval => "interval",
-            Self::Summary => "summary",
+            Self::Summary { .. } => "summary",
         }
     }
 }
@@ -762,10 +820,10 @@ impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "elapsed: {}, {} records sent, {} records/s, ({}), latency: {} min, {:.1}ms avg, {} max",
+            "elapsed: {}, {} records produced, {} records/s, ({}), latency: {} min, {:.1}ms avg, {} max",
             self.elapsed().format_duration(),
-            self.records_sent(),
-            self.records_sent_per_second()
+            self.records_produced(),
+            self.records_produced_per_second()
                 .map_or_else(|| "-".to_owned(), |rate| format!("{rate:.1}")),
             self.bandwidth().map_or_else(
                 || "-".to_owned(),
@@ -820,38 +878,33 @@ struct ObservationLatency {
     latency: Latency,
 }
 
+/// Prints an interval line of the report on each export, and keeps the totals of the last export
+/// for the summary that the run prints when it ends.
 #[derive(Debug)]
 struct MetricExporter {
     started_at: SystemTime,
     temporality: Temporality,
-    previous: Mutex<Option<ObservationLatency>>,
+    /// The totals of the last export, since the start of the run: the metrics are cumulative.
+    /// An interval line is the difference from the export before it.
+    totals: Arc<Mutex<Option<ObservationLatency>>>,
     cancellation: CancellationToken,
-    /// Set by the export that prints the summary, so that the summary prints once.
-    summarised: AtomicBool,
     report: ReportFormat,
 }
 
 impl MetricExporter {
-    fn new(cancellation: CancellationToken, report: ReportFormat) -> Self {
-        let started_at = SystemTime::now();
+    fn new(
+        started_at: SystemTime,
+        cancellation: CancellationToken,
+        totals: Arc<Mutex<Option<ObservationLatency>>>,
+        report: ReportFormat,
+    ) -> Self {
         Self {
             started_at,
             temporality: Default::default(),
-            previous: Default::default(),
+            totals,
             cancellation,
-            summarised: AtomicBool::new(false),
             report,
         }
-    }
-
-    /// Prints a line of the report. A closed stdout does not fail the run.
-    fn print(&self, info: &Info, kind: ReportKind) {
-        let line = match self.report {
-            ReportFormat::Text => info.to_string(),
-            ReportFormat::Json => info.json_line(kind),
-        };
-
-        _ = writeln!(io::stdout(), "{line}").inspect_err(|error| debug!(?error));
     }
 
     #[instrument(skip_all, fields(scope = scope.name(), metric = metric.name()))]
@@ -894,28 +947,12 @@ impl MetricExporter {
 
 impl PushMetricExporter for MetricExporter {
     async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
-        let mut previous = self
-            .previous
+        let mut totals = self
+            .totals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Read under the lock, so that an export of the timer that runs while the run shuts down
-        // either prints its interval before the summary or is the one that prints the summary.
-        let cancelled = self.cancellation.is_cancelled();
-
-        // The summary prints once: an export of the timer after the token is cancelled and the
-        // export of the shutdown both see a cancelled token, and the second has nothing to add.
-        if cancelled && self.summarised.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        // The export of a shutdown, after the token was cancelled, has the totals since the start
-        // of the run: its line is the summary, over the whole run, so it has no previous line.
-        let mut info = Info::new(self.started_at).with_previous(if cancelled {
-            None
-        } else {
-            previous.take()
-        });
+        let mut info = Info::new(self.started_at).with_previous(*totals);
 
         for scope in metrics.scope_metrics() {
             debug!(scope = scope.scope().name());
@@ -927,13 +964,14 @@ impl PushMetricExporter for MetricExporter {
             }
         }
 
-        if cancelled {
-            self.print(&info, ReportKind::Summary);
-        } else {
-            self.print(&info, ReportKind::Interval);
-
-            _ = previous.replace(info.current);
+        // Once the run has ended, an export only updates the totals for the summary: the last
+        // interval is in the summary, and a line here would follow it on a timer export that
+        // raced the shutdown.
+        if !self.cancellation.is_cancelled() {
+            print_report(self.report, &info, ReportKind::Interval);
         }
+
+        _ = totals.replace(info.current);
 
         Ok(())
     }
@@ -964,10 +1002,13 @@ mod tests {
         info.current.observation.record_count = 5;
         info.current.observation.bytes_sent = 500;
 
-        assert_eq!(None, info.records_sent_per_second());
+        assert_eq!(None, info.records_produced_per_second());
         assert_eq!(None, info.bandwidth().map(|bandwidth| bandwidth.0));
         let line = info.to_string();
-        assert!(line.contains("5 records sent, - records/s, (-)"), "{line}");
+        assert!(
+            line.contains("5 records produced, - records/s, (-)"),
+            "{line}"
+        );
         assert!(!line.contains("NaN") && !line.contains("inf"), "{line}");
     }
 
@@ -979,7 +1020,7 @@ mod tests {
         info.current.observation.record_count = 50;
         info.current.observation.bytes_sent = 51_200;
 
-        assert_eq!(Some(100.0), info.records_sent_per_second());
+        assert_eq!(Some(100.0), info.records_produced_per_second());
         // Whole seconds would round the half second down to zero and show 0 B/s beside a
         // records/s of 100.
         assert_eq!(Some(102_400), info.bandwidth().map(|bandwidth| bandwidth.0));
@@ -1002,11 +1043,16 @@ mod tests {
         // The default observation is taken when it is built, a moment after `now`.
         info.current.observation.taken_at = now;
 
-        for kind in [ReportKind::Interval, ReportKind::Summary] {
+        for kind in [
+            ReportKind::Interval,
+            ReportKind::Summary {
+                error_code: ErrorCode::None,
+            },
+        ] {
             let json: serde_json::Value = serde_json::from_str(&info.json_line(kind)).unwrap();
 
             assert_eq!(kind.name(), json["type"]);
-            assert_eq!(0, json["records_sent"]);
+            assert_eq!(0, json["records_produced"]);
             assert!(json["records_per_second"].is_null(), "{json}");
             assert!(json["latency_ms"]["min"].is_null(), "{json}");
             assert!(json["latency_ms"]["mean"].is_null(), "{json}");
@@ -1030,16 +1076,83 @@ mod tests {
             },
         };
 
-        let json: serde_json::Value =
-            serde_json::from_str(&info.json_line(ReportKind::Summary)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&info.json_line(ReportKind::Summary {
+            error_code: ErrorCode::None,
+        }))
+        .unwrap();
 
         assert_eq!(4000, json["elapsed_ms"]);
-        assert_eq!(656, json["records_sent"]);
+        assert_eq!(656, json["records_produced"]);
         assert_eq!(164.0, json["records_per_second"]);
         assert_eq!(16_364.0, json["bytes_per_second"]);
         assert_eq!(2, json["latency_ms"]["min"]);
         assert_eq!(4.5, json["latency_ms"]["mean"]);
         assert_eq!(9, json["latency_ms"]["max"]);
+        assert_eq!(0, json["error_code"], "{json}");
+    }
+
+    #[test]
+    fn the_summary_has_the_error_code_that_ended_the_run() {
+        let info = Info::new(SystemTime::now());
+        let kind = ReportKind::Summary {
+            error_code: ErrorCode::UnknownTopicOrPartition,
+        };
+
+        let json: serde_json::Value = serde_json::from_str(&info.json_line(kind)).unwrap();
+        assert_eq!("summary", json["type"]);
+        assert_eq!(3, json["error_code"], "{json}");
+
+        let interval: serde_json::Value =
+            serde_json::from_str(&info.json_line(ReportKind::Interval)).unwrap();
+        assert!(interval.get("error_code").is_none(), "{interval}");
+    }
+
+    #[test]
+    fn the_text_summary_line_says_which_line_it_is() {
+        let info = Info::new(SystemTime::now());
+        let kind = ReportKind::Summary {
+            error_code: ErrorCode::None,
+        };
+
+        let line = report_line(ReportFormat::Text, &info, kind);
+        assert_eq!(
+            Some(info.to_string().as_str()),
+            line.strip_prefix("summary: ")
+        );
+
+        let interval = report_line(ReportFormat::Text, &info, ReportKind::Interval);
+        assert_eq!(info.to_string(), interval);
+    }
+
+    #[test]
+    fn the_summary_covers_the_run_over_the_last_totals() {
+        let now = SystemTime::now();
+        let started_at = now.checked_sub(Duration::from_secs(4)).unwrap();
+        let totals = ObservationLatency {
+            observation: Observation {
+                // The export that took the totals was earlier than the run's end.
+                taken_at: now.checked_sub(Duration::from_secs(1)).unwrap(),
+                bytes_sent: 65_456,
+                record_count: 656,
+            },
+            latency: Latency {
+                min: Some(Duration::from_millis(2)),
+                max: Some(Duration::from_millis(9)),
+                mean: Some(4.5),
+            },
+        };
+
+        let info = summary(started_at, now, totals);
+
+        assert_eq!(Duration::from_secs(4), info.elapsed());
+        assert_eq!(656, info.records_produced());
+        assert_eq!(65_456, info.bytes_sent());
+        assert_eq!(Some(4.5), info.current.latency.mean);
+
+        // No export at all leaves a summary of zeros over the run's time.
+        let empty = summary(started_at, now, ObservationLatency::default());
+        assert_eq!(Duration::from_secs(4), empty.elapsed());
+        assert_eq!(0, empty.records_produced());
     }
 
     #[test]
@@ -1107,7 +1220,7 @@ mod tests {
 
         assert_eq!(elapsed, info.elapsed());
         assert_eq!(Some(5_555), info.bandwidth().map(|bandwidth| bandwidth.0));
-        assert_eq!(Some(111f64), info.records_sent_per_second());
+        assert_eq!(Some(111f64), info.records_produced_per_second());
     }
 
     #[test]
@@ -1132,6 +1245,6 @@ mod tests {
 
         assert_eq!(elapsed, info.elapsed());
         assert_eq!(Some(16_364), info.bandwidth().map(|bandwidth| bandwidth.0));
-        assert_eq!(Some(164f64), info.records_sent_per_second());
+        assert_eq!(Some(164f64), info.records_produced_per_second());
     }
 }

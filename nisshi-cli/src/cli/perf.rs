@@ -56,15 +56,17 @@ pub(super) enum Command {
         duration: Option<human_units::Duration>,
 
         /// How to print the report: a line of text (`table`) or a JSON object (`json`) for each
-        /// interval and one for the run
+        /// interval and one for the run, which starts with `summary: ` as text
         ///
-        /// `json` prints {"type":"interval"|"summary","elapsed_ms","records_sent","bytes_sent",
-        /// "records_per_second","bytes_per_second","latency_ms":{"min","mean","max"}}. The rates
-        /// are null when no time has elapsed and the latency is null until a request was
-        /// answered. The latency is over the run so far, not over the interval. `records_sent`
-        /// counts the records of the batches the broker accepted, and `bytes_sent` counts the
-        /// bytes written to the broker, including requests it refused. The first produce
-        /// request that the broker refuses ends the run with exit status 4
+        /// `json` prints {"type":"interval"|"summary","elapsed_ms","records_produced",
+        /// "bytes_sent","records_per_second","bytes_per_second","latency_ms":{"min","mean",
+        /// "max"}}, and the summary also "error_code". The rates are null when no time has
+        /// elapsed, and each member of latency_ms is null until a request was answered. The
+        /// latency is over the run so far, not over the interval. `records_produced` counts the
+        /// records of the batches the broker accepted, and `bytes_sent` counts the bytes written
+        /// to the broker, including requests it refused. The first produce request that the
+        /// broker refuses ends the run with exit status 4, with its Kafka error code in the
+        /// summary's `error_code` (0 when none was refused)
         #[arg(long, value_enum, default_value_t = Output::Table)]
         output: Output,
     },
