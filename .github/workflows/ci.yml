@@ -225,7 +225,7 @@ jobs:
           # under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -633,7 +633,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
+      - uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
         with:
           config: typos.toml
   # actionlint already runs shellcheck on each workflow `run:` block. This
@@ -650,7 +650,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -735,7 +735,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-about@0.8.4
       # The release binary is built with --all-features, so the list is too.
@@ -809,7 +809,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -893,7 +893,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -1022,7 +1022,7 @@ jobs:
       # dependencies. cargo-about writes the licence list that the tarball and
       # the image carry. This job generates it beside the build, instead of
       # waiting on the third-party-license job, which takes minutes.
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1108,7 +1108,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1166,7 +1166,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
