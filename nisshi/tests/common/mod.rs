@@ -167,16 +167,34 @@ impl Broker {
 
     /// Runs `nisshi` with `args` and `env`, which name the broker themselves.
     pub(crate) fn run_unaided(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut process = nisshi()
+        finish(self.spawn_unaided(args, env))
+    }
+
+    /// Starts `nisshi` with `args` and `env`, which name the broker themselves, and leaves it
+    /// running.
+    pub(crate) fn spawn_unaided(&self, args: &[&str], env: &[(&str, &str)]) -> Child {
+        nisshi()
             .envs(env.iter().copied())
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("command starts");
-        drop(process.stdin.take());
-        finish(process)
+            .expect("command starts")
+    }
+
+    /// Waits until `topic` holds a record, by fetching it with `cat consume` until a fetch returns
+    /// one. A fetch waits up to 5 s for a record, so the wait ends soon after the broker stores
+    /// the first batch.
+    pub(crate) fn wait_for_a_record(&self, topic: &str) {
+        let started = Instant::now();
+
+        while self.run(&["cat", "consume", topic], "").stdout.is_empty() {
+            assert!(
+                started.elapsed() < STARTUP_TIMEOUT,
+                "no record in {topic} within {STARTUP_TIMEOUT:?}"
+            );
+        }
     }
 
     /// Runs `nisshi` as [`Broker::run`] does, with the read end of its stdout closed before it
@@ -250,29 +268,59 @@ fn write_stdin(process: &mut Child, stdin: &str) {
         .expect("stdin written");
 }
 
+/// Sends SIGINT to `process`, as Ctrl-C does.
+#[cfg(unix)]
+pub(crate) fn interrupt(process: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &process.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -INT: {status}");
+}
+
 /// Waits for `process` to exit and returns its output. Kills it after [`COMMAND_TIMEOUT`].
-fn finish(mut process: Child) -> Output {
+pub(crate) fn finish(process: Child) -> Output {
+    finish_timed(process).0
+}
+
+/// Waits for `process` to exit as [`finish`] does, and also returns how long after this call
+/// the first line of stdout was complete, if one was.
+pub(crate) fn finish_timed(mut process: Child) -> (Output, Option<Duration>) {
     // Threads drain stdout and stderr while the process runs, so that a full pipe can't stop it.
-    let stdout = process.stdout.take().map(read_to_end);
-    let stderr = process.stderr.take().map(read_to_end);
     let started = Instant::now();
+    let stdout = process
+        .stdout
+        .take()
+        .map(|pipe| read_to_end_timed(pipe, started));
+    let stderr = process.stderr.take().map(read_to_end);
 
     loop {
         if let Some(status) = process.try_wait().expect("command status") {
-            return Output {
-                status,
-                stdout: joined(stdout),
-                stderr: joined(stderr),
-            };
+            let (stdout, first_line) = stdout
+                .map(|reader| reader.join().expect("pipe reader"))
+                .unwrap_or_default();
+
+            return (
+                Output {
+                    status,
+                    stdout,
+                    stderr: joined(stderr),
+                },
+                first_line,
+            );
         }
 
         if started.elapsed() > COMMAND_TIMEOUT {
             _ = process.kill();
             _ = process.wait();
 
+            let stdout = stdout
+                .map(|reader| reader.join().expect("pipe reader").0)
+                .unwrap_or_default();
+
             panic!(
                 "command did not exit within {COMMAND_TIMEOUT:?}, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&joined(stdout)),
+                String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&joined(stderr))
             );
         }
@@ -287,6 +335,34 @@ fn read_to_end(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
         let mut bytes = vec![];
         _ = pipe.read_to_end(&mut bytes);
         bytes
+    })
+}
+
+/// Reads `pipe` to its end on a thread of its own, and notes how long after `started` the first
+/// newline arrived.
+fn read_to_end_timed(
+    mut pipe: impl Read + Send + 'static,
+    started: Instant,
+) -> JoinHandle<(Vec<u8>, Option<Duration>)> {
+    thread::spawn(move || {
+        let mut bytes = vec![];
+        let mut first_line = None;
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+
+                    if first_line.is_none() && bytes.contains(&b'\n') {
+                        first_line = Some(started.elapsed());
+                    }
+                }
+            }
+        }
+
+        (bytes, first_line)
     })
 }
 

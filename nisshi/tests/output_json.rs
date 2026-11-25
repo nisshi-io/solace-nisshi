@@ -20,7 +20,9 @@
 
 mod common;
 
-use common::{Broker, closed_port, schema_registry};
+#[cfg(unix)]
+use common::interrupt;
+use common::{Broker, closed_port, finish, finish_timed, schema_registry};
 use serde_json::Value;
 use std::process::Output;
 
@@ -28,6 +30,14 @@ use std::process::Output;
 fn json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("stdout is not JSON ({error}): {output:?}"))
+}
+
+/// Parses each line of the stdout of a command as JSON, whatever its exit status.
+fn json_lines(output: &Output) -> Vec<Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}")))
+        .collect()
 }
 
 #[test]
@@ -191,14 +201,13 @@ fn perf_prints_a_json_object_for_each_interval_and_a_summary() {
     );
     assert_eq!(Some(0), output.status.code(), "{output:?}");
 
-    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}")))
-        .collect();
-
+    let lines = json_lines(&output);
     let (summary, intervals) = lines.split_last().expect("a summary");
     assert_eq!("summary", summary["type"], "{output:?}");
-    assert!(summary["records_produced"].as_u64().unwrap() > 0, "{summary}");
+    assert!(
+        summary["records_produced"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
     assert!(!intervals.is_empty(), "{output:?}");
     for interval in intervals {
         assert_eq!("interval", interval["type"], "{interval}");
@@ -331,6 +340,172 @@ fn a_refused_produce_still_prints_the_json_summary_and_exits_4() {
     assert_eq!(0, summary["records_produced"], "{output:?}");
     // UNKNOWN_TOPIC_OR_PARTITION is 3.
     assert_eq!(3, summary["error_code"], "{output:?}");
+}
+
+/// A refused perf run prints its summary from the run itself, so it prints one whether or not
+/// any metric was recorded before the refusal.
+#[test]
+fn a_refused_perf_produce_prints_one_json_summary_and_exits_4() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+
+    let output = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--partition",
+            "7",
+            "--duration",
+            "30s",
+            "--output",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(Some(4), output.status.code(), "{output:?}");
+
+    let lines = json_lines(&output);
+    assert_eq!(1, lines.len(), "{output:?}");
+    assert_eq!("summary", lines[0]["type"], "{output:?}");
+    assert_eq!(0, lines[0]["records_produced"], "{output:?}");
+    // UNKNOWN_TOPIC_OR_PARTITION is 3.
+    assert_eq!(3, lines[0]["error_code"], "{output:?}");
+}
+
+/// Ctrl-C ends a perf run with its summary as the last line, after the intervals, and with 0.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_perf_run_ends_with_one_json_summary_and_exits_0() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+
+    let process = broker.spawn_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--duration",
+            "30s",
+            "--output",
+            "json",
+        ],
+        // Export every half second, so that the run has interval lines before the interrupt.
+        &[("OTEL_METRIC_EXPORT_INTERVAL", "500")],
+    );
+    broker.wait_for_a_record("taxi");
+    let started = std::time::Instant::now();
+    interrupt(&process);
+
+    let output = finish(process);
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the interrupt ends the run before its duration: {:?}",
+        started.elapsed()
+    );
+
+    let lines = json_lines(&output);
+    let (summary, intervals) = lines.split_last().expect("a summary");
+    assert_eq!("summary", summary["type"], "{output:?}");
+    assert_eq!(0, summary["error_code"], "{output:?}");
+    assert!(
+        summary["records_produced"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
+    for interval in intervals {
+        assert_eq!("interval", interval["type"], "{output:?}");
+    }
+}
+
+/// Ctrl-C ends a generator run with its one summary and with 0.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_generator_run_ends_with_one_json_summary_and_exits_0() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json-interrupted");
+
+    let process = broker.spawn_unaided(
+        &[
+            "generator",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "50",
+            "--duration-seconds",
+            "30",
+            "--output",
+            "json",
+        ],
+        &[],
+    );
+    broker.wait_for_a_record("taxi");
+    let started = std::time::Instant::now();
+    interrupt(&process);
+
+    let output = finish(process);
+    _ = std::fs::remove_dir_all(&registry);
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the interrupt ends the run before its duration: {:?}",
+        started.elapsed()
+    );
+
+    let lines = json_lines(&output);
+    assert_eq!(1, lines.len(), "{output:?}");
+    assert_eq!("summary", lines[0]["type"], "{output:?}");
+    assert_eq!(0, lines[0]["error_code"], "{output:?}");
+    assert!(
+        lines[0]["records_produced"].as_u64().unwrap() > 0,
+        "{output:?}"
+    );
+}
+
+/// The summary is final once the producers have stopped, so it prints then, before the metrics
+/// flush and the grace period that follow the run. A run of 1 s prints it within a few seconds,
+/// although the process exits 5 s later.
+#[test]
+fn the_generator_summary_prints_when_the_run_ends_not_when_the_process_exits() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("json-prompt");
+
+    let process = broker.spawn_unaided(
+        &[
+            "generator",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "10",
+            "--duration-seconds",
+            "1",
+            "--output",
+            "json",
+        ],
+        &[],
+    );
+    let (output, summary_after) = finish_timed(process);
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(0), output.status.code(), "{output:?}");
+    assert_eq!("summary", json(&output)["type"], "{output:?}");
+    let summary_after = summary_after.expect("a summary line");
+    assert!(
+        summary_after < std::time::Duration::from_secs(4),
+        "the summary came {summary_after:?} after the start of a 1 s run"
+    );
 }
 
 /// The metrics are flushed when the run ends. A collector that is down then must neither drop
