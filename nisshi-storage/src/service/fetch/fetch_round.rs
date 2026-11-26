@@ -21,7 +21,7 @@ use nisshi_sans_io::{
 use tokio::time::Instant;
 use tracing::debug;
 
-use super::{ByteSize as _, PartitionFetch, PartitionRead, next_partition_deadline};
+use super::{PartitionFetch, PartitionRead, RecordBytes as _, next_partition_deadline};
 use crate::{Result, fetched::ByteLimit};
 
 /// One round of a Fetch, in which each partition of the request is read once. The round tracks
@@ -166,7 +166,7 @@ impl FetchRound {
     /// Adds `partition_read` to the round, so that the limit and deadline of the next partition's
     /// read, and the check of `min_bytes`, take it into account.
     fn finish_partition(&mut self, partition_read: &PartitionRead) {
-        let returned = partition_read.data.byte_size();
+        let returned = partition_read.data.record_bytes();
 
         debug_assert!(self.partitions_left > 0, "{self:?}");
         self.partitions_left = self.partitions_left.saturating_sub(1);

@@ -15,13 +15,13 @@
 use std::sync::LazyLock;
 
 use nisshi_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
+    ApiKey, ByteSize as _, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
         AbortedTransaction, EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId,
     },
     metadata_response::MetadataResponseTopic,
-    record::deflated::{BATCH_OVERHEAD, Batch, Frame},
+    record::deflated::{Batch, Frame},
 };
 use opentelemetry::{KeyValue, metrics::Counter};
 use rama::Service;
@@ -1307,50 +1307,52 @@ fn answers_without_waiting(responses: &[FetchableTopicResponse]) -> bool {
     every_partition_has_error
 }
 
-trait ByteSize {
-    fn byte_size(&self) -> u64;
+/// The encoded size of the record batches that a part of a Fetch response holds.
+trait RecordBytes {
+    fn record_bytes(&self) -> u64;
 }
 
-impl<T> ByteSize for Vec<T>
+impl<T> RecordBytes for Vec<T>
 where
-    T: ByteSize,
+    T: RecordBytes,
 {
-    fn byte_size(&self) -> u64 {
-        self.iter().map(|item| item.byte_size()).sum()
+    fn record_bytes(&self) -> u64 {
+        self.iter().map(|item| item.record_bytes()).sum()
     }
 }
 
-impl<T> ByteSize for Option<T>
+impl<T> RecordBytes for Option<T>
 where
-    T: ByteSize,
+    T: RecordBytes,
 {
-    fn byte_size(&self) -> u64 {
-        self.as_ref().map_or(0, |some| some.byte_size())
+    fn record_bytes(&self) -> u64 {
+        self.as_ref().map_or(0, |some| some.record_bytes())
     }
 }
 
 /// A batch counts as its encoded size, header included.
-impl ByteSize for Batch {
-    fn byte_size(&self) -> u64 {
-        (BATCH_OVERHEAD + self.record_data.len()) as u64
+impl RecordBytes for Batch {
+    fn record_bytes(&self) -> u64 {
+        self.size_in_bytes()
+            .map_or(u64::MAX, |size| u64::try_from(size).unwrap_or(u64::MAX))
     }
 }
 
-impl ByteSize for Frame {
-    fn byte_size(&self) -> u64 {
-        self.batches.byte_size()
+impl RecordBytes for Frame {
+    fn record_bytes(&self) -> u64 {
+        self.batches.record_bytes()
     }
 }
 
-impl ByteSize for PartitionData {
-    fn byte_size(&self) -> u64 {
-        self.records.byte_size()
+impl RecordBytes for PartitionData {
+    fn record_bytes(&self) -> u64 {
+        self.records.record_bytes()
     }
 }
 
-impl ByteSize for FetchableTopicResponse {
-    fn byte_size(&self) -> u64 {
-        self.partitions.byte_size()
+impl RecordBytes for FetchableTopicResponse {
+    fn record_bytes(&self) -> u64 {
+        self.partitions.record_bytes()
     }
 }
 
@@ -1386,8 +1388,8 @@ mod tests {
     };
 
     use super::{
-        ByteLimit, ByteSize as _, FETCH_DEADLINE_OVERHEAD, FetchService, PartitionFetch, ReadWait,
-        TimedOut, fetch_deadline,
+        ByteLimit, FETCH_DEADLINE_OVERHEAD, FetchService, PartitionFetch, ReadWait,
+        RecordBytes as _, TimedOut, fetch_deadline,
     };
     use crate::{
         Error, FetchValidationLayer, OffsetStage, Result, StorageOperation, Topition,
@@ -3131,7 +3133,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stalled_read_uses_none_of_max_bytes() -> Result<()> {
         let first = batch(0, &[0])?;
-        let size = u32::try_from(first.byte_size())?;
+        let size = u32::try_from(first.record_bytes())?;
 
         let storage = Partitions::new([
             (0, vec![Read::Batch(first), Read::Stall]),
@@ -3185,7 +3187,7 @@ mod tests {
         const PARTITION_MAX_BYTES: i32 = 1024;
 
         let record_batch = batch(0, &[0])?;
-        let round_bytes = 2 * u32::try_from(record_batch.byte_size())?;
+        let round_bytes = 2 * u32::try_from(record_batch.record_bytes())?;
 
         // Each round reads a batch from each partition, then reads nothing
         // from the next offset. The script holds more rounds than the long
@@ -3371,7 +3373,7 @@ mod tests {
     async fn a_later_read_returns_only_the_batches_that_fit_the_limit() -> Result<()> {
         let first = batch(0, &[0])?;
         let second = batch(1, &[0])?;
-        let both = u32::try_from(first.byte_size() + second.byte_size())?;
+        let both = u32::try_from(first.record_bytes() + second.record_bytes())?;
 
         let storage = Partitions::new([(0, vec![Read::Batch(first), Read::Batch(second)])]);
 
@@ -3407,7 +3409,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn only_the_first_non_empty_partition_exceeds_its_limit() -> Result<()> {
         let record_batch = batch(0, &[0])?;
-        let one_byte_short = u32::try_from(record_batch.byte_size())? - 1;
+        let one_byte_short = u32::try_from(record_batch.record_bytes())? - 1;
 
         let storage = Partitions::new([
             (0, vec![]),
@@ -3429,7 +3431,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_partition_after_one_at_its_limit_returns_its_batch() -> Result<()> {
         let fits = batch(0, &[0])?;
-        let limit = u32::try_from(fits.byte_size())?;
+        let limit = u32::try_from(fits.record_bytes())?;
 
         let storage = Partitions::new([
             (0, vec![Read::Batch(fits.clone())]),
@@ -3458,7 +3460,7 @@ mod tests {
     async fn a_partition_that_returns_nothing_at_its_limit_spends_nothing_of_the_response()
     -> Result<()> {
         let fits = batch(0, &[0])?;
-        let partition_max_bytes = u32::try_from(fits.byte_size())?;
+        let partition_max_bytes = u32::try_from(fits.record_bytes())?;
 
         let storage = Partitions::new([
             (0, vec![Read::Batch(fits.clone())]),
@@ -3487,7 +3489,7 @@ mod tests {
     async fn a_partition_that_returns_records_at_its_limit_spends_its_limit_of_the_response()
     -> Result<()> {
         let one_record = batch(0, &[0])?;
-        let partition_max_bytes = 2 * u32::try_from(one_record.byte_size())?;
+        let partition_max_bytes = 2 * u32::try_from(one_record.record_bytes())?;
         let does_not_fit = batch(1, &[0, 1, 2])?;
 
         let storage = Partitions::new([
@@ -3530,7 +3532,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_partition_at_its_limit_counts_its_limit_toward_min_bytes() -> Result<()> {
         let small = batch(0, &[0])?;
-        let small_size = small.byte_size();
+        let small_size = small.record_bytes();
         // Partition 0's batch fits the limit, and partition 1's batch is larger than it.
         let partition_max_bytes = i32::try_from(small_size + 1)?;
 
@@ -3628,7 +3630,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exactly_min_bytes_answers_at_once() -> Result<()> {
         let record_batch = batch(0, &[0])?;
-        let size = i32::try_from(record_batch.byte_size())?;
+        let size = i32::try_from(record_batch.record_bytes())?;
 
         for (min_bytes, script) in [(size, vec![Read::Batch(record_batch)]), (0, vec![])] {
             let (_, elapsed) = fetch_with_min_bytes(
