@@ -147,21 +147,22 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-case when s.bytes <= $5 or (s.ordinal = 1 and $9) then s.k end as key,
-case when s.bytes <= $5 or (s.ordinal = 1 and $9) then s.v end as value,
+case when s.sent then s.k end as key,
+case when s.sent then s.v end as value,
 s.producer_id,
 s.producer_epoch,
 
 -- The first half of headers holds the keys, and the second half the values.
-case when s.bytes <= $5 or (s.ordinal = 1 and $9)
+case when s.sent
     then s.headers[1:cardinality(s.headers) / 2] end as header_keys,
-case when s.bytes <= $5 or (s.ordinal = 1 and $9)
+case when s.sent
     then s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] end as header_values,
-not (s.bytes <= $5 or (s.ordinal = 1 and $9)) as limit_reached
+not s.sent as limit_reached
 
 from
 
-sized s
+-- `sent` is whether the query sends the row with its key, value and headers.
+(select sized.*, sized.bytes <= $5 or (sized.ordinal = 1 and $9) as sent from sized) s
 
 where
 

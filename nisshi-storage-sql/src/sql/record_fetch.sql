@@ -107,16 +107,17 @@ select
 r.offset_id,
 r.attributes,
 r.timestamp,
-case when s.bytes <= $5 or (s.ordinal = 1 and $8) then r.k end as key,
-case when s.bytes <= $5 or (s.ordinal = 1 and $8) then r.v end as value,
+case when s.sent then r.k end as key,
+case when s.sent then r.v end as value,
 s.bytes,
 r.producer_id,
 r.producer_epoch,
-not (s.bytes <= $5 or (s.ordinal = 1 and $8)) as limit_reached
+not s.sent as limit_reached
 
 from
 
-sized s
+-- `sent` is whether the query sends the row with its key and value.
+(select sized.*, sized.bytes <= $5 or (sized.ordinal = 1 and $8) as sent from sized) s
 join record r on r.topition = s.topition and r.offset_id = s.offset_id
 
 where
