@@ -17,7 +17,9 @@ use std::{cmp::min, sync::LazyLock};
 use nisshi_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
-    fetch_response::{EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId},
+    fetch_response::{
+        AbortedTransaction, EpochEndOffset, FetchableTopicResponse, PartitionData, SnapshotId,
+    },
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
@@ -632,14 +634,74 @@ where
             offset_stage = offset_stage.with_high_watermark_at_least(offset);
         }
 
-        Ok(Self::partition_data(partition_index, offset_stage, batches))
-            .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        // A `read_committed` client drops the records of the transactions that this list names, so
+        // the list covers the transactions that overlap `[fetch_offset, last_stable)`. Kafka
+        // collects it only at `read_committed` ([UnifiedLog.scala#L1289-L1291]). At
+        // `read_uncommitted` Nisshi answers an empty list where Kafka answers null, and a client
+        // reads both the same way. The call is skipped when the partition returns no records or
+        // the fetch offset is at or above the last stable offset, because then no transaction
+        // overlaps the range.
+        //
+        // [UnifiedLog.scala#L1289-L1291]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/log/UnifiedLog.scala#L1289-L1291
+        let aborted_transactions = if isolation == IsolationLevel::ReadCommitted
+            && !batches.is_empty()
+            && fetch_offset < offset_stage.last_stable()
+        {
+            match ReadDeadline::new(StorageOperation::AbortedTransactions, partition_deadline)
+                .run_until_deadline(self.storage.aborted_transactions(
+                    &tp,
+                    fetch_offset,
+                    offset_stage.last_stable(),
+                ))
+                .await
+            {
+                Ok(Err(Error::Api(ErrorCode::UnknownTopicOrPartition))) => {
+                    return Ok(Self::unknown_to_storage(
+                        &tp,
+                        StorageOperation::AbortedTransactions,
+                    ));
+                }
+                Ok(Ok(aborted_transactions)) => aborted_transactions,
+                // The partition answers with an error and no records, because a `read_committed`
+                // client that received the records without the list would deliver the records of
+                // an aborted transaction.
+                Ok(Err(error)) => {
+                    return Ok(Self::storage_failure(
+                        &tp,
+                        StorageOperation::AbortedTransactions,
+                        fetch_offset,
+                        &error,
+                    ));
+                }
+                Err(reason) => {
+                    log_timed_out(
+                        &tp,
+                        StorageOperation::AbortedTransactions,
+                        fetch_offset,
+                        reason,
+                        started_at,
+                    );
+                    return Ok(Self::unknown_offsets(partition_index, ErrorCode::None));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self::partition_data(
+            partition_index,
+            offset_stage,
+            batches,
+            aborted_transactions,
+        ))
+        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
     fn partition_data(
         partition_index: i32,
         offset_stage: OffsetStage,
         batches: Vec<Batch>,
+        aborted_transactions: Vec<AbortedTransaction>,
     ) -> PartitionData {
         PartitionData::default()
             .partition_index(partition_index)
@@ -650,7 +712,7 @@ where
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
+            .aborted_transactions(Some(aborted_transactions))
             .preferred_read_replica(Some(-1))
             .records(if batches.is_empty() {
                 None
@@ -825,7 +887,7 @@ where
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
+            .aborted_transactions(no_aborted_transactions())
             .preferred_read_replica(Some(-1))
             .records(None)
     }
@@ -896,7 +958,7 @@ where
             // on a deleted topic
             .current_leader(None)
             .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
-            .aborted_transactions(Some([].into()))
+            .aborted_transactions(no_aborted_transactions())
             .preferred_read_replica(Some(-1))
             .records(None)
     }
@@ -1201,6 +1263,11 @@ where
     }
 }
 
+/// The `aborted_transactions` of an answer that reports no aborted transactions.
+fn no_aborted_transactions() -> Option<Vec<AbortedTransaction>> {
+    Some(Vec::new())
+}
+
 /// Builds a [`FetchableTopicResponse`] reporting `error_code` on every partition `fetch` requested.
 pub(super) fn topic_error_response(
     fetch: &FetchTopic,
@@ -1228,7 +1295,7 @@ pub(super) fn topic_error_response(
                         // consumer close then hangs on a deleted topic
                         .current_leader(None)
                         .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
-                        .aborted_transactions(Some([].into()))
+                        .aborted_transactions(no_aborted_transactions())
                         .preferred_read_replica(Some(-1))
                         .records(None)
                 })
@@ -1373,7 +1440,7 @@ mod tests {
     use nisshi_sans_io::{
         ErrorCode, FetchRequest, IsolationLevel, RequestInput,
         fetch_request::{FetchPartition, FetchTopic},
-        fetch_response::PartitionData,
+        fetch_response::{AbortedTransaction, PartitionData},
         metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
         record::{Record, deflated, inflated},
     };
@@ -1452,6 +1519,12 @@ mod tests {
         /// The error that `current_offset_stage` answers.
         current_error: Option<Error>,
         current_offset_stage_reads: Arc<AtomicUsize>,
+        /// What `aborted_transactions` answers.
+        aborted_transactions: Vec<AbortedTransaction>,
+        /// The error that `aborted_transactions` answers instead of its list.
+        aborted_transactions_error: Option<Error>,
+        /// The offset and last stable offset of each `aborted_transactions` call.
+        aborted_transactions_calls: Arc<Mutex<Vec<(i64, i64)>>>,
     }
 
     impl Scripted {
@@ -1471,7 +1544,17 @@ mod tests {
                 current_delay: None,
                 current_error: None,
                 current_offset_stage_reads: Arc::new(AtomicUsize::new(0)),
+                aborted_transactions: vec![],
+                aborted_transactions_error: None,
+                aborted_transactions_calls: Arc::new(Mutex::new(vec![])),
             }
+        }
+
+        fn aborted_transactions_calls(&self) -> Vec<(i64, i64)> {
+            self.aborted_transactions_calls
+                .lock()
+                .expect("aborted transactions calls")
+                .clone()
         }
 
         fn current_offset_stage_reads(&self) -> usize {
@@ -1579,6 +1662,22 @@ mod tests {
                 high_watermark: self.offset_stage.high_watermark + growth,
                 ..self.offset_stage
             })
+        }
+
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            offset: i64,
+            last_stable_offset: i64,
+        ) -> Result<Vec<AbortedTransaction>> {
+            self.aborted_transactions_calls
+                .lock()?
+                .push((offset, last_stable_offset));
+
+            match &self.aborted_transactions_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.aborted_transactions.clone()),
+            }
         }
 
         async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
@@ -1736,6 +1835,113 @@ mod tests {
 
     /// A partition whose log starts at 100, whose last stable offset is
     /// 500, and whose high watermark is 1,000.
+    /// A `read_committed` partition that returns records carries the aborted transactions that
+    /// storage reports for the range from the fetch offset to the last stable offset.
+    #[tokio::test(start_paused = true)]
+    async fn read_committed_carries_aborted_transactions() -> Result<()> {
+        let aborted = vec![AbortedTransaction::default().producer_id(7).first_offset(3)];
+
+        let storage = Scripted {
+            aborted_transactions: aborted.clone(),
+            ..Scripted::new(vec![vec![batch(2, &[0, 1])?]], OFFSET_STAGE)
+        };
+
+        let partition = fetch_partition_at(
+            storage.clone(),
+            Duration::from_millis(100),
+            1024,
+            IsolationLevel::ReadCommitted,
+            2,
+        )
+        .await?;
+
+        assert_eq!(Some(aborted), partition.aborted_transactions);
+        assert_eq!(vec![(2, 1_000)], storage.aborted_transactions_calls());
+
+        Ok(())
+    }
+
+    /// A `read_uncommitted` partition answers an empty list and does not ask storage.
+    #[tokio::test(start_paused = true)]
+    async fn read_uncommitted_carries_no_aborted_transactions() -> Result<()> {
+        let storage = Scripted {
+            aborted_transactions: vec![
+                AbortedTransaction::default().producer_id(7).first_offset(3),
+            ],
+            ..Scripted::new(vec![vec![batch(2, &[0, 1])?]], OFFSET_STAGE)
+        };
+
+        let partition = fetch_partition_at(
+            storage.clone(),
+            Duration::from_millis(100),
+            1024,
+            IsolationLevel::ReadUncommitted,
+            2,
+        )
+        .await?;
+
+        assert_eq!(Some(vec![]), partition.aborted_transactions);
+        assert!(storage.aborted_transactions_calls().is_empty());
+
+        Ok(())
+    }
+
+    /// With no records to filter, or a fetch offset at the last stable offset, there is nothing
+    /// to report, so storage is not asked.
+    #[tokio::test(start_paused = true)]
+    async fn read_committed_asks_nothing_without_a_range() -> Result<()> {
+        let aborted = vec![AbortedTransaction::default().producer_id(7).first_offset(3)];
+
+        for (name, fetch_offset, responses) in [
+            ("no records", 2, vec![vec![]]),
+            ("at the last stable offset", 1_000, vec![vec![]]),
+        ] {
+            let storage = Scripted {
+                aborted_transactions: aborted.clone(),
+                ..Scripted::new(responses, OFFSET_STAGE)
+            };
+
+            let partition = fetch_partition_at(
+                storage.clone(),
+                Duration::from_millis(100),
+                1024,
+                IsolationLevel::ReadCommitted,
+                fetch_offset,
+            )
+            .await?;
+
+            assert_eq!(Some(vec![]), partition.aborted_transactions, "{name}");
+            assert!(storage.aborted_transactions_calls().is_empty(), "{name}");
+        }
+
+        Ok(())
+    }
+
+    /// A failed `aborted_transactions` answers the partition with an error and no records, so a
+    /// `read_committed` client never receives the records of an aborted transaction without the
+    /// list.
+    #[tokio::test(start_paused = true)]
+    async fn read_committed_aborted_transactions_failure_withholds_records() -> Result<()> {
+        let storage = Scripted {
+            aborted_transactions_error: Some(Error::Message("the read failed".into())),
+            ..Scripted::new(vec![vec![batch(2, &[0, 1])?]], OFFSET_STAGE)
+        };
+
+        let partition = fetch_partition_at(
+            storage,
+            Duration::from_millis(100),
+            1024,
+            IsolationLevel::ReadCommitted,
+            2,
+        )
+        .await?;
+
+        assert_ne!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
+        assert_eq!(None, partition.records);
+
+        Ok(())
+    }
+
     fn bounded() -> Scripted {
         Scripted::new(
             vec![],
@@ -2555,6 +2761,15 @@ mod tests {
                 Read::Fail => Err(Error::Message("the read failed".into())),
                 Read::FailTransient => Err(Error::from(std::io::Error::other("the read failed"))),
             }
+        }
+
+        async fn aborted_transactions(
+            &self,
+            _topition: &Topition,
+            _offset: i64,
+            _last_stable_offset: i64,
+        ) -> Result<Vec<AbortedTransaction>> {
+            Ok(vec![])
         }
 
         async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
