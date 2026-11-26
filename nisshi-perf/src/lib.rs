@@ -475,8 +475,9 @@ impl Perf {
         // The abort ends each producer at its next await, whether or not that await races the
         // token, so this drain can't hang on an await that a later change adds. A producer
         // counts a batch in the same poll as the produce that returned it, so the abort loses
-        // no count. The drain waits for the request each producer had in flight to be dropped,
-        // and for nothing else.
+        // no count that a poll has started. An answer that no poll has read yet is lost, as it
+        // is when the token wins the producer's select. The drain waits for the request each
+        // producer had in flight to be dropped, and for nothing else.
         set.abort_all();
         while set.join_next().await.is_some() {}
 
