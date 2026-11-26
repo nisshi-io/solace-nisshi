@@ -14183,6 +14183,24 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Makes `topition`'s topic virtual, and returns the partition of its keyed view whose fetch
+    /// reads the topic's records with the key `key-a`.
+    async fn keyed_view(storage: &Postgres, topition: &Topition) -> Result<Topition> {
+        _ = storage
+            .connection()
+            .await?
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, 'tansu.virtual', 'true' \
+                 from topic t join cluster c on c.id = t.cluster \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        Ok(Topition::new(format!("{}/key-a", topition.topic()), 0))
+    }
+
     /// A topic and its keyed view each hold 3 records with a 200-byte value. Under a hard limit of
     /// 50 bytes, a read from offset 0 returns nothing and reports that it reached its limit. A read
     /// from offset 3, the high watermark, returns nothing and does not report it.
@@ -14192,18 +14210,7 @@ pub(crate) mod tests {
             return Ok(());
         };
 
-        // `tansu.virtual` makes the topic virtual: a fetch of `<topic>/key-a` reads the topic's
-        // records whose key is `key-a`.
-        let c = storage.connection().await?;
-        _ = c
-            .execute(
-                "insert into topic_configuration (topic, name, value) \
-                 select t.id, 'tansu.virtual', 'true' \
-                 from topic t join cluster c on c.id = t.cluster \
-                 where c.name = $1 and t.name = $2",
-                &[&storage.cluster, &topition.topic()],
-            )
-            .await?;
+        let keyed = keyed_view(&storage, &topition).await?;
 
         let batch = (0..3)
             .fold(Batch::builder(), |builder, delta| {
@@ -14220,8 +14227,6 @@ pub(crate) mod tests {
             .and_then(TryInto::try_into)?;
 
         _ = storage.produce(None, &topition, batch).await?;
-
-        let keyed = Topition::new(format!("{}/key-a", topition.topic()), 0);
 
         for fetched in [&topition, &keyed] {
             for (offset, reached_limit) in [(0, true), (3, false)] {
@@ -14246,6 +14251,7 @@ pub(crate) mod tests {
 
         // The keyed query shows the first record that does not fit with a marker row, which holds
         // no key, value or headers.
+        let c = storage.connection().await?;
         let query = pg_record_fetch::KEYED_QUERY.key();
         let statement = c.prepare(storage.sql_lookup(query)?).await?;
         let reader = pg_record_fetch::Row::reader(&ResultColumns::new(query, &statement))?;
@@ -14297,18 +14303,7 @@ pub(crate) mod tests {
             return Ok(());
         };
 
-        // `tansu.virtual` makes the topic virtual: a fetch of `<topic>/key-a` reads the topic's
-        // records whose key is `key-a`.
-        let c = storage.connection().await?;
-        _ = c
-            .execute(
-                "insert into topic_configuration (topic, name, value) \
-                 select t.id, 'tansu.virtual', 'true' \
-                 from topic t join cluster c on c.id = t.cluster \
-                 where c.name = $1 and t.name = $2",
-                &[&storage.cluster, &topition.topic()],
-            )
-            .await?;
+        let keyed = keyed_view(&storage, &topition).await?;
 
         let batch = (0..3)
             .fold(Batch::builder(), |builder, delta| {
@@ -14325,8 +14320,6 @@ pub(crate) mod tests {
             .and_then(TryInto::try_into)?;
 
         _ = storage.produce(None, &topition, batch).await?;
-
-        let keyed = Topition::new(format!("{}/key-a", topition.topic()), 0);
 
         for fetched in [&topition, &keyed] {
             for (offset, limit, read_end) in [
@@ -14352,6 +14345,70 @@ pub(crate) mod tests {
                         )
                         .await?,
                     "{fetched:?} from {offset} within {limit:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A topic and its keyed view each hold 3 records, each with a 5-byte key, a 3-byte value and
+    /// one header with a 1-byte key and a 2-byte value. The query counts each record as 20 bytes:
+    /// 7 for the smallest record, its key and value, and each header's key and value with 2 bytes
+    /// more. A read under a hard limit of the 60 bytes of the 3 records ends without reaching its
+    /// limit, and a read under 59 bytes stops at it. A query that left out any part of the count
+    /// would also end without reaching a limit of 59 bytes.
+    #[tokio::test]
+    async fn the_fetch_query_counts_a_record_with_its_key_value_and_headers() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let keyed = keyed_view(&storage, &topition).await?;
+
+        let batch = (0..3)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::from_static(b"key-a").into())
+                        .value(Bytes::from_static(b"val").into())
+                        .header(
+                            Header::builder()
+                                .key(Bytes::from_static(b"h"))
+                                .value(Bytes::from_static(b"hv")),
+                        )
+                        .offset_delta(delta),
+                )
+            })
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        for fetched in [&topition, &keyed] {
+            for (limit, read_end) in [
+                (ByteLimit::Hard(60), ReadEnd::Finished),
+                (ByteLimit::Hard(59), ReadEnd::ReachedLimit),
+            ] {
+                // The test keeps the receiver, because a read fails with `UnableToSend` once its
+                // receiver is dropped.
+                let (sender, _receiver) = fetched::channel();
+
+                assert_eq!(
+                    read_end,
+                    storage
+                        .fetch(
+                            fetched,
+                            0,
+                            1,
+                            limit,
+                            IsolationLevel::ReadUncommitted,
+                            sender
+                        )
+                        .await?,
+                    "{fetched:?} within {limit:?}"
                 );
             }
         }

@@ -14,8 +14,11 @@
 
 //! A Fetch over records with no key, no value and no headers still spends `max_bytes`. Kafka counts
 //! the whole record batch toward `max_bytes`, at least 7 bytes for a record and 61 for the batch
-//! header ([`DefaultRecordBatch.java#L129`]). The SQL engines used to count such a record as 0
-//! bytes, so a read returned every one of them up to the row limit, however small `max_bytes` was.
+//! header ([`DefaultRecordBatch.java#L129`]). The read that every engine's records pass through
+//! measures each record by its encoded size, so this test checks that limit on each engine. It
+//! passes whatever an engine's own query counts. The SQL engines used to count such a record as 0
+//! bytes, and the tests of each fetch query pin their count: `limbo`'s `fetch_counts_*` tests and
+//! PostgreSQL's `the_fetch_query_counts_a_record_with_its_key_value_and_headers`.
 //!
 //! [`DefaultRecordBatch.java#L129`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
 
