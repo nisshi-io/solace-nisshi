@@ -223,6 +223,31 @@ struct FetchBounds {
     high_watermark: i64,
 }
 
+/// Returns how many bytes a GET of the batch at `base_offset` asks for, under what is left of the
+/// read's `limit`, or `None` for the whole batch.
+///
+/// Once no batch may exceed the limit, under a hard limit or after the first batch under a soft
+/// one, the GET asks for only the bytes left, as Kafka reads its log only up to the limit. For a
+/// batch below `fetch_offset`, it asks for at least the batch's header, which shows whether the
+/// batch ends before the fetch offset.
+///
+/// The read learns a batch's size from this GET, instead of from a HEAD request first. A HEAD adds
+/// a request to every batch, to save part of the last batch of a read, and that costs more than the
+/// discarded bytes unless batches are large and the store bills each download.
+fn batch_get_size(limit: ByteLimit, base_offset: i64, fetch_offset: i64) -> Result<Option<u64>> {
+    if limit.is_soft() {
+        return Ok(None);
+    }
+
+    let bytes_left = u64::from(limit.bytes());
+
+    Ok(Some(if base_offset < fetch_offset {
+        bytes_left.max(u64::try_from(deflated::BATCH_OVERHEAD)?)
+    } else {
+        bytes_left
+    }))
+}
+
 /// Counts the fetches that list the whole partition, because no listing near the fetch offset
 /// found the batch that holds it.
 static FETCH_FULL_LISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -2357,31 +2382,19 @@ impl DynoStore {
         mut first_object: Option<GetResult>,
         data: &mut FetchedDataSender,
     ) -> Result<ReadEnd> {
-        let mut bytes_left = u64::from(bounds.limit.bytes());
-        let mut first_may_exceed = matches!(bounds.limit, ByteLimit::Soft(_));
-        let batch_header_size = u64::try_from(deflated::BATCH_OVERHEAD)?;
+        let mut limit = bounds.limit;
 
         while base_offset < bounds.high_watermark {
-            // Once no batch may exceed the limit, under a hard limit or after the first batch under
-            // a soft one, the GET asks for only the bytes left, as Kafka reads its log only up to
-            // the limit. For a batch below the fetch offset, it asks for at least the batch's
-            // header, which shows whether the batch ends before the fetch offset.
-            //
-            // The read learns a batch's size from this GET, instead of from a HEAD request first.
-            // A HEAD adds a request to every batch, to save part of the last batch of a read, and
-            // that costs more than the discarded bytes unless batches are large and the store
-            // bills each download.
-            let max_size = (!first_may_exceed).then(|| {
-                if base_offset < bounds.offset {
-                    bytes_left.max(batch_header_size)
-                } else {
-                    bytes_left
-                }
-            });
-
             let object = match first_object.take() {
                 Some(object) => Some(object),
-                None => self.batch_object(topition, base_offset, max_size).await?,
+                None => {
+                    self.batch_object(
+                        topition,
+                        base_offset,
+                        batch_get_size(limit, base_offset, bounds.offset)?,
+                    )
+                    .await?
+                }
             };
 
             // If the object is larger than the range asked for, the batch does not fit. The read
@@ -2451,26 +2464,21 @@ impl DynoStore {
                 continue;
             }
 
-            let size = u64::try_from(batch.size_in_bytes()?)?;
-
-            if size > bytes_left && !first_may_exceed {
+            if !limit.take(u64::try_from(batch.size_in_bytes()?)?) {
                 return Ok(ReadEnd::ReachedLimit);
             }
 
             data.send_batch(batch).await?;
-            first_may_exceed = false;
 
-            // The batch's size is at least the bytes left of the limit, so no later batch fits. The
-            // read stopped at its limit only if records remain below the high watermark.
-            if size >= bytes_left {
+            // No later batch fits. The read stopped at its limit only if records remain below the
+            // high watermark.
+            if limit.is_spent() {
                 return Ok(if base_offset < bounds.high_watermark {
                     ReadEnd::ReachedLimit
                 } else {
                     ReadEnd::Finished
                 });
             }
-
-            bytes_left -= size;
         }
 
         Ok(ReadEnd::Finished)
@@ -4503,23 +4511,18 @@ impl Storage for DynoStore {
 
         // A consumer that reads in order fetches the base offset of the next batch, so try that
         // batch first. Only a fetch offset that is not a base offset needs a listing.
-        // Under a hard limit, the batch at the fetch offset must fit, so the GET asks for at most
-        // the limit's bytes.
-        let max_size = match limit {
-            ByteLimit::Hard(bytes) => Some(u64::from(bytes)),
-            ByteLimit::Soft(_) => None,
+        let (base_offset, first_object) = match self
+            .batch_object(topition, offset, batch_get_size(limit, offset, offset)?)
+            .await?
+        {
+            Some(object) => (offset, Some(object)),
+            None => (
+                self.find_base_offset_for_batch_containing(topition, offset)
+                    .await?
+                    .unwrap_or(offset),
+                None,
+            ),
         };
-
-        let (base_offset, first_object) =
-            match self.batch_object(topition, offset, max_size).await? {
-                Some(object) => (offset, Some(object)),
-                None => (
-                    self.find_base_offset_for_batch_containing(topition, offset)
-                        .await?
-                        .unwrap_or(offset),
-                    None,
-                ),
-            };
 
         self.send_batches_from(topition, bounds, base_offset, first_object, &mut data)
             .await

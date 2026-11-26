@@ -212,6 +212,25 @@ impl ByteLimit {
     pub fn is_soft(self) -> bool {
         matches!(self, Self::Soft(_))
     }
+
+    /// Takes a record or batch of `size` bytes from the limit, and returns whether it fits. Under a
+    /// soft limit it fits whatever its size. Once it fits, the limit is hard, with the bytes that
+    /// are left, or 0 if it exceeded the limit.
+    pub fn take(&mut self, size: u64) -> bool {
+        let fits = self.is_soft() || size <= u64::from(self.bytes());
+
+        if fits {
+            *self =
+                Self::Hard(u32::try_from(size).map_or(0, |size| self.bytes().saturating_sub(size)));
+        }
+
+        fits
+    }
+
+    /// Returns whether the limit takes no more records or batches: it is hard, with no bytes left.
+    pub fn is_spent(self) -> bool {
+        self == Self::Hard(0)
+    }
 }
 
 /// What [`Storage::fetch`] reads handed to their caller.
@@ -494,22 +513,8 @@ pub(crate) struct FetchedBatches {
     closed: Vec<deflated::Batch>,
     /// The batch that records are added to.
     open: Option<inflated::Builder>,
-    /// The bytes that the batches can still take.
-    bytes_left: u64,
-    /// Whether the first record or batch may be larger than the limit.
-    first_may_exceed: bool,
-}
-
-impl Default for FetchedBatches {
-    /// Returns batches that do not limit their size.
-    fn default() -> Self {
-        Self {
-            closed: Vec::new(),
-            open: None,
-            bytes_left: u64::MAX,
-            first_may_exceed: true,
-        }
-    }
+    /// What is left of the limit on the batches' encoded size.
+    limit: ByteLimit,
 }
 
 impl FetchedBatches {
@@ -522,9 +527,9 @@ impl FetchedBatches {
     /// so larger than the limit.
     pub(crate) fn within(limit: ByteLimit) -> Self {
         Self {
-            bytes_left: u64::from(limit.bytes()),
-            first_may_exceed: matches!(limit, ByteLimit::Soft(_)),
-            ..Self::default()
+            closed: Vec::new(),
+            open: None,
+            limit,
         }
     }
 
@@ -614,36 +619,21 @@ impl FetchedBatches {
         Ok(true)
     }
 
-    /// Takes `size` bytes from the limit, and returns whether they fit. The first record or batch
-    /// fits whatever its size when `first_may_exceed` is set.
+    /// Takes `size` bytes from the limit, and returns whether they fit, as [`ByteLimit::take`]
+    /// does.
     fn take(&mut self, size: usize) -> bool {
-        let size = size as u64;
-        let fits = size <= self.bytes_left || (self.first_may_exceed && !self.has_records());
-
-        if fits {
-            self.bytes_left = self.bytes_left.saturating_sub(size);
-        }
-
-        fits
+        self.limit.take(u64::try_from(size).unwrap_or(u64::MAX))
     }
 
-    /// Returns whether the batches are full: the limit is spent, and no soft limit still lets a
-    /// first record or batch exceed it.
+    /// Returns whether the batches are full: the limit is spent.
     fn is_full(&self) -> bool {
-        self.bytes_left == 0 && !(self.first_may_exceed && !self.has_records())
+        self.limit.is_spent()
     }
 
-    /// Returns the limit of the next read: the bytes that the batches can still take, at most
-    /// `u32::MAX`. The limit is soft while a first record or batch may still exceed it, and hard
-    /// otherwise.
+    /// Returns the limit of the next read: what is left of the batches' limit. It is soft until a
+    /// first record or batch has been added.
     fn limit(&self) -> ByteLimit {
-        let bytes = u32::try_from(self.bytes_left).unwrap_or(u32::MAX);
-
-        if self.first_may_exceed && !self.has_records() {
-            ByteLimit::Soft(bytes)
-        } else {
-            ByteLimit::Hard(bytes)
-        }
+        self.limit
     }
 
     /// Returns whether a record or a whole batch has been added.
@@ -696,6 +686,9 @@ mod tests {
     use super::*;
     use crate::storage_double::storage_double;
 
+    /// A limit larger than any test's batches.
+    const NO_LIMIT: ByteLimit = ByteLimit::Hard(u32::MAX);
+
     fn record(offset: i64, timestamp: i64, attributes: i16) -> FetchedRecord {
         FetchedRecord {
             offset,
@@ -727,7 +720,7 @@ mod tests {
 
     #[test]
     fn records_with_the_same_attributes_share_a_batch() -> Result<()> {
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         for offset in 0..3 {
             assert!(batches.push_record(record(offset, 1_000 + offset, 0))?);
@@ -744,7 +737,7 @@ mod tests {
 
     #[test]
     fn a_record_with_other_attributes_starts_a_batch() -> Result<()> {
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         assert!(batches.push_record(record(0, 1_000, 0))?);
         assert!(batches.push_record(record(1, 1_000, 0))?);
@@ -762,7 +755,7 @@ mod tests {
     #[test]
     fn a_log_append_time_record_with_another_time_starts_a_batch() -> Result<()> {
         let log_append_time = 8;
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         assert!(batches.push_record(record(0, 1_000, log_append_time))?);
         assert!(batches.push_record(record(1, 1_000, log_append_time))?);
@@ -777,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_record_of_another_producer_starts_a_batch() -> Result<()> {
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         for (offset, producer_id) in [(0, 7), (1, 7), (2, 8), (3, 7)] {
             assert!(batches.push_record(FetchedRecord {
@@ -806,7 +799,7 @@ mod tests {
 
     #[test]
     fn a_record_of_another_producer_epoch_starts_a_batch() -> Result<()> {
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         for (offset, producer_epoch) in [(0, 0), (1, 0), (2, 1)] {
             assert!(batches.push_record(FetchedRecord {
@@ -836,7 +829,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "record 1 follows offset Some(3)")]
     fn a_record_out_of_offset_order_fails_the_assertion() {
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
 
         assert!(batches.push_record(record(2, 1_000, 0)).expect("record 2"));
         _ = batches.push_record(record(1, 1_000, 0)).expect("record 1");
@@ -850,7 +843,7 @@ mod tests {
             .build()
             .and_then(deflated::Batch::try_from)?;
 
-        let mut batches = FetchedBatches::default();
+        let mut batches = FetchedBatches::within(NO_LIMIT);
         assert!(batches.push_record(record(0, 1_000, 0))?);
         assert!(batches.push_record(record(1, 1_000, 0))?);
         assert!(batches.push_batch(stored)?);
