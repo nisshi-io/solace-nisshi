@@ -561,9 +561,12 @@ impl Generate {
         // Before the flush and the grace period below, which are not time spent producing.
         let elapsed = started.elapsed();
 
-        // Each producer ends at its next await once the token is cancelled, so this waits for
-        // the request each one had in flight to be dropped, and for nothing else. The counters
-        // are final after it.
+        // The abort ends each producer at its next await, whether or not that await races the
+        // token, so this drain can't hang on an await that a later change adds. A producer
+        // counts a batch in the same poll as the produce that returned it, so the abort loses
+        // no count. The drain waits for the request each producer had in flight to be dropped,
+        // and for nothing else. The counters are final after it.
+        set.abort_all();
         while set.join_next().await.is_some() {}
 
         if self.configuration.report == ReportFormat::Json {
