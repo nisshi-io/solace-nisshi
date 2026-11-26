@@ -14,8 +14,11 @@
 
 //! A Fetch over records with no key, no value and no headers still spends `max_bytes`. Kafka counts
 //! the whole record batch toward `max_bytes`, at least 7 bytes for a record and 61 for the batch
-//! header ([`DefaultRecordBatch.java#L129`]). The SQL engines used to count such a record as 0
-//! bytes, so a read returned every one of them up to the row limit, however small `max_bytes` was.
+//! header ([`DefaultRecordBatch.java#L129`]). The read that every engine's records pass through
+//! measures each record by its encoded size, so this test checks that limit on each engine. It
+//! passes whatever an engine's own query counts. The SQL engines used to count such a record as 0
+//! bytes, and the tests of each fetch query pin their count: `limbo`'s `fetch_counts_*` tests and
+//! PostgreSQL's `the_fetch_query_counts_a_record_with_its_key_value_and_headers`.
 //!
 //! [`DefaultRecordBatch.java#L129`]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
 
@@ -25,7 +28,7 @@ use crate::{
 };
 use bytes::Bytes;
 use nisshi_broker::Result;
-use nisshi_sans_io::record::{Record, inflated};
+use nisshi_sans_io::record::{Record, deflated::BATCH_OVERHEAD, inflated};
 use nisshi_storage::{Storage, Topition};
 use rand::{prelude::*, rng};
 use url::Url;
@@ -60,10 +63,11 @@ where
     Ok(())
 }
 
-/// A record with no value and no headers costs 7 bytes, 8 with the 1 byte key of a virtual
-/// topic's record, so a `max_bytes` of 70 returns the 9 or 8 records whose running total stays
-/// under it. A `max_bytes` of 1 still returns the first record (KIP-74). The test reads from the
-/// engine, not through `FetchService`, which reads again until the response's `max_bytes` is spent.
+/// A record with no value and no headers is 7 bytes, or 8 bytes with the 1-byte key of a virtual
+/// topic's record, and their batch adds a 61-byte header. So a `max_bytes` of 61 + 70 bytes returns
+/// 10 plain records or 8 keyed ones. A `max_bytes` of 1 still returns the first record (KIP-74).
+/// The test reads from the engine directly, because `FetchService` reads again until the response's
+/// `max_bytes` is spent.
 pub async fn empty_records_count_toward_max_bytes<C, G>(
     cluster_id: C,
     broker_id: i32,
@@ -76,14 +80,14 @@ where
     register_broker(cluster_id, broker_id, &sc).await?;
 
     // a keyed fetch of a virtual topic reads through its own statement
-    for (keyed, returned) in [(false, 9), (true, 8)] {
+    for (keyed, returned) in [(false, 10), (true, 8)] {
         let (topition, fetched) = create_topic(&sc, keyed).await?;
 
         produce_empty_records(&sc, &topition, keyed, 100).await?;
 
         assert_eq!(
             (0..returned).collect::<Vec<_>>(),
-            fetched_offsets(&sc, &fetched, 0, 70).await?,
+            fetched_offsets(&sc, &fetched, 0, u32::try_from(BATCH_OVERHEAD)? + 70).await?,
             "keyed: {keyed}"
         );
 

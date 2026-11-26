@@ -20,7 +20,7 @@
 //! reads the bytes. The tests run against the backends that decode a produced batch: Postgres and
 //! libSQL. The object store keeps the bytes as sent.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{assert_matches, time::Duration};
 
 use crate::common::{StorageType, alphanumeric_string, init_tracing};

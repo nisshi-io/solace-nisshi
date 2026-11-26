@@ -53,9 +53,9 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, GroupDetailResponse,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, GroupDetailResponse,
     ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version,
 };
@@ -218,11 +218,11 @@ impl Storage for Engine {
         _topition: &Topition,
         _offset: i64,
         _min_bytes: u32,
-        _max_bytes: u32,
+        _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched_sender: nisshi_storage::FetchedSender,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<ReadEnd> {
+        Ok(ReadEnd::Finished)
     }
 
     #[instrument(skip_all)]

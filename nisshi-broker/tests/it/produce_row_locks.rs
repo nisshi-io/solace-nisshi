@@ -29,7 +29,7 @@ use nisshi_sans_io::{
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use nisshi_storage::{ArcDynStorage, Storage as _, Topition};
 use rand::{RngExt as _, rng};
 use std::{collections::BTreeMap, time::Duration};

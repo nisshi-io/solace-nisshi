@@ -23,7 +23,7 @@ use crate::common::{self, StorageType, alphanumeric_string, init_tracing, regist
 use bytes::Bytes;
 use nisshi_broker::Result;
 use nisshi_sans_io::{
-    ErrorCode, FetchRequest, IsolationLevel, NULL_TOPIC_ID, RequestInput,
+    ByteSize as _, ErrorCode, FetchRequest, IsolationLevel, NULL_TOPIC_ID, RequestInput,
     create_topics_request::CreatableTopic,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::PartitionData,
@@ -197,13 +197,13 @@ fn record_count(partition: &PartitionData) -> u32 {
     })
 }
 
-/// The size of the records in a partition answer, as Fetch counts it against `min_bytes`.
-fn record_bytes(partition: &PartitionData) -> usize {
-    partition.records.as_ref().map_or(0, |frame| {
+/// The size of the batches in a partition answer, as Fetch counts it against `min_bytes`.
+fn batch_bytes(partition: &PartitionData) -> Result<usize> {
+    partition.records.as_ref().map_or(Ok(0), |frame| {
         frame
             .batches
             .iter()
-            .map(|batch| batch.record_data.len())
+            .map(|batch| batch.size_in_bytes().map_err(Into::into))
             .sum()
     })
 }
@@ -223,7 +223,7 @@ where
     // It must be more than the 1 byte that this fetch asks for, or the second fetch below tests
     // nothing new.
     let (partitions, _) = fetch_from_start(&storage, &topition, MAX_WAIT, 1).await?;
-    let record_size = i32::try_from(record_bytes(&partitions[0]))?;
+    let record_size = i32::try_from(batch_bytes(&partitions[0])?)?;
     assert!(record_size > 1, "{record_size}");
 
     let (partitions, elapsed) =

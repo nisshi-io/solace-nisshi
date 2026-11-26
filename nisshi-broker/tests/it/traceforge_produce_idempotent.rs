@@ -92,14 +92,14 @@ use nisshi_sans_io::{
     },
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, CreateTopicsService,
+    ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, CreateTopicsService,
     CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProduceService,
-    ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    ProducerIdResponse, ReadEnd, Result as StorageResult, ScramCredential, Storage, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use rama::{Layer as _, Service as _, extensions::Extensions};
 use std::{
@@ -451,16 +451,16 @@ impl Storage for FaultInjectingProduceStorage {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: nisshi_storage::FetchedSender,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<ReadEnd> {
         self.inner
             .fetch(
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )

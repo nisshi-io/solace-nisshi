@@ -45,10 +45,10 @@ use nisshi_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    ReadEnd, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 use tracing::instrument;
 use url::Url;
@@ -378,10 +378,10 @@ impl Storage for FailingOffsets {
         _topition: &Topition,
         _offset: i64,
         _min_bytes: u32,
-        _max_bytes: u32,
+        _limit: ByteLimit,
         _isolation_level: IsolationLevel,
         _fetched: nisshi_storage::FetchedSender,
-    ) -> nisshi_storage::Result<()> {
+    ) -> nisshi_storage::Result<ReadEnd> {
         unimplemented!()
     }
 

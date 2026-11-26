@@ -57,11 +57,11 @@ use nisshi_sans_io::{
 };
 use nisshi_service::routable_range;
 use nisshi_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail,
-    ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, Result as StorageResult, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, FetchedSender,
+    GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, ReadEnd, Result as StorageResult, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use tokio::time::{sleep, timeout};
 use url::Url;
@@ -1103,16 +1103,16 @@ impl Storage for OutageStorage {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
-        fetched_sender: nisshi_storage::FetchedSender,
-    ) -> StorageResult<()> {
+        fetched_sender: FetchedSender,
+    ) -> StorageResult<ReadEnd> {
         self.inner
             .fetch(
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )

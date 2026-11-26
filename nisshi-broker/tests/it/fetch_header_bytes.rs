@@ -19,7 +19,7 @@
 //!
 //! [`ReplicaManager.scala#L1733-L1739`]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::time::Duration;
 
 use crate::common::{self, StorageType, alphanumeric_string, init_tracing, register_broker};
@@ -93,17 +93,15 @@ where
     Ok(())
 }
 
-/// A record costs the sum of its headers, and a header costs 2 bytes of framing, the length of its
-/// key and the length of its value, whatever the header holds. Two shapes of record pin each part
-/// of that sum, and a Fetch that left one out would return two records where it returns one:
+/// Records whose headers make up most of their size return one at a time from a `max_bytes` smaller
+/// than two records: records with 50 headers with an empty key and a null value under 150 bytes,
+/// and records with a header with a 40-byte key and one with a 40-byte value under 110 bytes.
 ///
-/// - 50 headers with an empty key and a null value cost 107 bytes with the 7 of every record (108
-///   with the key of a keyed record), and a `max_bytes` of 150 returns one record. Dropping the
-///   framing costs 7 (8 keyed), and taking the largest header, not the sum, costs 9 (10 keyed).
-/// - a header with a 40 byte key and a null value, and one with a null key and a 40 byte value,
-///   cost 91 bytes (92 keyed), and a `max_bytes` of 110 returns one record. Dropping the key, or
-///   the value, costs 51 (52 keyed), and taking the larger header costs 49 (50 keyed), so each
-///   returns two.
+/// The read that every engine's records pass through measures each record by its encoded size,
+/// headers included, so the test checks that limit on each engine, and passes whatever an engine's
+/// own query counts. The tests of each SQL fetch query pin how the query counts headers: `limbo`'s
+/// `fetch_counts_*` tests and PostgreSQL's
+/// `the_fetch_query_counts_a_record_with_its_key_value_and_headers`.
 ///
 /// The test reads from the engine, not through `FetchService`, which reads again until the
 /// response's `max_bytes` is spent.

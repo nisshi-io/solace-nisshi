@@ -45,10 +45,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DeleteRecordsConcurrency, GroupDetail,
     ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, StorageOperation,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     UpdateError, Version,
     fetched::FetchedSender,
     produce_path,
@@ -264,10 +264,10 @@ where
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let start = SystemTime::now();
 
         let _permit = self
@@ -287,7 +287,7 @@ where
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )
@@ -706,7 +706,7 @@ mod tests {
     use crate::{
         Result, Storage, Topition,
         decoded_batch_probe::probe,
-        fetched::FetchUntilDeadline as _,
+        fetched::FetchUntilLimit as _,
         read_deadline::{ReadWait, TimedOut},
         service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };

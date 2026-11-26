@@ -70,11 +70,11 @@ use nisshi_schema::{
     lake::{House, LakeHouse as _},
 };
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_CONCURRENCY,
     DELETE_RECORDS_INVALID_LOW_WATERMARK, DeleteRecordsConcurrency, Error, FetchedRecord,
     FetchedSender, GroupDetail, LIST_OFFSETS_CONCURRENCY, ListOffsetResponse, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, PRODUCE_CONCURRENCY, ProduceEpoch,
-    ProducerIdResponse, Result, ScramCredential, Storage, StorageOperation, StoredEpochs,
+    ProducerIdResponse, ReadEnd, Result, ScramCredential, Storage, StorageOperation, StoredEpochs,
     TopicConfiguration, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
     TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim,
     config::{self, apply_op},
@@ -637,9 +637,9 @@ const FETCH_PLAN_SETTINGS: &str = "SET LOCAL enable_bitmapscan = off; \
 /// records statement started, or the server ended the statement with an error.
 #[derive(Debug)]
 enum RecordsStatement {
-    /// The statement sent all of its rows, and its transaction committed, so no statement runs on
-    /// the connection.
-    Ended,
+    /// The statement sent all of its rows, and its transaction committed, so the connection does
+    /// not run a statement. The [`ReadEnd`] holds how the read ended.
+    Ended(ReadEnd),
     /// The read stopped before its statement ended, because a row failed to decode or the caller
     /// stopped taking records. The statement can still be running on the connection.
     Abandoned(Error),
@@ -2012,7 +2012,7 @@ impl Postgres {
         key_filter: Option<&str>,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
     ) -> Result<RecordsStatement> {
@@ -2033,10 +2033,11 @@ impl Postgres {
             ?isolation_level,
             high_watermark,
             min_bytes,
-            max_bytes
+            ?limit
         );
 
         let mut fetched_data = fetched_sender.send_offsets(offset_stage).await?;
+        let mut read_end = ReadEnd::Finished;
 
         let tx = c.transaction().await?;
 
@@ -2050,7 +2051,8 @@ impl Postgres {
             pg_record_fetch::QUERY
         };
         let partition = topition.partition();
-        let max_bytes = i64::from(max_bytes);
+        let max_bytes = i64::from(limit.bytes());
+        let first_may_exceed = limit.is_soft();
         let mut params: Vec<&(dyn ToSql + Sync)> = vec![
             &self.cluster,
             &base_topic,
@@ -2061,6 +2063,7 @@ impl Postgres {
         ];
         params.extend(key_filter.as_ref().map(|key| key as &(dyn ToSql + Sync)));
         params.push(&ROWS_PER_FETCH);
+        params.push(&first_may_exceed);
 
         let query = query.key();
         let (sql, prepared) = self.prepare_statement(&tx, query).await?;
@@ -2109,12 +2112,20 @@ impl Postgres {
                     error!(?offset, "a fetched record can't be read");
                 })
                 .and_then(|row| {
-                    FetchedRecord::try_from(row).inspect_err(|error| {
-                        error!(?error);
-                        metrics::decode_failed(sql, &self.cluster);
-                    })
+                    row.within_limit()
+                        .map(|row| {
+                            FetchedRecord::try_from(row).inspect_err(|error| {
+                                error!(?error);
+                                metrics::decode_failed(sql, &self.cluster);
+                            })
+                        })
+                        .transpose()
                 }) {
-                Ok(record) => record,
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    read_end = ReadEnd::ReachedLimit;
+                    continue;
+                }
                 Err(error) => {
                     statement.failed();
                     return Ok(RecordsStatement::Abandoned(error));
@@ -2134,7 +2145,8 @@ impl Postgres {
 
         // The transaction only reads, so a rollback has the same effect as a commit.
         tx.commit().await?;
-        Ok(RecordsStatement::Ended)
+
+        Ok(RecordsStatement::Ended(read_end))
     }
 
     /// Reads the log start, high watermark and last stable offset of
@@ -4470,10 +4482,10 @@ impl Storage for Postgres {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         // A `/` in the name checks out a connection of its own, so this
         // runs before the read holds its connection.
         let (base_topic, key_filter): (&str, Option<&str>) =
@@ -4498,16 +4510,16 @@ impl Storage for Postgres {
                 key_filter,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation_level,
                 fetched_sender,
             )
             .await;
 
         match read {
-            Ok(RecordsStatement::Ended) => {
+            Ok(RecordsStatement::Ended(end)) => {
                 connection.release();
-                Ok(())
+                Ok(end)
             }
             // The statement may still be running on the connection. Dropping the connection
             // cancels it.
@@ -6089,7 +6101,7 @@ pub(crate) mod tests {
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
     use nisshi_storage::{
-        fetched::{self, FetchUntilDeadline as _},
+        fetched::{self, ByteLimit, FetchUntilLimit as _},
         read_deadline::TimedOut,
     };
     use opentelemetry::KeyValue;
@@ -7713,7 +7725,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            1024 * 1024,
+            ByteLimit::Soft(1024 * 1024),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14171,6 +14183,239 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Makes `topition`'s topic virtual, and returns the partition of its keyed view whose fetch
+    /// reads the topic's records with the key `key-a`.
+    async fn keyed_view(storage: &Postgres, topition: &Topition) -> Result<Topition> {
+        _ = storage
+            .connection()
+            .await?
+            .execute(
+                "insert into topic_configuration (topic, name, value) \
+                 select t.id, 'tansu.virtual', 'true' \
+                 from topic t join cluster c on c.id = t.cluster \
+                 where c.name = $1 and t.name = $2",
+                &[&storage.cluster, &topition.topic()],
+            )
+            .await?;
+
+        Ok(Topition::new(format!("{}/key-a", topition.topic()), 0))
+    }
+
+    /// A topic and its keyed view each hold 3 records with a 200-byte value. Under a hard limit of
+    /// 50 bytes, a read from offset 0 returns nothing and reports that it reached its limit. A read
+    /// from offset 3, the high watermark, returns nothing and does not report it.
+    #[tokio::test]
+    async fn a_hard_read_before_a_record_that_does_not_fit_reaches_its_limit() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let keyed = keyed_view(&storage, &topition).await?;
+
+        let batch = (0..3)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::from_static(b"key-a").into())
+                        .value(Bytes::from(vec![b'v'; 200]).into())
+                        .offset_delta(delta),
+                )
+            })
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        for fetched in [&topition, &keyed] {
+            for (offset, reached_limit) in [(0, true), (3, false)] {
+                let read = storage
+                    .fetch_until_limit(
+                        fetched,
+                        offset,
+                        1,
+                        ByteLimit::Hard(50),
+                        IsolationLevel::ReadUncommitted,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await?;
+
+                assert!(read.batches.is_empty(), "{fetched:?} from {offset}");
+                assert_eq!(
+                    reached_limit, read.reached_limit,
+                    "{fetched:?} from {offset}"
+                );
+            }
+        }
+
+        // The keyed query shows the first record that does not fit with a marker row, which holds
+        // no key, value or headers.
+        let c = storage.connection().await?;
+        let query = pg_record_fetch::KEYED_QUERY.key();
+        let statement = c.prepare(storage.sql_lookup(query)?).await?;
+        let reader = pg_record_fetch::Row::reader(&ResultColumns::new(query, &statement))?;
+        let rows = c
+            .query(
+                &statement,
+                &[
+                    &storage.cluster,
+                    &topition.topic(),
+                    &topition.partition(),
+                    &0_i64,
+                    &50_i64,
+                    &3_i64,
+                    &"key-a",
+                    &ROWS_PER_FETCH,
+                    &false,
+                ],
+            )
+            .await?
+            .iter()
+            .map(|row| pg_record_fetch::Row::read(&reader, row))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_matches!(
+            rows.as_slice(),
+            [pg_record_fetch::Row {
+                offset_id: 0,
+                key: None,
+                value: None,
+                header_keys: None,
+                header_values: None,
+                limit_reached: true,
+                ..
+            }]
+        );
+
+        Ok(())
+    }
+
+    /// A topic and its keyed view each hold 3 records with a 200-byte value. Under a soft limit of
+    /// 1 byte, a read from offset 0 sends the first record and then stops at its limit before the
+    /// second. A read under a hard limit of 1 MiB sends every record, and a read from offset 3, the
+    /// high watermark, sends nothing: neither stops at its limit. The query counts each record as
+    /// 212 bytes, so a hard limit of 636 bytes holds all three, and that read does not stop at its
+    /// limit either.
+    #[tokio::test]
+    async fn a_read_reports_a_stop_at_its_limit_after_records() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let keyed = keyed_view(&storage, &topition).await?;
+
+        let batch = (0..3)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::from_static(b"key-a").into())
+                        .value(Bytes::from(vec![b'v'; 200]).into())
+                        .offset_delta(delta),
+                )
+            })
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        for fetched in [&topition, &keyed] {
+            for (offset, limit, read_end) in [
+                (0, ByteLimit::Soft(1), ReadEnd::ReachedLimit),
+                (0, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+                (0, ByteLimit::Hard(636), ReadEnd::Finished),
+                (3, ByteLimit::Hard(1024 * 1024), ReadEnd::Finished),
+            ] {
+                // The test keeps the receiver, because a read fails with `UnableToSend` once its
+                // receiver is dropped.
+                let (sender, _receiver) = fetched::channel();
+
+                assert_eq!(
+                    read_end,
+                    storage
+                        .fetch(
+                            fetched,
+                            offset,
+                            1,
+                            limit,
+                            IsolationLevel::ReadUncommitted,
+                            sender
+                        )
+                        .await?,
+                    "{fetched:?} from {offset} within {limit:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A topic and its keyed view each hold 3 records, each with a 5-byte key, a 3-byte value and
+    /// one header with a 1-byte key and a 2-byte value. The query counts each record as 20 bytes:
+    /// 7 for the smallest record, its key and value, and each header's key and value with 2 bytes
+    /// more. A read under a hard limit of the 60 bytes of the 3 records ends without reaching its
+    /// limit, and a read under 59 bytes stops at it. A query that left out any part of the count
+    /// would also end without reaching a limit of 59 bytes.
+    #[tokio::test]
+    async fn the_fetch_query_counts_a_record_with_its_key_value_and_headers() -> Result<()> {
+        let Some((storage, topition)) = storage_with_empty_topic().await? else {
+            return Ok(());
+        };
+
+        let keyed = keyed_view(&storage, &topition).await?;
+
+        let batch = (0..3)
+            .fold(Batch::builder(), |builder, delta| {
+                builder.record(
+                    Record::builder()
+                        .key(Bytes::from_static(b"key-a").into())
+                        .value(Bytes::from_static(b"val").into())
+                        .header(
+                            Header::builder()
+                                .key(Bytes::from_static(b"h"))
+                                .value(Bytes::from_static(b"hv")),
+                        )
+                        .offset_delta(delta),
+                )
+            })
+            .last_offset_delta(2)
+            .base_sequence(0)
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        _ = storage.produce(None, &topition, batch).await?;
+
+        for fetched in [&topition, &keyed] {
+            for (limit, read_end) in [
+                (ByteLimit::Hard(60), ReadEnd::Finished),
+                (ByteLimit::Hard(59), ReadEnd::ReachedLimit),
+            ] {
+                // The test keeps the receiver, because a read fails with `UnableToSend` once its
+                // receiver is dropped.
+                let (sender, _receiver) = fetched::channel();
+
+                assert_eq!(
+                    read_end,
+                    storage
+                        .fetch(
+                            fetched,
+                            0,
+                            1,
+                            limit,
+                            IsolationLevel::ReadUncommitted,
+                            sender
+                        )
+                        .await?,
+                    "{fetched:?} within {limit:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns the headers of the record at `offset_delta`: one whose key differs from its value,
     /// and one with a null value. Both name the record, so a header on the wrong record shows.
     fn keyed_record_headers(offset_delta: i32) -> [header::Builder; 2] {
@@ -14285,11 +14530,13 @@ pub(crate) mod tests {
         for (query, arguments) in [
             (
                 pg_record_fetch::QUERY.key(),
-                format!("'{cluster}', '{topic}', 0, 0, 1048576, 100000, {ROWS_PER_FETCH}"),
+                format!("'{cluster}', '{topic}', 0, 0, 1048576, 100000, {ROWS_PER_FETCH}, true"),
             ),
             (
                 pg_record_fetch::KEYED_QUERY.key(),
-                format!("'{cluster}', '{topic}', 0, 0, 1048576, 100000, 'k', {ROWS_PER_FETCH}"),
+                format!(
+                    "'{cluster}', '{topic}', 0, 0, 1048576, 100000, 'k', {ROWS_PER_FETCH}, true"
+                ),
             ),
         ] {
             let sql = storage.sql_lookup(query)?;
@@ -14487,7 +14734,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            u32::MAX,
+            ByteLimit::Soft(u32::MAX),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14534,7 +14781,7 @@ pub(crate) mod tests {
             &topition,
             0,
             1,
-            u32::MAX,
+            ByteLimit::Soft(u32::MAX),
             IsolationLevel::ReadUncommitted,
             fetched_sender,
         );
@@ -14631,11 +14878,11 @@ pub(crate) mod tests {
         cut.store(true, atomic::Ordering::Relaxed);
 
         let fetched = storage
-            .fetch_until_deadline_or_failure(
+            .fetch_until_limit(
                 &topition,
                 0,
                 1,
-                u32::MAX,
+                ByteLimit::Soft(u32::MAX),
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(30),
             )
@@ -14808,7 +15055,8 @@ pub(crate) mod tests {
                  NULL::bigint AS producer_id, \
                  NULL::smallint AS producer_epoch, \
                  ARRAY['\\x01'::bytea] AS header_keys, \
-                 ARRAY[]::bytea[] AS header_values",
+                 ARRAY[]::bytea[] AS header_values, \
+                 false AS limit_reached",
             )
             .await?;
         let reader = pg_record_fetch::Row::reader(&ResultColumns::new(

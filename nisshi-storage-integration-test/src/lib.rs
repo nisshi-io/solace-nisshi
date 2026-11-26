@@ -49,6 +49,7 @@
 pub mod broker;
 mod commit_metadata;
 pub mod consumer_group;
+pub mod fetch;
 pub mod group;
 mod init_producer;
 mod metadata_max_size;
@@ -125,6 +126,7 @@ macro_rules! storage_integration_tests {
 macro_rules! __areas {
     ($config:tt) => {
         $crate::__area_consumer_group!($config);
+        $crate::__area_fetch!($config);
         $crate::__area_offset!($config);
         $crate::__area_producer_id!($config);
         $crate::__area_transactions!($config);
@@ -240,6 +242,48 @@ macro_rules! __area_consumer_group {
                     first_join_of_a_new_group_waits_for_the_initial_delay(storage),
                     rebalance_ends_once_every_member_has_rejoined(storage),
                     rebalance_across_brokers_ends_once_the_last_member_rejoins(storage),
+                ], $config);
+            }
+        );
+    };
+}
+
+/// Defines the `fetch` area, unless `without` names it. The case lists follow the rules of
+/// `__file!`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __area_fetch {
+    ($config:tt) => {
+        $crate::__unless_listed!(fetch; $config;
+            pub mod fetch {
+                #[allow(unused_imports)]
+                use super::*;
+
+                $crate::__file!(fetch, fetch_limits, [
+                    [not_on_slatedb]
+                    an_oversized_first_batch_counts_in_full_against_the_response_max_bytes(
+                        cluster_id,
+                        broker_id,
+                        storage
+                    ),
+                    [not_on_slatedb]
+                    a_later_partition_returns_no_batch_larger_than_its_limit(
+                        cluster_id,
+                        broker_id,
+                        storage
+                    ),
+                    [not_on_slatedb]
+                    a_partition_at_its_hard_limit_counts_toward_min_bytes(
+                        cluster_id,
+                        broker_id,
+                        storage
+                    ),
+                    [not_on_slatedb]
+                    every_partition_returns_the_records_that_fit_its_limit(
+                        cluster_id,
+                        broker_id,
+                        storage
+                    ),
                 ], $config);
             }
         );
@@ -519,10 +563,12 @@ macro_rules! __unless_listed {
         $crate::__unless_listed!(@search $name; [$($without),*]; $($item)*);
     };
     (@search consumer_group; [consumer_group $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search fetch; [fetch $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search offset; [offset $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search producer_id; [producer_id $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search transactions; [transactions $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search init_producer_id; [init_producer_id $(, $rest:ident)*]; $($item:tt)*) => {};
+    (@search fetch_limits; [fetch_limits $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search new_cg; [new_cg $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_slatedb; [not_on_slatedb $(, $rest:ident)*]; $($item:tt)*) => {};
     (@search not_on_in_memory; [not_on_in_memory $(, $rest:ident)*]; $($item:tt)*) => {};

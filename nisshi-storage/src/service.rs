@@ -140,11 +140,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    RequestTimer, Result, ScramCredential, Storage, StorageOperation, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, Error, GroupDetail, ListOffsetResponse,
+    METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, ReadEnd, RequestTimer, Result, ScramCredential, Storage, StorageOperation,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
     fetched::FetchedSender,
     produce_path,
     service::read_deadline::{QueueWait as _, ReadWait},
@@ -172,7 +172,7 @@ pub enum Request {
         topition: Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
     },
@@ -323,7 +323,7 @@ pub enum Response {
     DescribeConfig(Result<DescribeConfigsResult>),
     DescribeGroups(Result<Vec<NamedGroupDetail>>),
     DescribeTopicPartitions(Result<Vec<DescribeTopicPartitionsResponseTopic>>),
-    Fetch(Result<()>),
+    Fetch(Result<ReadEnd>),
     GroupWithVersion(Result<Option<(GroupDetail, Version)>>),
     IncrementalAlterResponse(Result<AlterConfigsResourceResponse>),
     InitProducer(Result<ProducerIdResponse>),
@@ -797,15 +797,15 @@ impl Storage for RequestChannelService {
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         let request = Request::Fetch {
             topition: topition.to_owned(),
             offset,
             min_bytes,
-            max_bytes,
+            limit,
             isolation,
             fetched_sender,
         };
@@ -1312,7 +1312,7 @@ where
                     if let Request::Fetch { fetched_sender, .. } = &request
                         && fetched_sender.reader_has_stopped()
                     {
-                        _ = tx.send(Ok(Response::Fetch(Ok(()))));
+                        _ = tx.send(Ok(Response::Fetch(Ok(ReadEnd::Finished))));
                         continue;
                     }
 
@@ -1461,7 +1461,7 @@ where
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             } => {
@@ -1473,9 +1473,9 @@ where
                 Ok(Response::Fetch(tokio::select! {
                     biased;
                     fetched = self.storage.fetch(
-                        &topition, offset, min_bytes, max_bytes, isolation, fetched_sender,
+                        &topition, offset, min_bytes, limit, isolation, fetched_sender,
                     ) => fetched,
-                    () = reader_stopped => Ok(()),
+                    () = reader_stopped => Ok(ReadEnd::Finished),
                 }))
             }
             Request::OffsetStage(topition) => Ok(Response::OffsetStage(
@@ -1656,7 +1656,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        fetched::{self, FetchUntilDeadline as _},
+        fetched::{self, ByteLimit, FetchUntilLimit as _},
         storage_double::storage_double,
     };
     use nisshi_sans_io::record::inflated;
@@ -1713,7 +1713,7 @@ mod tests {
                     topition: topition.clone(),
                     offset: 0,
                     min_bytes: 0,
-                    max_bytes: 0,
+                    limit: ByteLimit::Soft(0),
                     isolation: IsolationLevel::default(),
                     fetched_sender,
                 },
@@ -1956,7 +1956,9 @@ mod tests {
             data.send_batch(batch).await.expect("the reader");
             drop(data);
 
-            reply.send(Ok(Response::Fetch(Ok(())))).expect("the reader");
+            reply
+                .send(Ok(Response::Fetch(Ok(ReadEnd::Finished))))
+                .expect("the reader");
         };
 
         let (fetched, ()) = tokio::join!(fetch(&storage, deadline), answer);
@@ -2018,7 +2020,7 @@ mod tests {
             topition: Topition::new("abc", 0),
             offset: 0,
             min_bytes: 1,
-            max_bytes: 1024,
+            limit: ByteLimit::Soft(1024),
             isolation: IsolationLevel::ReadUncommitted,
             fetched_sender,
         });
@@ -2028,7 +2030,7 @@ mod tests {
 
         let served = tokio::time::timeout(Duration::from_secs(1), serving).await;
 
-        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(())))));
+        assert_matches!(served, Ok(Ok(Response::Fetch(Ok(ReadEnd::Finished)))));
         assert_matches!(
             read_ended.try_recv(),
             Err(TryRecvError::Closed),
@@ -2059,7 +2061,7 @@ mod tests {
         data.send_batch(batch).await?;
         drop(data);
 
-        self.outcome.clone()
+        self.outcome.clone().map(|()| ReadEnd::Finished)
     });
 
     /// Returns a client of a storage channel whose service loop serves `storage`, as mpsc mode
@@ -2110,11 +2112,11 @@ mod tests {
         });
 
         let read = storage
-            .fetch_until_deadline_or_failure(
+            .fetch_until_limit(
                 &Topition::new("abc", 0),
                 0,
                 1,
-                1024,
+                ByteLimit::Soft(1024),
                 IsolationLevel::ReadUncommitted,
                 Instant::now() + Duration::from_secs(1),
             )

@@ -13,7 +13,8 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- prepare record_fetch_keyed (text, text, integer, integer, integer, integer, bytea, bigint) as
+-- prepare record_fetch_keyed
+--   (text, text, integer, integer, integer, integer, bytea, bigint, boolean) as
 -- Each row holds one record with all of its headers, so that a read stopped after any row keeps
 -- only complete records.
 --
@@ -32,7 +33,8 @@
 -- ([DefaultRecordBatch.java#L129]), because this query does not know where the batches that
 -- a read builds begin. Counting less than Kafka means a read spends the budget no sooner than Kafka
 -- would for the same records, and a record with no key, no value and no headers still costs 7.
--- The bytes of a response can therefore exceed max_bytes by the framing that this count leaves out.
+-- So the query can send a record past the limit, and the read that every engine's records pass
+-- through (fetched.rs), which measures each record by its encoded size, discards it.
 --
 -- [DefaultRecordBatch.java#L129]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
 --
@@ -98,32 +100,45 @@ attributes,
 timestamp,
 k,
 v,
-(sum(
-    7
-    + coalesce(length(k), 0)
-    + coalesce(length(v), 0)
-    + coalesce((select sum(coalesce(length(e), 0)) from unnest(headers) as e), 0)
-    + coalesce(cardinality(headers), 0)
-) over (order by offset_id))::bigint as bytes,
+row_bytes,
+(sum(row_bytes) over (order by offset_id))::bigint as bytes,
 row_number() over (order by offset_id) as ordinal,
 producer_id,
 producer_epoch,
 headers
 
+from (
+
+select
+
+candidates.*,
+7
+    + coalesce(length(k), 0)
+    + coalesce(length(v), 0)
+    + coalesce((select sum(coalesce(length(e), 0)) from unnest(headers) as e), 0)
+    + coalesce(cardinality(headers), 0) as row_bytes
+
 from
 
-candidates)
+candidates) sized_rows)
 
--- The query returns the first row even when that row alone is larger than $5, so that a consumer
--- always gets past a record larger than its fetch limit (KIP-74). Kafka returns the whole first
--- batch, and only for the first non-empty partition of a fetch ([ReplicaManager.scala#L1733-L1739],
--- [LogSegment.java#L439-L441]). This query returns the first record of every read, because it
--- does not know about batches or about the other partitions of the fetch.
+-- If $9 is true, the query returns the first row even when that row alone is larger than $5. The
+-- caller sets $9 for a soft limit, so that a consumer gets past a record larger than its fetch
+-- limit (KIP-74). Kafka returns the whole first batch, and only for the first non-empty partition
+-- of a fetch ([ReplicaManager.scala#L1733-L1739], [LogSegment.java#L439-L441]). This query does
+-- not know about batches or about the other partitions of the fetch, so its caller decides.
 --
 -- The query finds the first row by its ordinal, so that finding it does not depend on every
 -- record having a non-zero size. It does not compare offset_id
 -- with a min(offset_id) over sized, because a second reference to sized makes PostgreSQL store
 -- every row of it, keys and values included, instead of streaming them.
+--
+-- The query sends a row, with its key, value and headers, if the row's `bytes`, the size of
+-- the rows up to and including it, is at most $5, or if it is the first row and $9 is true.
+-- It also returns the first row that it does not send, as a marker: `limit_reached` is true, and
+-- the key, value and headers are null, so the query does not send their bytes. Without the
+-- marker, a result that stopped at $5 looks the same as one that ended at $6 or at the row limit
+-- $8.
 --
 -- [ReplicaManager.scala#L1733-L1739]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1733-L1739
 -- [LogSegment.java#L439-L441]: https://github.com/apache/kafka/blob/3.9.1/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java#L439-L441
@@ -132,22 +147,30 @@ select
 s.offset_id,
 s.attributes,
 s.timestamp,
-s.k as key,
-s.v as value,
+case when s.sent then s.k end as key,
+case when s.sent then s.v end as value,
 s.producer_id,
 s.producer_epoch,
 
 -- The first half of headers holds the keys, and the second half the values.
-s.headers[1:cardinality(s.headers) / 2] as header_keys,
-s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] as header_values
+case when s.sent
+    then s.headers[1:cardinality(s.headers) / 2] end as header_keys,
+case when s.sent
+    then s.headers[cardinality(s.headers) / 2 + 1:cardinality(s.headers)] end as header_values,
+not s.sent as limit_reached
 
 from
 
-sized s
+-- `sent` is whether the query sends the row with its key, value and headers.
+(select sized.*, sized.bytes <= $5 or (sized.ordinal = 1 and $9) as sent from sized) s
 
 where
 
-s.bytes < $5
-or s.ordinal = 1
+-- The query returns the first row, and each row after a row that it sends: `s.bytes - s.row_bytes`
+-- is the `bytes` of the row before. `bytes` grows with every row, so the last row returned is the
+-- first row that the query does not send: the marker.
+s.ordinal = 1
+or s.bytes - s.row_bytes <= $5
+or (s.ordinal = 2 and $9)
 
 order by s.offset_id;

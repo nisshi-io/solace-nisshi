@@ -1094,7 +1094,7 @@ mod cleanup_policy {
     };
 
     use super::*;
-    use nisshi_storage::fetched::FetchUntilDeadline as _;
+    use nisshi_storage::fetched::FetchUntilLimit as _;
 
     async fn topic_with_policy(engine: &Engine, name: &str, configs: &[(&str, &str)]) -> Topition {
         let topic = CreatableTopic::default()

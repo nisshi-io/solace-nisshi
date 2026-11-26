@@ -23,7 +23,7 @@
 //! `traceforge_produce_object_store_fault` in `nisshi-broker` fails the batch write. These tests
 //! fail the writes before it: the watermark, and the transaction's record of the batch.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{assert_matches, time::Duration};
 use tokio::time::Instant;
 

@@ -54,11 +54,12 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, CommittedOffset, DeleteRecordsConcurrency, Error, GroupDetail,
-    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version, fetched::FetchedSender, inflate_produced, offload, produce_path,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DeleteRecordsConcurrency, Error,
+    GroupDetail, ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ReadEnd, Result, ScramCredential,
+    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version, fetched::FetchedSender, inflate_produced,
+    offload, produce_path,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -939,16 +940,16 @@ where
         topition: &'_ Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
         self.storage
             .fetch(
                 topition,
                 offset,
                 min_bytes,
-                max_bytes,
+                limit,
                 isolation,
                 fetched_sender,
             )
@@ -1559,10 +1560,10 @@ mod tests {
             _topition: &Topition,
             _offset: i64,
             _min_bytes: u32,
-            _max_bytes: u32,
+            _limit: ByteLimit,
             _isolation_level: IsolationLevel,
             _fetched: FetchedSender,
-        ) -> Result<()> {
+        ) -> Result<ReadEnd> {
             unimplemented!()
         }
 

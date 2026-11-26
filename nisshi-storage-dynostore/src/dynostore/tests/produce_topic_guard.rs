@@ -20,7 +20,7 @@
 //! These tests use only the `Storage` trait and the raw bucket, so they
 //! compile against the code before the fix and fail there at runtime.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},

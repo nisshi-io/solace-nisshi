@@ -19,7 +19,7 @@
 //! The `tansu.*` alias warning is process-wide and a test checks the log of the whole process,
 //! so each test needs a process of its own, as `cargo nextest` gives it.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{
     io,
     sync::{Arc, Mutex, OnceLock},

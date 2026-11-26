@@ -52,12 +52,12 @@ use nisshi_sans_io::{
 };
 use nisshi_schema::lake::LakeHouse as _;
 use nisshi_storage::{
-    BrokerRegistrationRequest, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK, Error,
-    FetchedSender, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    TxnState, UpdateError, Version, check_claim, config::apply_op, delete_records_cutoff, inflate,
-    max_message_bytes, producer_claim,
+    BrokerRegistrationRequest, ByteLimit, CommittedOffset, DELETE_RECORDS_INVALID_LOW_WATERMARK,
+    Error, FetchedSender, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ReadEnd, Result, ScramCredential,
+    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, check_claim, config::apply_op,
+    delete_records_cutoff, inflate, max_message_bytes, producer_claim,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::time::sleep;
@@ -1073,10 +1073,11 @@ impl Storage for Engine {
         topition: &Topition,
         offset: i64,
         min_bytes: u32,
-        max_bytes: u32,
+        limit: ByteLimit,
         isolation_level: IsolationLevel,
         fetched_sender: FetchedSender,
-    ) -> Result<()> {
+    ) -> Result<ReadEnd> {
+        let max_bytes = limit.bytes();
         // Get the high watermark based on isolation level
         let offset_stage = self.offset_stage(topition).await?;
         let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
@@ -1112,7 +1113,7 @@ impl Storage for Engine {
         let mut data = fetched_sender.send_offsets(offset_stage).await?;
 
         if offset >= high_watermark {
-            return Ok(());
+            return Ok(ReadEnd::Finished);
         }
 
         let prefix = postcard::to_stdvec(&BatchKeyPrefix::new(metadata.id, topition.partition))?;
@@ -1182,7 +1183,7 @@ impl Storage for Engine {
             }
         }
 
-        Ok(())
+        Ok(ReadEnd::Finished)
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
