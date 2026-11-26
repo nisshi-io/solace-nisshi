@@ -26,7 +26,8 @@
 ///   body of [`Storage::fetch`](crate::Storage::fetch), and leaves every other method
 ///   unimplemented.
 /// - `storage_double!(Double { ... })` takes whole methods. The double gives `fetch`,
-///   `offset_stage` and `metadata` itself, because this form leaves them out.
+///   `offset_stage`, `metadata` and `aborted_transactions` itself, because this form leaves them
+///   out.
 ///
 /// The macro puts the impl in a `const _` block with its own imports of the types in the
 /// signatures of [`Storage`](crate::Storage), so that a file that uses the macro does not import
@@ -51,6 +52,15 @@ macro_rules! storage_double {
             }
 
             async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+                unimplemented!()
+            }
+
+            async fn aborted_transactions(
+                &self,
+                _topition: &Topition,
+                _offset: i64,
+                _last_stable_offset: i64,
+            ) -> Result<Vec<AbortedTransaction>> {
                 unimplemented!()
             }
         });
@@ -279,15 +289,6 @@ macro_rules! storage_double {
                 }
 
                 async fn maintain_transactions(&self, _now: SystemTime) -> Result<()> {
-                    unimplemented!()
-                }
-
-                async fn aborted_transactions(
-                    &self,
-                    _topition: &Topition,
-                    _offset: i64,
-                    _last_stable_offset: i64,
-                ) -> Result<Vec<AbortedTransaction>> {
                     unimplemented!()
                 }
 
