@@ -68,7 +68,32 @@ difference matches, is stricter or looser than Kafka, or does not apply by desig
   node 111 once per replica on purpose. This is looser than Kafka, and `docs/compatibility.md` does
   not mention it. Decide whether to keep it and document it.
 
-## Not triaged
+## Triage of the suspect failures
 
-Quota classes (`*QuotaTest`, 5 failures each) and `DynamicBrokerReconfigurationTest` look like
-embedded-broker limits, but I did not read their failures one by one.
+41 failures were not in an obvious "needs an embedded broker" class: the timeouts, the assertion
+differences and the "other" bucket. I read each failure's message, and the test code where the
+message was not enough. None is a new Nisshi bug. Each is a documented gap, a deliberate
+difference, or a limit of running Kafka's tests against an external broker. I did not rerun each
+test by hand.
+
+| Count | Tests | Cause | Verdict |
+| --: | --- | --- | --- |
+| 10 | `UserQuotaTest`, `UserClientIdQuotaTest` (5 each) | `setUp` creates a topic with a GSSAPI admin client, which times out against the plaintext broker. The tests then need `AlterClientQuotas`. | Not applicable (Kerberos). Quotas themselves are not supported, see `docs/compatibility.md`, so these cannot pass without both. |
+| 6 | `CustomQuotaCallbackTest`, `DescribeAuthorizedOperationsTest` (3), `MetricsTest` (2) | The client uses SASL and the broker does not enable it ("Timed out waiting for a node assignment", `IllegalSaslStateException`). | Not applicable here. Authentication is covered by `nisshi-smoke-test`. |
+| 9 | `ConsumerBounceTest` (5), `PlaintextConsumerTest.testCoordinatorFailover`, `FetchFromFollowerIntegrationTest`, `FetchRequestTestDowngrade`, `MetadataRequestBetweenDifferentIbpTest` | The test restarts or kills a broker, or needs a second broker, a controller or an old inter-broker protocol. `EndToEndClusterIdTest` (not in this count) reads a broker-side metrics reporter. | Not applicable to an external single node. |
+| 4 | `BrokerApiVersionsCommandTest`, `PlaintextConsumerTest.testListTopics`, `ProducerFailureHandlingTest.testCannotSendToInternalTopic`, `GroupCoordinatorIntegrationTest` | The test expects broker id 0, or the `__consumer_offsets` topic. | By design: node id 111 and no internal topics. |
+| 10 | `AdminClientWithPoliciesIntegrationTest` (`ALTER_CONFIGS`), `PlaintextConsumerTest` and `PlaintextProducerSendTest` (`CREATE_PARTITIONS`, 2), `ProducerSendWhileDeletionTest` (`ALTER_PARTITION_REASSIGNMENTS`), `ConsumerBounceTest.testConsumerReceivesFatalExceptionWhenGroupPassesMaxSize` (`group.max.size`), `PlaintextProducerSendTest.testSendWithInvalidBeforeAndAfterTimestamp` (2), `ProducerIdExpirationTest` (transactions), `PlaintextConsumerFetchTest` fetch size (2) | An API or setting that Nisshi does not have, or the fetch difference described above. | Documented gaps in `docs/compatibility.md` and `docs/consumer-groups.md`, except the fetch difference, now documented there too. |
+| 2 | `LogAppendTimeTest.testProduceConsume`, `ProducerFailureHandlingTest.testTooLargeRecordWithAckOne` | The test sets a broker-wide default (`log.message.timestamp.type`, `message.max.bytes`) that Nisshi cannot take. Nisshi has the per-topic `message.timestamp.type` and `max.message.bytes`, but not the broker-wide defaults. | Harness limit. A broker-wide default setting would make both tests runnable. |
+
+The other 366 failures were assigned by keyword and not read one by one: embedded-broker use
+(238, including `DynamicBrokerReconfigurationTest`), authentication and SSL, transactions, and
+tiered storage (`RemoteTopicCrudTest`, 22). The embedded-broker count is probably an
+undercount, because a failure goes in the first bucket that matches.
+
+## Next
+
+- The `Transactions*` classes and `ListOffsetsIntegrationTest` are ready acceptance suites for
+  transactions and `ListOffsets` v7.
+- A broker-wide `message.max.bytes` and `log.message.timestamp.type` would make two more tests
+  runnable.
+- Run the allow-list on Postgres and SQLite.
