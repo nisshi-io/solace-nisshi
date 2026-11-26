@@ -141,6 +141,22 @@ pub enum ReportFormat {
     Json,
 }
 
+impl ReportFormat {
+    /// The line of the report for `info`, as this format prints it.
+    fn line(self, info: &Info, kind: ReportKind) -> String {
+        match (self, kind) {
+            (Self::Text, ReportKind::Interval) => info.to_string(),
+            (Self::Text, ReportKind::Summary { .. }) => format!("summary: {info}"),
+            (Self::Json, kind) => info.json_line(kind),
+        }
+    }
+
+    /// Prints a line of the report. A closed stdout does not fail the run.
+    fn print(self, info: &Info, kind: ReportKind) {
+        _ = writeln!(io::stdout(), "{}", self.line(info, kind)).inspect_err(|error| debug!(?error));
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Perf {
     broker: Url,
@@ -479,7 +495,7 @@ impl Perf {
             _ => ErrorCode::None,
         };
 
-        let summary = summary(
+        let summary = Info::summary(
             started_at,
             ended_at,
             totals
@@ -487,7 +503,8 @@ impl Perf {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .unwrap_or_default(),
         );
-        print_report(self.report, &summary, ReportKind::Summary { error_code });
+        self.report
+            .print(&summary, ReportKind::Summary { error_code });
 
         // A failed shutdown stands as the run's error only when no refusal is held already,
         // because a refusal names what the broker did, and that is the more specific answer.
@@ -505,35 +522,6 @@ impl Perf {
 
         failure.map_or(Ok(ErrorCode::None), Err)
     }
-}
-
-/// The report of the whole run, from `started_at` to `ended_at`, over the last exported
-/// `totals`.
-fn summary(started_at: SystemTime, ended_at: SystemTime, totals: ObservationLatency) -> Info {
-    let mut info = Info::new(started_at);
-    info.current = ObservationLatency {
-        observation: Observation {
-            taken_at: ended_at,
-            ..totals.observation
-        },
-        latency: totals.latency,
-    };
-    info
-}
-
-/// The line of the report for `info`, as `report` prints it.
-fn report_line(report: ReportFormat, info: &Info, kind: ReportKind) -> String {
-    match (report, kind) {
-        (ReportFormat::Text, ReportKind::Interval) => info.to_string(),
-        (ReportFormat::Text, ReportKind::Summary { .. }) => format!("summary: {info}"),
-        (ReportFormat::Json, kind) => info.json_line(kind),
-    }
-}
-
-/// Prints a line of the report. A closed stdout does not fail the run.
-fn print_report(report: ReportFormat, info: &Info, kind: ReportKind) {
-    _ = writeln!(io::stdout(), "{}", report_line(report, info, kind))
-        .inspect_err(|error| debug!(?error));
 }
 
 #[derive(Clone, Debug)]
@@ -722,6 +710,20 @@ impl Info {
 
     fn with_previous(self, previous: Option<ObservationLatency>) -> Self {
         Self { previous, ..self }
+    }
+
+    /// The report of the whole run, from `started_at` to `ended_at`, over the last exported
+    /// `totals`.
+    fn summary(started_at: SystemTime, ended_at: SystemTime, totals: ObservationLatency) -> Self {
+        let mut info = Self::new(started_at);
+        info.current = ObservationLatency {
+            observation: Observation {
+                taken_at: ended_at,
+                ..totals.observation
+            },
+            latency: totals.latency,
+        };
+        info
     }
 
     fn elapsed(&self) -> Duration {
@@ -973,7 +975,7 @@ impl PushMetricExporter for MetricExporter {
         // interval is in the summary, and a line here would follow it on a timer export that
         // raced the shutdown.
         if !self.cancellation.is_cancelled() {
-            print_report(self.report, &info, ReportKind::Interval);
+            self.report.print(&info, ReportKind::Interval);
         }
 
         _ = totals.replace(info.current);
@@ -1119,13 +1121,13 @@ mod tests {
             error_code: ErrorCode::None,
         };
 
-        let line = report_line(ReportFormat::Text, &info, kind);
+        let line = ReportFormat::Text.line(&info, kind);
         assert_eq!(
             Some(info.to_string().as_str()),
             line.strip_prefix("summary: ")
         );
 
-        let interval = report_line(ReportFormat::Text, &info, ReportKind::Interval);
+        let interval = ReportFormat::Text.line(&info, ReportKind::Interval);
         assert_eq!(info.to_string(), interval);
     }
 
@@ -1147,7 +1149,7 @@ mod tests {
             },
         };
 
-        let info = summary(started_at, now, totals);
+        let info = Info::summary(started_at, now, totals);
 
         assert_eq!(Duration::from_secs(4), info.elapsed());
         assert_eq!(656, info.records_produced());
@@ -1155,7 +1157,7 @@ mod tests {
         assert_eq!(Some(4.5), info.current.latency.mean);
 
         // No export at all leaves a summary of zeros over the run's time.
-        let empty = summary(started_at, now, ObservationLatency::default());
+        let empty = Info::summary(started_at, now, ObservationLatency::default());
         assert_eq!(Duration::from_secs(4), empty.elapsed());
         assert_eq!(0, empty.records_produced());
     }
