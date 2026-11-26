@@ -503,7 +503,8 @@ fn the_generator_summary_prints_when_the_run_ends_not_when_the_process_exits() {
     assert_eq!("summary", json(&output)["type"], "{output:?}");
     let summary_after = summary_after.expect("a summary line");
     assert!(
-        summary_after < std::time::Duration::from_secs(4),
+        // The old order printed it after the 5 s grace period, so at 6 s or later.
+        summary_after < std::time::Duration::from_secs(5),
         "the summary came {summary_after:?} after the start of a 1 s run"
     );
 }

@@ -73,7 +73,8 @@ pub(super) struct Arg {
     /// `json` prints {"type":"summary","elapsed_ms","batches_produced","records_produced",
     /// "error_code"}, counting the batches that the broker accepted. The first produce request
     /// that the broker refuses ends the run with exit status 4, and the summary is printed all
-    /// the same, with the refusal's Kafka error code in `error_code` (0 when none was refused)
+    /// the same, with the refusal's Kafka error code in `error_code` (0 when none was refused,
+    /// -1 for a code this release does not know)
     #[arg(long, value_enum, default_value_t = Output::Table)]
     output: Output,
 

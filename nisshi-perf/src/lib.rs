@@ -803,7 +803,8 @@ enum ReportKind {
     Interval,
 
     /// What happened in the whole run. `error_code` is the code of the produce request that
-    /// ended it, or [`ErrorCode::None`] when the broker refused none.
+    /// ended it, [`ErrorCode::None`] when the broker refused none, or
+    /// [`ErrorCode::UnknownServerError`] for a code this crate does not know.
     Summary { error_code: ErrorCode },
 }
 

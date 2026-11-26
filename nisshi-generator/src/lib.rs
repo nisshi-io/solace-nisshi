@@ -145,8 +145,8 @@ pub enum ReportFormat {
 ///
 /// Only batches that the broker accepted are counted. A batch whose answer the run did not wait
 /// for, because it ended first, is not counted, so the topic may hold up to one more batch per
-/// producer. `error_code` is the code of the produce request that ended the run, as the broker
-/// sent it, or 0 when the broker refused none.
+/// producer. `error_code` is the code of the produce request that ended the run, 0 when the
+/// broker refused none, or -1 (`UnknownServerError`) for a code this crate does not know.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct Summary {
     r#type: &'static str,

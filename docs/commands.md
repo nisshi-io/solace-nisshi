@@ -202,7 +202,9 @@ command's log lines and error messages go to stderr, so stdout holds JSON only.
 line, and the `type` field says which line it is. A run that is refused still prints its summary,
 with the Kafka error code of the refused produce request in the summary's `error_code`, and ends
 with exit status 4. `error_code` is 0 when the broker refused no produce request, also after a
-refused login, which has no code: stderr says why.
+refused login, which has no code: stderr says why. A code that this release does not know is
+reported as -1 (`UNKNOWN_SERVER_ERROR`), and the log line on stderr has the number the broker
+sent.
 
 ```shell
 $ nisshi generator taxi --schema-registry file://./etc/schema --duration-seconds 5 --output json

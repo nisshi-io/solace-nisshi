@@ -66,7 +66,8 @@ pub(super) enum Command {
         /// records of the batches the broker accepted, and `bytes_sent` counts the bytes written
         /// to the broker, including requests it refused. The first produce request that the
         /// broker refuses ends the run with exit status 4, with its Kafka error code in the
-        /// summary's `error_code` (0 when none was refused)
+        /// summary's `error_code` (0 when none was refused, -1 for a code this release does not
+        /// know)
         #[arg(long, value_enum, default_value_t = Output::Table)]
         output: Output,
     },
