@@ -305,8 +305,8 @@ impl<G> ApiKey for FetchService<G> {
 struct PartitionRead {
     /// The partition's answer.
     data: PartitionData,
-    /// The limit that a read of the partition stopped at, if the read stopped before a record or
-    /// batch that did not fit. The partition then holds records after the ones it returned.
+    /// The partition's limit, if a read of the partition stopped before a record or batch that did
+    /// not fit. The partition then holds records after the ones it returned.
     reached_limit: Option<ByteLimit>,
     /// Whether a read failed after the partition had records. The partition answers with those
     /// records and no error code.

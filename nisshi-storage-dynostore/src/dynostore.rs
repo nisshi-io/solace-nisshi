@@ -2362,8 +2362,9 @@ impl DynoStore {
         let batch_header_size = u64::try_from(deflated::BATCH_OVERHEAD)?;
 
         while base_offset < bounds.high_watermark {
-            // Under a hard limit, the GET asks for only the bytes left, as Kafka reads its log only
-            // up to the limit. For a batch below the fetch offset, it asks for at least the batch's
+            // Once no batch may exceed the limit, under a hard limit or after the first batch under
+            // a soft one, the GET asks for only the bytes left, as Kafka reads its log only up to
+            // the limit. For a batch below the fetch offset, it asks for at least the batch's
             // header, which shows whether the batch ends before the fetch offset.
             //
             // The read learns a batch's size from this GET, instead of from a HEAD request first.

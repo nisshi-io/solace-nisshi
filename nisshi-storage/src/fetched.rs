@@ -217,7 +217,8 @@ impl ByteLimit {
 /// What [`Storage::fetch`] reads handed to their caller.
 #[derive(Debug, Default)]
 pub struct FetchRead {
-    /// The latest offset stage that the reads sent, if they sent one before they stopped.
+    /// For each offset, the largest that the reads' offset stages held, if the reads sent a stage
+    /// before they stopped.
     pub offsets: Option<OffsetStage>,
     /// The batches that the reads sent, in offset order, with the batch that they were building
     /// when they stopped. Their encoded size is at most the reads' limit, except that the first

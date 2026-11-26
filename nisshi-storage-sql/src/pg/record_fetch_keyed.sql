@@ -33,7 +33,8 @@
 -- ([DefaultRecordBatch.java#L129]), because this query does not know where the batches that
 -- a read builds begin. Counting less than Kafka means a read spends the budget no sooner than Kafka
 -- would for the same records, and a record with no key, no value and no headers still costs 7.
--- The bytes of a response can therefore exceed max_bytes by the framing that this count leaves out.
+-- So the query can send a record past the limit, and the read that every engine's records pass
+-- through (fetched.rs), which measures each record by its encoded size, discards it.
 --
 -- [DefaultRecordBatch.java#L129]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/record/DefaultRecordBatch.java#L129
 --

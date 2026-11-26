@@ -29,7 +29,8 @@
 -- ([DefaultRecordBatch.java#L129]), because this query does not know where the batches that
 -- a read builds begin. Counting less than Kafka means a read spends the budget no sooner than Kafka
 -- would for the same records, and a record with no key, no value and no headers still costs 7.
--- The bytes of a response can therefore exceed max_bytes by the framing that this count leaves out.
+-- So the query can send a record past the limit, and the read that every engine's records pass
+-- through (fetched.rs), which measures each record by its encoded size, discards it.
 -- The header table is probed by its primary key for each record, so a record that holds only
 -- headers still spends the budget. The probe is a result column of a derived table, because the
 -- Turso engine does not accept a subquery inside the argument of a window function.

@@ -1357,6 +1357,10 @@ impl OffsetStage {
     }
 
     /// Returns the stage that has, for each offset, the larger of this stage's and `other`'s.
+    ///
+    /// Offsets only grow, so the result bounds every record that either stage bounds. A caller
+    /// that combines the stages of several reads takes the larger of each offset, not the stage
+    /// that came last, because a read can send an older stage than one that was read before it.
     pub(crate) fn latest(self, other: Self) -> Self {
         Self {
             last_stable: self.last_stable.max(other.last_stable),
