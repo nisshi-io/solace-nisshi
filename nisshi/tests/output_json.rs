@@ -250,7 +250,14 @@ fn perf_prints_a_json_summary_when_the_run_is_shorter_than_an_interval() {
     );
 
     assert_eq!(Some(0), output.status.code(), "{output:?}");
-    assert_eq!("summary", json(&output)["type"], "{output:?}");
+    let summary = json(&output);
+    assert_eq!("summary", summary["type"], "{output:?}");
+    // No interval export ran, so only the export at the shutdown of the meter provider can
+    // supply the count. A summary read before that export would show 0.
+    assert!(
+        summary["records_produced"].as_u64().unwrap() > 0,
+        "{summary}"
+    );
 }
 
 #[test]
