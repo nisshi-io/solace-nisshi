@@ -20,8 +20,8 @@
 
 mod common;
 
-use common::{Broker, run};
-use std::{net::TcpListener, thread};
+use common::{Broker, closed_port, run, schema_registry};
+use std::thread;
 
 const TOOLS: [&[&str]; 5] = [
     &["topic", "list"],
@@ -88,29 +88,6 @@ fn a_refusal_by_the_broker_is_4() {
         "{\"value\": 1}\n",
     );
     assert_eq!(Some(4), output.status.code(), "{output:?}");
-}
-
-/// A schema registry directory with the `taxi` schema in it, which `generator` needs, and the
-/// `file://` URL that names it relative to the directory that the command runs in.
-fn schema_registry(name: &str) -> (std::path::PathBuf, String) {
-    let registry =
-        std::env::temp_dir().join(format!("nisshi-exit-codes-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&registry).expect("registry directory");
-    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
-    let url = format!(
-        "file://./{}",
-        registry.file_name().unwrap().to_str().unwrap()
-    );
-
-    (registry, url)
-}
-
-/// A TCP port with nothing listening on it.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .expect("free port")
 }
 
 /// Runs each tool against a port nobody listens on. A client retries a refused connection for 30
@@ -215,6 +192,111 @@ fn a_refused_login_ends_generator_and_perf_with_4() {
     assert!(
         String::from_utf8_lossy(&generator.stderr).contains("does not use SASL"),
         "generator: {generator:?}"
+    );
+}
+
+/// A refused produce request ends `generator` and `perf` at once, with 4, before the run's
+/// duration ends.
+#[test]
+fn a_refused_produce_ends_generator_and_perf_with_4() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("refused");
+
+    // Partition 7 of a topic that has one partition: the broker answers with an error code.
+    let started = std::time::Instant::now();
+    let perf = broker.run_unaided(
+        &[
+            "perf",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "produce",
+            "--partition",
+            "7",
+            "--duration",
+            "30s",
+        ],
+        &[],
+    );
+    assert_eq!(Some(4), perf.status.code(), "perf: {perf:?}");
+    assert!(
+        String::from_utf8_lossy(&perf.stderr).contains("UnknownTopicOrPartition"),
+        "perf: {perf:?}"
+    );
+    // The text summary of a refused run is a line of zeros, so it says which line it is.
+    assert!(
+        String::from_utf8_lossy(&perf.stdout)
+            .lines()
+            .any(|line| line.starts_with("summary: ")),
+        "perf: {perf:?}"
+    );
+
+    let generator = broker.run_unaided(
+        &[
+            "generator",
+            "taxi",
+            "--broker",
+            broker.url(),
+            "--schema-registry",
+            &schema_registry,
+            "--partition",
+            "7",
+            "--duration-seconds",
+            "30",
+        ],
+        &[],
+    );
+    _ = std::fs::remove_dir_all(&registry);
+    assert_eq!(Some(4), generator.status.code(), "generator: {generator:?}");
+    assert!(
+        String::from_utf8_lossy(&generator.stderr).contains("UnknownTopicOrPartition"),
+        "generator: {generator:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a refusal ends the run before its duration: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A run that produced everything it was asked to, and then could not export its metrics, ends
+/// with 1: the run was asked for metrics with `--otlp-endpoint-url` and gave none.
+#[test]
+fn a_collector_that_is_down_when_a_successful_generator_run_ends_is_1() {
+    let broker = Broker::start();
+    _ = broker.run(&["topic", "create", "taxi"], "");
+    let (registry, schema_registry) = schema_registry("collector-down");
+
+    let output = broker.run(
+        &[
+            "generator",
+            "taxi",
+            "--schema-registry",
+            &schema_registry,
+            "--per-second",
+            "1",
+            "--duration-seconds",
+            "1",
+            "--otlp-endpoint-url",
+            &format!("http://127.0.0.1:{}", closed_port()),
+            "--output",
+            "json",
+        ],
+        "",
+    );
+    _ = std::fs::remove_dir_all(&registry);
+
+    assert_eq!(Some(1), output.status.code(), "{output:?}");
+    // The export fails after the run, so the summary still prints.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"type\":\"summary\""),
+        "{output:?}"
+    );
+    // The 1 is the failed export's, and nothing else's.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("were not exported"),
+        "{output:?}"
     );
 }
 

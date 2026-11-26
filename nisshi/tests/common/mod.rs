@@ -167,16 +167,34 @@ impl Broker {
 
     /// Runs `nisshi` with `args` and `env`, which name the broker themselves.
     pub(crate) fn run_unaided(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        let mut process = nisshi()
+        finish(self.spawn_unaided(args, env))
+    }
+
+    /// Starts `nisshi` with `args` and `env`, which name the broker themselves, and leaves it
+    /// running.
+    pub(crate) fn spawn_unaided(&self, args: &[&str], env: &[(&str, &str)]) -> Child {
+        nisshi()
             .envs(env.iter().copied())
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("command starts");
-        drop(process.stdin.take());
-        finish(process)
+            .expect("command starts")
+    }
+
+    /// Waits until `topic` holds a record, by fetching it with `cat consume` until a fetch returns
+    /// one. A fetch waits up to 5 s for a record, so the wait ends soon after the broker stores
+    /// the first batch.
+    pub(crate) fn wait_for_a_record(&self, topic: &str) {
+        let started = Instant::now();
+
+        while self.run(&["cat", "consume", topic], "").stdout.is_empty() {
+            assert!(
+                started.elapsed() < STARTUP_TIMEOUT,
+                "no record in {topic} within {STARTUP_TIMEOUT:?}"
+            );
+        }
     }
 
     /// Runs `nisshi` as [`Broker::run`] does, with the read end of its stdout closed before it
@@ -194,6 +212,14 @@ impl Drop for Broker {
         _ = self.process.kill();
         _ = self.process.wait();
     }
+}
+
+/// A TCP port with nothing listening on it.
+pub(crate) fn closed_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .expect("free port")
 }
 
 /// Runs `nisshi` with `args` and no input, and returns its output.
@@ -242,29 +268,59 @@ fn write_stdin(process: &mut Child, stdin: &str) {
         .expect("stdin written");
 }
 
+/// Sends SIGINT to `process`, as Ctrl-C does.
+#[cfg(unix)]
+pub(crate) fn interrupt(process: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &process.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -INT: {status}");
+}
+
 /// Waits for `process` to exit and returns its output. Kills it after [`COMMAND_TIMEOUT`].
-fn finish(mut process: Child) -> Output {
+pub(crate) fn finish(process: Child) -> Output {
+    finish_timed(process).0
+}
+
+/// Waits for `process` to exit as [`finish`] does, and also returns how long after this call
+/// the first line of stdout was complete, if one was.
+pub(crate) fn finish_timed(mut process: Child) -> (Output, Option<Duration>) {
     // Threads drain stdout and stderr while the process runs, so that a full pipe can't stop it.
-    let stdout = process.stdout.take().map(read_to_end);
-    let stderr = process.stderr.take().map(read_to_end);
     let started = Instant::now();
+    let stdout = process
+        .stdout
+        .take()
+        .map(|pipe| read_to_end_timed(pipe, started));
+    let stderr = process.stderr.take().map(read_to_end);
 
     loop {
         if let Some(status) = process.try_wait().expect("command status") {
-            return Output {
-                status,
-                stdout: joined(stdout),
-                stderr: joined(stderr),
-            };
+            let (stdout, first_line) = stdout
+                .map(|reader| reader.join().expect("pipe reader"))
+                .unwrap_or_default();
+
+            return (
+                Output {
+                    status,
+                    stdout,
+                    stderr: joined(stderr),
+                },
+                first_line,
+            );
         }
 
         if started.elapsed() > COMMAND_TIMEOUT {
             _ = process.kill();
             _ = process.wait();
 
+            let stdout = stdout
+                .map(|reader| reader.join().expect("pipe reader").0)
+                .unwrap_or_default();
+
             panic!(
                 "command did not exit within {COMMAND_TIMEOUT:?}, stdout: {}, stderr: {}",
-                String::from_utf8_lossy(&joined(stdout)),
+                String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&joined(stderr))
             );
         }
@@ -282,6 +338,34 @@ fn read_to_end(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
     })
 }
 
+/// Reads `pipe` to its end on a thread of its own, and notes how long after `started` the first
+/// newline arrived.
+fn read_to_end_timed(
+    mut pipe: impl Read + Send + 'static,
+    started: Instant,
+) -> JoinHandle<(Vec<u8>, Option<Duration>)> {
+    thread::spawn(move || {
+        let mut bytes = vec![];
+        let mut first_line = None;
+        let mut chunk = [0u8; 4096];
+
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+
+                    if first_line.is_none() && bytes.contains(&b'\n') {
+                        first_line = Some(started.elapsed());
+                    }
+                }
+            }
+        }
+
+        (bytes, first_line)
+    })
+}
+
 fn joined(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
     reader
         .map(|reader| reader.join().expect("pipe reader"))
@@ -292,4 +376,19 @@ fn joined(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
 pub(crate) fn stdout(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
     String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
+}
+
+/// A schema registry directory with the `taxi` schema in it, which `generator` needs, and the
+/// `file://` URL that names it relative to the directory that the command runs in.
+pub(crate) fn schema_registry(name: &str) -> (std::path::PathBuf, String) {
+    let registry =
+        std::env::temp_dir().join(format!("nisshi-exit-codes-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&registry).expect("registry directory");
+    _ = std::fs::copy("../etc/schema/taxi.proto", registry.join("taxi.proto")).expect("schema");
+    let url = format!(
+        "file://./{}",
+        registry.file_name().unwrap().to_str().unwrap()
+    );
+
+    (registry, url)
 }

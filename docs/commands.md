@@ -191,11 +191,50 @@ them, with its field names.
 | `user create`, `user delete` | an array of the one result for the user you named |
 | `cat produce` | an array of the one partition result, with `base_offset`, `error_code`, `error_message` and `record_errors` |
 | `cat consume` | always JSON, with or without the option: one array of records per batch, on its own line |
+| `generator` | one object when the run ends: a summary of what the broker accepted |
+| `perf produce` | one object per interval while the run goes, then one summary of the whole run |
 
 The JSON is printed whether or not the broker refused the request, and its `error_code` says
 why. `--silent` hides only the confirmation line, so `--output json` prints even with it. A
-command's log lines and error messages go to stderr, so stdout holds JSON only. `generator` and
-`perf` do not take `--output` yet.
+command's log lines and error messages go to stderr, so stdout holds JSON only.
+
+`generator` and `perf produce` run until their duration ends, so their JSON is one object per
+line, and the `type` field says which line it is. A run that is refused still prints its summary,
+with the Kafka error code of the refused produce request in the summary's `error_code`, and ends
+with exit status 4. `error_code` is 0 when the broker refused no produce request, also after a
+refused login, which has no code: stderr says why. A code that this release does not know is
+reported as -1 (`UNKNOWN_SERVER_ERROR`), and the log line on stderr has the number the broker
+sent.
+
+```shell
+$ nisshi generator taxi --schema-registry file://./etc/schema --duration-seconds 5 --output json
+{"type":"summary","elapsed_ms":5003,"batches_produced":2845,"records_produced":2845,"error_code":0}
+$ OTEL_METRIC_EXPORT_INTERVAL=2000 nisshi perf taxi produce --duration 5s --output json
+{"bytes_per_second":2900135.09274723,"bytes_sent":5815609,"elapsed_ms":2005,"latency_ms":{"max":2,"mean":0.00491448791035974,"min":0},"records_per_second":2536.7914549972597,"records_produced":5087,"type":"interval"}
+{"bytes_per_second":2644672.0281227054,"bytes_sent":5302377,"elapsed_ms":2004,"latency_ms":{"max":2,"mean":0.0026732469668928646,"min":0},"records_per_second":2313.798799757398,"records_produced":4639,"type":"interval"}
+{"bytes_per_second":2776554.482473523,"bytes_sent":13889761,"elapsed_ms":5002,"error_code":0,"latency_ms":{"max":2,"mean":0.002715825857954078,"min":0},"records_per_second":2428.9772528509147,"records_produced":12151,"type":"summary"}
+```
+
+- `generator` has no report of its own for each interval, so `--output table` prints nothing and
+  `--output json` prints the one summary. It counts the batches the broker accepted.
+- `perf produce` prints an `interval` object each time its metrics are exported, every 60 seconds
+  unless `OTEL_METRIC_EXPORT_INTERVAL` (in milliseconds) says otherwise, and a `summary` last, even
+  when the run is shorter than an interval. `elapsed_ms`, `records_produced`, `bytes_sent` and the
+  rates of an `interval` are for that interval, and the summary's are for the whole run.
+  `records_produced` counts the records of the batches the broker accepted, and `bytes_sent`
+  counts the bytes written to the broker, including requests it refused. The rates are `null` when
+  no time has elapsed. `latency_ms` is for the run so far in both, and each of its members is
+  `null` until a request was answered. With `--output table`, the line of the whole run starts
+  with `summary: `, so a refused run's line of zeros is not taken for an interval.
+- Both print the summary whenever a producer started, so also after a refusal (a refused login
+  or a refused produce request), with zeros if nothing was accepted. Neither prints anything when
+  the tool fails before that: an unreachable broker, a missing schema. With `--otlp-endpoint-url`,
+  a `generator` run whose metrics can't be exported when it ends still prints its summary, and
+  ends with 1 unless the broker refused it, which ends it with 4. The summary prints as soon as
+  the producers have stopped, before the metrics are exported.
+- When a run stops, each producer drops the produce request it is waiting on. The broker may
+  store that batch, so the topic may hold up to one more batch per producer than the summary
+  counts.
 
 ```shell
 $ nisshi topic create taxi --output json
@@ -212,9 +251,13 @@ $ nisshi topic create taxi --output json
 | 3 | broker unreachable | No connection opened: the address does not resolve, or the connection attempt was refused, failed or timed out. |
 | 4 | broker refused | The command connected, and the broker answered with a Kafka error code, refused the login or rejected the TLS connection, or the client refused what the broker offered (a certificate it does not trust). The status does not say whether a retry can succeed. For an error code, read the code: `--output json` prints it. |
 
-`generator` and `perf` keep running when the broker refuses a produce request, so a refused
-produce does not end them with 4. A refused login or TLS connection ends them with 4, because
-nothing can be produced. `nisshi perf consume` is not implemented and ends with 1.
+`generator` and `perf` stop at the first produce request that the broker refuses and end with 4,
+as they do for a refused login or TLS connection. That includes a transient error code, such as
+`KAFKA_STORAGE_ERROR` or `REQUEST_TIMED_OUT`, which Kafka's own producer retries: these tools do
+not retry a batch, because a retry would hide an outage of the broker or its storage in the
+numbers of the run. The message on stderr names the error code, the summary's `error_code` holds
+it, and the batches that the broker accepted before it are in the summary. `nisshi perf consume`
+is not implemented and ends with 1.
 
 Releases up to 0.8.2 exited with 1 when the broker refused a request or could not be reached. A
 script that tests for `1` should test for non-zero, or for `3` and `4`. The client tools also log
