@@ -172,40 +172,44 @@ impl FetchRound {
         self.partitions_left = self.partitions_left.saturating_sub(1);
         self.read_failed |= partition_read.read_failed;
 
-        // A partition that stopped at its limit spends its whole limit, also the part that it did
-        // not return. Kafka returns the start of the batch that does not fit, which the client
-        // drops, and subtracts it ([ReplicaManager.scala#L1736-L1740]). If the round subtracted
-        // only the bytes returned, each later partition whose next batch does not fit would read
-        // its whole limit again. Dynostore downloads that limit and discards it, so a Fetch of many
-        // such partitions would download many times its `max_bytes`.
+        let has_records = partition_read
+            .data
+            .records
+            .as_ref()
+            .is_some_and(|records| !records.batches.is_empty());
+
+        // A partition that stopped at its limit counts at least its whole limit toward `min_bytes`,
+        // whether or not it returned records, because at least that many bytes wait in it. Kafka
+        // counts each partition the same way ([DelayedFetch.scala#L108-L110]). If the partition
+        // counted only the bytes that it returned, a Fetch would wait the whole `max_wait` when a
+        // partition holds a batch larger than the partition's limit.
+        //
+        // [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
+        let available = match partition_read.reached_limit {
+            Some(limit) => returned.max(u64::from(limit.bytes())),
+            None => returned,
+        };
+
+        // A partition that returned records and stopped at its limit spends its whole limit, also
+        // the part that it did not return. Kafka returns the start of the batch that does not fit,
+        // which the client drops, and subtracts it ([ReplicaManager.scala#L1736-L1740]). A
+        // partition that returned no records spends nothing, because Kafka answers a partition
+        // whose first batch does not fit with no records ([ReplicaManager.scala#L1619-L1622]).
         //
         // The first partition with records can return a batch larger than `bytes_left`, so
         // `bytes_left` stops at 0.
         //
         // [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
-        let spent = match partition_read.reached_limit {
-            Some(limit) => returned.max(u64::from(limit.bytes())),
-            None => returned,
-        };
+        // [ReplicaManager.scala#L1619-L1622]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1619-L1622
+        let spent = if has_records { available } else { returned };
 
         self.bytes_left = self
             .bytes_left
             .saturating_sub(u32::try_from(spent).unwrap_or(u32::MAX));
 
         // Only a partition that returned records makes the limits of the next partitions hard.
-        self.has_records |= partition_read
-            .data
-            .records
-            .as_ref()
-            .is_some_and(|records| !records.batches.is_empty());
+        self.has_records |= has_records;
 
-        // A partition that stopped at its limit adds at least its whole limit to `available_bytes`,
-        // because at least that many bytes wait in it. Kafka counts each partition the same way
-        // ([DelayedFetch.scala#L108-L110]). If the partition added only the bytes that it
-        // returned, a Fetch would wait the whole `max_wait` when a partition holds a batch larger
-        // than the partition's limit.
-        //
-        // [DelayedFetch.scala#L108-L110]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/DelayedFetch.scala#L108-L110
-        self.available_bytes += spent;
+        self.available_bytes += available;
     }
 }

@@ -3313,13 +3313,30 @@ mod tests {
         partitions: i32,
         partition_max_bytes: u32,
     ) -> Result<Vec<usize>> {
+        batches_within_max_bytes(
+            storage,
+            partitions,
+            u32::try_from(MAX_BYTES)?,
+            partition_max_bytes,
+        )
+        .await
+    }
+
+    /// Fetches the first `partitions` partitions of [`TOPIC`] from offset 0 with `max_bytes` and
+    /// `partition_max_bytes`, and returns how many batches each partition returned.
+    async fn batches_within_max_bytes(
+        storage: Partitions,
+        partitions: i32,
+        max_bytes: u32,
+        partition_max_bytes: u32,
+    ) -> Result<Vec<usize>> {
         let partition_max_bytes = i32::try_from(partition_max_bytes)?;
 
         let responses = FetchService { storage }
             .fetch(
                 MAX_WAIT,
                 1,
-                u32::try_from(MAX_BYTES)?,
+                max_bytes,
                 IsolationLevel::ReadUncommitted,
                 &[FetchTopic::default()
                     .topic(Some(TOPIC.into()))
@@ -3429,16 +3446,19 @@ mod tests {
     }
 
     /// The response's `max_bytes` holds two partition limits. Partitions 0 and 2 each hold a batch
-    /// that fits a partition's limit, and partition 1 a batch that does not. Partition 1 returns
-    /// nothing but spends its whole limit, so partition 2 has no bytes left, is not read, and
-    /// returns nothing. Kafka subtracts the start of partition 1's batch that it returns
+    /// that fills a partition's limit, and partition 1 a batch that does not fit it. Partition 1
+    /// returns nothing and spends nothing, so partition 2 still has its whole limit and returns
+    /// its batch. Kafka answers a partition whose first batch does not fit with no records
+    /// ([ReplicaManager.scala#L1619-L1622]), and so subtracts nothing for it
     /// ([ReplicaManager.scala#L1736-L1740]).
     ///
+    /// [ReplicaManager.scala#L1619-L1622]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1619-L1622
     /// [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
     #[tokio::test(start_paused = true)]
-    async fn a_partition_at_its_limit_spends_its_limit_of_the_response() -> Result<()> {
+    async fn a_partition_that_returns_nothing_at_its_limit_spends_nothing_of_the_response()
+    -> Result<()> {
         let fits = batch(0, &[0])?;
-        let partition_max_bytes = i32::try_from(fits.byte_size())?;
+        let partition_max_bytes = u32::try_from(fits.byte_size())?;
 
         let storage = Partitions::new([
             (0, vec![Read::Batch(fits.clone())]),
@@ -3446,36 +3466,54 @@ mod tests {
             (2, vec![Read::Batch(fits)]),
         ]);
 
-        let responses = FetchService {
-            storage: storage.clone(),
-        }
-        .fetch(
-            MAX_WAIT,
-            1,
-            u32::try_from(2 * partition_max_bytes)?,
-            IsolationLevel::ReadUncommitted,
-            &[FetchTopic::default()
-                .topic(Some(TOPIC.into()))
-                .partitions(Some(
-                    (0..3)
-                        .map(|partition| {
-                            FetchPartition::default()
-                                .partition(partition)
-                                .fetch_offset(0)
-                                .partition_max_bytes(partition_max_bytes)
-                        })
-                        .collect(),
-                ))],
-        )
-        .await?;
+        assert_eq!(
+            vec![1, 0, 1],
+            batches_within_max_bytes(storage, 3, 2 * partition_max_bytes, partition_max_bytes)
+                .await?
+        );
+
+        Ok(())
+    }
+
+    /// The response's `max_bytes` holds two partition limits, and each partition's limit holds two
+    /// one-record batches. Partitions 0 and 1 each hold a one-record batch and then a batch that
+    /// does not fit what is left of the limit. Each returns its first batch and spends its whole
+    /// limit, so partition 2 has no bytes left and is not read. Kafka returns the start of the
+    /// batch that does not fit, which the client drops, and subtracts it
+    /// ([ReplicaManager.scala#L1736-L1740]).
+    ///
+    /// [ReplicaManager.scala#L1736-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1736-L1740
+    #[tokio::test(start_paused = true)]
+    async fn a_partition_that_returns_records_at_its_limit_spends_its_limit_of_the_response()
+    -> Result<()> {
+        let one_record = batch(0, &[0])?;
+        let partition_max_bytes = 2 * u32::try_from(one_record.byte_size())?;
+        let does_not_fit = batch(1, &[0, 1, 2])?;
+
+        let storage = Partitions::new([
+            (
+                0,
+                vec![
+                    Read::Batch(one_record.clone()),
+                    Read::Batch(does_not_fit.clone()),
+                ],
+            ),
+            (
+                1,
+                vec![Read::Batch(one_record.clone()), Read::Batch(does_not_fit)],
+            ),
+            (2, vec![Read::Batch(one_record)]),
+        ]);
 
         assert_eq!(
-            vec![1, 0, 0],
-            responses
-                .into_iter()
-                .flat_map(|topic| topic.partitions.unwrap_or_default())
-                .map(|partition| batches(&partition))
-                .collect::<Vec<_>>()
+            vec![1, 1, 0],
+            batches_within_max_bytes(
+                storage.clone(),
+                3,
+                2 * partition_max_bytes,
+                partition_max_bytes
+            )
+            .await?
         );
         assert_eq!(0, storage.calls(2).len());
 
