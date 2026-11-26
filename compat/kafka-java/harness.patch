@@ -15,6 +15,44 @@ index 05069923a7..29e35a1685 100644
  junit.jupiter.params.displayname.default = "{displayName}.{argumentsWithNames}"
 +junit.jupiter.extensions.autodetection.enabled = true
 +junit.jupiter.execution.timeout.default = 90s
+diff --git a/core/src/test/scala/integration/kafka/api/IntegrationTestHarness.scala b/core/src/test/scala/integration/kafka/api/IntegrationTestHarness.scala
+index 1c41cbc4fd..eabdd5c678 100644
+--- a/core/src/test/scala/integration/kafka/api/IntegrationTestHarness.scala
++++ b/core/src/test/scala/integration/kafka/api/IntegrationTestHarness.scala
+@@ -24,7 +24,7 @@ import kafka.utils.Implicits._
+ 
+ import java.util.Properties
+ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig}
+-import kafka.server.KafkaConfig
++import kafka.server.{KafkaConfig, QuorumTestHarness}
+ import kafka.integration.KafkaServerTestHarness
+ import org.apache.kafka.clients.admin.{Admin, AdminClientConfig}
+ import org.apache.kafka.common.network.{ListenerName, ConnectionMode}
+@@ -147,7 +147,10 @@ abstract class IntegrationTestHarness extends KafkaServerTestHarness {
+ 
+     consumerConfig.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers())
+     consumerConfig.putIfAbsent(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
+-    consumerConfig.putIfAbsent(ConsumerConfig.GROUP_ID_CONFIG, "group")
++    // Nisshi: the broker outlives the test, so a group id shared by every test also shares the members and
++    // offsets that an earlier test left in it.
++    consumerConfig.putIfAbsent(ConsumerConfig.GROUP_ID_CONFIG,
++      if (QuorumTestHarness.externalBootstrap.isDefined) "group-" + java.util.UUID.randomUUID() else "group")
+     consumerConfig.putIfAbsent(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)
+     consumerConfig.putIfAbsent(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, classOf[ByteArrayDeserializer].getName)
+     maybeGroupProtocolSpecified(testInfo).map(groupProtocol => consumerConfig.putIfAbsent(ConsumerConfig.GROUP_PROTOCOL_CONFIG, groupProtocol.name))
+@@ -223,7 +226,11 @@ abstract class IntegrationTestHarness extends KafkaServerTestHarness {
+     try {
+       producers.foreach(_.close(Duration.ZERO))
+       consumers.foreach(_.wakeup())
+-      consumers.foreach(_.close(Duration.ZERO))
++      // Nisshi: the broker outlives the test, so a consumer that closes without waiting can leave its group
++      // member behind, to disturb the next test that uses the same group id.
++      val consumerCloseTimeout =
++        if (QuorumTestHarness.externalBootstrap.isDefined) Duration.ofSeconds(5) else Duration.ZERO
++      consumers.foreach(_.close(consumerCloseTimeout))
+       adminClients.foreach(_.close(Duration.ZERO))
+ 
+       producers.clear()
 diff --git a/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala b/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala
 index e1f7415ca3..c20fcfdddd 100755
 --- a/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala
@@ -100,7 +138,7 @@ index 0000000000..c0d617e862
 +  }
 +}
 diff --git a/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala b/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
-index 4b7d882136..d82a817844 100755
+index 4b7d882136..cda2e83a89 100755
 --- a/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
 +++ b/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
 @@ -102,7 +102,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
@@ -112,20 +150,23 @@ index 4b7d882136..d82a817844 100755
    }
  
    protected def securityProtocol: SecurityProtocol = SecurityProtocol.PLAINTEXT
-@@ -116,6 +116,12 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -116,6 +116,15 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
    override def setUp(testInfo: TestInfo): Unit = {
      super.setUp(testInfo)
  
 +    if (QuorumTestHarness.externalBootstrap.isDefined) {
 +      // Nisshi: the broker is already running, and `brokers` stays empty.
 +      alive = new Array[Boolean](0)
++      // Nisshi: a client of the previous test can still auto-create a topic after that test's teardown
++      // deleted it, so the next test starts from an empty broker only if it deletes the topics too.
++      deleteAllTopicsExternal()
 +      return
 +    }
 +
      if (configs.isEmpty)
        throw new KafkaException("Must supply at least one server config.")
  
-@@ -131,11 +137,15 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -131,11 +140,15 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
  
    @AfterEach
    override def tearDown(): Unit = {
@@ -141,7 +182,7 @@ index 4b7d882136..d82a817844 100755
      // The test must be allowed to fail and be torn down if an exception is raised here.
      if (reconfigure) {
        instanceConfigs = null
-@@ -154,6 +164,8 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -154,6 +167,8 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
      listenerName: ListenerName = listenerName,
      adminClientConfig: Properties = new Properties
    ): Unit = {
@@ -150,7 +191,7 @@ index 4b7d882136..d82a817844 100755
      if (isKRaftTest()) {
        Using.resource(createAdminClient(brokers, listenerName, adminClientConfig)) { admin =>
          TestUtils.createOffsetsTopicWithAdmin(admin, brokers, controllerServers)
-@@ -176,6 +188,9 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -176,6 +191,9 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
      listenerName: ListenerName = listenerName,
      adminClientConfig: Properties = new Properties
    ): scala.collection.immutable.Map[Int, Int] = {
@@ -160,7 +201,7 @@ index 4b7d882136..d82a817844 100755
      if (isKRaftTest()) {
        Using.resource(createAdminClient(brokers, listenerName, adminClientConfig)) { admin =>
          TestUtils.createTopicWithAdmin(
-@@ -200,6 +215,51 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -200,6 +218,51 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
      }
    }
  
@@ -212,7 +253,7 @@ index 4b7d882136..d82a817844 100755
    /**
     * Create a topic in ZooKeeper using a customized replica assignment.
     * Wait until the leader is elected and the metadata is propagated to all brokers.
-@@ -210,7 +270,11 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+@@ -210,7 +273,11 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
      partitionReplicaAssignment: collection.Map[Int, Seq[Int]],
      listenerName: ListenerName = listenerName
    ): scala.collection.immutable.Map[Int, Int] =

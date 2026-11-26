@@ -19,8 +19,9 @@ Gradle does not run on a newer JDK. It starts a fresh `memory://` broker for eac
 colima the container reaches the broker at 192.168.5.2 (the default of `BROKER_HOST`); under
 Docker Desktop, set `BROKER_HOST=host.docker.internal`.
 
-Under colima, `run.sh` first sets the VM clock to the host's, because a skew fails the
-`LogAppendTime` tests.
+Under colima, `run.sh` first sets the VM clock to the host's, because a 2 s skew hangs the
+`LogAppendTime` tests. A skew of tens of milliseconds still fails three of them, which are off the
+allow-list.
 
 The results go to `target/compat/kafka-java.csv`, with a log and a JUnit XML per class in
 `target/compat/kafka-java/`.
@@ -36,5 +37,5 @@ The results go to `target/compat/kafka-java.csv`, with a log and a JUnit XML per
   `ExecutionCondition`;
 - fails a test that runs longer than 90 s, because many Kafka tests wait on a future without a limit.
 
-`tests.allow` lists the 110 test methods that pass reliably. Of the 1,272 tests in 95 classes,
+`tests.allow` lists the 108 test methods that pass reliably. Of the 1,272 tests in 95 classes,
 188 pass, 408 fail and 676 are skipped as not applicable. `FINDINGS.md` explains the failures.
