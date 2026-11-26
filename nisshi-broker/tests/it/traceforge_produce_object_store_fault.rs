@@ -80,7 +80,7 @@ use nisshi_sans_io::{
         inflated,
     },
 };
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use nisshi_storage::{
     ArcDynStorage, CreateTopicsService, CreateTopicsValidationLayer, InitProducerIdService,
     ProduceService, Storage, Topition, TxnAddPartitionsRequest,

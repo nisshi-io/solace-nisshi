@@ -92,7 +92,7 @@ use nisshi_sans_io::{
     },
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use nisshi_storage::{
     ArcDynStorage, BrokerRegistrationRequest, ByteLimit, CommittedOffset, CreateTopicsService,
     CreateTopicsValidationLayer, Error, GroupDetail, InitProducerIdService, ListOffsetResponse,

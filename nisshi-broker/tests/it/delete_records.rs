@@ -24,7 +24,7 @@ use nisshi_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, inflated},
 };
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use nisshi_storage::{
     DeleteRecordsService, FetchService, FetchValidationLayer, ListOffsetResponse, Storage, Topition,
 };

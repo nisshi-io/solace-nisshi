@@ -706,7 +706,7 @@ mod tests {
     use crate::{
         Result, Storage, Topition,
         decoded_batch_probe::probe,
-        fetched::FetchUntilDeadline as _,
+        fetched::FetchUntilLimit as _,
         read_deadline::{ReadWait, TimedOut},
         service::{ChannelRequest, Request, RequestChannelService, Response, bounded_channel},
     };

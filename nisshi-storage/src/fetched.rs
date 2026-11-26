@@ -146,10 +146,11 @@ async fn send(sender: &mpsc::Sender<Fetched>, fetched: Fetched) -> Result<()> {
     }
 }
 
-/// Runs [`Storage::fetch`] reads until their deadline, for any [`Storage`].
-pub trait FetchUntilDeadline: Storage {
-    /// Runs one [`Storage::fetch`] read of `topition` from `offset` until `deadline`, and returns
-    /// what it sent.
+/// Runs [`Storage::fetch`] reads within a limit and until a deadline, for any [`Storage`].
+pub trait FetchUntilLimit: Storage {
+    /// Runs one [`Storage::fetch`] read of `topition` from `offset`, under a soft limit of
+    /// `max_bytes`, until `deadline`, and returns what it sent. Engine tests use it to check one
+    /// read of an engine. The fetch service reads with [`Self::fetch_until_limit`].
     ///
     /// The deadline drops the read when it passes, while the read waits for I/O or for room in
     /// its channel. A read that never waits for I/O stops at the deadline too, because it waits
@@ -249,11 +250,11 @@ pub struct FetchRead {
     /// Why the reads stopped before their end, if the deadline stopped them.
     pub timed_out: Option<TimedOut>,
     /// The error that ended the reads, if a read failed after they had sent a record. Only
-    /// [`FetchUntilDeadline::fetch_until_limit`] sets it.
+    /// [`FetchUntilLimit::fetch_until_limit`] sets it.
     pub failed: Option<Error>,
 }
 
-impl<G> FetchUntilDeadline for G
+impl<G> FetchUntilLimit for G
 where
     G: Storage + ?Sized,
 {

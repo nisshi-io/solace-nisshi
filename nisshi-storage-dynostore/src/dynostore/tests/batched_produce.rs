@@ -16,7 +16,7 @@
 //! `s3://` and `gs://` engines put in front of `DynoStore` when
 //! `batch_max_delay` is set.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::time::Duration;
 
 use tokio::time::Instant;

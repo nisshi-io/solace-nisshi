@@ -15,7 +15,7 @@
 //! The deadline contract of [`Storage::fetch`] that the fetch service relies on, on each storage
 //! engine.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::time::Duration;
 
 use bytes::Bytes;

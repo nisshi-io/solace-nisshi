@@ -30,7 +30,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     InitProducerIdService, Storage, Topition, TxnAddPartitionsRequest,
-    fetched::FetchUntilDeadline as _,
+    fetched::FetchUntilLimit as _,
 };
 use rama::{Service, extensions::Extensions};
 use std::time::Duration;

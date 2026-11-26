@@ -31,7 +31,7 @@ use tracing::{debug, error, instrument, warn};
 use crate::{
     Error, METER, OffsetStage, Result, STORAGE_FAILURE_WARN_INTERVAL, Storage, StorageOperation,
     TopicId, Topition, WarnLimit,
-    fetched::{ByteLimit, FetchUntilDeadline as _},
+    fetched::{ByteLimit, FetchUntilLimit as _},
     service::{
         read_deadline::{ReadDeadline, ReadWait, TimedOut},
         read_share::{FetchReadShare, warn_timeout_at_client_share},

@@ -5585,7 +5585,7 @@ mod tests {
     use tracing_subscriber::EnvFilter;
 
     use super::*;
-    use nisshi_storage::fetched::FetchUntilDeadline as _;
+    use nisshi_storage::fetched::FetchUntilLimit as _;
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};

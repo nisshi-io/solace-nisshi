@@ -6101,7 +6101,7 @@ pub(crate) mod tests {
         ArcDynStorage, StartupFailure, StorageFactory as _, StorageFactoryConfiguration,
     };
     use nisshi_storage::{
-        fetched::{self, ByteLimit, FetchUntilDeadline as _},
+        fetched::{self, ByteLimit, FetchUntilLimit as _},
         read_deadline::TimedOut,
     };
     use opentelemetry::KeyValue;

@@ -16,7 +16,7 @@
 //! starts at the fetch offset, and otherwise lists from near the fetch offset, so its cost does
 //! not grow with the partition.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{
     assert_matches,
     fmt::Display,

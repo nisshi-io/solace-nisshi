@@ -23,7 +23,7 @@
 //! there without the lock, so the second batch can pass its check, or be stored, before the first
 //! one is. The tests read every wait from `pg_blocking_pids`, not from a timer.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{assert_matches, collections::BTreeMap, time::Duration};
 
 use crate::common::{alphanumeric_string, postgres_storage, postgres_url};

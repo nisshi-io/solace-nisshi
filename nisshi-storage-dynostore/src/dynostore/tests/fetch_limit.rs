@@ -33,7 +33,7 @@ use nisshi_sans_io::{
 };
 use nisshi_storage::{
     ByteLimit, Result, Storage as _, Topition,
-    fetched::{FetchRead, FetchUntilDeadline as _},
+    fetched::{FetchRead, FetchUntilLimit as _},
 };
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,

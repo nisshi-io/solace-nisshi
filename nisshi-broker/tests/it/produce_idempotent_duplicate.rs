@@ -19,7 +19,7 @@
 //! with `OUT_OF_ORDER_SEQUENCE_NUMBER`. Clients count a duplicate as delivered,
 //! so a new batch answered as one would be acknowledged and lost.
 
-use nisshi_storage::fetched::FetchUntilDeadline as _;
+use nisshi_storage::fetched::FetchUntilLimit as _;
 use std::{assert_matches, time::Duration};
 use tokio::time::Instant;
 

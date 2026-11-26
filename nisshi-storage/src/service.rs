@@ -1656,7 +1656,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        fetched::{self, ByteLimit, FetchUntilDeadline as _},
+        fetched::{self, ByteLimit, FetchUntilLimit as _},
         storage_double::storage_double,
     };
     use nisshi_sans_io::record::inflated;
