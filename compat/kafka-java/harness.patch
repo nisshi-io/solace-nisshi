@@ -1,0 +1,274 @@
+diff --git a/core/src/test/resources/META-INF/services/org.junit.jupiter.api.extension.Extension b/core/src/test/resources/META-INF/services/org.junit.jupiter.api.extension.Extension
+new file mode 100644
+index 0000000000..ca559032b0
+--- /dev/null
++++ b/core/src/test/resources/META-INF/services/org.junit.jupiter.api.extension.Extension
+@@ -0,0 +1 @@
++kafka.utils.NisshiExternalCondition
+diff --git a/core/src/test/resources/junit-platform.properties b/core/src/test/resources/junit-platform.properties
+index 05069923a7..29e35a1685 100644
+--- a/core/src/test/resources/junit-platform.properties
++++ b/core/src/test/resources/junit-platform.properties
+@@ -13,3 +13,5 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ junit.jupiter.params.displayname.default = "{displayName}.{argumentsWithNames}"
++junit.jupiter.extensions.autodetection.enabled = true
++junit.jupiter.execution.timeout.default = 90s
+diff --git a/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala b/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala
+index e1f7415ca3..c20fcfdddd 100755
+--- a/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala
++++ b/core/src/test/scala/integration/kafka/server/QuorumTestHarness.scala
+@@ -240,7 +240,10 @@ abstract class QuorumTestHarness extends Logging {
+   def controllerServer: ControllerServer = asKRaft().controllerServer
+ 
+   def controllerServers: Seq[ControllerServer] = {
+-    if (isKRaftTest()) {
++    // Nisshi: there is no embedded controller.
++    if (QuorumTestHarness.externalBootstrap.isDefined) {
++      Seq()
++    } else if (isKRaftTest()) {
+       Seq(asKRaft().controllerServer)
+     } else {
+       Seq()
+@@ -282,7 +285,10 @@ abstract class QuorumTestHarness extends Logging {
+     val name = testInfo.getTestMethod.asScala
+       .map(_.toString)
+       .getOrElse("[unspecified]")
+-    if (TestInfoUtils.isKRaft(testInfo)) {
++    if (QuorumTestHarness.externalBootstrap.isDefined) {
++      // Nisshi: no embedded quorum. NisshiExternalCondition skips the variants that cannot run.
++      info(s"Running external test $name against ${QuorumTestHarness.externalBootstrap.get}")
++    } else if (TestInfoUtils.isKRaft(testInfo)) {
+       info(s"Running KRAFT test $name")
+       implementation = newKRaftQuorum(testInfo)
+     } else {
+@@ -461,6 +467,9 @@ abstract class QuorumTestHarness extends Logging {
+ }
+ 
+ object QuorumTestHarness {
++  /** Nisshi: the bootstrap address of a running broker. When set, no embedded brokers or quorum start. */
++  val externalBootstrap: Option[String] = sys.env.get("NISSHI_BOOTSTRAP").filter(_.nonEmpty)
++
+   val ZkClientEventThreadSuffix = "-EventThread"
+ 
+   /**
+diff --git a/core/src/test/scala/kafka/utils/NisshiExternalCondition.scala b/core/src/test/scala/kafka/utils/NisshiExternalCondition.scala
+new file mode 100644
+index 0000000000..c0d617e862
+--- /dev/null
++++ b/core/src/test/scala/kafka/utils/NisshiExternalCondition.scala
+@@ -0,0 +1,40 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package kafka.utils
++
++import org.junit.jupiter.api.extension.{ConditionEvaluationResult, ExecutionCondition, ExtensionContext}
++
++/**
++ * Nisshi: when NISSHI_BOOTSTRAP is set, skips the test variants that cannot run against an external
++ * Nisshi broker: ZooKeeper and ZK-migration quorums, and the KIP-848 consumer group protocol.
++ */
++class NisshiExternalCondition extends ExecutionCondition {
++  override def evaluateExecutionCondition(context: ExtensionContext): ConditionEvaluationResult = {
++    if (sys.env.get("NISSHI_BOOTSTRAP").forall(_.isEmpty)) {
++      ConditionEvaluationResult.enabled("no external broker")
++    } else {
++      val name = context.getDisplayName
++      if (name.contains("quorum=zk")) {
++        ConditionEvaluationResult.disabled("Nisshi has no ZooKeeper mode")
++      } else if (name.contains("kip848") || name.contains("groupProtocol=consumer")) {
++        ConditionEvaluationResult.disabled("Nisshi does not advertise ConsumerGroupHeartbeat (KIP-848)")
++      } else {
++        ConditionEvaluationResult.enabled("runs against Nisshi")
++      }
++    }
++  }
++}
+diff --git a/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala b/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
+index 4b7d882136..d82a817844 100755
+--- a/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
++++ b/core/src/test/scala/unit/kafka/integration/KafkaServerTestHarness.scala
+@@ -102,7 +102,7 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+   def boundPort(server: KafkaServer): Int = server.boundPort(listenerName)
+ 
+   def bootstrapServers(listenerName: ListenerName = listenerName): String = {
+-    TestUtils.bootstrapServers(_brokers, listenerName)
++    QuorumTestHarness.externalBootstrap.getOrElse(TestUtils.bootstrapServers(_brokers, listenerName))
+   }
+ 
+   protected def securityProtocol: SecurityProtocol = SecurityProtocol.PLAINTEXT
+@@ -116,6 +116,12 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+   override def setUp(testInfo: TestInfo): Unit = {
+     super.setUp(testInfo)
+ 
++    if (QuorumTestHarness.externalBootstrap.isDefined) {
++      // Nisshi: the broker is already running, and `brokers` stays empty.
++      alive = new Array[Boolean](0)
++      return
++    }
++
+     if (configs.isEmpty)
+       throw new KafkaException("Must supply at least one server config.")
+ 
+@@ -131,11 +137,15 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+ 
+   @AfterEach
+   override def tearDown(): Unit = {
++    // Nisshi: the broker outlives the test, so delete what the test created.
++    if (QuorumTestHarness.externalBootstrap.isDefined) deleteAllTopicsExternal()
+     TestUtils.shutdownServers(_brokers)
+     super.tearDown()
+   }
+ 
+   def recreateBrokers(reconfigure: Boolean = false, startup: Boolean = false): Unit = {
++    // Nisshi: there are no embedded brokers to recreate.
++    if (QuorumTestHarness.externalBootstrap.isDefined) return
+     // The test must be allowed to fail and be torn down if an exception is raised here.
+     if (reconfigure) {
+       instanceConfigs = null
+@@ -154,6 +164,8 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+     listenerName: ListenerName = listenerName,
+     adminClientConfig: Properties = new Properties
+   ): Unit = {
++    // Nisshi keeps group state in its storage engine, so there is no offsets topic to create.
++    if (QuorumTestHarness.externalBootstrap.isDefined) return
+     if (isKRaftTest()) {
+       Using.resource(createAdminClient(brokers, listenerName, adminClientConfig)) { admin =>
+         TestUtils.createOffsetsTopicWithAdmin(admin, brokers, controllerServers)
+@@ -176,6 +188,9 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+     listenerName: ListenerName = listenerName,
+     adminClientConfig: Properties = new Properties
+   ): scala.collection.immutable.Map[Int, Int] = {
++    if (QuorumTestHarness.externalBootstrap.isDefined) {
++      return createTopicExternal(topic, numPartitions, replicationFactor, topicConfig, adminClientConfig)
++    }
+     if (isKRaftTest()) {
+       Using.resource(createAdminClient(brokers, listenerName, adminClientConfig)) { admin =>
+         TestUtils.createTopicWithAdmin(
+@@ -200,6 +215,51 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+     }
+   }
+ 
++  /** Nisshi: delete every topic, so the next test starts from an empty broker as it does with embedded brokers. */
++  private def deleteAllTopicsExternal(): Unit = {
++    val props = new Properties
++    props.put(org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers())
++    try {
++      Using.resource(org.apache.kafka.clients.admin.Admin.create(props)) { admin =>
++        val names = admin.listTopics().names().get(30, java.util.concurrent.TimeUnit.SECONDS)
++        if (!names.isEmpty) admin.deleteTopics(names).all().get(30, java.util.concurrent.TimeUnit.SECONDS)
++      }
++    } catch {
++      case e: Exception => logger.warn(s"Could not delete topics from the external broker: $e")
++    }
++  }
++
++  /** Nisshi: create the topic through the admin client, then wait until every partition has a leader. */
++  private def createTopicExternal(
++    topic: String,
++    numPartitions: Int,
++    replicationFactor: Int,
++    topicConfig: Properties,
++    adminClientConfig: Properties
++  ): scala.collection.immutable.Map[Int, Int] = {
++    val props = new Properties
++    props.putAll(adminClientConfig)
++    props.put(org.apache.kafka.clients.admin.AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers())
++    Using.resource(org.apache.kafka.clients.admin.Admin.create(props)) { admin =>
++      val newTopic = new org.apache.kafka.clients.admin.NewTopic(topic, math.max(numPartitions, 1), replicationFactor.toShort)
++        .configs(topicConfig.asScala.map { case (k, v) => (k.toString, v.toString) }.asJava)
++      try admin.createTopics(Collections.singleton(newTopic)).all().get(30, java.util.concurrent.TimeUnit.SECONDS)
++      catch {
++        case e: java.util.concurrent.ExecutionException if e.getCause.isInstanceOf[TopicExistsException] =>
++      }
++      val deadline = System.currentTimeMillis() + 30000
++      var leaders = Map.empty[Int, Int]
++      while (leaders.size < math.max(numPartitions, 1) && System.currentTimeMillis() < deadline) {
++        val desc = admin.describeTopics(Collections.singleton(topic)).allTopicNames().get(30, java.util.concurrent.TimeUnit.SECONDS)
++        leaders = desc.get(topic).partitions().asScala
++          .filter(_.leader() != null).map(p => p.partition() -> p.leader().id()).toMap
++        if (leaders.size < math.max(numPartitions, 1)) Thread.sleep(100)
++      }
++      if (leaders.size < math.max(numPartitions, 1)) throw new KafkaException(s"Topic $topic has no leader for every partition")
++      leaders
++    }
++  }
++
+   /**
+    * Create a topic in ZooKeeper using a customized replica assignment.
+    * Wait until the leader is elected and the metadata is propagated to all brokers.
+@@ -210,7 +270,11 @@ abstract class KafkaServerTestHarness extends QuorumTestHarness {
+     partitionReplicaAssignment: collection.Map[Int, Seq[Int]],
+     listenerName: ListenerName = listenerName
+   ): scala.collection.immutable.Map[Int, Int] =
+-    if (isKRaftTest()) {
++    if (QuorumTestHarness.externalBootstrap.isDefined) {
++      // Nisshi: a manual assignment names broker ids that do not exist here, so keep only its shape.
++      createTopicExternal(topic, partitionReplicaAssignment.size, partitionReplicaAssignment.head._2.size,
++        new Properties, new Properties)
++    } else if (isKRaftTest()) {
+       Using.resource(createAdminClient(brokers, listenerName)) { admin =>
+         TestUtils.createTopicWithAdmin(
+           admin = admin,
+diff --git a/core/src/test/scala/unit/kafka/utils/TestUtils.scala b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+index 3046682d16..bbbf940d75 100755
+--- a/core/src/test/scala/unit/kafka/utils/TestUtils.scala
++++ b/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+@@ -234,11 +234,12 @@ object TestUtils extends Logging {
+     brokers: Seq[B],
+     listenerName: ListenerName
+   ): String = {
+-    brokers.map { s =>
++    // Nisshi: an external broker replaces the embedded ones.
++    kafka.server.QuorumTestHarness.externalBootstrap.getOrElse(brokers.map { s =>
+       val listener = s.config.effectiveAdvertisedBrokerListeners.find(_.listenerName == listenerName).getOrElse(
+         sys.error(s"Could not find listener with name ${listenerName.value}"))
+       formatAddress(listener.host, s.boundPort(listenerName))
+-    }.mkString(",")
++    }.mkString(","))
+   }
+ 
+   /**
+@@ -448,7 +449,8 @@ object TestUtils extends Logging {
+       cause != null &&
+         cause.isInstanceOf[TopicExistsException] &&
+         // wait until all partitions metadata are propagated before verifying partitions number and replication factor
+-        waitForAllPartitionsMetadata(brokers, topic, effectiveNumPartitions).nonEmpty &&
++        (kafka.server.QuorumTestHarness.externalBootstrap.isDefined ||
++          waitForAllPartitionsMetadata(brokers, topic, effectiveNumPartitions).nonEmpty) &&
+         topicHasSameNumPartitionsAndReplicationFactor(admin, topic, effectiveNumPartitions, replicationFactor)
+     }
+ 
+@@ -468,6 +470,17 @@ object TestUtils extends Logging {
+         }
+     }
+ 
++    if (kafka.server.QuorumTestHarness.externalBootstrap.isDefined) {
++      // Nisshi: no embedded brokers to inspect, so wait for a leader through the admin client.
++      var leaders = scala.collection.immutable.Map.empty[Int, Int]
++      waitUntilTrue(() => {
++        val desc = admin.describeTopics(Collections.singleton(topic)).allTopicNames().get(30, TimeUnit.SECONDS).get(topic)
++        leaders = desc.partitions().asScala.filter(_.leader() != null).map(p => p.partition() -> p.leader().id()).toMap
++        leaders.size == effectiveNumPartitions
++      }, s"Topic [$topic] has no leader for every partition", waitTimeMs = 30000L)
++      return leaders.toMap
++    }
++
+     // wait until we've propagated all partitions metadata to all brokers
+     val allPartitionsMetadata = waitForAllPartitionsMetadata(brokers, topic, effectiveNumPartitions)
+     controllers.foreach(controller => ensureConsistentKRaftMetadata(brokers, controller))
