@@ -85,11 +85,7 @@ pub enum Error {
 
 impl Error {
     /// Whether the broker refused the login, the TLS connection or a produce request, or the
-    /// client refused what the broker offered. The run ends with the first refusal, a transient
-    /// error code such as `KafkaStorageError` or `RequestTimedOut` included. Kafka's own producer
-    /// retries those, and this tool does not: a retry would hide an outage of the broker or its
-    /// storage in the numbers of a run that measures the broker. The exit status and the code
-    /// on stderr show it instead.
+    /// client refused what the broker offered, a transient error code included.
     fn is_refusal(&self) -> bool {
         match self {
             Self::Api(_) => true,
@@ -476,8 +472,13 @@ impl Generate {
                                         PRODUCE_API_DURATION.record(produce_start.elapsed().inspect(|duration|debug!(produce_duration_ms = duration.as_millis())).map_or(0, |duration| duration.as_millis() as u64), &attributes);
                                     }
 
-                                    // The login, the TLS connection or the produce request was
-                                    // refused: end the run with the error.
+                                    // The run ends with the first refusal of the login, the TLS
+                                    // connection or a produce request, a transient error code
+                                    // such as `KafkaStorageError` or `RequestTimedOut` included.
+                                    // Kafka's own producer retries those, and this tool does
+                                    // not, because a retry would hide an outage of the broker or
+                                    // its storage in the numbers of the run. The exit status and
+                                    // the code on stderr show it instead.
                                     Err(error) if error.is_refusal() => return Err(error),
 
                                     // Any other failure of a request leaves this producer idle

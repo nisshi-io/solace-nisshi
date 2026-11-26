@@ -195,8 +195,8 @@ fn a_refused_login_ends_generator_and_perf_with_4() {
     );
 }
 
-/// A refused produce request ends `generator` and `perf` at once, with 4, not with 0 after a
-/// panic in a producer or when the run's duration ends.
+/// A refused produce request ends `generator` and `perf` at once, with 4, before the run's
+/// duration ends.
 #[test]
 fn a_refused_produce_ends_generator_and_perf_with_4() {
     let broker = Broker::start();

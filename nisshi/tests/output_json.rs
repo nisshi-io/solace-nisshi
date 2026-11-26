@@ -349,8 +349,8 @@ fn a_refused_produce_still_prints_the_json_summary_and_exits_4() {
     assert_eq!(3, summary["error_code"], "{output:?}");
 }
 
-/// A refused perf run prints its summary from the run itself, so it prints one whether or not
-/// any metric was recorded before the refusal.
+/// `perf` prints its summary after the producers stop, with zero counts when no metric was
+/// recorded, so a refusal before the first record still prints one summary.
 #[test]
 fn a_refused_perf_produce_prints_one_json_summary_and_exits_4() {
     let broker = Broker::start();
@@ -510,7 +510,8 @@ fn the_generator_summary_prints_when_the_run_ends_not_when_the_process_exits() {
     assert_eq!("summary", json(&output)["type"], "{output:?}");
     let summary_after = summary_after.expect("a summary line");
     assert!(
-        // The old order printed it after the 5 s grace period, so at 6 s or later.
+        // After a run that reaches its duration, the process sleeps 5 s before it exits, so a
+        // summary within 5 s of the start shows that the summary is printed before that sleep.
         summary_after < std::time::Duration::from_secs(5),
         "the summary came {summary_after:?} after the start of a 1 s run"
     );
