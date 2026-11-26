@@ -5,6 +5,8 @@ extend-exclude = [
     # not our typos
     "license.html",
     "nisshi-sans-io/message",
+    # lines of Kafka's own source, which the patch quotes as context
+    "compat/kafka-java/harness.patch",
     # PEM fixtures: base64, not prose
     "nisshi-cli/tests/fixtures/tls",
 ]
