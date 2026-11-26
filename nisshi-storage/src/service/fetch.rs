@@ -3447,6 +3447,40 @@ mod tests {
         Ok(())
     }
 
+    /// A Fetch that skipped its validation, with a negative `partition_max_bytes`, fails with
+    /// INVALID_REQUEST, instead of reading the partition with a limit of about 4 GiB.
+    #[tokio::test(start_paused = true)]
+    async fn a_negative_partition_max_bytes_fails_a_fetch_that_skipped_validation() -> Result<()> {
+        let storage = Partitions::new([(0, vec![Read::Batch(batch(0, &[0])?)])]);
+
+        let fetched = FetchService {
+            storage: storage.clone(),
+        }
+        .fetch(
+            MAX_WAIT,
+            1,
+            u32::try_from(MAX_BYTES)?,
+            IsolationLevel::ReadUncommitted,
+            &[FetchTopic::default()
+                .topic(Some(TOPIC.into()))
+                .partitions(Some(vec![
+                    FetchPartition::default()
+                        .partition(0)
+                        .fetch_offset(0)
+                        .partition_max_bytes(-1),
+                ]))],
+        )
+        .await;
+
+        assert!(
+            matches!(fetched, Err(Error::Api(ErrorCode::InvalidRequest))),
+            "{fetched:?}"
+        );
+        assert_eq!(0, storage.calls(0).len());
+
+        Ok(())
+    }
+
     /// The response's `max_bytes` holds two partition limits. Partitions 0 and 2 each hold a batch
     /// that fills a partition's limit, and partition 1 a batch that does not fit it. Partition 1
     /// returns nothing and spends nothing, so partition 2 still has its whole limit and returns

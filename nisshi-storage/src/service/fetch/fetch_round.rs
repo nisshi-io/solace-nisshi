@@ -15,14 +15,14 @@
 use std::cmp::min;
 
 use nisshi_sans_io::{
-    IsolationLevel,
+    ErrorCode, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
 };
 use tokio::time::Instant;
 use tracing::debug;
 
 use super::{PartitionFetch, PartitionRead, RecordBytes as _, next_partition_deadline};
-use crate::{Result, fetched::ByteLimit};
+use crate::{Error, Result, fetched::ByteLimit};
 
 /// One round of a Fetch, in which each partition of the request is read once. The round tracks
 /// the time and bytes that its partitions can still use, and the totals of their answers.
@@ -117,7 +117,12 @@ impl FetchRound {
         let partition = PartitionFetch {
             topic,
             request,
-            limit: self.limit_for(request.partition_max_bytes),
+            // The Fetch's validation answers a negative `partition_max_bytes` with
+            // INVALID_REQUEST, so only a Fetch that skipped it fails here.
+            limit: self.limit_for(
+                u32::try_from(request.partition_max_bytes)
+                    .map_err(|_| Error::Api(ErrorCode::InvalidRequest))?,
+            ),
             deadline: self.partition_deadline(),
             min_bytes: self.min_bytes,
             isolation: self.isolation,
@@ -151,10 +156,8 @@ impl FetchRound {
     ///
     /// [ReplicaManager.scala#L1633]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1633
     /// [ReplicaManager.scala#L1731-L1740]: https://github.com/apache/kafka/blob/3.9.1/core/src/main/scala/kafka/server/ReplicaManager.scala#L1731-L1740
-    fn limit_for(&self, partition_max_bytes: i32) -> ByteLimit {
-        // The Fetch's validation rejects a negative `partition_max_bytes`.
-        debug_assert!(partition_max_bytes >= 0, "{partition_max_bytes}");
-        let bytes = min(partition_max_bytes as u32, self.bytes_left);
+    fn limit_for(&self, partition_max_bytes: u32) -> ByteLimit {
+        let bytes = min(partition_max_bytes, self.bytes_left);
 
         if self.has_records {
             ByteLimit::Hard(bytes)

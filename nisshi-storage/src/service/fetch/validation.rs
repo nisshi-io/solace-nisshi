@@ -28,7 +28,8 @@ use crate::{Error, Result};
 
 const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
 
-/// A [`FetchRequest`] whose whole-request fields have decoded to valid values.
+/// A [`FetchRequest`] whose whole-request fields have decoded to valid values, and whose
+/// partitions' `partition_max_bytes` are not negative.
 ///
 /// [`FetchService`](super::FetchService) takes this instead of a [`FetchRequest`], so it
 /// never parses those fields itself.
