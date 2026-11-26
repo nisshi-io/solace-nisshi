@@ -266,10 +266,11 @@ where
     Ok(())
 }
 
-/// Two partitions each hold 1,200 records of 1,000 bytes, more than their 1 MiB
+/// Two partitions each hold 80 records of 1,000 bytes, more than their 64 KiB
 /// `partition_max_bytes`. Each partition returns records that fill its limit to within one record,
-/// and never past it. The SQL engines count each record a few bytes smaller than its encoding, so
-/// this also checks that the broker drops the records that the engines let past the limit.
+/// and never past it. The SQL engines count each record a few bytes smaller than its encoding, and
+/// `fetched::tests::records_fill_the_limit_by_their_encoded_size` in `nisshi-storage` checks that
+/// the read drops a record that an engine sends past the limit.
 pub async fn every_partition_returns_the_records_that_fit_its_limit<C, G>(
     cluster_id: C,
     broker_id: i32,
@@ -279,7 +280,7 @@ where
     C: Into<String>,
     G: Storage + Clone,
 {
-    const PARTITION_MAX_BYTES: i32 = 1024 * 1024;
+    const PARTITION_MAX_BYTES: i32 = 64 * 1024;
 
     register_broker(cluster_id, broker_id, &sc).await?;
 
@@ -309,7 +310,7 @@ where
 
     // Each partition holds more records than fit its limit.
     for partition in 0..2 {
-        for _ in 0..1_200 {
+        for _ in 0..80 {
             _ = sc
                 .produce(
                     None,
@@ -322,15 +323,13 @@ where
 
     // The Fetch answers after its first round, because `min_bytes` is 1, so a long `max_wait`
     // does not slow the test. It gives each read time to fill its limit on a slow machine,
-    // where a read cut short by its deadline would return fewer records than fit. The first
-    // partition's read gets about half of `max_wait`, and on a CI runner a Turso read took 18 s to
-    // return 600 of the records.
+    // where a read cut short by its deadline would return fewer records than fit.
     let partitions = partition_data(
         fetch_offsets_within(
             &sc,
             &topic_name,
             &[(0, 0), (1, 0)],
-            120_000,
+            30_000,
             1,
             50 * 1024 * 1024,
             PARTITION_MAX_BYTES,
