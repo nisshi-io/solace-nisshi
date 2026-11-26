@@ -26,7 +26,9 @@ allow_list="$here/tests.allow"
 docker_network=()
 if [[ "$(uname)" == Linux ]]; then
     broker_host=${BROKER_HOST:-127.0.0.1}
-    docker_network=(--network host)
+    # The container shares the host network, and runs as this user so that the files it writes into
+    # the mounted worktree can be removed by this script (root-owned files cannot).
+    docker_network=(--network host --user "$(id -u):$(id -g)" -e HOME=/tmp)
 else
     broker_host=${BROKER_HOST:-192.168.5.2}
 fi
@@ -79,7 +81,7 @@ for test_class in "${classes[@]}"; do
     # `timeout` stops the docker client and not the container, so the container is removed by name.
     timeout "$seconds_per_class" docker run --rm --name "$container" ${docker_network[@]+"${docker_network[@]}"} \
         -e NISSHI_BOOTSTRAP="$broker_host:9092" \
-        -v "$patched_kafka":/kafka -v "$gradle_home":/root/.gradle -w /kafka eclipse-temurin:17-jdk \
+        -v "$patched_kafka":/kafka -e GRADLE_USER_HOME=/gradle-home -v "$gradle_home":/gradle-home -w /kafka eclipse-temurin:17-jdk \
         ./gradlew --no-daemon -q :core:test --tests "*.$test_class" \
         >"$root/target/compat/kafka-java/$test_class.log" 2>&1 || true
     docker rm -f "$container" >/dev/null 2>&1 || true
