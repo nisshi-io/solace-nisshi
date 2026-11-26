@@ -111,17 +111,17 @@ const TEST_FLOORS: &[TestFloor] = &[
     #[cfg(feature = "dynostore")]
     TestFloor {
         engine: "in_memory",
-        minimum_tests: 97,
+        minimum_tests: 101,
     },
     #[cfg(feature = "libsql")]
     TestFloor {
         engine: "lite",
-        minimum_tests: 102,
+        minimum_tests: 106,
     },
     #[cfg(feature = "postgres")]
     TestFloor {
         engine: "pg",
-        minimum_tests: 102,
+        minimum_tests: 106,
     },
     #[cfg(feature = "slatedb")]
     TestFloor {
@@ -131,7 +131,7 @@ const TEST_FLOORS: &[TestFloor] = &[
     #[cfg(feature = "turso")]
     TestFloor {
         engine: "turso",
-        minimum_tests: 33,
+        minimum_tests: 37,
     },
 ];
 
