@@ -3,12 +3,14 @@
 Runs Apache Kafka 3.9.1's own integration tests (`core/src/test/scala/integration`) against a
 Nisshi broker. The tests use the real Java producer, consumer and admin client.
 
-This directory is a spike. CI and `just` do not run it yet. [`FINDINGS.md`](FINDINGS.md) has the
-results and the recommendation.
+[`FINDINGS.md`](FINDINGS.md) has the results of running every class. `just compat-kafka-java`
+runs the classes in `tests.allow` and fails if a test in it fails or does not run. CI runs it on the
+memory engine as an experimental job, which does not fail `ci-gate`.
 
 ## Running
 
 ```shell
+just compat-kafka-java                                  # the tests in tests.allow, about 10 minutes
 cargo build --features dynostore -p nisshi
 ./compat/kafka-java/run.sh                              # every class, about 3 hours
 ./compat/kafka-java/run.sh PlaintextConsumerCommitTest  # one class
