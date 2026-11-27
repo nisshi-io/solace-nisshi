@@ -605,8 +605,10 @@ jobs:
       - run: |
           "${DUCKDB_CLI}/duckdb" -markdown -f reports/.github/workflows/scripts/pivot-integration-report.sql >> "${GITHUB_STEP_SUMMARY}"
   # Apache Kafka 3.9.1's own integration tests, against a broker on the memory engine. The job is
-  # experimental, so a failure here does not fail ci-gate, until it has a record in CI. The leg
-  # for each other storage engine comes after that.
+  # experimental, so a failure here does not fail ci-gate, and `continue-on-error` shows the job
+  # green either way: the verdict is the PASS or FAIL heading in the job's step summary. Once it
+  # has 10 green runs in a row, drop `continue-on-error`, and add the leg for each other storage
+  # engine.
   compat-kafka-java:
     if: needs.changes.outputs.rust == 'true' && github.ref != 'refs/heads/main'
     needs: [changes]
@@ -641,6 +643,7 @@ jobs:
           path: |
             ${{env.RESULTS_FILE}}
             target/compat/kafka-java/*.log
+            target/compat/kafka-java/*.xml
           if-no-files-found: warn
   cargo-publish-dry-run:
     if: &tier_b needs.changes.outputs.rust == 'true' && (github.event_name != 'pull_request' || (vars.MERGE_QUEUE != 'on' && github.event.pull_request.head.repo.full_name == github.repository))
