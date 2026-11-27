@@ -15,7 +15,7 @@
 //! [`Detached::write_until`] on a record of its own, so that no other test's write is in it.
 //! Every test runs on a paused clock, so the time that a write and a wait take is exact.
 
-use std::time::Duration;
+use std::{assert_matches, time::Duration};
 
 use tokio::{
     sync::oneshot,
@@ -39,7 +39,7 @@ fn topition() -> Topition {
 
 #[tokio::test(start_paused = true)]
 async fn a_write_that_ends_before_at_returns_its_output() {
-    let detached = Detached::default();
+    let detached = Detached::new();
 
     let outcome = detached
         .write_until(
@@ -49,13 +49,13 @@ async fn a_write_that_ends_before_at_returns_its_output() {
         )
         .await;
 
-    assert!(matches!(outcome, WriteOutcome::Ended(42)), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Ended(42));
     assert!(!detached.contains(&topition(), PRODUCER_ID));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_write_that_outlives_at_is_reported_until_it_ends() {
-    let detached = Detached::default();
+    let detached = Detached::new();
     let (release, released) = oneshot::channel::<()>();
 
     let outcome = detached
@@ -71,7 +71,7 @@ async fn a_write_that_outlives_at_is_reported_until_it_ends() {
         )
         .await;
 
-    assert!(matches!(outcome, WriteOutcome::Detached), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Detached);
     assert!(detached.contains(&topition(), PRODUCER_ID));
     assert!(detached.contains(&Topition::new("orders", 1), PRODUCER_ID));
     // The record is keyed by producer as well as by partition.
@@ -86,7 +86,7 @@ async fn a_write_that_outlives_at_is_reported_until_it_ends() {
 
 #[tokio::test(start_paused = true)]
 async fn the_detachment_says_when_the_request_stops_waiting() {
-    let detached = Detached::default();
+    let detached = Detached::new();
     let (handed, detachment) = oneshot::channel::<Detachment>();
     let (release, released) = oneshot::channel::<()>();
 
@@ -95,7 +95,6 @@ async fn the_detachment_says_when_the_request_stops_waiting() {
             Instant::now() + TIMEOUT,
             [(topition(), PRODUCER_ID)],
             |detachment| {
-                // The test reads the handle that the write gets.
                 _ = handed.send(detachment);
 
                 async move {
@@ -106,7 +105,7 @@ async fn the_detachment_says_when_the_request_stops_waiting() {
         .await;
     let detachment = detachment.await.expect("the handle");
 
-    assert!(matches!(outcome, WriteOutcome::Detached), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Detached);
     assert!(detachment.is_detached());
 
     _ = release.send(());
@@ -115,7 +114,7 @@ async fn the_detachment_says_when_the_request_stops_waiting() {
 
 #[tokio::test(start_paused = true)]
 async fn the_detachment_says_the_request_waits_while_it_does() {
-    let detached = Detached::default();
+    let detached = Detached::new();
 
     let outcome = detached
         .write_until(
@@ -125,12 +124,12 @@ async fn the_detachment_says_the_request_waits_while_it_does() {
         )
         .await;
 
-    assert!(matches!(outcome, WriteOutcome::Ended(false)), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Ended(false));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_write_that_panics_returns_panicked_and_leaves_no_partition() {
-    let detached = Detached::default();
+    let detached = Detached::new();
 
     let outcome = detached
         .write_until(
@@ -140,16 +139,13 @@ async fn a_write_that_panics_returns_panicked_and_leaves_no_partition() {
         )
         .await;
 
-    assert!(
-        matches!(outcome, WriteOutcome::<()>::Panicked),
-        "{outcome:?}"
-    );
+    assert_matches!(outcome, WriteOutcome::<()>::Panicked);
     assert!(!detached.contains(&topition(), PRODUCER_ID));
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_detached_write_of_a_producer_without_an_id_is_not_reported() {
-    let detached = Detached::default();
+    let detached = Detached::new();
     let (release, released) = oneshot::channel::<()>();
 
     let outcome = detached
@@ -162,7 +158,7 @@ async fn a_detached_write_of_a_producer_without_an_id_is_not_reported() {
         )
         .await;
 
-    assert!(matches!(outcome, WriteOutcome::Detached), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Detached);
     assert!(!detached.contains(&topition(), -1));
 
     _ = release.send(());
@@ -171,7 +167,7 @@ async fn a_detached_write_of_a_producer_without_an_id_is_not_reported() {
 
 #[tokio::test(start_paused = true)]
 async fn the_wait_at_shutdown_waits_for_a_detached_write() {
-    let detached = Detached::default();
+    let detached = Detached::new();
     let (release, released) = oneshot::channel::<()>();
 
     let outcome = detached
@@ -183,7 +179,7 @@ async fn the_wait_at_shutdown_waits_for_a_detached_write() {
             },
         )
         .await;
-    assert!(matches!(outcome, WriteOutcome::Detached), "{outcome:?}");
+    assert_matches!(outcome, WriteOutcome::Detached);
 
     // The write ends one second into the wait.
     drop(tokio::spawn(async move {

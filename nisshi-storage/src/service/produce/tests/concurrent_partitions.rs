@@ -704,7 +704,7 @@ async fn a_write_left_running_at_the_deadline_keeps_its_permit_until_it_ends() -
     let permits = Arc::new(Semaphore::new(1));
     let (storage, gate) = stalled();
     let storage = storage.with_produce_permits(Arc::clone(&permits));
-    let detached = Detached::default();
+    let detached = Detached::new();
     let service = ProduceService::new_sharing(storage.clone(), detached.clone()).with_validation();
 
     _ = serve(&service, acked(&[0, 1])?).await?;
@@ -732,7 +732,7 @@ async fn a_partition_waiting_for_the_budget_holds_no_shared_permit() -> Result<(
             Instant::now() + Duration::from_secs(600),
         )
         .await;
-    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
+    let service = ProduceService::new_sharing(storage.clone(), Detached::new())
         .with_decoded_budget(budget, Duration::from_secs(60))
         .with_validation();
     let mut waiting = std::pin::pin!(serve(&service, acked(&[0])?));

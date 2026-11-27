@@ -40,7 +40,7 @@ static DETACHED_WRITES: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 
 /// The set that every service of this process shares, as the decoded-bytes budget is shared. The
 /// broker builds a produce service for each connection, and a retry usually arrives on a new one.
-static PROCESS: LazyLock<Detached> = LazyLock::new(Detached::default);
+static PROCESS: LazyLock<Detached> = LazyLock::new(Detached::new);
 
 /// A partition and the producer that wrote to it. A non-idempotent batch has the producer ID -1.
 type Key = (Topition, i64);
@@ -56,7 +56,7 @@ type Key = (Topition, i64);
 /// protect and are not held. A client chooses its `timeout_ms`, and it must not hold the
 /// partition for the others with it. The set is the process's, so it covers the requests that
 /// this process serves, on any connection, and not a retry that reaches another node.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Detached {
     writes: Arc<Mutex<HashMap<Key, usize>>>,
     /// The task of each write that has started and not ended, whether or not its request still
@@ -102,6 +102,15 @@ impl Detached {
                 writes: self.tasks.len(),
                 detached_partitions: self.partitions(),
             },
+        }
+    }
+
+    /// Returns an empty set of its own. [`wait_for_detached_writes`] waits only for the set of the
+    /// process, so code outside the crate gets a set through [`Self::process`].
+    pub(crate) fn new() -> Self {
+        Self {
+            writes: Arc::default(),
+            tasks: TaskTracker::new(),
         }
     }
 
@@ -188,8 +197,7 @@ pub enum WriteOutcome<T> {
     Panicked,
 }
 
-/// Tells a write that [`Detached::write_until`] runs whether its request still waits for it, so
-/// that the write can log its own outcome once nobody else will.
+/// Tells a write that [`Detached::write_until`] runs whether its request still waits for it.
 #[derive(Clone, Debug)]
 pub struct Detachment(Arc<Vec<Write>>);
 
@@ -219,6 +227,17 @@ impl Detached {
     /// the write runs on, and [`Self::contains`] reports each of those partitions until it
     /// ends, so that a producer's next write to one of them can wait for it. A write that ends
     /// in the same instant as `at` returns its output.
+    ///
+    /// This method does not check [`Self::contains`]. A caller checks it for each of its
+    /// partitions first, so that a retry does not start while an earlier write still runs.
+    ///
+    /// If `at` passes first, the output of the write is dropped. The write then reports its own
+    /// outcome, and reads from its [`Detachment`] whether its request still waits for it.
+    ///
+    /// If the returned future is dropped before it completes, the write runs on and the broker's
+    /// shutdown waits for it, but [`Self::contains`] does not report its partitions.
+    ///
+    /// The task runs in the span that is current when this method is called.
     pub async fn write_until<W, F, T>(
         &self,
         at: Instant,
