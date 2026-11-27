@@ -105,6 +105,7 @@ pub mod shutdown;
 pub mod shutdown_produce_writes;
 pub mod startup_failure;
 pub mod storage_alter_user_scram_credentials;
+pub mod storage_alter_user_scram_credentials_iterations;
 pub mod storage_capabilities;
 pub mod storage_create_acls;
 pub mod storage_delete_acls;

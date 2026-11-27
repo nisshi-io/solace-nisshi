@@ -147,6 +147,11 @@ To create the first user, run the broker on the same storage without
    The password is an argument, so it is in your shell history, and other
    users of the machine can see it while the command runs.
 
+   The broker refuses a credential whose iteration count is below 4096 or
+   above 16384, as Kafka 3.9.1 does, so `--iterations` takes a count in that
+   range (the default is 8192), and the command refuses a count outside it
+   before it connects.
+
 3. Stop the broker, and start it again with `--authentication`:
 
    ```shell

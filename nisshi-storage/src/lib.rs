@@ -289,6 +289,7 @@ pub use service::{
     bounded_channel, describe_groups_response, inflate_produced, list_groups_response,
     wait_for_detached_writes,
 };
+pub use service::{MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS};
 
 #[cfg(feature = "dynostore")]
 mod os;

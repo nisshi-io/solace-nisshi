@@ -21,6 +21,7 @@ use nisshi_broker::{TracingFormat, otel};
 use nisshi_cli::{Cli, ExitStatus, Outcome};
 use nisshi_client::FailureKind;
 use nisshi_sans_io::ErrorCode;
+use nisshi_storage::{MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS};
 use std::{
     io,
     net::SocketAddr,
@@ -99,12 +100,15 @@ fn refusal_message(error: &nisshi_client::Error, broker_option: &str) -> Option<
         return Some(format!(
             "The client refused the SCRAM login: the broker asked for {iterations} iterations, \
             and the client accepts {} to {}. Kafka's own client refuses fewer than {}. Recreate \
-            the user's credential with `nisshi user create --iterations` set within that range \
-            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
-            can also ask for such a count.",
+            the user's credential with `nisshi user create --iterations` set from {} to {}, the \
+            range that the broker accepts when it creates a credential (the default is 8192). On \
+            SASL_PLAINTEXT, another server that answers for the broker can also ask for such a \
+            count.",
             accepted.start(),
             accepted.end(),
-            accepted.start()
+            accepted.start(),
+            MIN_SCRAM_ITERATIONS,
+            MAX_SCRAM_ITERATIONS
         ));
     }
 
@@ -674,9 +678,10 @@ mod tests {
         assert_eq!(
             "The client refused the SCRAM login: the broker asked for 1000 iterations, and the \
             client accepts 4096 to 65536. Kafka's own client refuses fewer than 4096. Recreate \
-            the user's credential with `nisshi user create --iterations` set within that range \
-            (the default is 8192). On SASL_PLAINTEXT, another server that answers for the broker \
-            can also ask for such a count.",
+            the user's credential with `nisshi user create --iterations` set from 4096 to 16384, \
+            the range that the broker accepts when it creates a credential (the default is 8192). \
+            On SASL_PLAINTEXT, another server that answers for the broker can also ask for such a \
+            count.",
             message
         );
         assert!(

@@ -16,13 +16,70 @@ use crate::{Error, Result, ScramCredential, Storage, user_credentials_unsupporte
 use bytes::Bytes;
 use nisshi_sans_io::{
     AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ApiKey, ErrorCode,
-    RequestInput, ScramMechanism,
+    RequestInput, ScramMechanism, alter_user_scram_credentials_request::ScramCredentialUpsertion,
     alter_user_scram_credentials_response::AlterUserScramCredentialsResult,
 };
 use rama::Service;
 use rsasl::mechanisms::scram::tools::derive_keys;
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::{BTreeMap, btree_map::Entry};
 use tracing::{debug, instrument, warn};
+
+/// The smallest iteration count in a SCRAM-SHA-256 or SCRAM-SHA-512 credential that
+/// [Kafka 3.9.1 accepts][kafka-minimum].
+///
+/// [kafka-minimum]: https://github.com/apache/kafka/blob/3.9.1/clients/src/main/java/org/apache/kafka/common/security/scram/internals/ScramMechanism.java#L32-L33
+pub const MIN_SCRAM_ITERATIONS: i32 = 4096;
+
+/// The largest iteration count in a SCRAM-SHA-256 or SCRAM-SHA-512 credential that
+/// [Kafka 3.9.1 accepts][kafka-maximum].
+///
+/// [kafka-maximum]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L58
+pub const MAX_SCRAM_ITERATIONS: i32 = 16384;
+
+/// Returns Kafka's message for an iteration count outside `MIN_SCRAM_ITERATIONS` to
+/// `MAX_SCRAM_ITERATIONS`, and `None` for a count inside it.
+fn unacceptable_iterations_message(iterations: i32) -> Option<&'static str> {
+    if iterations < MIN_SCRAM_ITERATIONS {
+        Some("Too few iterations")
+    } else if iterations > MAX_SCRAM_ITERATIONS {
+        Some("Too many iterations")
+    } else {
+        None
+    }
+}
+
+/// Returns, for each user, the message for the first upsertion of that user that has a known
+/// mechanism and an iteration count outside Kafka's range.
+///
+/// Kafka orders its checks as empty name, unknown mechanism, then iteration count, so an item
+/// with an unknown mechanism keeps its mechanism error and never counts here.
+fn iterations_refusals(upsertions: &[ScramCredentialUpsertion]) -> BTreeMap<String, &'static str> {
+    let mut refusals = BTreeMap::new();
+
+    for upsertion in upsertions {
+        let Ok(mechanism) = ScramMechanism::try_from(upsertion.mechanism) else {
+            continue;
+        };
+
+        let Some(message) = unacceptable_iterations_message(upsertion.iterations) else {
+            continue;
+        };
+
+        if let Entry::Vacant(refusal) = refusals.entry(upsertion.name.clone()) {
+            warn!(
+                user = upsertion.name.as_str(),
+                ?mechanism,
+                iterations = upsertion.iterations,
+                "iteration count out of range, answering UNACCEPTABLE_CREDENTIAL"
+            );
+
+            _ = refusal.insert(message);
+        }
+    }
+
+    refusals
+}
 
 /// The answer for `user` once storage has upserted or deleted its credential.
 ///
@@ -105,6 +162,26 @@ where
         }
 
         if let Some(upsertions) = input.request.upsertions {
+            // [Kafka 3.9.1 refuses][kafka-range-check] an iteration count outside its range, and
+            // then stores none of the upsertions of that user in the request. So this loop
+            // refuses each upsertion of such a user with the message of the first refusal, and
+            // stores the upsertions of every other user.
+            //
+            // [kafka-range-check]: https://github.com/apache/kafka/blob/3.9.1/metadata/src/main/java/org/apache/kafka/controller/ScramControlManager.java#L284-L296
+            //
+            // Two differences from Kafka remain. Kafka answers once per user, and this loop
+            // answers once per upsertion. Kafka answers DUPLICATE_RESOURCE for a user that the
+            // request names more than once, and runs none of that user's items. This loop
+            // handles such a user as follows:
+            //
+            // - A deletion and an out-of-range upsertion: this service deletes the credential
+            //   and refuses the new one, so a delete-then-add rotation with a bad count ends
+            //   with no credential.
+            // - A valid upsertion and a refused one: this service answers both with the refused
+            //   message.
+            // - Two valid upsertions with different mechanisms: this service stores both.
+            let refusals = iterations_refusals(&upsertions);
+
             for upsertion in upsertions {
                 let mechanism = match ScramMechanism::try_from(upsertion.mechanism)
                     .inspect(|mechanism| debug!(?mechanism))
@@ -127,6 +204,17 @@ where
                         continue;
                     }
                 };
+
+                if let Some(message) = refusals.get(&upsertion.name) {
+                    results.push(
+                        AlterUserScramCredentialsResult::default()
+                            .user(upsertion.name.clone())
+                            .error_code(ErrorCode::UnacceptableCredential.into())
+                            .error_message(Some((*message).into())),
+                    );
+
+                    continue;
+                }
 
                 let (stored_key, server_key) = if mechanism == ScramMechanism::Scram256 {
                     let (client_key, server_key) =
@@ -173,51 +261,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stored_is_none() -> Result<()> {
-        let answered = result("alice".into(), Ok(()));
-
-        assert_eq!("alice", answered.user);
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(answered.error_code)?);
-        Ok(())
-    }
-
-    #[test]
-    fn unsupported_engine_is_unsupported_version_naming_the_engine() -> Result<()> {
-        let answered = result(
-            "alice".into(),
-            Err(Error::UserCredentialsUnsupported {
-                engine: "in-memory (memory://)".into(),
-            }),
-        );
-
-        assert_eq!(
-            ErrorCode::UnsupportedVersion,
-            ErrorCode::try_from(answered.error_code)?
-        );
-        assert_eq!(
-            Some(
-                "The in-memory (memory://) storage engine can't store SCRAM credentials, so \
-                nothing was changed. SCRAM users need PostgreSQL or SQLite storage."
-            ),
-            answered.error_message.as_deref()
-        );
-        Ok(())
-    }
-
-    /// Any other storage failure is answered as before this engine check existed.
-    #[test]
-    fn other_failure_is_unchanged() -> Result<()> {
-        let answered = result("alice".into(), Err(Error::Message("broken".into())));
-
-        assert_eq!(
-            ErrorCode::UnsupportedSaslMechanism,
-            ErrorCode::try_from(answered.error_code)?
-        );
-        assert_eq!(Some(""), answered.error_message.as_deref());
-        Ok(())
-    }
-}
+mod tests;
