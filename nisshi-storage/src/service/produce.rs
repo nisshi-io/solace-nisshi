@@ -44,11 +44,12 @@ use rama::{Layer as _, Service};
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 
+use self::slots::Slots;
 pub use self::{
     acks_zero::{AcksZeroLayer, AcksZeroService},
     admission::Admission,
     batch_validation::{BatchValidationLayer, BatchValidationService},
-    detached::{StillRunning, wait_for_detached_writes},
+    detached::{Detached, StillRunning, WriteOutcome, wait_for_detached_writes},
     partition::PartitionProduce,
     request_validation::{
         ProduceRequestValidationLayer, ProduceRequestValidationService, ProduceTopic,
@@ -61,7 +62,6 @@ pub use self::{
     topic_configuration::TopicConfiguration,
     unknown_partition::{UnknownPartitionLayer, UnknownPartitionService},
 };
-use self::{detached::Detached, slots::Slots};
 use crate::{
     Error, Result, Storage,
     decoded_budget::{self, DecodedBytesBudget},

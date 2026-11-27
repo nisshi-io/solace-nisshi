@@ -132,7 +132,7 @@ pub(super) fn acked(partitions: &[i32]) -> Result<RequestInput<ProduceRequest>> 
 pub(super) fn service(
     storage: &CountingStorage,
 ) -> impl Service<RequestInput<ProduceRequest>, Output = ProduceResponse, Error = Error> {
-    service_sharing(storage, Detached::default())
+    service_sharing(storage, Detached::new())
 }
 
 /// A service like [`service`] that tracks its in-flight writes in `detached`. The broker builds
@@ -263,7 +263,7 @@ async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()
     // The write takes a second after the gate opens, as an engine's write does, so the test must
     // wait for the write to end, not only for the runtime to have no task ready.
     let storage = storage.with_produce_delay(Duration::from_secs(1));
-    let detached = Detached::default();
+    let detached = Detached::new();
     let service = service_sharing(&storage, detached.clone());
 
     let responses = serve(&service, acked(&[0])?).await?;
@@ -289,7 +289,7 @@ async fn a_write_that_started_finishes_after_the_request_answered() -> Result<()
 #[tokio::test(start_paused = true)]
 async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() -> Result<()> {
     let (storage, gate) = stalled();
-    let detached = Detached::default();
+    let detached = Detached::new();
     let connection = service_sharing(&storage, detached.clone());
     let other_connection = service_sharing(&storage, detached.clone());
 
@@ -326,7 +326,7 @@ async fn a_retry_to_a_partition_with_a_write_in_flight_does_not_start_another() 
 async fn another_producer_and_a_non_idempotent_batch_are_not_refused_by_a_write_in_flight()
 -> Result<()> {
     let (storage, gate) = stalled();
-    let detached = Detached::default();
+    let detached = Detached::new();
     let service = service_sharing(&storage, detached.clone());
 
     let first = serve(&service, acked_by(7, &[0])?).await?;
@@ -431,7 +431,7 @@ async fn the_wait_for_the_budget_ends_at_the_deadline() -> Result<()> {
         )
         .await;
 
-    let service = ProduceService::new_sharing(storage.clone(), Detached::default())
+    let service = ProduceService::new_sharing(storage.clone(), Detached::new())
         .with_decoded_budget(budget, Duration::from_secs(60))
         .with_validation();
     let started_at = Instant::now();
@@ -499,7 +499,7 @@ async fn the_read_of_the_topic_configuration_ends_at_the_deadline() -> Result<()
 async fn a_detached_write_holds_its_budget_until_it_ends() -> Result<()> {
     let (storage, gate) = stalled();
     let budget = Arc::new(DecodedBytesBudget::new(4 * MAX_DECODED_BATCH_BYTES));
-    let detached = Detached::default();
+    let detached = Detached::new();
     let service = ProduceService::new_sharing(storage.clone(), detached.clone())
         .with_decoded_budget(Arc::clone(&budget), Duration::from_secs(60))
         .with_validation();
@@ -630,7 +630,7 @@ async fn the_deadline_counts_each_partition_it_stopped() -> Result<()> {
     let (storage, gate) = stalled();
     // One write at a time, so that the deadline stops partitions at every stage.
     let storage = storage.with_produce_concurrency(1);
-    let detached = Detached::default();
+    let detached = Detached::new();
     let service = service_sharing(&storage, detached.clone());
 
     let responses = serve(&service, acked_by(7, &[0, 1, 2])?).await?;
@@ -680,7 +680,7 @@ async fn the_deadline_counts_a_partition_that_waited_for_the_budget() -> Result<
             Instant::now() + Duration::from_secs(600),
         )
         .await;
-    let service = ProduceService::new_sharing(storage, Detached::default())
+    let service = ProduceService::new_sharing(storage, Detached::new())
         .with_decoded_budget(budget, Duration::from_secs(60))
         .with_validation();
 
