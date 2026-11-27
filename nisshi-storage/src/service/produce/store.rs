@@ -110,36 +110,32 @@ where
         let reservation = request.reservation.clone();
         let partitions = [(topition.clone(), batch.producer_id)];
 
+        let write = async move {
+            // Both live as long as the write holds the engine's connection, not as long as its
+            // request. Dropping the task drops them, on a panic and on an abort too.
+            let _reservation = reservation;
+            let _permit = permit;
+
+            run(
+                &storage,
+                at,
+                transaction_id.as_deref(),
+                &topition,
+                batch,
+                inflated,
+            )
+            .await
+        };
+
         let waited = self
             .detached
-            .write_until(at, partitions, |detachment| async move {
-                // Both live as long as the write holds the engine's connection, not as long as
-                // its request. Dropping the task drops them, on a panic and on an abort too.
-                let _reservation = reservation;
-                let _permit = permit;
-
-                let result = run(
-                    &storage,
-                    at,
-                    transaction_id.as_deref(),
-                    &topition,
-                    batch,
-                    inflated,
-                )
-                .await;
-
-                if detachment.is_detached() {
-                    match &result {
-                        Ok(base_offset) => {
-                            info!(base_offset, "a write that outlived its request ended");
-                        }
-                        Err(error) => {
-                            warn!(?error, "a write that outlived its request failed");
-                        }
-                    }
+            .write_until(at, partitions, write, |result| match result {
+                Ok(base_offset) => {
+                    info!(base_offset, "a write that outlived its request ended");
                 }
-
-                result
+                Err(error) => {
+                    warn!(?error, "a write that outlived its request failed");
+                }
             })
             .await;
 

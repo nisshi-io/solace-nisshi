@@ -274,7 +274,7 @@ pub use service::{
     DELETE_RECORDS_CONCURRENCY, DeleteAclsService, DeleteGroupsService, DeleteRecordsConcurrency,
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
     DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, Detached, Detachment, FetchService, FetchValidationLayer,
+    DescribeUserScramCredentialsService, Detached, FetchService, FetchValidationLayer,
     FetchValidationService, FindCoordinatorService, IncrementalAlterConfigsService,
     InitProducerIdService, KnownTopics, LIST_OFFSETS_CONCURRENCY, ListGroupsService,
     ListOffsetsService, ListPartitionReassignmentsService, MalformedCreateTopicsRequest,

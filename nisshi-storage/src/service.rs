@@ -115,7 +115,7 @@ use opentelemetry::{
 };
 pub use produce::{
     AcksZeroLayer, AcksZeroService, Admission, BatchValidationLayer, BatchValidationService,
-    Detached, Detachment, PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
+    Detached, PRODUCE_CONCURRENCY, PartitionProduce, ProduceRequestValidationLayer,
     ProduceRequestValidationService, ProduceService, ProduceTopic, ProduceTopicService,
     SchemaValidationLayer, SchemaValidationService, StillRunning, StorePartitionService,
     StoredPartitions, TimestampLayer, TimestampService, TopicConfiguration, UnknownPartitionLayer,

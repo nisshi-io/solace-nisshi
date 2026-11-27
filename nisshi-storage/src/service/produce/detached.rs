@@ -15,7 +15,8 @@
 use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
-    sync::{Arc, LazyLock, Mutex, PoisonError},
+    mem,
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
@@ -150,16 +151,6 @@ impl Detached {
             .collect()
     }
 
-    /// Returns the tracker of a write to `topition` from `producer_id`, which starts as a write
-    /// that its request still waits for.
-    pub(super) fn track(&self, topition: Topition, producer_id: i64) -> Write {
-        Write {
-            detached: self.clone(),
-            key: (topition, producer_id),
-            state: Mutex::new(State::Running),
-        }
-    }
-
     fn add(&self, key: &Key) {
         *self
             .writes
@@ -189,98 +180,81 @@ impl Detached {
 /// What a caller of [`Detached::write_until`] learns of its write.
 #[derive(Debug)]
 pub enum WriteOutcome<T> {
-    /// The write ended before the deadline, with its output.
+    /// The write ended while the caller still waited for it, with its output.
     Ended(T),
     /// The deadline passed first, and the write runs on in its own task.
     Detached,
-    /// The write panicked before the deadline.
+    /// The write panicked while the caller still waited for it.
     Panicked,
 }
 
-/// Tells a write that [`Detached::write_until`] runs whether its request still waits for it.
-#[derive(Clone, Debug)]
-pub struct Detachment(Arc<Vec<Write>>);
-
-impl Detachment {
-    /// Returns whether the request no longer waits for the write.
-    pub fn is_detached(&self) -> bool {
-        self.0.iter().any(Write::is_detached)
-    }
-}
-
-/// Marks each write of a task as ended when the task ends, whether it returned or panicked.
-struct End(Arc<Vec<Write>>);
-
-impl Drop for End {
-    fn drop(&mut self) {
-        for write in self.0.iter() {
-            write.finish();
-        }
-    }
-}
-
 impl Detached {
-    /// Runs the future that `write` returns in a task of its own, which the broker's shutdown
-    /// waits for, and waits for its output until `at`.
+    /// Runs `write` in a task of its own, which the broker's shutdown waits for, and waits for
+    /// its output until `at`.
     ///
     /// The write covers `partitions`, each with the producer of its batch. If `at` passes first,
     /// the write runs on, and [`Self::contains`] reports each of those partitions until it
-    /// ends, so that a producer's next write to one of them can wait for it. A write that ends
-    /// in the same instant as `at` returns its output.
+    /// ends, so that a producer's next write to one of them can wait for it.
+    ///
+    /// The output goes to one place only. If the caller still waits when the write ends, it gets
+    /// the output in [`WriteOutcome::Ended`]. Otherwise no request reports the output, and the
+    /// task passes it to `on_detached`.
     ///
     /// This method does not check [`Self::contains`]. A caller checks it for each of its
     /// partitions first, so that a retry does not start while an earlier write still runs.
     ///
-    /// If `at` passes first, the output of the write is dropped. The write then reports its own
-    /// outcome, and reads from its [`Detachment`] whether its request still waits for it.
+    /// If the returned future is dropped before `at`, the write runs on and the broker's shutdown
+    /// waits for it, but [`Self::contains`] does not report its partitions.
     ///
-    /// If the returned future is dropped before it completes, the write runs on and the broker's
-    /// shutdown waits for it, but [`Self::contains`] does not report its partitions.
-    ///
-    /// The task runs in the span that is current when this method is called.
-    pub async fn write_until<W, F, T>(
+    /// The task, and `on_detached` with it, run in the span that is current when this method is
+    /// called.
+    pub async fn write_until<F, D>(
         &self,
         at: Instant,
         partitions: impl IntoIterator<Item = (Topition, i64)>,
-        write: W,
-    ) -> WriteOutcome<T>
+        write: F,
+        on_detached: D,
+    ) -> WriteOutcome<F::Output>
     where
-        W: FnOnce(Detachment) -> F,
-        F: Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+        D: FnOnce(F::Output) + Send + 'static,
     {
-        let writes = Arc::new(
-            partitions
-                .into_iter()
-                .map(|(topition, producer_id)| self.track(topition, producer_id))
-                .collect::<Vec<_>>(),
-        );
+        let task = Arc::new(Task {
+            detached: self.clone(),
+            keys: partitions.into_iter().collect(),
+            state: Mutex::new(State::Running),
+        });
         let (sender, mut receiver) = oneshot::channel();
-        let future = write(Detachment(Arc::clone(&writes)));
-        let end = End(Arc::clone(&writes));
+        let end = End(Arc::clone(&task));
 
         self.spawn(
             async move {
-                let _end = end;
+                let output = write.await;
 
-                // The caller has stopped waiting when this fails, and the write logs its own
-                // outcome through its `Detachment`.
-                _ = sender.send(future.await);
+                let unclaimed = if end.0.finish() {
+                    match sender.send(output) {
+                        Ok(()) => return,
+                        // The caller dropped the future that waited for the output.
+                        Err(output) => output,
+                    }
+                } else {
+                    output
+                };
+
+                on_detached(unclaimed);
             }
             .instrument(Span::current()),
         );
 
         match timeout_at(at, &mut receiver).await {
             Ok(output) => output.map_or(WriteOutcome::Panicked, WriteOutcome::Ended),
+            Err(_) if task.detach() => WriteOutcome::Detached,
 
-            // Every write of the task ends together, so a task that ended in the same instant
-            // detaches none of them, and its output is waiting. Each write is detached, so the
-            // count visits every one rather than stopping at the first.
-            Err(_) if writes.iter().filter(|write| write.detach()).count() > 0 => {
-                WriteOutcome::Detached
-            }
+            // The task ended first, so its output is the caller's. The task sends it after it
+            // releases the lock, so it can still be on its way. A task that panicked sends none.
             Err(_) => receiver
-                .try_recv()
+                .await
                 .map_or(WriteOutcome::Panicked, WriteOutcome::Ended),
         }
     }
@@ -288,31 +262,34 @@ impl Detached {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    /// The request that started the write still waits for it.
+    /// The caller still waits for the write.
     Running,
-    /// The request answered, and the write runs on.
+    /// The caller stopped waiting, and the write runs on.
     Detached,
     /// The write ended.
     Finished,
 }
 
-/// One write to a partition, from its start to its end. It lets the request that started the
-/// write detach from it, and the write's own task mark its end, in either order.
-#[derive(Debug)]
-pub(super) struct Write {
+/// One call to [`Detached::write_until`], which its caller and its task share.
+///
+/// One lock covers every partition of the write, so that the caller detaches the write from all
+/// of them or from none. Whichever side takes the lock first decides where the output goes: the
+/// task that finishes first gives it to the caller, and the caller that detaches first leaves it
+/// to the task. Neither side does more than that under the lock.
+struct Task {
     detached: Detached,
-    key: Key,
+    keys: Vec<Key>,
     state: Mutex<State>,
 }
 
-impl Write {
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+impl Task {
+    fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Leaves the write running without its request. Returns `false` when the write ended
-    /// already, so that nothing runs on.
-    pub(super) fn detach(&self) -> bool {
+    /// Leaves the write running without its caller, and adds its partitions to the set. Returns
+    /// `false` when the write ended already, so that its output is the caller's.
+    fn detach(&self) -> bool {
         let mut state = self.state();
 
         if *state != State::Running {
@@ -320,25 +297,36 @@ impl Write {
         }
 
         *state = State::Detached;
-        self.detached.add(&self.key);
+
+        for key in &self.keys {
+            self.detached.add(key);
+        }
 
         true
     }
 
-    /// Returns whether the write runs on without its request.
-    pub(super) fn is_detached(&self) -> bool {
-        *self.state() == State::Detached
-    }
-
-    /// Marks the write as ended, and takes it out of the set if it was detached. The task of the
-    /// write calls this when it is dropped, also when the write panics.
-    pub(super) fn finish(&self) {
+    /// Marks the write as ended, and takes its partitions out of the set if it was detached.
+    /// Returns whether the caller still waited for the write, so that the output is the
+    /// caller's. A second call changes nothing and returns `false`.
+    fn finish(&self) -> bool {
         let mut state = self.state();
+        let previous = mem::replace(&mut *state, State::Finished);
 
-        if *state == State::Detached {
-            self.detached.remove(&self.key);
+        if previous == State::Detached {
+            for key in &self.keys {
+                self.detached.remove(key);
+            }
         }
 
-        *state = State::Finished;
+        previous == State::Running
+    }
+}
+
+/// Ends the write of a task when the task ends, also when the write panics.
+struct End(Arc<Task>);
+
+impl Drop for End {
+    fn drop(&mut self) {
+        _ = self.0.finish();
     }
 }
