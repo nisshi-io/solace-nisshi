@@ -126,7 +126,7 @@ iceberg-catalog-rest = "0.10.1"
 iceberg-datafusion = "0.10.1"
 iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3", "opendal-fs", "opendal-memory"] }
 indicatif = "0.18.3"
-jsonschema = "0.60.0"
+jsonschema = "0.61.2"
 lazy_static = "1.4.0"
 libc = "0.2.189"
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
