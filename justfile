@@ -806,6 +806,10 @@ compat-franz-go storage="memory://" features="dynostore": clean-nisshi-db (build
     trap 'kill ${broker}' EXIT
     BROKER_PID=${broker} ./compat/franz-go/run.sh
 
+# run the tests in compat/kafka-java/tests.allow, which are Apache Kafka 3.9.1's own integration tests, against the given storage engine (needs Docker)
+compat-kafka-java storage="memory://" features="dynostore": clean-nisshi-db (build "dev" features)
+    STORAGE_ENGINE='{{ storage }}' ALLOW_LIST_ONLY=1 ./compat/kafka-java/run.sh
+
 # run the Kafka CLI smoke suite (nisshi-smoke-test) against postgres, sqlite, memory or s3 (needs Docker; starts its own broker and services); passes extra arguments to `cargo nextest run`
 [positional-arguments]
 smoke engine *nextest_args:
