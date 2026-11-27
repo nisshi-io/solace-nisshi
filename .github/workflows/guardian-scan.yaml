@@ -254,7 +254,7 @@ jobs:
       # flagged license (policy_flag) asks for a review, not a block, so it is
       # only reported.
       - name: FOSSA licensing guard
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@cb2443adc94d370db25bb0c7d42ffa0fdbc2e4df # main 2026-11-11, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@5a7b42c8eaeb1bcec89fa6246ccd0e581ccefb4c # main 2026-11-11, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
@@ -272,7 +272,7 @@ jobs:
       # but not when there is no fresh analysis to read.
       - name: FOSSA vulnerability guard
         if: ${{ !cancelled() && steps.analyze.outcome == 'success' }}
-        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@cb2443adc94d370db25bb0c7d42ffa0fdbc2e4df # main 2026-11-11, untagged
+        uses: SolaceDev/solace-public-workflows/.github/actions/fossa-guard@5a7b42c8eaeb1bcec89fa6246ccd0e581ccefb4c # main 2026-11-11, untagged
         with:
           fossa_api_key: ${{ secrets.FOSSA_API_KEY }}
           fossa_project_id: ${{ env.FOSSA_PROJECT_ID }}
