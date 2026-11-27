@@ -65,15 +65,26 @@ else
         find "$patched_kafka/core/src/test/scala/integration" -name '*.scala' | sort)
 fi
 
+# Stops only the broker that this script started, not any other Nisshi broker on the machine.
+broker_pid=
+stop_broker() {
+    if [[ -n "$broker_pid" ]]; then
+        kill "$broker_pid" 2>/dev/null || true
+        wait "$broker_pid" 2>/dev/null || true
+        broker_pid=
+    fi
+}
+trap stop_broker EXIT
+
 echo "class,tests,failures,skipped,seconds" >"$results"
 for test_class in "${classes[@]}"; do
     # The Kafka test broker for this class turns off topic auto-creation.
     broker_args=()
     [[ "$test_class" == ProducerFailureHandlingTest ]] && broker_args+=(--auto-create-topics-enable=false)
-    pkill -f 'nisshi broker' 2>/dev/null || true
-    sleep 1
+    stop_broker
     "$root/target/debug/nisshi" broker --storage-engine="$storage_engine" --listener-url=tcp://0.0.0.0:9092 \
         --advertised-listener-url="tcp://$broker_host:9092" ${broker_args[@]+"${broker_args[@]}"} >"$root/target/compat/kafka-java/broker.log" 2>&1 &
+    broker_pid=$!
     sleep 2
     rm -rf "$patched_kafka/core/build/test-results/test"
     start=$SECONDS
@@ -97,7 +108,7 @@ EOF
         echo "$test_class,0,0,0,$((SECONDS - start))  # no result: build failure, timeout or no such class" >>"$results"
     fi
 done
-pkill -f 'nisshi broker' 2>/dev/null || true
+stop_broker
 cat "$results"
 
 if [[ "${ALLOW_LIST_ONLY:-}" == 1 ]]; then
