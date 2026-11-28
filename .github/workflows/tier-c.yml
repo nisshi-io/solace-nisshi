@@ -109,7 +109,7 @@ jobs:
           # that ci.yml restores on every pull request.
           cache-shared-key: dev
           cache-save-if: false
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@0.9.146
       # The test and report steps match ci.yml's `test` job, which explains
@@ -259,7 +259,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.1"
       - run: just compat-infra-up
@@ -322,7 +322,7 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$env:TARGET"
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
@@ -354,7 +354,7 @@ jobs:
           build-warnings: ""
           cache: false
       - run: rustup target add "$TARGET"
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-auditable@0.7.6
           fallback: none
