@@ -225,7 +225,7 @@ jobs:
           # under the same key and never save it.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-shared-key: dev
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@0.9.146
       - run: df -h
@@ -560,7 +560,7 @@ jobs:
         with:
           cache-shared-key: dev
           cache-save-if: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: "1.27.1"
       - run: just compat-infra-up
@@ -691,7 +691,7 @@ jobs:
           just-version: 1.58.0
       # We install a pinned version instead of using the runner image's copy,
       # so that a runner image update cannot fail this check on unchanged code.
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: shellcheck@0.11.0
       - run: just shellcheck
@@ -776,7 +776,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-about@0.8.4
       # The release binary is built with --all-features, so the list is too.
@@ -850,7 +850,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -934,7 +934,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
           cache: false
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-nextest@0.9.146
       # The image is built here from release's binaries and never pushed.
@@ -1063,7 +1063,7 @@ jobs:
       # dependencies. cargo-about writes the licence list that the tarball and
       # the image carry. This job generates it beside the build, instead of
       # waiting on the third-party-license job, which takes minutes.
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1149,7 +1149,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
@@ -1207,7 +1207,7 @@ jobs:
       - if: ${{github.ref_type != 'tag'}}
         run: cargo check --bin nisshi --all-features --target "$TARGET"
       - if: ${{github.ref_type == 'tag'}}
-        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
           tool: cargo-auditable@0.7.6,cargo-about@0.8.4
           fallback: none
